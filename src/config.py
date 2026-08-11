@@ -24,6 +24,11 @@ DATA_DIR.mkdir(exist_ok=True)
 SESSION_FILE = DATA_DIR / "fomo_session.json"
 # probe 原始响应 dump 目录
 PROBE_DIR = DATA_DIR / "fomo_probe"
+# 登录用的浏览器持久化 profile。
+# 用持久化 profile 而不是每次开一个全新的临时 profile,有两个实际好处:
+#   1) 全新 profile 本身就是"自动化"的特征之一,Google OAuth 会因此拒绝登录
+#   2) 登录态留在 profile 里,下次 --login 通常不用重新走一遍第三方授权
+PROFILE_DIR = DATA_DIR / "playwright_profile"
 
 
 class FomoSettings(BaseSettings):

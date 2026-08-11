@@ -72,6 +72,33 @@ notepad .env
 会弹出一个浏览器窗口，**你自己登录**（程序不经手你的密码）。登录态存在
 `data/fomo_session.json`，之后自动续期，不用反复登录。
 
+#### Google 登录报「Couldn't sign you in / This browser or app may not be secure」
+
+Google 会拒绝"被自动化控制"的浏览器。它看三条：启动开关 `--enable-automation`、
+`navigator.webdriver === true`、以及浏览器本体是不是真实 Chrome。
+`--login` 已经把三条都处理了（持久化 profile + 系统真实 Chrome 渠道 + 抹掉 webdriver 标志），
+但 Google 的策略随时会变。真被拦了，按这个顺序试：
+
+**方案一（最省事）：换个登录方式。** FOMO 用的 Privy 支持邮箱验证码登录，
+不走 Google OAuth 就没有这个问题。在登录弹窗里选邮箱那一项即可。
+
+**方案二：attach 到你自己的 Chrome。** 这是最可靠的 ——
+那就是一个普通 Chrome，Google 完全看不出异常。先把 Chrome 全部退出，然后：
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+在这个 Chrome 里登录 fomo.family，然后另开一个终端：
+
+```powershell
+.\bot.ps1 --login --cdp http://127.0.0.1:9222
+```
+
+**方案三：** 装个 Chrome（如果系统里只有 Edge 或干脆没有）。
+没有系统浏览器时会退回 Playwright 打包的 Chromium，那个版本号和指纹都对不上真实 Chrome，
+Google 基本必拦。
+
 ### 4. 探测 API（重要，第一次必须跑）
 
 ```powershell

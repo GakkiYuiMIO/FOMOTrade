@@ -24,7 +24,7 @@ from pathlib import Path
 import httpx
 from loguru import logger
 
-from src.config import SESSION_FILE, get_settings, mask
+from src.config import PROFILE_DIR, SESSION_FILE, get_settings, mask
 from src.models import pick
 
 # ============================================================
@@ -49,6 +49,29 @@ _FALLBACK_TTL_SEC = 900
 
 LOGIN_TIMEOUT_SEC = 300
 _LOGIN_POLL_SEC = 2.0
+
+# ============================================================
+# 反自动化检测(给 Google / X 这类第三方登录用)
+# ============================================================
+# 现象:走 Google 登录时报 "Couldn't sign you in — This browser or app may not be secure"。
+# Google 判定"被自动化控制"主要看三条,**三条必须同时抹掉,少一条照样被拦**:
+#   1) 启动开关 --enable-automation(Playwright 默认会加,还会顶出"正受自动化控制"横幅)
+#   2) navigator.webdriver === true
+#   3) 浏览器本体:打包的 Chromium / headless-shell 版本号与指纹都对不上真实 Chrome
+# 对应的三条对策就是下面的 _DROP_DEFAULT_ARGS / _STEALTH_JS / _LOGIN_CHANNELS。
+_STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+_DROP_DEFAULT_ARGS = ["--enable-automation"]
+# init script 在每个 document 创建时**先于页面脚本**执行,所以检测代码读到的已经是改过的值
+_STEALTH_JS = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+
+# 浏览器渠道优先级:系统真实 Chrome > Edge > Playwright 打包的 Chromium。
+# 前两个是真浏览器,Google 认;最后一个只是兜底 ——
+# 用它能完成 FOMO 自己的邮箱登录,但 Google OAuth 大概率仍会被拦。
+_LOGIN_CHANNELS = ("chrome", "msedge", None)
 
 # ---- Privy token 在浏览器里的候选存放位置(全部未实测) ----
 # TODO(probe): 用 --login 跑一次,照日志里打印的实际键名把下面的候选列表收敛成一条
@@ -380,13 +403,71 @@ def _extract_tokens(context) -> tuple[str | None, str | None, str]:
     return access, refresh, source or "none"
 
 
-def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC) -> bool:
+def _open_login_context(p, settings, cdp_url: str | None):
+    """
+    打开一个尽量"像真人在用"的浏览器上下文,返回 (context, closer)。
+
+    两种模式:
+      - cdp_url 给了 → attach 到用户自己启动的 Chrome(最可靠,Google 完全看不出异常)
+      - 否则 → 用持久化 profile 起系统真实 Chrome,并抹掉自动化特征
+    """
+    # ---- 模式一:attach 到用户自己开的 Chrome ----
+    if cdp_url:
+        logger.info("attach 到已运行的浏览器: {}", cdp_url)
+        browser = p.chromium.connect_over_cdp(cdp_url)
+        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        # attach 模式下代理由那个浏览器自己决定,这里不覆盖
+        return ctx, browser.close
+
+    # ---- 模式二:持久化 profile + 真实 Chrome 渠道 ----
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    base: dict = {
+        "user_data_dir": str(PROFILE_DIR),
+        "headless": False,
+        "locale": "en-US",
+        "args": list(_STEALTH_ARGS),
+        "ignore_default_args": list(_DROP_DEFAULT_ARGS),
+        # 不覆盖 UA:真实 Chrome 自带的 UA 与它的版本、指纹是自洽的,
+        # 手写一个 Chrome/131 反而会和实际内核版本对不上,更容易被识破
+    }
+    if settings.fomo_proxy:
+        # Playwright 只认 {"server": ...} 这种形状,不吃 httpx 的 proxies 字典
+        base["proxy"] = {"server": settings.fomo_proxy}
+        logger.info("登录浏览器走代理: {}", settings.fomo_proxy)
+
+    last_err = None
+    for channel in _LOGIN_CHANNELS:
+        kwargs = dict(base)
+        if channel:
+            kwargs["channel"] = channel
+        try:
+            ctx = p.chromium.launch_persistent_context(**kwargs)
+            label = channel or "bundled-chromium"
+            if channel is None:
+                logger.warning(
+                    "没找到系统 Chrome/Edge,退回 Playwright 打包的 Chromium —— "
+                    "FOMO 自己的邮箱登录可以用,但 Google 第三方登录大概率仍会被拦。"
+                    "建议装个 Chrome,或改用 --login --cdp 附着到你自己的浏览器"
+                )
+            else:
+                logger.info("登录浏览器: {}(系统真实浏览器,已抹掉自动化特征)", label)
+            return ctx, ctx.close
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.debug("启动 {} 失败: {}", channel or "chromium", e)
+    raise RuntimeError(f"所有浏览器渠道都启动失败,最后错误: {last_err}")
+
+
+def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None = None) -> bool:
     """
     拉起有头浏览器,等用户自己在 fomo.family 上完成登录,然后抓 Privy token 存盘。
 
     ⚠️ 程序全程不碰账号密码 —— 只在用户登录成功后读浏览器里已经存在的 token。
     ⚠️ playwright 在这里才 import:HttpFomoClient 路径根本用不到浏览器,
        顶层 import 会让没装 chromium 的机器连 --run 都起不来。
+
+    cdp_url: 形如 "http://127.0.0.1:9222"。给了就 attach 到用户自己启动的 Chrome ——
+             Google 对自动化浏览器的封锁在这个模式下完全不存在(那就是一个普通 Chrome)。
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -395,21 +476,25 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC) -> bool:
         return False
 
     settings = get_settings()
-    launch_kwargs: dict = {"headless": False}
-    if settings.fomo_proxy:
-        # Playwright 只认 {"server": ...} 这种形状,不吃 httpx 的 proxies 字典
-        launch_kwargs["proxy"] = {"server": settings.fomo_proxy}
-        logger.info("登录浏览器走代理: {}", settings.fomo_proxy)
-
     logger.info("正在打开浏览器,请在窗口里自己完成登录(程序不会代填任何账号密码)…")
     deadline = time.time() + timeout_sec
     access = refresh = None
     source = "none"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(user_agent=USER_AGENT, locale="en-US")
-        page = context.new_page()
+        try:
+            context, closer = _open_login_context(p, settings, cdp_url)
+        except Exception as e:  # noqa: BLE001
+            logger.error("浏览器启动失败: {}", e)
+            return False
+
+        # 页面脚本跑之前先把 navigator.webdriver 抹掉
+        try:
+            context.add_init_script(_STEALTH_JS)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("注入 stealth 脚本失败(不致命): {}", e)
+
+        page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto(FOMO_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:  # noqa: BLE001
@@ -417,6 +502,8 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC) -> bool:
             logger.warning("首页加载异常(继续等待登录): {}", e)
 
         logger.info("等待登录完成…最多等 {} 秒。登录成功后本窗口会自动关闭。", timeout_sec)
+        logger.info("提示:如果 Google 登录被拒(This browser or app may not be secure),"
+                    "改用 FOMO 的邮箱验证码登录,或看 README 的 --cdp 方案")
         while time.time() < deadline:
             if not context.pages:  # 用户把窗口全关了
                 logger.error("浏览器已被关闭,登录未完成")
@@ -430,7 +517,7 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC) -> bool:
             time.sleep(_LOGIN_POLL_SEC)
 
         try:
-            browser.close()
+            closer()
         except Exception:  # noqa: BLE001
             pass
 

@@ -541,13 +541,16 @@ def cmd_init_db() -> int:
     return 0
 
 
-def cmd_login() -> int:
+def cmd_login(cdp_url: str | None = None) -> int:
     """有头浏览器登录,程序不经手密码"""
     from src.auth import interactive_login
 
-    logger.info("即将打开浏览器,请在窗口里自行完成 FOMO 登录(本程序不经手你的账号密码)")
+    if cdp_url:
+        logger.info("将 attach 到你自己启动的浏览器: {}", cdp_url)
+    else:
+        logger.info("即将打开浏览器,请在窗口里自行完成 FOMO 登录(本程序不经手你的账号密码)")
     try:
-        ok = interactive_login()
+        ok = interactive_login(cdp_url=cdp_url)
     except Exception as e:  # noqa: BLE001
         logger.exception("登录流程异常: {}", e)
         return 1
@@ -761,6 +764,10 @@ def main() -> int:
     )
     parser.add_argument("--login", action="store_true",
                         help="打开浏览器手动登录 FOMO,保存登录态(程序不经手密码)")
+    parser.add_argument("--cdp", metavar="URL", default=None,
+                        help="配合 --login:attach 到你自己启动的 Chrome(例 http://127.0.0.1:9222)。"
+                             "Google 第三方登录拒绝自动化浏览器时用这个 —— "
+                             "先用 --remote-debugging-port=9222 启动 Chrome")
     parser.add_argument("--probe", action="store_true",
                         help="打全部 API 端点 + dump 原始 JSON + 打印字段核对表(Phase 0 必跑)")
     parser.add_argument("--handle", type=str, default=None, metavar="HANDLE",
@@ -779,7 +786,7 @@ def main() -> int:
     store.init_db()
 
     if args.login:
-        return cmd_login()
+        return cmd_login(args.cdp)
     if args.probe:
         return cmd_probe(args.handle)
     if args.check:
