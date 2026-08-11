@@ -264,6 +264,21 @@ def _balance_key(b: dict) -> tuple[str | None, str | None]:
     return net, ca
 
 
+def _fill(d: dict, key: str, value) -> None:
+    """
+    只在**当前值为空**时写入。
+
+    ⚠️ 不能用 dict.setdefault:它只判断"键在不在",不判断值是不是 None。
+       trades 分支先跑,若某个币的 tokenMetadata 是空的(真实响应里不罕见),
+       就会把 symbol / price_usd / network_raw 写成 None 并占住这个键 ——
+       之后 balances 明明有这些值也补不进去。
+       后果:消息里没有 $SYMBOL、市值行消失,而且 network_raw=None 会让
+       这个币被 _collect_thesis 整个跳过(观点永远抓不到)。
+    """
+    if d.get(key) is None and value is not None:
+        d[key] = value
+
+
 def _balance_usd(b: dict) -> float | None:
     """
     这条持仓值多少美元。
@@ -461,6 +476,8 @@ class Poller:
             snapshots = self._fetch_snapshots(users)
             # 先建代币/持仓索引:归一化时要用它补 symbol、市值、持仓、均价
             self._build_token_index(snapshots)
+            # 行情落库,供 /hot 算倍数(失败不影响推送)
+            self._save_token_snapshots(conn)
 
             # --- 3) 归一化 + 游标过滤 ---
             events = self._collect_events(conn, users, snapshots)
@@ -563,9 +580,9 @@ class Poller:
                 cost = _f(t.get("totalCostBasis"))
                 realized = _f(t.get("realizedPnlUsd"))
                 m = meta.setdefault((net, ca), {})
-                m.setdefault("symbol", _clean_symbol(_pick_str(tm, "symbol")))
-                m.setdefault("price_usd", price)
-                m.setdefault("network_raw", t.get("networkId"))
+                _fill(m, "symbol", _clean_symbol(_pick_str(tm, "symbol")))
+                _fill(m, "price_usd", price)
+                _fill(m, "network_raw", t.get("networkId"))
 
                 # ⚠️ 同一个币可能同时有一条活跃单和多条已平仓单(买→清→再买)。
                 #    无脑覆盖的话,后写的已平仓单(剩余量 0)会把活跃单的真实持仓抹成 $0.00 ——
@@ -607,13 +624,13 @@ class Poller:
                 tok = tfr.get("token") if isinstance(tfr.get("token"), dict) else {}
                 price = _f(tfr.get("priceUSD"))
                 m = meta.setdefault((net, ca), {})
-                # setdefault:同一个币多人持有时以先到的为准,值都一样,不必反复覆盖
-                m.setdefault("symbol", _clean_symbol(_pick_str(tok, "symbol")))
-                m.setdefault("market_cap", _f(tfr.get("marketCap")))
-                m.setdefault("price_usd", price)
+                # 只补空、不覆盖:同一个币多人持有时以先到的为准,值都一样
+                _fill(m, "symbol", _clean_symbol(_pick_str(tok, "symbol")))
+                _fill(m, "market_cap", _f(tfr.get("marketCap")))
+                _fill(m, "price_usd", price)
                 # 拉 thesis 时要用**原始**数字 networkId(1399811149),
                 # 不能用归一化后的 "solana" —— 那是我们内部的聚合键,API 不认
-                m.setdefault("network_raw", tok.get("networkId"))
+                _fill(m, "network_raw", tok.get("networkId"))
 
                 ut = b.get("userToken") if isinstance(b.get("userToken"), dict) else None
                 if not ut:
@@ -635,6 +652,29 @@ class Poller:
         self._token_meta = meta
         self._positions = pos
         logger.debug("代币索引 {} 个 · 持仓索引 {} 条", len(meta), len(pos))
+
+    def _save_token_snapshots(self, conn) -> None:
+        """
+        把本 tick 的行情落库,供 /hot 算"买入时市值 → 现在市值"的倍数。
+
+        ⚠️ 不落库的话 /hot 执行时得现拉几十个币的行情,一条命令要等十几秒。
+           这里是顺手写几十行,几乎零成本。
+        ⚠️ 只覆盖名单里还有人持有的币 —— 清仓后不再更新,
+           updated_at 就是它最后已知的时间,/hot 会据此标注数据是不是旧的。
+        """
+        rows = [
+            (net, ca, m.get("symbol"), m.get("price_usd"), m.get("market_cap"))
+            for (net, ca), m in self._token_meta.items()
+            if m.get("price_usd") is not None or m.get("market_cap") is not None
+        ]
+        if not rows:
+            return
+        try:
+            with store.tx(conn):
+                store.upsert_token_snapshots(conn, rows)
+        except Exception as e:  # noqa: BLE001
+            # 行情快照只影响 /hot 的展示,绝不能因为它失败而中断本轮推送
+            logger.warning("行情快照落库失败(不影响推送): {}", e)
 
     def _collect_thesis(self, conn, users) -> list[FomoEvent]:
         """

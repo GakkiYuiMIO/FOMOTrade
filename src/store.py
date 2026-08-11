@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS fomo_events (
     --   而"共识数 vs 后续涨幅"是这个交易项目明确的回溯需求
     cs_buyers     INTEGER,
     cs_watchlist  INTEGER,
+    -- 【买入榜】事件发生时的市值。与 cs_* 同理:这是**时点值,事后无法重算**,
+    --   而"名单买入时 $1M → 现在 $15M"正是判断金狗的核心依据。
+    --   price_usd 已经在上面存了,两者合起来才能算倍数。
+    market_cap    REAL,
     sent          INTEGER NOT NULL DEFAULT 0,  -- 0=未发出;每 tick 末尾补发 10 分钟内未发出项
     raw_json      TEXT NOT NULL       -- 原始报文全量留存,便于日后离线回填
 );
@@ -118,6 +122,21 @@ CREATE TABLE IF NOT EXISTS user_token_stats (
     PRIMARY KEY (user_id, network_id, token_address)
 );
 CREATE INDEX IF NOT EXISTS idx_uts_token ON user_token_stats(network_id, token_address);
+
+-- ============ 【买入榜】代币行情快照 ============
+-- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
+-- 存在的理由:/hot 要算"买入时市值 → 现在市值"的倍数,
+-- 而"现在"这个值只有在轮询到持仓时才拿得到 —— 不落地的话命令执行时得现拉 N 个币。
+-- 只覆盖**名单里还有人持有**的币;清仓后不再更新,updated_at 就是它最后已知的时间。
+CREATE TABLE IF NOT EXISTS token_snapshot (
+    network_id    TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    symbol        TEXT,
+    price_usd     REAL,
+    market_cap    REAL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (network_id, token_address)
+);
 """
 
 
@@ -170,9 +189,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     所以新增列必须在这里 ALTER,否则老库升级后直接报 no such column。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(fomo_events)").fetchall()}
-    if cols and "user_handle" not in cols:
-        conn.execute("ALTER TABLE fomo_events ADD COLUMN user_handle TEXT")
-        logger.info("迁移:fomo_events 补列 user_handle")
+    for col, ddl in (("user_handle", "TEXT"), ("market_cap", "REAL")):
+        if cols and col not in cols:
+            conn.execute(f"ALTER TABLE fomo_events ADD COLUMN {col} {ddl}")  # noqa: S608
+            logger.info("迁移:fomo_events 补列 {}", col)
 
     for old, new in _NETWORK_RENAMES.items():
         for table in ("fomo_events", "user_token_stats"):
@@ -391,11 +411,12 @@ def insert_event(conn, ev: FomoEvent) -> bool:
         """
         INSERT OR IGNORE INTO fomo_events
             (event_id, event_type, user_id, handle, user_handle, network_id, token_address,
-             token_symbol, amount_usd, token_amount, price_usd, tx_hash, event_ts, ingested_at,
-             badge, badge_reason, raw_json)
+             token_symbol, amount_usd, token_amount, price_usd, market_cap, tx_hash,
+             event_ts, ingested_at, badge, badge_reason, raw_json)
         VALUES (:event_id, :event_type, :user_id, :handle, :user_handle, :network_id,
                 :token_address, :token_symbol, :amount_usd, :token_amount, :price_usd,
-                :tx_hash, :event_ts, :ingested_at, :badge, :badge_reason, :raw_json)
+                :market_cap, :tx_hash, :event_ts, :ingested_at,
+                :badge, :badge_reason, :raw_json)
         """,
         r,
     )
@@ -590,6 +611,90 @@ def count_consensus(conn, ev: FomoEvent) -> tuple[int | None, int | None]:
         "SELECT COUNT(*) AS n FROM watch_users WHERE active = 1 AND stats_ready = 1"
     ).fetchone()["n"]
     return buyers, size
+
+
+def upsert_token_snapshots(conn, rows: list[tuple]) -> None:
+    """
+    批量写入代币行情快照。rows = [(net, ca, symbol, price, market_cap), ...]
+
+    每 tick 覆盖一次。只覆盖名单里还有人持有的币 ——
+    清仓之后不再更新,updated_at 就是它最后已知的时间点(/hot 会据此标注数据新鲜度)。
+    """
+    ts = now_iso()
+    conn.executemany(
+        """
+        INSERT INTO token_snapshot (network_id, token_address, symbol, price_usd,
+                                    market_cap, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(network_id, token_address) DO UPDATE SET
+            symbol     = COALESCE(excluded.symbol, symbol),
+            price_usd  = COALESCE(excluded.price_usd, price_usd),
+            market_cap = COALESCE(excluded.market_cap, market_cap),
+            updated_at = excluded.updated_at
+        """,
+        [(n, c, s, p, m, ts) for n, c, s, p, m in rows],
+    )
+
+
+def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
+    """
+    【买入榜】给定时间窗内,名单里的人买了哪些币。
+
+    排序:先按**买入人数**(这才是共识信号),再按总买入额。
+    单人反复加仓不会把一个币刷到榜首 —— COUNT(DISTINCT user_id) 决定名次。
+
+    ⚠️ 只统计 BUY 且**排除掉计价币**(badge_reason='quote_token' 的那些):
+       稳定币互换会让 $USDC 恒居榜首,整个榜就废了。
+    ⚠️ 市值取窗口内**最早那笔买入**时的值(first_mcap)——
+       "名单开始买的时候多大" 才是算倍数的基准,取最近一笔就没意义了。
+    """
+    return conn.execute(
+        """
+        SELECT
+            e.network_id,
+            e.token_address,
+            MAX(e.token_symbol)                       AS symbol,
+            COUNT(DISTINCT e.user_id)                 AS buyers,
+            COUNT(*)                                  AS buys,
+            SUM(COALESCE(e.amount_usd, 0))            AS total_usd,
+            MIN(e.event_ts)                           AS first_ts,
+            MAX(e.event_ts)                           AS last_ts,
+            -- 窗口内最早一笔的市值/价格(SQLite 的 MIN(a), b 关联取值)
+            (SELECT market_cap FROM fomo_events x
+              WHERE x.network_id = e.network_id AND x.token_address = e.token_address
+                AND x.event_type = 'BUY' AND x.event_ts >= ?
+              ORDER BY x.event_ts LIMIT 1)            AS first_mcap,
+            s.market_cap                              AS now_mcap,
+            s.updated_at                              AS mcap_at
+        FROM fomo_events e
+        LEFT JOIN token_snapshot s
+               ON s.network_id = e.network_id AND s.token_address = e.token_address
+        WHERE e.event_type = 'BUY'
+          AND e.event_ts >= ?
+          AND e.token_address IS NOT NULL
+          AND COALESCE(e.badge_reason, '') != 'quote_token'
+        GROUP BY e.network_id, e.token_address
+        ORDER BY buyers DESC, total_usd DESC
+        LIMIT ?
+        """,
+        (since_iso, since_iso, int(limit)),
+    ).fetchall()
+
+
+def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
+                 limit: int = 6) -> list[sqlite3.Row]:
+    """某个币在窗口内被谁买过(按首次买入时间正序 —— 谁先发现的排前面)"""
+    return conn.execute(
+        """
+        SELECT COALESCE(MAX(user_handle), MAX(handle)) AS who, MIN(event_ts) AS ts
+        FROM fomo_events
+        WHERE event_type = 'BUY' AND network_id = ? AND token_address = ? AND event_ts >= ?
+        GROUP BY user_id
+        ORDER BY ts
+        LIMIT ?
+        """,
+        (network_id, token_address, since_iso, int(limit)),
+    ).fetchall()
 
 
 def list_buyers(conn, network_id: str, token_address: str) -> list[sqlite3.Row]:

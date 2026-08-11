@@ -21,13 +21,13 @@ from __future__ import annotations
 import html
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
 from src import store
 from src.config import get_settings
-from src.models import normalize_network, normalize_token_address
+from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
 POLL_TIMEOUT_SEC = 30
@@ -63,6 +63,7 @@ _PNL_FIELD = {"24h": "pnl24h", "7d": "pnl7d", "30d": "pnl30d", "following": "pnl
 #    这份列表与 _dispatch 里的分支必须**同步维护** —— 菜单里有、_dispatch 里没有,
 #    用户点了只会得到"未知命令"。
 _COMMAND_MENU = [
+    ("hot", "名单买入榜:/hot [今日|3日|7日] — 大家都在买哪些币"),
     ("add", "加入监控:/add <handle>"),
     ("following", "批量导入某人的关注列表:/following <handle>"),
     ("top", "今日榜单:/top [24h|7d|30d|following] [条数]"),
@@ -73,11 +74,22 @@ _COMMAND_MENU = [
     ("help", "命令说明"),
 ]
 
+# 买入榜的时间窗。key 是用户可以敲的写法
+_HOT_WINDOWS = {
+    "1d": 1, "24h": 1, "今日": 1, "今天": 1, "日": 1, "day": 1,
+    "3d": 3, "3日": 3, "三日": 3, "3天": 3,
+    "7d": 7, "7日": 7, "七日": 7, "7天": 7, "week": 7, "周": 7,
+}
+# ⚠️ 是**滚动窗口**不是自然日:"今日"写成"近 24 小时"才不会被误读成"从今天零点起"
+_HOT_LABEL = {1: "近 24 小时", 3: "近 3 日", 7: "近 7 日"}
+MAX_HOT_ROWS = 12
+
 _HELP = (
     "🤖 <b>FOMO 监控 Bot</b>\n"
+    "/hot [今日|3日|7日] — 名单买入榜:大家都在买哪些币 🔥\n"
     "/add &lt;handle&gt; — 加入监控(立即生效,历史基线由下一轮建立)\n"
     "/following &lt;handle&gt; — 把这个人关注的所有人批量加入监控\n"
-    "/top [24h|7d|30d|following] [条数] — 榜单,默认今日前 15\n"
+    "/top [24h|7d|30d|following] [条数] — 交易员榜单,默认今日前 15\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态\n"
     "/status — 运行状态\n"
@@ -89,6 +101,48 @@ _HELP = (
 def _esc(v) -> str:
     """HTML 转义。API 返回的昵称里带 '<' 并不罕见,不转义整条回执直接 400"""
     return html.escape(str(v)) if v is not None else ""
+
+
+def _iso_days_ago(days: int, hours: int = 0) -> str:
+    """
+    N 天前的 UTC ISO 字符串。
+
+    ⚠️ 必须与 models.now_iso() 同格式 —— event_ts 的窗口比较是**字符串比较**,
+       格式差一点结果就完全失真(store.load_unsent_recent 踩过这个坑)。
+    """
+    return (datetime.now(UTC) - timedelta(days=days, hours=hours)).isoformat(timespec="seconds")
+
+
+def _ago(iso: str | None) -> str:
+    """
+    ISO → "3 小时前" 这种相对时间。
+
+    ⚠️ 刻意不显示绝对时刻:库里存的是 UTC,而用户在 UTC+8 ——
+       直接显示 "19:20 起" 会被读成本地时间,差 8 小时。
+       转成本地时间又要猜时区。相对时间没有这个歧义,而且"多久之前"
+       本来就比"几点"更贴近看盘时的判断。
+    """
+    if not iso:
+        return "时间未知"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return "时间未知"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    mins = (datetime.now(UTC) - dt).total_seconds() / 60
+    if mins < 1:
+        return "刚刚"
+    if mins < 60:
+        return f"{int(mins)} 分钟前"
+    if mins < 60 * 24:
+        return f"{int(mins // 60)} 小时前"
+    return f"{int(mins // 1440)} 天前"
+
+
+def _chain_name(net: str | None) -> str:
+    """链的展示名。未收录时原样透传(该值来自 API,调用方负责 escape)"""
+    return NETWORK_DISPLAY.get((net or "").strip(), (net or "").strip() or "?")
 
 
 def _money(v: float) -> str:
@@ -222,6 +276,8 @@ class CommandBot:
             return self._cmd_following(arg)
         if cmd in ("/top", "/leaderboard", "/lb"):
             return self._cmd_top(arg)
+        if cmd in ("/hot", "/coins", "/buys"):
+            return self._cmd_hot(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
         if cmd == "/list":
@@ -270,6 +326,85 @@ class CommandBot:
             f"✅ 已加入 <b>{name}</b>(@{_esc(handle)})\n"
             f"⏳ 正在建立历史基线,完成前的买入不打徽章、不显示共识"
         )
+
+    def _cmd_hot(self, arg: str) -> str:
+        """
+        /hot [今日|3日|7日] —— 名单买入榜:监控的这批人在窗口内买了哪些币。
+
+        这是**按币聚合**,不是按人 —— 想看的是"大家都在买什么",
+        所以名次由 **买入人数** 决定(单人反复加仓刷不上来)。
+
+        全部走本地库,零 API 调用:
+          买入人数 / 总额 / 首次时间  ← fomo_events
+          现在市值                    ← token_snapshot(poller 每轮落的行情)
+        倍数 = 现在市值 ÷ **窗口内最早那笔买入时的市值**,
+        也就是"名单开始买之后涨了多少" —— 这才是判断金狗的依据。
+        """
+        days = 1
+        for tok in (arg or "").split():
+            t = tok.strip().lower()
+            if t in _HOT_WINDOWS:
+                days = _HOT_WINDOWS[t]
+        since = _iso_days_ago(days)
+        label = _HOT_LABEL.get(days, f"近 {days} 日")
+
+        with store.get_conn() as conn:
+            rows = store.hot_tokens(conn, since, limit=MAX_HOT_ROWS)
+            ready = len([r for r in store.list_active_users(conn) if r["stats_ready"]])
+            detail = {
+                (r["network_id"], r["token_address"]):
+                    store.token_buyers(conn, r["network_id"], r["token_address"], since, limit=4)
+                for r in rows
+            }
+
+        if not rows:
+            return (
+                f"🔥 <b>名单买入榜 · {label}</b>\n"
+                f"这段时间名单里没人买入。\n"
+                f"(名单 {ready} 人已就绪;刚 /add 的人要等基线建好才会有数据)"
+            )
+
+        lines = [f"🔥 <b>名单买入榜 · {label}</b>"]
+        for i, r in enumerate(rows, 1):
+            sym = _esc(r["symbol"] or "?")
+            buyers, buys = r["buyers"], r["buys"]
+            head = f"{i}. <b>${sym}</b> · 👥 {buyers} 人买入"
+            if buys > buyers:
+                head += f"({buys} 笔)"
+            lines.append(head)
+
+            seg = [f"💰 {_money(_num(r['total_usd']))}"]
+            now_mc, first_mc = r["now_mcap"], r["first_mcap"]
+            if now_mc:
+                seg.append(f"💎 {_money(_num(now_mc))}")
+            # 倍数:现在市值 ÷ 名单最早买入时的市值
+            if now_mc and first_mc and _num(first_mc) > 0:
+                x = _num(now_mc) / _num(first_mc)
+                if x >= 1.1:
+                    seg.append(f"🚀 {x:.1f}x")
+                elif x <= 0.9:
+                    seg.append(f"📉 {(x - 1) * 100:+.0f}%")
+            lines.append("   " + " · ".join(seg))
+
+            who = detail.get((r["network_id"], r["token_address"])) or []
+            names = " ".join(f"@{_esc(w['who'])}" for w in who if w["who"])
+            if names:
+                more = buyers - len(who)
+                lines.append(f"   👤 {names}" + (f" +{more}" if more > 0 else ""))
+            lines.append(f"   🧬 {_esc(_chain_name(r['network_id']))} · {_ago(r['first_ts'])}开始买")
+            lines.append(f"   <code>{_esc(r['token_address'])}</code>")
+
+        # 行情新鲜度:清仓后 token_snapshot 就不再更新,倍数会失真,必须让用户知道
+        stale = [r for r in rows if r["mcap_at"] and r["mcap_at"] < _iso_days_ago(0, hours=1)]
+        if stale:
+            lines.append(f"\n{_esc('⚠️')} {len(stale)} 个币的行情已超过 1 小时未更新"
+                         f"(名单里没人持有了,倍数仅供参考)")
+        lines.append(f"\n按买入人数排序 · 名单 {ready} 人 · /hot 今日|3日|7日")
+        # 3日/7日 的数据要靠 bot 持续运行积累:每轮只拉每人最近 50 笔 swaps,
+        # 刚跑起来时更长的窗口和"今日"看着会差不多。不说明的话用户会以为是 bug。
+        if days > 1:
+            lines.append("(更长的窗口需要 bot 持续运行来积累,刚启动时数据会偏少)")
+        return "\n".join(lines)
 
     def _cmd_top(self, arg: str) -> str:
         """

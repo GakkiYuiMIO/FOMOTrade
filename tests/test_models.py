@@ -388,14 +388,17 @@ def test_to_row只输出落库字段():
     assert set(row) == {
         "event_id", "event_type", "user_id", "handle", "user_handle",
         "network_id", "token_address", "token_symbol", "amount_usd", "token_amount",
-        "price_usd", "tx_hash", "event_ts", "ingested_at",
+        "price_usd", "market_cap", "tx_hash", "event_ts", "ingested_at",
         "badge", "badge_reason", "raw_json",
     }
-    assert "market_cap" not in row
     assert "ts_fallback" not in row
-    # 盈亏是展示字段(每 tick 从 /trades 重新拿),不落库
+    # 持仓与盈亏是展示字段(每 tick 从 /trades 重新拿),不落库
+    assert "holding_usd" not in row
     assert "realized_pnl" not in row
     assert "unrealized_pnl" not in row
+    # ⚠️ market_cap 例外:它是**时点值,事后无法重算**,
+    #    /hot 的"买入时市值 → 现在市值"倍数全靠它,所以必须落库(与 cs_* 同理)
+    assert row["market_cap"] == 1.9e7
 
 
 def test_徽章字段默认为空():

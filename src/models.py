@@ -400,6 +400,8 @@ class FomoEvent:
             "amount_usd": self.amount_usd,
             "token_amount": self.token_amount,
             "price_usd": self.price_usd,
+            # 市值是时点值、事后无法重算 —— /hot 的"买入时市值 → 现在"倍数靠它
+            "market_cap": self.market_cap,
             "tx_hash": self.tx_hash,
             "event_ts": self.event_ts,
             "ingested_at": self.ingested_at,
