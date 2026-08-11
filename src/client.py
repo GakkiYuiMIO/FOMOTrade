@@ -149,13 +149,30 @@ _LIST_KEYS = (
 )
 
 
+def _unwrap(payload):
+    """
+    剥掉 FOMO 的统一响应信封。
+
+    实测(2026-08-11)所有端点都是这个形状:
+        {"success": true, "message": "...", "responseObject": <真正的数据>, "statusCode": 200}
+
+    ⚠️ 这一步必须显式做。原来只靠 _LIST_KEYS 里的通用候选键去猜,猜不中 responseObject,
+       于是 get_swaps() 恒返回 0 条,而同一个请求 raw_get() 明明能拿到 100 条 ——
+       表现为"能连通、不报错、但永远没有新事件",比直接报错难查得多。
+    """
+    if isinstance(payload, dict) and "responseObject" in payload:
+        return payload["responseObject"]
+    return payload
+
+
 def _as_list(payload, _depth: int = 0) -> list[dict]:
     """
-    把响应压成 list[dict]。裸数组 / {"data": [...]} / {"data": {"items": [...]}} 三种都吃。
+    把响应压成 list[dict]。裸数组 / {"responseObject": {"swaps": [...]}} / {"data": [...]} 都吃。
 
     ⚠️ 解析不出来返回 [] 而不是抛异常 —— 上层拿到空列表只是「本轮没有新事件」,
-       拿到异常则会把整个用户的这一类数据判为失败。字段名没实测过,前者的代价小得多。
+       拿到异常则会把整个用户的这一类数据判为失败。
     """
+    payload = _unwrap(payload)
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict) and _depth < 3:
@@ -167,11 +184,16 @@ def _as_list(payload, _depth: int = 0) -> list[dict]:
                 inner = _as_list(v, _depth + 1)
                 if inner:
                     return inner
+        # 信封里只有一个数组时不必猜键名(如 {"swaps": [...], "hasNextPage": false})
+        arrays = [v for v in payload.values() if isinstance(v, list)]
+        if len(arrays) == 1:
+            return [x for x in arrays[0] if isinstance(x, dict)]
     return []
 
 
 def _as_obj(payload) -> dict:
-    """把响应压成单个对象。{"data": {...}} / {"user": {...}} / 裸对象都吃。"""
+    """把响应压成单个对象。{"responseObject": {...}} / {"data": {...}} / 裸对象都吃。"""
+    payload = _unwrap(payload)
     if isinstance(payload, dict):
         for k in ("data", "user", "result", "item", "profile"):
             v = payload.get(k)

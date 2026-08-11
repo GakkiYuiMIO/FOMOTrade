@@ -83,6 +83,10 @@ _P_LEG_IN = ("tokenIn", "fromToken", "inputToken", "in", "from", "sell", "sold")
 _P_LEG_OUT = ("tokenOut", "toToken", "outputToken", "out", "to", "buy", "bought")
 
 _K_AMOUNT_USD = ("amountUsd", "usdValue", "valueUsd", "usdAmount", "totalUsd", "usd", "amountUSD", "volumeUsd")
+# 实测:swap 记录的 USD 金额是分侧的。取标的那一侧 —— 买入看 out、卖出看 in。
+# 跨链 swap 两侧数值有细微差(手续费/滑点),取错侧显示的就不是这笔的真实成交额。
+_USD_OUT_FIRST = ("humanUsdAmountOut", "humanUsdAmountIn")
+_USD_IN_FIRST = ("humanUsdAmountIn", "humanUsdAmountOut")
 _K_TOKEN_AMOUNT = ("amount", "tokenAmount", "uiAmount", "quantity", "qty", "rawAmount", "amountRaw", "balance")
 _K_PRICE_USD = ("priceUsd", "price", "tokenPrice", "usdPrice", "priceInUsd", "unitPrice")
 
@@ -800,7 +804,14 @@ class Poller:
             network_id=net,
             token_address=ca,
             token_symbol=_clean_symbol(sym),
-            amount_usd=_f(pick(src, *_K_AMOUNT_USD)) or _f(pick(raw, *_K_AMOUNT_USD)),
+            # ⚠️ 实测记录里 USD 金额是分侧的:humanUsdAmountIn / humanUsdAmountOut。
+            #    要取**标的那一侧**的值:买入时标的在 out 侧,卖出时在 in 侧。
+            #    跨链 swap 两侧数值会有细微差(手续费/滑点),取错侧显示的就不是这笔的成交额。
+            amount_usd=(
+                _f(pick(src, *_K_AMOUNT_USD))
+                or _f(pick(raw, *(_USD_OUT_FIRST if event_type == EVENT_BUY else _USD_IN_FIRST)))
+                or _f(pick(raw, *_K_AMOUNT_USD))
+            ),
             token_amount=amount,
             price_usd=_f(pick(src, *_K_PRICE_USD)) or _f(pick(raw, *_K_PRICE_USD)),
             tx_hash=tx_hash,
@@ -1001,15 +1012,23 @@ def _extract_leg(raw: dict, nested_keys: tuple[str, ...], flat_prefixes: tuple[s
             return v
     for p in flat_prefixes:
         leg: dict = {}
+        # 顺序即优先级,先命中的不被后面覆盖(setdefault)。
+        # ⚠️ 前两项是 2026-08-11 实测确认的真实字段名:
+        #      inTokenAddress / outTokenAddress、inHumanAmount / outHumanAmount
+        #    原来只拼 p+"Address"(= inAddress),真实记录里没有这个键,
+        #    于是两侧都取不到 → 走单侧降级分支 → 方向判不出 → 所有买卖都成了 side_unknown。
         for suffix, target in (
-            ("Address", "address"), ("Symbol", "symbol"), ("Amount", "amount"),
+            ("TokenAddress", "address"), ("Address", "address"), ("Mint", "mint"),
+            ("TokenSymbol", "symbol"), ("Symbol", "symbol"),
+            ("HumanAmount", "amount"), ("Amount", "amount"),
             ("NetworkId", "networkId"), ("ChainId", "chainId"),
-            ("AmountUsd", "amountUsd"), ("Price", "price"), ("Mint", "mint"),
+            ("AmountUsd", "amountUsd"), ("Price", "price"),
         ):
             val = raw.get(p + suffix)
             if val is not None and not isinstance(val, (dict, list)):
-                leg[target] = val
-        if leg:
+                leg.setdefault(target, val)
+        if leg.get("address"):
+            # 只有拿到地址才算解析出这一侧 —— 光有 amount 判不了是不是计价币
             return leg
     return None
 
