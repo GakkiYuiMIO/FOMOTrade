@@ -41,6 +41,8 @@ EP_BALANCES = "/v2/users/{uid}/balances"
 # 持仓单(含已平仓的)。orderBy 只接受 'closedAt' / 'realizedPnlUsd' 两个值
 EP_TRADES = "/trades"
 EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
+# 榜单。period ∈ {24h, 7d, 30d, following};⚠️ limit 必传,不带直接 400
+EP_LEADERBOARD = "/v2/leaderboard/{period}"
 # ⚠️ 服务端硬上限 100,传 201 会直接 400 —— 实测出来的,不要改大
 _FOLLOWING_PAGE = 100
 # ⚠️ 不提供转账查询。实测 /v2/transfers/with/{uid} 是「**我**与该用户之间的转账」——
@@ -117,6 +119,7 @@ class FomoClient(Protocol):
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
+    def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
     def fetch_snapshot(self, user_id: str) -> UserSnapshot: ...
@@ -356,6 +359,18 @@ class _BaseFomoClient:
 
     def get_balances(self, user_id: str) -> list[dict]:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
+
+    def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list[dict]:
+        """
+        榜单。period ∈ {24h, 7d, 30d, following};following 是"我关注的人里的排名"。
+
+        ⚠️ limit **必传**:不带直接 400。服务端上限 100,传更大也只给 100。
+        字段:id / displayName / userHandle / pnl24h / totalVolume / numTrades /
+             followers / totalHoldings / topHoldings[] / clan。
+        """
+        p = (period or "24h").strip().lower()
+        path = EP_LEADERBOARD.format(period=quote(p, safe=""))
+        return _as_list(self._get(path, {"limit": max(1, min(int(limit), 100))}))
 
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]:
         """

@@ -81,6 +81,35 @@ class TelegramNotifier:
                     return False
         return False
 
+    def set_my_commands(self, commands: list[tuple[str, str]]) -> bool:
+        """
+        注册命令菜单 —— 用户在输入框敲 `/` 时 Telegram 弹出的那个列表。
+
+        ⚠️ 这是 Telegram 服务端保存的状态,不是消息:调一次就一直生效,
+           所以每次启动调是幂等的,不会刷屏。
+        ⚠️ command 只能是小写字母/数字/下划线,且**不带前导斜杠** ——
+           带了斜杠 TG 会静默拒绝整个列表(返回 400),菜单就一直是空的。
+        """
+        if not self.enabled:
+            return False
+        url = f"https://api.telegram.org/bot{self._token}/setMyCommands"
+        payload = {
+            "commands": [
+                {"command": c.lstrip("/").lower(), "description": d[:256]}
+                for c, d in commands
+            ]
+        }
+        try:
+            with self._client() as c:
+                resp = c.post(url, json=payload)
+            resp.raise_for_status()
+            logger.info("已注册 {} 条命令菜单", len(payload["commands"]))
+            return True
+        except Exception as e:  # noqa: BLE001
+            # 菜单注册失败不影响命令本身可用,降级为警告
+            logger.warning("注册命令菜单失败(不影响命令可用): {}", e)
+            return False
+
     def get_updates(self, offset: int | None = None, timeout: int = 30) -> list[dict]:
         """
         长轮询拉取命令消息。返回 update 列表,失败返回空列表(不抛异常,由调用方决定重试)。

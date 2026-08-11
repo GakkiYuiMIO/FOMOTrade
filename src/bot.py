@@ -45,10 +45,39 @@ MAX_LIST_ROWS = 50
 # 80 人 × 3 = 240 请求/轮,已经是对 FOMO 相当可观的压力,再高就该拉长轮询间隔了。
 MAX_FOLLOWING_IMPORT = 80
 
+# 榜单一次最多列这么多行(TG 单条 4096 字符硬上限;每行约 70 字符)
+MAX_TOP_ROWS = 20
+# 榜单周期别名 → API 的 period
+_TOP_PERIODS = {
+    "24h": "24h", "1d": "24h", "day": "24h", "今日": "24h", "日": "24h",
+    "7d": "7d", "week": "7d", "周": "7d", "本周": "7d",
+    "30d": "30d", "month": "30d", "月": "30d", "本月": "30d",
+    "following": "following", "关注": "following", "f": "following",
+}
+_PERIOD_LABEL = {"24h": "24 小时", "7d": "7 天", "30d": "30 天", "following": "我关注的人 · 24 小时"}
+# ⚠️ 盈亏字段是**按周期命名**的:pnl24h / pnl7d / pnl30d。
+#    用固定的 pnl24h 去读 7d 榜单会全部取到 None,显示成一片 $0.00 而不报错。
+_PNL_FIELD = {"24h": "pnl24h", "7d": "pnl7d", "30d": "pnl30d", "following": "pnl24h"}
+
+# ⚠️ 命令菜单(用户敲 `/` 时 TG 弹出的列表)。
+#    这份列表与 _dispatch 里的分支必须**同步维护** —— 菜单里有、_dispatch 里没有,
+#    用户点了只会得到"未知命令"。
+_COMMAND_MENU = [
+    ("add", "加入监控:/add <handle>"),
+    ("following", "批量导入某人的关注列表:/following <handle>"),
+    ("top", "今日榜单:/top [24h|7d|30d|following] [条数]"),
+    ("list", "查看监控名单与基线状态"),
+    ("status", "运行状态"),
+    ("who", "名单里谁买过这个币:/who <CA>"),
+    ("del", "移出监控:/del <handle>"),
+    ("help", "命令说明"),
+]
+
 _HELP = (
     "🤖 <b>FOMO 监控 Bot</b>\n"
     "/add &lt;handle&gt; — 加入监控(立即生效,历史基线由下一轮建立)\n"
     "/following &lt;handle&gt; — 把这个人关注的所有人批量加入监控\n"
+    "/top [24h|7d|30d|following] [条数] — 榜单,默认今日前 15\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态\n"
     "/status — 运行状态\n"
@@ -60,6 +89,22 @@ _HELP = (
 def _esc(v) -> str:
     """HTML 转义。API 返回的昵称里带 '<' 并不罕见,不转义整条回执直接 400"""
     return html.escape(str(v)) if v is not None else ""
+
+
+def _money(v: float) -> str:
+    """
+    榜单用的紧凑金额:$205.3K / $1.24M。
+
+    榜单一行要塞下名字、盈亏、笔数,写全 $205,268.32 会撑爆手机一行 ——
+    这里的取舍与推送消息里的 _fmt_usd 不同:那边要精确到分(是成交额),
+    这边只要量级(是排名依据)。
+    """
+    a = abs(v)
+    sign = "-" if v < 0 else ""
+    for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= div:
+            return f"{sign}${a / div:,.2f}{unit}"
+    return f"{sign}${a:,.2f}"
 
 
 def _num(v) -> float:
@@ -121,6 +166,10 @@ class CommandBot:
             logger.error("未配置 FOMO_TELEGRAM_ADMIN_CHAT_ID / CHAT_ID,命令层不启动(拒绝无主 Bot)")
             return
 
+        # 注册 `/` 输入框的命令菜单。这是 TG 服务端保存的状态,每次启动调一次是幂等的;
+        # 失败只降级为警告 —— 菜单没了命令照样能手打
+        self._notifier.set_my_commands(_COMMAND_MENU)
+
         logger.info("Telegram 命令层已启动 | 仅响应 chat_id={}", admin)
         while not stop_event.is_set():
             try:
@@ -171,6 +220,8 @@ class CommandBot:
             return self._cmd_add(arg)
         if cmd == "/following":
             return self._cmd_following(arg)
+        if cmd in ("/top", "/leaderboard", "/lb"):
+            return self._cmd_top(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
         if cmd == "/list":
@@ -219,6 +270,75 @@ class CommandBot:
             f"✅ 已加入 <b>{name}</b>(@{_esc(handle)})\n"
             f"⏳ 正在建立历史基线,完成前的买入不打徽章、不显示共识"
         )
+
+    def _cmd_top(self, arg: str) -> str:
+        """
+        /top [24h|7d|30d|following] [条数] —— 榜单。
+
+        榜单的用处不只是看谁在赚 —— 更实用的是**对照自己的监控名单**:
+        每行标注是否已在监控(👁)、是否已建好基线(⏳),
+        没标记的就是"排在前面但你还没盯"的人,可以直接 /add。
+        """
+        period, count = "24h", 15
+        for tok in (arg or "").split():
+            t = tok.strip().lower()
+            if t in _TOP_PERIODS:
+                period = _TOP_PERIODS[t]
+            elif t.isdigit():
+                count = max(1, min(int(t), MAX_TOP_ROWS))
+
+        try:
+            rows = self._client.get_leaderboard(period, limit=count)
+        except Exception as e:  # noqa: BLE001
+            return self._resolve_error(period, e)
+        if not rows:
+            return f"ℹ️ {_PERIOD_LABEL.get(period, period)} 榜单暂无数据"
+
+        # ⚠️ /v2/leaderboard/following 返回的是**关注列表顺序**,不是排名
+        #    (实测 -39.96K 排在 +37K 前面)。按选定周期的盈亏自己排一遍;
+        #    24h/7d/30d 三个榜服务端已排好,再排一次是无害的 no-op。
+        pnl_key = _PNL_FIELD.get(period, "pnl24h")
+        rows = sorted(
+            (u for u in rows if isinstance(u, dict)),
+            key=lambda u: _num(u.get(pnl_key)),
+            reverse=True,
+        )
+
+        # 一次查出名单状态,避免逐行开连接
+        with store.get_conn() as conn:
+            watched = {
+                r["user_id"]: r["stats_ready"]
+                for r in conn.execute(
+                    "SELECT user_id, stats_ready FROM watch_users WHERE active = 1"
+                ).fetchall()
+            }
+
+        lines = [f"🏆 <b>FOMO 榜单 · {_PERIOD_LABEL.get(period, period)}</b>"]
+        new_cnt = 0
+        for i, u in enumerate(rows[:count], 1):
+            if not isinstance(u, dict):
+                continue
+            uid = str(u.get("id") or "")
+            name = _esc(str(u.get("displayName") or u.get("userHandle") or "?")[:16])
+            handle = _esc(store.clean_handle(u.get("userHandle") or ""))
+            # 👁 已在监控且基线就绪 / ⏳ 在监控但基线还没建好 / 无标记 = 还没盯
+            if uid in watched:
+                mark = "👁" if watched[uid] else "⏳"
+            else:
+                mark = "　"      # 全角空格占位,保持各行对齐
+                new_cnt += 1
+            pnl = _num(u.get(pnl_key))
+            trades = int(_num(u.get("numTrades")))
+            lines.append(
+                f"{i:2d}. {mark} <b>{name}</b> @{handle}\n"
+                f"      {'📈' if pnl >= 0 else '📉'} {_money(pnl)} · {trades} 笔"
+            )
+
+        lines.append("")
+        lines.append(f"👁 已监控且基线就绪 · ⏳ 基线建立中 · 无标记 = 还没盯({new_cnt} 人)")
+        if new_cnt:
+            lines.append("想盯谁就 /add &lt;handle&gt;")
+        return "\n".join(lines)
 
     def _cmd_following(self, arg: str) -> str:
         """
