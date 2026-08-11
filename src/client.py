@@ -365,6 +365,13 @@ class _BaseFomoClient:
             "tokenAddress": token_address,
             "networkId": network_id,
             "limit": limit,
+            # ⚠️ threshold=0 **必须显式传**。它按发帖人的**持仓美元额**过滤,
+            #    不传时服务端用一个非 0 的默认值,小仓位的观点会被静默丢掉。
+            #    实测:同一个币不传 → 100 条里 0 条是目标用户的;
+            #          传 threshold=0 → 同样 100 条里有 2 条是他的(持仓仅 $3.71)。
+            #    网页版自己调的时候带的就是 threshold=0,我们漏了这一个参数,
+            #    表现为"观点功能完全不工作但没有任何报错"。
+            "threshold": 0,
         }
         if after_ms:
             params["afterTime"] = int(after_ms)
