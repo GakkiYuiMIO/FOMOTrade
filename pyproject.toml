@@ -1,0 +1,49 @@
+[tool.poetry]
+name = "fomo-trade"
+version = "0.1.0"
+description = "FOMO 平台指定用户交易监控 → Telegram 推送"
+authors = ["GakkiYuiMIO"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+# HTTP —— Telegram Bot API / Privy token 续期
+httpx = "^0.27.2"
+# Cloudflare WAF 绕过尝试(Chrome TLS 指纹)
+curl-cffi = "^0.15.0"
+# 登录取 token + HttpClient 不通时的降级实现
+playwright = "^1.58.0"
+# 配置
+python-dotenv = "^1.0.1"
+pydantic = "^2.9.0"
+pydantic-settings = "^2.5.0"
+# 日志
+loguru = "^0.7.2"
+# 调度
+apscheduler = "^3.10.4"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+ruff = "^0.6.0"
+
+[[tool.poetry.source]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+priority = "primary"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
