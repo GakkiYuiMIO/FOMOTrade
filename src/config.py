@@ -63,6 +63,13 @@ class FomoSettings(BaseSettings):
     # 拉取并发度。实测单人快照约 1s,串行拉 68 人要 69s 远超轮询间隔 ——
     # 名单一大就必须并发。调太高会给 FOMO 打出可观的瞬时 QPS,6 是延迟与礼貌的折中。
     fomo_fetch_workers: int = Field(6, ge=1, le=16, description="快照拉取并发线程数")
+    # 距上一轮超过这么久(分钟)就认定"中间停过机":本轮事件照常入库,
+    # 但不逐条推送,改发一条汇总。
+    # 默认 45 分钟 —— 比正常轮询间隔(20-35s)大两个量级,不会被网络抖动误触发;
+    # 又足够短,睡一觉起来必然命中。设成 0 可关闭该行为。
+    fomo_catchup_threshold_min: int = Field(
+        45, ge=0, description="超过这么久没跑就走停机汇总模式(分钟);0=关闭"
+    )
 
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")

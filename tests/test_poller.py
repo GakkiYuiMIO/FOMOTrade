@@ -401,6 +401,75 @@ def test_稳定币互换落库但不推送(db):
         assert n == 0, "计价币不进 stats"
 
 
+def test_停机后只发一条汇总而不是逐条推送(db):
+    """
+    用户拿自己的电脑跑、晚上关机。第二天开机时积压着一整夜的事件
+    (实测 68 人名单约 857 条/天,停 8 小时近 300 条)。
+    逐条推要发一个多小时,而且信息早就过期了。
+
+    正确行为:事件**照常入库**(共识计数/首次建仓/hot 榜单都读库,数据不受影响),
+    但只发一条汇总。
+    """
+    _add_ready("uA", "alice")
+    with store.get_conn() as c:
+        with store.tx(c):
+            # 上一轮是 8 小时前 → 超过默认 45 分钟阈值
+            store.set_state(c, "last_tick_at",
+                            (datetime.now(UTC) - timedelta(hours=8)).isoformat(timespec="seconds"))
+
+    items = [_swap(f"n{i}") for i in range(6)]
+    client = FakeClient({
+        "uA": UserSnapshot("uA", swaps=items, transfers=[], thesis=[], balances=[]),
+    })
+    notifier = FakeNotifier()
+    n = Poller(client, notifier).tick()
+
+    assert n == 6, "事件必须照常入库 —— 共识计数与 /hot 都靠它"
+    assert len(notifier.sent) == 1, f"只该发一条汇总,实际发了 {len(notifier.sent)} 条"
+    assert "停机期间汇总" in notifier.sent[0]
+
+    with store.get_conn() as c:
+        unsent = store.load_unsent_recent(c, minutes=10)
+        assert unsent == [], "⚠️ 必须 mark_sent,否则补发队列会把积压一条条捞出来重推"
+        assert c.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 6
+
+
+def test_间隔正常时不走汇总模式(db):
+    """刚跑过一轮(1 分钟前)就该正常逐条推,别把日常推送误当成积压吞掉"""
+    _add_ready("uA", "alice")
+    with store.get_conn() as c:
+        with store.tx(c):
+            store.set_state(c, "last_tick_at",
+                            (datetime.now(UTC) - timedelta(minutes=1)).isoformat(timespec="seconds"))
+
+    client = FakeClient({
+        "uA": UserSnapshot("uA", swaps=[_swap("a1")], transfers=[], thesis=[], balances=[]),
+    })
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+    assert len(notifier.sent) == 1
+    assert "停机期间汇总" not in notifier.sent[0], "正常间隔被误判成停机了"
+    assert "🌱" in notifier.sent[0]
+
+
+def test_首次运行不走汇总模式(db):
+    """
+    全新的库没有 last_tick_at。此时游标也是 /add 时刚设的,本来就不会有积压 ——
+    误判成"停机"会把第一批正常事件吞成一条汇总。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({
+        "uA": UserSnapshot("uA", swaps=[_swap("a1")], transfers=[], thesis=[], balances=[]),
+    })
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+    assert notifier.sent and "停机期间汇总" not in notifier.sent[0]
+
+    # 跑完一轮后必须记下时间,否则下一轮又认不出间断
+    with store.get_conn() as c:
+        assert store.get_state(c, "last_tick_at"), "tick 结束后没有记录 last_tick_at"
+
+
 def test_事件类型与去重键(db):
     """落库的事件类型必须是 BUY,且 event_id 用了原生 id"""
     _add_ready("uA", "alice")

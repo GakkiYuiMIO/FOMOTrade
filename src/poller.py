@@ -22,6 +22,7 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 from loguru import logger
 
@@ -140,6 +141,21 @@ _THESIS_TOKENS_PER_TICK = 25
 # afterTime 回看窗口(秒)。够覆盖轮转一圈的时间即可 —— 拉太久白费流量,
 # 拉太短会在轮转间隙漏掉观点。精确去重由 event_id + 游标负责,这里只是压 payload。
 _THESIS_LOOKBACK_SEC = 3600
+
+# runtime_state 里记录上一轮时间的键。用来识别"关机了一晚上"这类长间断
+_LAST_TICK_KEY = "last_tick_at"
+
+
+def _num_fmt(v) -> str:
+    """汇总里的紧凑金额:12.3K / 1.24M。一行要塞下币名、人数、金额"""
+    try:
+        a = abs(float(v or 0))
+    except (TypeError, ValueError):
+        return "0"
+    for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= div:
+            return f"{a / div:,.2f}{unit}"
+    return f"{a:,.0f}"
 
 
 # ============================================================
@@ -450,6 +466,8 @@ class Poller:
         self._token_meta: dict[tuple, dict] = {}    # (net, ca)        → symbol/市值/现价
         self._positions: dict[tuple, dict] = {}     # (uid, net, ca)   → 持仓/均价/盈亏
         self._thesis_rr = 0                         # 观点轮转扫描的游标(见 _collect_thesis)
+        # 本轮是不是"停机后的第一轮"。见 tick() 里的说明
+        self._catchup_since: str | None = None
 
     # --------------------------------------------------------
     # 主循环
@@ -471,6 +489,8 @@ class Poller:
                 logger.debug("监控名单为空,本 tick 跳过")
                 return 0
             self._refresh_watched_index(users)
+            # 识别"中间停过机"。必须在采集之前判,采集之后 last_tick_at 就被刷新了
+            self._catchup_since = self._detect_gap(conn)
 
             # --- 2) 采集 ---
             snapshots = self._fetch_snapshots(users)
@@ -500,7 +520,43 @@ class Poller:
             # --- 5) 第二循环:事务外统一渲染 + 串行发送 ---
             self._dispatch(conn, snapshots, new_events, dry_run=dry_run)
 
+            # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
+            # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
+            if not dry_run:
+                try:
+                    with store.tx(conn):
+                        store.set_state(conn, _LAST_TICK_KEY, now_iso())
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("记录 last_tick_at 失败(不影响推送): {}", e)
+
         return len(new_events)
+
+    def _detect_gap(self, conn) -> str | None:
+        """
+        距上一轮太久 → 返回上一轮的时间(进入"停机汇总"模式),否则 None。
+
+        场景:用户拿自己的电脑跑,晚上关机。第二天开机时积压着一整夜的事件 ——
+        实测 68 人名单约 857 条/天,停 8 小时就是近 300 条。
+        以 3.5s/条的节流要发一个多小时,而且那时候的信息早就过期了。
+
+        处置:这些事件**照常入库**(共识计数、首次建仓判定、/hot 榜单都读库,
+        数据完整性不受影响),只是不逐条推送,改发一条汇总。
+        """
+        threshold = self.settings.fomo_catchup_threshold_min
+        if threshold <= 0:
+            return None
+        last = store.get_state(conn, _LAST_TICK_KEY)
+        if not last:
+            # 首次运行:没有上一轮可比。此时游标也是新设的,本来就不会有积压
+            return None
+        try:
+            gap_min = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds() / 60
+        except ValueError:
+            return None
+        if gap_min < threshold:
+            return None
+        logger.info("检测到中断 {:.0f} 分钟,本轮走汇总模式(事件照常入库,不逐条推送)", gap_min)
+        return last
 
     def _refresh_watched_index(self, users) -> None:
         self._watched_ids = {u["user_id"] for u in users}
@@ -763,6 +819,77 @@ class Poller:
                 events.extend(_drop_before_cursor(evs, store.get_cursor(conn, uid, kind)))
         return events
 
+    def _dispatch_catchup(self, conn, new_events: list[FomoEvent], dry_run: bool) -> None:
+        """
+        停机汇总:把积压事件统一标记为已处理,只发一条概览。
+
+        ⚠️ 必须 mark_sent,不能只是"跳过发送" —— 否则 sent 永远是 0,
+           补发队列会把它们一条条捞出来重推,等于绕开了整个汇总机制。
+        ⚠️ 汇总失败也要标记:宁可漏一条汇总,也不能让几百条积压在下一轮喷出来。
+        """
+        since = self._catchup_since or now_iso()
+        try:
+            with store.tx(conn):
+                for ev in new_events:
+                    store.mark_sent(conn, ev.event_id, None, None)
+        except Exception as e:  # noqa: BLE001
+            logger.error("汇总模式标记已发送失败: {}", e)
+
+        try:
+            text = self._build_catchup_digest(conn, since, new_events)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("汇总消息渲染失败,降级为最简文本: {}", e)
+            text = (f"🌙 <b>停机期间汇总</b>\n"
+                    f"积压 {len(new_events)} 条事件已入库,未逐条推送。\n"
+                    f"看买入榜:/hot 今日")
+        if dry_run:
+            logger.info("[dry-run] {}", text.replace("\n", " ⏎ "))
+            return
+        self.notifier.send(text)
+
+    def _build_catchup_digest(self, conn, since: str, new_events: list[FomoEvent]) -> str:
+        """用 /hot 同一套聚合做停机概览 —— 关心的本来就是"这段时间大家在买什么"""
+        gap_min = 0.0
+        try:
+            gap_min = (datetime.now(UTC) - datetime.fromisoformat(since)).total_seconds() / 60
+        except ValueError:
+            pass
+        gap = (f"{gap_min / 60:.1f} 小时" if gap_min >= 60 else f"{gap_min:.0f} 分钟")
+
+        # ⚠️ 按**本轮实际入库的那批**计数,不查 DB 时间窗:
+        #    游标可能比 since 更早(停机前就落后了),按窗口查会报出与
+        #    "已全部入库 N 条"对不上的数字,用户第一反应是"是不是漏了"。
+        counts: dict[str, int] = {}
+        for ev in new_events:
+            counts[ev.event_type] = counts.get(ev.event_type, 0) + 1
+        buys, sells = counts.get(EVENT_BUY, 0), counts.get(EVENT_SELL, 0)
+        thesis = counts.get(EVENT_THESIS, 0)
+
+        lines = [
+            f"🌙 <b>停机期间汇总 · {gap}</b>",
+            f"共 {len(new_events)} 条:{buys} 买 · {sells} 卖"
+            + (f" · {thesis} 条观点" if thesis else ""),
+            "已全部入库,不逐条推送(避免几百条过期消息刷屏)。",
+        ]
+        hot = store.hot_tokens(conn, since, limit=5)
+        if hot:
+            # 同名不同链的币会在榜里并列出现($sami 同时有 Base 和 Solana 版本),
+            # 只有重名时才补链名 —— 不重名时加上纯属噪音
+            seen: dict[str, int] = {}
+            for r in hot:
+                s = str(r["symbol"] or "?")
+                seen[s] = seen.get(s, 0) + 1
+            lines.append("\n<b>买入最集中的:</b>")
+            for i, r in enumerate(hot, 1):
+                sym = html.escape(str(r["symbol"] or "?"))
+                suffix = ""
+                if seen.get(str(r["symbol"] or "?"), 0) > 1:
+                    suffix = f" ({html.escape(str(r['network_id'] or '?'))})"
+                lines.append(f"{i}. <b>${sym}</b>{suffix} · 👥 {r['buyers']} 人 · "
+                             f"${_num_fmt(r['total_usd'])}")
+        lines.append("\n完整榜单:/hot 今日  ·  恢复正常推送 ✅")
+        return "\n".join(lines)
+
     def _persist(self, conn, events: list[FomoEvent]) -> list[FomoEvent]:
         """
         第一循环:单事务内 judge_badge → insert_event → upsert_stats。
@@ -802,6 +929,12 @@ class Poller:
         """
         第二循环:此时 stats 已是一致快照,所有消息共用同一个共识时点值。
         """
+        # 停机后的第一轮:积压的事件已经全部入库(共识计数、首次建仓判定、
+        # /hot 榜单都读库,数据完整性不受影响),这里只发一条汇总,不逐条推。
+        if self._catchup_since:
+            self._dispatch_catchup(conn, new_events, dry_run=dry_run)
+            return
+
         pending = list(new_events)
         seen = {e.event_id for e in new_events}
         # C-2 补发:落库成功但推送失败/进程崩溃的事件。只捞 10 分钟内的 ——

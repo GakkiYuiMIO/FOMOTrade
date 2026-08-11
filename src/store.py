@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS user_token_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_uts_token ON user_token_stats(network_id, token_address);
 
+-- ============ 运行时状态(key-value) ============
+-- 目前只存 last_tick_at:用来识别"关机了一晚上"这种长间断。
+-- 不存的话进程重启后无从知道离开了多久,只能把积压的几百条逐条推出来。
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- ============ 【买入榜】代币行情快照 ============
 -- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
 -- 存在的理由:/hot 要算"买入时市值 → 现在市值"的倍数,
@@ -611,6 +620,30 @@ def count_consensus(conn, ev: FomoEvent) -> tuple[int | None, int | None]:
         "SELECT COUNT(*) AS n FROM watch_users WHERE active = 1 AND stats_ready = 1"
     ).fetchone()["n"]
     return buyers, size
+
+
+def get_state(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_state(conn, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, now_iso()),
+    )
+
+
+def count_events_since(conn, since_iso: str) -> dict:
+    """停机汇总用:窗口内各类事件的条数"""
+    rows = conn.execute(
+        "SELECT event_type, COUNT(*) n FROM fomo_events WHERE event_ts >= ? GROUP BY event_type",
+        (since_iso,),
+    ).fetchall()
+    return {r["event_type"]: r["n"] for r in rows}
 
 
 def upsert_token_snapshots(conn, rows: list[tuple]) -> None:
