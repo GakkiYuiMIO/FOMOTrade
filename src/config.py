@@ -60,6 +60,9 @@ class FomoSettings(BaseSettings):
     fomo_send_interval_sec: float = Field(
         3.5, ge=0, description="推送间隔(秒),规避 TG 同 chat 约 20 msg/min 限流"
     )
+    # 拉取并发度。实测单人快照约 1s,串行拉 68 人要 69s 远超轮询间隔 ——
+    # 名单一大就必须并发。调太高会给 FOMO 打出可观的瞬时 QPS,6 是延迟与礼貌的折中。
+    fomo_fetch_workers: int = Field(6, ge=1, le=16, description="快照拉取并发线程数")
 
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")

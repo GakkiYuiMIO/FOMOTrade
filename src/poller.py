@@ -21,6 +21,7 @@ import html
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger
 
@@ -494,20 +495,38 @@ class Poller:
         一个人的网络抖动不能让整个名单的推送停摆(count_holders 会据此整段降级)。
         """
         snapshots: dict = {}
-        for u in users:
+        auth_err: AuthError | None = None
+        workers = max(1, min(self.settings.fomo_fetch_workers, len(users)))
+
+        def one(u):
             uid = u["user_id"]
             try:
-                snapshots[uid] = self.client.fetch_snapshot(uid)
-            except AuthError:
-                # ⚠️ 必须上抛,绝不能被下面的裸 except 吞掉。
-                #    登录态失效是"整个管道都废了",不是"某个用户拉取失败" ——
-                #    吞掉的后果是程序每 20 秒空转一次只刷 ERROR 日志,
-                #    而 §3.5 要求的那条「🔐 登录态失效」TG 告警永远发不出去,
-                #    用户会一直以为监控还活着。
-                raise
+                return uid, self.client.fetch_snapshot(uid), None
+            except AuthError as e:
+                return uid, None, e
             except Exception as e:  # noqa: BLE001
                 logger.error("拉取快照失败 user={} handle={} err={}", uid, _row_get(u, "handle"), e)
-                snapshots[uid] = None
+                return uid, None, None
+
+        if workers == 1:
+            results = [one(u) for u in users]
+        else:
+            # ⚠️ 并发是名单规模的硬需求,不是优化:实测单人快照 1.01s,
+            #    串行拉 68 人要 69s,而轮询间隔才 20s —— tick 会无限堆积。
+            #    HttpFomoClient 已改成每线程一个 curl 会话,并发是安全的。
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fomo-fetch") as ex:
+                results = list(ex.map(one, users))
+
+        for uid, snap, err in results:
+            snapshots[uid] = snap
+            if err is not None and auth_err is None:
+                auth_err = err
+        if auth_err is not None:
+            # ⚠️ 必须上抛,绝不能吞掉。登录态失效是"整个管道都废了",
+            #    不是"某个用户拉取失败" —— 吞掉的后果是程序每 20 秒空转一次只刷 ERROR 日志,
+            #    而 §3.5 要求的那条「🔐 登录态失效」TG 告警永远发不出去,
+            #    用户会一直以为监控还活着。
+            raise auth_err
         return snapshots
 
     def _build_token_index(self, snapshots: dict) -> None:

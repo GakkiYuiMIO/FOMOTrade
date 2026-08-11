@@ -40,6 +40,9 @@ EP_SWAPS = "/v2/users/{uid}/swaps"
 EP_BALANCES = "/v2/users/{uid}/balances"
 # 持仓单(含已平仓的)。orderBy 只接受 'closedAt' / 'realizedPnlUsd' 两个值
 EP_TRADES = "/trades"
+EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
+# ⚠️ 服务端硬上限 100,传 201 会直接 400 —— 实测出来的,不要改大
+_FOLLOWING_PAGE = 100
 # ⚠️ 不提供转账查询。实测 /v2/transfers/with/{uid} 是「**我**与该用户之间的转账」——
 #    对自己调会返回 400 "Cannot fetch transfers with self",
 #    拿不到"某人与第三方之间的转账"。FOMO 没有别的转账查询入口,
@@ -113,6 +116,7 @@ class FomoClient(Protocol):
                          limit: int = 100) -> list[dict]: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
+    def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
     def fetch_snapshot(self, user_id: str) -> UserSnapshot: ...
@@ -353,6 +357,37 @@ class _BaseFomoClient:
     def get_balances(self, user_id: str) -> list[dict]:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
 
+    def get_following(self, user_id: str, max_items: int = 300) -> list[dict]:
+        """
+        某人关注的人。字段含 id / userHandle / displayName / swapCount / numTrades /
+        private / isRestricted。
+
+        ⚠️ limit 服务端上限是 **100**(传 200 直接 400
+           "Number must be less than or equal to 100")。关注几百人的账号要翻页,
+           游标是 lastId —— 与 transfers 的分页形式一致。
+        ⚠️ 一旦某页没有任何**新** id 就立刻停:若 lastId 其实不生效,
+           API 会一直返回第一页,不停就是无限循环。
+        """
+        path = EP_FOLLOWING.format(uid=quote(user_id, safe=""))
+        out: list[dict] = []
+        seen: set[str] = set()
+        last_id: str | None = None
+        for _ in range(_MAX_PAGES):
+            params: dict = {"limit": _FOLLOWING_PAGE}
+            if last_id:
+                params["lastId"] = last_id
+            items = _as_list(self._get(path, params))
+            fresh = [u for u in items if u.get("id") and str(u["id"]) not in seen]
+            if not fresh:
+                break
+            for u in fresh:
+                seen.add(str(u["id"]))
+                out.append(u)
+            if len(out) >= max_items or len(items) < _FOLLOWING_PAGE:
+                break
+            last_id = str(fresh[-1]["id"])
+        return out[:max_items]
+
     def get_trades(self, user_id: str) -> list[dict]:
         """
         拉某人的持仓单(activeTrades + closedTrades),扁平成一个列表返回。
@@ -518,44 +553,50 @@ class HttpFomoClient(_BaseFomoClient):
 
     def __init__(self, token_provider: TokenProvider | None = None) -> None:
         super().__init__(token_provider)
-        self._session = None
-        # ⚠️ libcurl 的 easy handle 不能被多线程同时使用。poller 线程轮询、bot 线程 /add 时
-        #    resolve_handle,两者会撞上 —— 不加锁是概率性的崩溃/串包,不是理论问题。
-        self._lock = threading.Lock()
+        # ⚠️ libcurl 的 easy handle **不能被多线程同时使用**,共用一个 Session
+        #    是概率性的崩溃/串包,不是理论问题。
+        #    早期用全局锁解决,但那把所有请求串行化了 —— 名单到几十人时
+        #    一轮要一分多钟(实测 1.01s/人),远超 20s 的轮询间隔,tick 会一直堆积。
+        #    改成**每线程一个 Session**:线程之间天然隔离,锁可以整个去掉,
+        #    poller 才能开线程池并发拉取。
+        self._tl = threading.local()
 
     def _ensure_session(self):
-        if self._session is None:
+        sess = getattr(self._tl, "session", None)
+        if sess is None:
             # 延迟 import:curl_cffi 带原生库,顶层 import 会让 playwright 路径也被它的加载失败拖累
             from curl_cffi import requests as cffi_requests
 
             settings = get_settings()
-            self._session = cffi_requests.Session(
+            sess = cffi_requests.Session(
                 impersonate="chrome",
                 proxies=settings.proxies,
                 timeout=_TIMEOUT_SEC,
             )
-            logger.debug("curl_cffi 会话已创建 | proxy={}", settings.fomo_proxy or "无")
-        return self._session
+            self._tl.session = sess
+            logger.debug("curl_cffi 会话已创建(线程 {}) | proxy={}",
+                         threading.current_thread().name, settings.fomo_proxy or "无")
+        return sess
 
     def _request(self, path: str, params: dict | None = None) -> tuple[int, str, dict]:
         token = self._tokens.get_access_token()
         url = BASE_URL + path
         clean = {k: v for k, v in (params or {}).items() if v is not None}
-        with self._lock:
-            try:
-                resp = self._ensure_session().get(url, params=clean or None, headers=_auth_headers(token))
-            except Exception as e:  # noqa: BLE001
-                raise _TransportError(str(e)) from e
+        try:
+            resp = self._ensure_session().get(url, params=clean or None, headers=_auth_headers(token))
+        except Exception as e:  # noqa: BLE001
+            raise _TransportError(str(e)) from e
         return resp.status_code, resp.text or "", dict(resp.headers or {})
 
     def close(self) -> None:
-        with self._lock:
-            if self._session is not None:
-                try:
-                    self._session.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._session = None
+        """只关当前线程的会话。工作线程退出时它自己那份由 GC 回收。"""
+        sess = getattr(self._tl, "session", None)
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._tl.session = None
 
 
 # ============================================================

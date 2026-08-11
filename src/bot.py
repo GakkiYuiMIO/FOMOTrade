@@ -40,9 +40,15 @@ STALE_COMMAND_SEC = 300
 # /list 单条消息最多列这么多人(TG 单条 4096 字符硬上限)
 MAX_LIST_ROWS = 50
 
+# /following 一次最多导入多少人。超出部分按"交易活跃度"取前 N ——
+# 每人每轮 3 个请求,名单规模直接决定一轮拉多久(实测约 1s/人,6 线程并发)。
+# 80 人 × 3 = 240 请求/轮,已经是对 FOMO 相当可观的压力,再高就该拉长轮询间隔了。
+MAX_FOLLOWING_IMPORT = 80
+
 _HELP = (
     "🤖 <b>FOMO 监控 Bot</b>\n"
     "/add &lt;handle&gt; — 加入监控(立即生效,历史基线由下一轮建立)\n"
+    "/following &lt;handle&gt; — 把这个人关注的所有人批量加入监控\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态\n"
     "/status — 运行状态\n"
@@ -54,6 +60,14 @@ _HELP = (
 def _esc(v) -> str:
     """HTML 转义。API 返回的昵称里带 '<' 并不罕见,不转义整条回执直接 400"""
     return html.escape(str(v)) if v is not None else ""
+
+
+def _num(v) -> float:
+    """排序用的数值化。取不到就当 0 —— 排序场景下 None 比大小会直接 TypeError"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _day_str(iso: str | None) -> str:
@@ -155,6 +169,8 @@ class CommandBot:
             return _HELP
         if cmd == "/add":
             return self._cmd_add(arg)
+        if cmd == "/following":
+            return self._cmd_following(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
         if cmd == "/list":
@@ -203,6 +219,81 @@ class CommandBot:
             f"✅ 已加入 <b>{name}</b>(@{_esc(handle)})\n"
             f"⏳ 正在建立历史基线,完成前的买入不打徽章、不显示共识"
         )
+
+    def _cmd_following(self, arg: str) -> str:
+        """
+        /following <handle> —— 把这个人关注的所有人批量加入监控。
+
+        ⚠️ 这是**一次性导入**,不是持续同步:对方之后新关注的人不会自动进来。
+           做成持续同步会带来"他取关了要不要自动 /del"这种没有正确答案的问题,
+           而误删会连带把本地已建好的基线一起作废。
+        ⚠️ 名单规模直接决定一轮拉多久(每人 3 个请求、实测约 1s/人)。
+           超过 MAX_FOLLOWING_IMPORT 时按 swapCount 取最活跃的那批 ——
+           被砍掉的是几乎不交易的人,信息损失最小。
+        """
+        handle = store.clean_handle(arg)
+        if not handle:
+            return "用法: /following &lt;handle&gt;  例: /following GakkiYuiTifa"
+
+        try:
+            user_id, display, canonical = self._client.resolve_handle(handle)
+            following = self._client.get_following(user_id)
+        except Exception as e:  # noqa: BLE001
+            return self._resolve_error(handle, e)
+        if not user_id:
+            return f"❌ 找不到用户 @{_esc(handle)}"
+        who = _esc(display or canonical or handle)
+        if not following:
+            return f"ℹ️ {who} 没有关注任何人"
+
+        # 只留能用的:有 id、非受限。private 账号照样收 —— 是否拿得到数据由 API 决定,
+        # 这里先不替它做判断,拉不到时 fetch_snapshot 会把该项降级为 None
+        cands = [u for u in following
+                 if isinstance(u, dict) and u.get("id") and not u.get("isRestricted")]
+        total = len(cands)
+        # 按交易活跃度排序:超限时砍掉的是几乎不交易的人
+        cands.sort(key=lambda u: (_num(u.get("swapCount")), _num(u.get("numTrades"))), reverse=True)
+        picked = cands[:MAX_FOLLOWING_IMPORT]
+
+        added = skipped = failed = 0
+        with store.get_conn() as conn:
+            for u in picked:
+                try:
+                    need_seed, _ = store.add_watch_user(
+                        conn, str(u["id"]),
+                        store.clean_handle(u.get("userHandle") or ""),
+                        u.get("displayName") or u.get("userHandle"),
+                    )
+                    added += 1 if need_seed else 0
+                    skipped += 0 if need_seed else 1
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                    logger.warning("批量加入失败 | {} | {}", u.get("userHandle"), e)
+            active_total = len(store.list_active_users(conn))
+
+        lines = [
+            f"✅ 已导入 <b>{who}</b> 的关注列表",
+            f"新增 {added} 人 · 已在监控 {skipped} 人" + (f" · 失败 {failed} 人" if failed else ""),
+        ]
+        if total > len(picked):
+            lines.append(
+                f"{_esc('⚠️')} 对方关注 {total} 人,只取了交易最活跃的 {len(picked)} 人"
+                f"(上限 {MAX_FOLLOWING_IMPORT},再多会拖垮轮询)"
+            )
+        # 一轮的实测成本。⚠️ 别只算快照:观点要扫 25 个代币、还要给一个新人建基线,
+        #    这两块加起来约 10s。只按快照估会低报一半,警告就形同虚设。
+        s = get_settings()
+        workers = max(1, s.fomo_fetch_workers)
+        est = active_total * 1.15 / workers + 10
+        interval = s.fomo_poll_interval_sec
+        lines.append(f"📋 当前名单 {active_total} 人 · 预计每轮耗时约 {est:.0f}s(间隔 {interval}s)")
+        if est > interval:
+            lines.append(
+                f"{_esc('⚠️')} 单轮耗时已超过轮询间隔,tick 会开始堆积。"
+                f"建议把 .env 的 FOMO_POLL_INTERVAL_SEC 调到 {int(est * 1.5)} 以上后重启"
+            )
+        lines.append(f"{_esc('⏳')} 历史基线每轮建一个人,约 {active_total} 轮后全部就绪")
+        return "\n".join(lines)
 
     def _resolve_error(self, handle: str, e: Exception) -> str:
         """
