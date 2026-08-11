@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS fomo_events (
     event_id      TEXT PRIMARY KEY,   -- 去重键,见 models.make_event_id
     event_type    TEXT NOT NULL,      -- BUY / SELL / THESIS / TRANSFER_IN / TRANSFER_OUT
     user_id       TEXT NOT NULL,
-    handle        TEXT,
+    handle        TEXT,               -- 展示名(displayName)
+    user_handle   TEXT,               -- @handle
     network_id    TEXT,               -- 归一化后:solana / base / bsc;缺失为 NULL
     token_address TEXT,               -- 归一化后:EVM 转小写,Solana(base58)保持原样
     token_symbol  TEXT,
@@ -157,14 +158,41 @@ def tx(conn: sqlite3.Connection):
         raise
 
 
+# 链标识重命名。早期版本对未收录的链直接存原始数字 ID,后来补上了名称。
+# ⚠️ 不迁移的话同一条链会裂成两个聚合键("4663" 和 "robinhood" 各算一份):
+#    已经建过仓的币会被重新判成「首次建仓」,而徽章落库即冻结、错了就是永久的。
+_NETWORK_RENAMES = {"4663": "robinhood", "143": "monad", "1337": "hyperliquid"}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    幂等迁移。CREATE TABLE IF NOT EXISTS 不会给已存在的表补列,
+    所以新增列必须在这里 ALTER,否则老库升级后直接报 no such column。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(fomo_events)").fetchall()}
+    if cols and "user_handle" not in cols:
+        conn.execute("ALTER TABLE fomo_events ADD COLUMN user_handle TEXT")
+        logger.info("迁移:fomo_events 补列 user_handle")
+
+    for old, new in _NETWORK_RENAMES.items():
+        for table in ("fomo_events", "user_token_stats"):
+            cur = conn.execute(
+                f"UPDATE {table} SET network_id = ? WHERE network_id = ?", (new, old)  # noqa: S608
+            )
+            if cur.rowcount:
+                logger.info("迁移:{} 里 {} 行的链标识 {} → {}", table, cur.rowcount, old, new)
+
+
 def init_db(conn: sqlite3.Connection | None = None) -> None:
-    """建表,幂等"""
+    """建表 + 迁移,幂等"""
     if conn is not None:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
         return
     DB_PATH.parent.mkdir(exist_ok=True)
     with get_conn() as c:
         c.executescript(_SCHEMA)
+        _migrate(c)
     logger.info("数据库已就绪: {}", DB_PATH)
 
 
@@ -173,12 +201,20 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
 # ============================================================
 def normalize_handle(raw: str) -> str:
     """
-    handle 输入归一化:去空白、去前导 @、转小写。
+    handle **查找键**归一化:去空白、去前导 @、转小写。
 
-    ⚠️ 不归一化的话,同一个人用 @Maxpain / maxpain 各 /add 一次会产生两行,
-       共识计数把一个人算两次。
+    ⚠️ 只用于比较和查找,**不要拿它当存储值** ——
+       转小写会把 @GakkiYuiTifa 显示成 @gakkiyuitifa,而 handle 是要给人看、
+       给人拿去搜的标识,大小写属于它本身的一部分。
+       存库存原样、查询时两边都过这个函数,既保留展示又不会重复添加。
+    ⚠️ 去重的最终保证是 user_id 主键,不是 handle。
     """
     return (raw or "").strip().lstrip("@").strip().lower()
+
+
+def clean_handle(raw: str) -> str:
+    """handle 存储值:只去空白与前导 @,**保留原始大小写**"""
+    return (raw or "").strip().lstrip("@").strip()
 
 
 def get_watch_user(conn, user_id: str):
@@ -188,8 +224,9 @@ def get_watch_user(conn, user_id: str):
 
 
 def find_user_by_handle(conn, handle: str):
+    """按 handle 查。⚠️ 必须忽略大小写:库里存的是原始大小写,用户输入未必一致"""
     return conn.execute(
-        "SELECT * FROM watch_users WHERE handle = ?", (normalize_handle(handle),)
+        "SELECT * FROM watch_users WHERE lower(handle) = ?", (normalize_handle(handle),)
     ).fetchone()
 
 
@@ -216,9 +253,20 @@ def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) ->
     ⚠️ /del 后回归必须重建基线:空窗期的买入本地无记录,
        不重建会让空窗期建的仓位在下次加仓时被误标 🌱。
     """
-    h = normalize_handle(handle)
+    # 存原始大小写(展示要用),去重靠 user_id 主键 —— 见 normalize_handle 的说明
+    h = clean_handle(handle)
     existing = get_watch_user(conn, user_id)
     if existing and existing["active"] and existing["stats_ready"]:
+        # 已在监控中:不重建基线,但**刷新名字** ——
+        # 用户在 FOMO 上改名、或早期版本存的是压过小写的 handle,都靠这一步纠正。
+        # 名字只是展示,更新它不影响任何判定。
+        if (existing["handle"], existing["display_name"]) != (h, display_name):
+            with tx(conn):
+                conn.execute(
+                    "UPDATE watch_users SET handle = ?, display_name = ? WHERE user_id = ?",
+                    (h, display_name, user_id),
+                )
+            logger.info("刷新名字 | {} → {} (@{})", existing["handle"], display_name, h)
         return False, f"ℹ️ {display_name or h} 已在监控中"
 
     with tx(conn):
@@ -342,12 +390,12 @@ def insert_event(conn, ev: FomoEvent) -> bool:
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO fomo_events
-            (event_id, event_type, user_id, handle, network_id, token_address, token_symbol,
-             amount_usd, token_amount, price_usd, tx_hash, event_ts, ingested_at,
+            (event_id, event_type, user_id, handle, user_handle, network_id, token_address,
+             token_symbol, amount_usd, token_amount, price_usd, tx_hash, event_ts, ingested_at,
              badge, badge_reason, raw_json)
-        VALUES (:event_id, :event_type, :user_id, :handle, :network_id, :token_address,
-                :token_symbol, :amount_usd, :token_amount, :price_usd, :tx_hash,
-                :event_ts, :ingested_at, :badge, :badge_reason, :raw_json)
+        VALUES (:event_id, :event_type, :user_id, :handle, :user_handle, :network_id,
+                :token_address, :token_symbol, :amount_usd, :token_amount, :price_usd,
+                :tx_hash, :event_ts, :ingested_at, :badge, :badge_reason, :raw_json)
         """,
         r,
     )

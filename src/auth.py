@@ -223,6 +223,13 @@ class TokenProvider:
             "referer": FOMO_ORIGIN + "/",
             "user-agent": USER_AGENT,
         }
+        # ⚠️ 必须带上**当前(即将过期)的** access token。
+        #    实测不带时 Privy 返回 400 {"error":"Missing access token",
+        #    "code":"missing_or_invalid_token"} —— 光有 refresh token 不够。
+        #    漏掉这一行的后果是:程序跑满一小时后续期必失败、轮询停摆,
+        #    而前一小时一切正常,很容易被误认为"跑着跑着自己挂了"。
+        if self._access:
+            headers["Authorization"] = f"Bearer {self._access}"
         logger.info("access token 即将过期,发起续期 | refresh={}", mask(self._refresh))
         try:
             with httpx.Client(timeout=20.0, proxy=settings.fomo_proxy) as c:

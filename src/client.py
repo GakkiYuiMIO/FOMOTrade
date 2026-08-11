@@ -38,6 +38,8 @@ EP_USER_BY_HANDLE = "/v2/users/userHandle/{handle}"
 EP_USER = "/v2/users/{uid}"
 EP_SWAPS = "/v2/users/{uid}/swaps"
 EP_BALANCES = "/v2/users/{uid}/balances"
+# 持仓单(含已平仓的)。orderBy 只接受 'closedAt' / 'realizedPnlUsd' 两个值
+EP_TRADES = "/trades"
 # ⚠️ 不提供转账查询。实测 /v2/transfers/with/{uid} 是「**我**与该用户之间的转账」——
 #    对自己调会返回 400 "Cannot fetch transfers with self",
 #    拿不到"某人与第三方之间的转账"。FOMO 没有别的转账查询入口,
@@ -97,16 +99,20 @@ class UserSnapshot:
     transfers: list[dict] | None = None
     thesis: list[dict] | None = None
     balances: list[dict] | None = None
+    # 持仓单(含已平仓)。已实现盈亏与"剩余 $0.00"只能从这里拿 ——
+    # 清仓后 balances 里就没有那个币了
+    trades: list[dict] | None = None
 
 
 class FomoClient(Protocol):
     """两个实现的公共协议。上层 poller / bot 只依赖这个,换实现只改一行配置。"""
 
-    def resolve_handle(self, handle: str) -> tuple[str, str]: ...
+    def resolve_handle(self, handle: str) -> tuple[str, str, str]: ...
     def get_swaps(self, user_id: str, limit: int = 50) -> list[dict]: ...
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
+    def get_trades(self, user_id: str) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
     def fetch_snapshot(self, user_id: str) -> UserSnapshot: ...
@@ -319,9 +325,9 @@ class _BaseFomoClient:
         return _parse_json(self._fetch_ok(path, params), path)
 
     # ---------- 端点 ----------
-    def resolve_handle(self, handle: str) -> tuple[str, str]:
+    def resolve_handle(self, handle: str) -> tuple[str, str, str]:
         """
-        handle → (user_id, display_name)。
+        handle → (user_id, display_name, 规范大小写的 handle)。
 
         ⚠️ URL 里**不做 lower()**:store.normalize_handle 的小写化是为了 DB 主键唯一,
            而 FOMO 的这个查询端点是否大小写敏感未知,擅自转小写可能查不到人。
@@ -335,15 +341,43 @@ class _BaseFomoClient:
         if not uid:
             raise FomoAPIError(f"响应里找不到 userId | handle={h} | {json.dumps(obj, default=str)[:300]}")
         display = pick(obj, "displayName", "display_name", "name", "username", "userHandle", "handle") or h
-        return str(uid), str(display)
+        # ⚠️ 回传 API 侧的**规范大小写** handle,而不是用户在 /add 里敲的那个 ——
+        #    handle 要显示给人看、还要拿去搜,@GakkiYuiTifa 和 @gakkiyuitifa 观感差很多。
+        canonical = pick(obj, "userHandle", "handle", "username") or h
+        return str(uid), str(display), str(canonical).lstrip("@")
 
     def get_swaps(self, user_id: str, limit: int = 50) -> list[dict]:
         # TODO(probe #1/#2/#3/#4): networkId 是否存在、唯一 id 字段名、时间单位、买卖方向表示
         return _as_list(self._get(EP_SWAPS.format(uid=quote(user_id, safe="")), {"limit": limit}))
 
     def get_balances(self, user_id: str) -> list[dict]:
-        # TODO(probe #6): tokenAddress/networkId/usdValue 是否齐全、是否一次返回全部链
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
+
+    def get_trades(self, user_id: str) -> list[dict]:
+        """
+        拉某人的持仓单(activeTrades + closedTrades),扁平成一个列表返回。
+
+        ⚠️ 这是「已实现盈亏」和「剩余持仓 $0.00」的**唯一**来源:
+           清仓之后 balances 里就没有这个币了,只有 closedTrades 还留着
+           realizedPnlUsd 与 humanTokenAmount=0。
+
+        每条形如(注意真正的数据在嵌套的 trade 里):
+          {"trade": {"tokenAddress":…, "networkId":…, "humanTokenAmount": 剩余数量,
+                     "avgEntryPrice":…, "realizedPnlUsd":…, "unrealizedPnlUsd":…,
+                     "totalCostBasis":…, "closedAt":…,
+                     "tokenMetadata": {"symbol":…, "currentPrice":…}},
+           "comment": {...}, "type": "spot"}
+        """
+        payload = self._get(EP_TRADES, {"userId": user_id, "orderBy": "closedAt"})
+        ro = _unwrap(payload)
+        if not isinstance(ro, dict):
+            return []
+        out: list[dict] = []
+        for key in ("activeTrades", "closedTrades"):
+            v = ro.get(key)
+            if isinstance(v, list):
+                out.extend(x for x in v if isinstance(x, dict))
+        return out
 
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]:
@@ -440,7 +474,7 @@ class _BaseFomoClient:
            swaps 照常推送。
         """
         snap = UserSnapshot(user_id=user_id)
-        for part in ("swaps", "balances"):
+        for part in ("swaps", "balances", "trades"):
             try:
                 setattr(snap, part, getattr(self, f"get_{part}")(user_id))
             except AuthError:

@@ -75,8 +75,22 @@ def test_验收9_同一user_id重复add只有一行且不重置基线(conn):
 
     rows = conn.execute("SELECT * FROM watch_users").fetchall()
     assert len(rows) == 1
-    assert rows[0]["handle"] == "maxpain"
     assert rows[0]["stats_ready"] == 1, "重复 /add 把已建好的基线重置了"
+
+    # handle 存**原始大小写**:它要显示给人看、还要拿去搜,大小写是它本身的一部分。
+    # 去重的保证是 user_id 主键,不是把 handle 压成小写。
+    # 重复 /add 会用新传入的值刷新名字(用户在 FOMO 上改名时靠这一步跟上),
+    # 所以这里是第二次传入的 "maxpain"。
+    assert rows[0]["handle"] == "maxpain"
+    need_seed3, _ = store.add_watch_user(conn, "u1", "@GakkiYuiTifa", "新名字")
+    assert need_seed3 is False, "刷新名字不该触发重建基线"
+    row = store.get_watch_user(conn, "u1")
+    assert (row["handle"], row["display_name"]) == ("GakkiYuiTifa", "新名字"), "改名后没跟上"
+    assert row["stats_ready"] == 1, "刷新名字把基线重置了"
+
+    # 查找必须忽略大小写,否则用户按自己记的写法输入就找不到人
+    for typed in ("@GAKKIYUITIFA", "gakkiyuitifa", " GakkiYuiTifa "):
+        assert store.find_user_by_handle(conn, typed) is not None, f"按 {typed!r} 查不到"
 
 
 def test_del后再add必须重建基线(conn):

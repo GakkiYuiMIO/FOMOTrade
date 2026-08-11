@@ -33,6 +33,9 @@ from src.models import (
     EVENT_THESIS,
     EVENT_TRANSFER_IN,
     EVENT_TRANSFER_OUT,
+    GMGN_SLUG,
+    NETWORK_DISPLAY,
+    NETWORK_SLUG,
     FomoEvent,
 )
 
@@ -69,6 +72,9 @@ EMOJI_NETWORK = "🧬"
 EMOJI_COUNTERPARTY = "👤"
 EMOJI_WARN = "⚠️"
 EMOJI_PENDING = "⏳"
+EMOJI_PNL_UP = "📈"
+EMOJI_PNL_DOWN = "📉"
+EMOJI_LINK = "🔗"
 
 # ============================================================
 # 固定文案
@@ -88,6 +94,13 @@ LABEL_FROM = "来自"
 LABEL_TO = "转给"
 # 方向判不出时用的中性说法 —— 「来自」和「转给」都是在断言方向,断错就是彻底的错误信息
 LABEL_COUNTERPARTY = "对手方"
+LABEL_PNL_REALIZED = "已实现盈亏"
+LABEL_PNL_UNREALIZED = "未实现盈亏"
+
+# 代币页链接。⚠️ 链 slug 未收录时**整个链接不出** ——
+# 错的链接比没有链接更糟(§10.3),拼一个平台不支持的链只会得到 404。
+FOMO_TOKEN_URL = "https://fomo.family/tokens/{slug}/{ca}"
+GMGN_TOKEN_URL = "https://gmgn.ai/{slug}/token/{ca}"
 
 # thesis 正文硬截断长度。TG 单条上限 4096,但一条几百字的观点在全推流里已经过长,
 # 超出部分用 expandable 折叠(Bot API 7.4+;旧客户端退化成普通引用,仍可读)
@@ -98,14 +111,8 @@ THESIS_MAX_CHARS = 500
 # ============================================================
 # 键是 models.normalize_network() 的输出(全小写)。未命中时原样透传 ——
 # ⚠️ 未命中值直接来自 API,必须 escape(见 _network_line)
-NETWORK_DISPLAY = {
-    "solana": "Solana",
-    "base": "Base",
-    "bsc": "BSC",
-    "ethereum": "Ethereum",
-    "arbitrum": "Arbitrum",
-    "polygon": "Polygon",
-}
+# 链的展示名与 slug 统一由 models 提供(与 fomo.family 官方映射一致),
+# 这里不再维护第二份 —— 两份必然会不同步。
 
 # 观点正文里的连续空行:手机端空行照样占行高(铁律 5),用户原文里的空行同样要压掉
 _BLANK_LINES = re.compile(r"\n\s*\n+")
@@ -256,9 +263,26 @@ def _esc(v) -> str:
 
 
 def _display_name(ev: FomoEvent) -> str:
-    """展示名优先用 handle;都没有时退到 user_id,绝不留空标题"""
+    """
+    展示名。有 @handle 时一并显示:`血手人屠·厉飞雨 (@GakkiYuiTifa)`。
+
+    展示名可以随时改、也可能重名,@handle 才是能拿去搜的那个标识 ——
+    两个都给,扫消息时认人、要查证时有据可循。
+    两者相同时不重复显示(有些人没设展示名,handle 会被直接当展示名用)。
+    """
     name = (ev.handle or "").strip() or (ev.user_id or "").strip()
     return _esc(name) if name else TEXT_UNKNOWN_USER
+
+
+def _handle_suffix(ev: FomoEvent) -> str:
+    """`(@handle)` 后缀。与展示名相同时不重复显示(有人没设展示名,handle 会被当展示名用)"""
+    h = (ev.user_handle or "").strip().lstrip("@")
+    if not h:
+        return ""
+    name = (ev.handle or "").strip()
+    if name and h.lower() == name.lower():
+        return ""
+    return f" (@{_esc(h)})"
 
 
 def _symbol_plain(ev: FomoEvent) -> str | None:
@@ -299,7 +323,8 @@ def _title_anchor(ev: FomoEvent) -> tuple[str, str]:
 
 def _title_line(ev: FomoEvent) -> str:
     emoji, label = _title_anchor(ev)
-    parts = [f"{emoji} <b>{_display_name(ev)}</b>", label]
+    # 只给展示名加粗:@handle 是辅助信息,一起加粗会把行首锚点的视觉重量冲散
+    parts = [f"{emoji} <b>{_display_name(ev)}</b>{_handle_suffix(ev)}", label]
     sym = _symbol_plain(ev)
     if sym is not None:
         parts.append(f"<b>${_esc(sym)}</b>")
@@ -457,6 +482,55 @@ def _network_line(ev: FomoEvent) -> str | None:
     return f"{EMOJI_NETWORK} {_esc(NETWORK_DISPLAY.get(net, net))}"
 
 
+def _pnl_line(ev: FomoEvent) -> str | None:
+    """
+    盈亏行。卖出看**已实现**,其余看**未实现** —— 卖出那一刻真正落袋的是前者。
+
+    ⚠️ 判据一律 `is None`:盈亏正好是 0 是有意义的真实值(刚开仓、或买卖打平)。
+    """
+    if ev.event_type in (EVENT_SELL, EVENT_TRANSFER_OUT):
+        val, pct, label = ev.realized_pnl, ev.realized_pnl_pct, LABEL_PNL_REALIZED
+    else:
+        val, pct, label = ev.unrealized_pnl, ev.unrealized_pnl_pct, LABEL_PNL_UNREALIZED
+    if val is None:
+        return None
+    usd = _fmt_usd(abs(val))
+    if usd is None:
+        return None
+    emoji = EMOJI_PNL_DOWN if val < 0 else EMOJI_PNL_UP
+    sign = "-" if val < 0 else "+"
+    line = f"{emoji} {label} {sign}{usd}"
+    if pct is not None:
+        try:
+            line += f" ({float(pct):+.2f}%)"
+        except (TypeError, ValueError):
+            pass
+    return line
+
+
+def _links_line(ev: FomoEvent) -> str | None:
+    """
+    快速跳转:FOMO 代币页 + GMGN。
+
+    ⚠️ 必须排在 CA 行**之前** —— CA 独占最后一行是硬规则(§10.3),
+       它是中国网络下唯一 100% 可用的操作(tap-to-copy),链接只是锦上添花。
+    ⚠️ 链 slug 未收录时对应链接直接不出:GMGN 不支持 Monad / Robinhood,
+       硬拼出来只会 404,而错的链接比没有链接更糟。
+    """
+    ca = (ev.token_address or "").strip()
+    net = (ev.network_id or "").strip()
+    if not ca or not net:
+        return None
+    parts = []
+    fomo_slug = NETWORK_SLUG.get(net)
+    if fomo_slug:
+        parts.append(f'<a href="{FOMO_TOKEN_URL.format(slug=fomo_slug, ca=_esc(ca))}">FOMO</a>')
+    gmgn_slug = GMGN_SLUG.get(net)
+    if gmgn_slug:
+        parts.append(f'<a href="{GMGN_TOKEN_URL.format(slug=gmgn_slug, ca=_esc(ca))}">GMGN</a>')
+    return f"{EMOJI_LINK} {' · '.join(parts)}" if parts else None
+
+
 def _ca_line(ev: FomoEvent) -> str | None:
     """
     CA 独占最后一行,纯 <code>(§10.3)。
@@ -521,10 +595,12 @@ def _render(
         else None,
         _holding_line(ev),
         _avg_price_line(ev),
+        _pnl_line(ev),                           # 卖出看已实现,其余看未实现
         _trade_count_line(ev),
         _market_cap_line(ev),
         _consensus_line(buyers, watchlist, holders),
         _network_line(ev),
+        _links_line(ev),                         # 链接在 CA 之前 —— CA 必须独占最后一行
         _ca_line(ev),                            # CA 永远是数据部分的最后一行
         TEXT_BASELINE_PENDING if baseline_pending else None,
     ]

@@ -373,6 +373,7 @@ def _event_from_row(row) -> FomoEvent | None:
             event_ts=row["event_ts"],
             raw_json=row["raw_json"],
             handle=_row_get(row, "handle"),
+            user_handle=_row_get(row, "user_handle"),
             network_id=_row_get(row, "network_id"),
             token_address=_row_get(row, "token_address"),
             token_symbol=_row_get(row, "token_symbol"),
@@ -511,18 +512,71 @@ class Poller:
 
     def _build_token_index(self, snapshots: dict) -> None:
         """
-        从本 tick 的 balances 建两张索引,供消息渲染补字段:
+        从本 tick 的 trades + balances 建两张索引,供消息渲染补字段:
 
-            _token_meta[(net, ca)]      → symbol / 市值 / 现价      (全局共享)
-            _positions[(uid, net, ca)]  → 持仓额 / 均价 / 未实现盈亏 (按人)
+            _token_meta[(net, ca)]      → symbol / 市值 / 现价                  (全局共享)
+            _positions[(uid, net, ca)]  → 持仓额 / 均价 / 未实现盈亏 / 已实现盈亏 (按人)
 
-        ⚠️ swap 记录本身**不含** symbol、市值、持仓、均价 —— 消息里那几行全靠这张索引。
-           而 balances 每个 tick 本来就要拉(count_holders 依赖它),所以零额外 API 开销。
-        ⚠️ 索引里没有的币,对应行整行消失,绝不本地推算(§10.4 铁律 2)。
-           清仓后 balances 里就没这个币了,所以卖出消息的持仓行消失是**正确行为**。
+        ⚠️ swap 记录本身**不含** symbol、市值、持仓、均价、盈亏 —— 消息里那几行全靠这张索引。
+        ⚠️ 两个来源各有不可替代的部分,所以都要吃:
+             trades    → 已实现盈亏、剩余持仓(**含已平仓的单**),balances 里没有
+             balances  → 市值(marketCap),trades 里没有
+           顺序是 trades 先、balances 后,后者只用 setdefault 补空,不覆盖前者。
+        ⚠️ 两边都没有的币,对应行整行消失,绝不本地推算(§10.4 铁律 2)。
         """
         meta: dict[tuple, dict] = {}
         pos: dict[tuple, dict] = {}
+
+        # ---- 先吃 trades:它含**已平仓**的单子,是「已实现盈亏」和「剩余 $0.00」的唯一来源 ----
+        # (清仓之后 balances 里就没这个币了,只有 closedTrades 还留着记录)
+        for uid, snap in snapshots.items():
+            for row in (getattr(snap, "trades", None) or []):
+                t = row.get("trade") if isinstance(row, dict) else None
+                if not isinstance(t, dict):
+                    continue
+                net = normalize_network(t.get("networkId"))
+                ca = normalize_token_address(_pick_str(t, "tokenAddress"))
+                if not net or not ca:
+                    continue
+                tm = t.get("tokenMetadata") if isinstance(t.get("tokenMetadata"), dict) else {}
+                price = _f(tm.get("currentPrice"))
+                qty = _f(t.get("humanTokenAmount"))
+                cost = _f(t.get("totalCostBasis"))
+                realized = _f(t.get("realizedPnlUsd"))
+                m = meta.setdefault((net, ca), {})
+                m.setdefault("symbol", _clean_symbol(_pick_str(tm, "symbol")))
+                m.setdefault("price_usd", price)
+                m.setdefault("network_raw", t.get("networkId"))
+
+                # ⚠️ 同一个币可能同时有一条活跃单和多条已平仓单(买→清→再买)。
+                #    无脑覆盖的话,后写的已平仓单(剩余量 0)会把活跃单的真实持仓抹成 $0.00 ——
+                #    实测就踩了这个:明明还持有 $3.79,消息里显示「持仓 $0.00」。
+                #    分工:**活跃单**给持仓/均价/未实现盈亏,**已平仓单**只给已实现盈亏。
+                p = pos.setdefault((uid, net, ca), {})
+                is_open = t.get("closedAt") is None
+                unreal = _f(t.get("unrealizedPnlUsd"))
+                snapshot = {
+                    # 剩余数量 × 现价。清仓时 humanTokenAmount=0 → 恰好渲染成「剩余 $0.00」
+                    "holding_usd": (qty * price) if (qty is not None and price is not None) else None,
+                    "avg_price": _f(t.get("avgEntryPrice")),
+                    "pnl": unreal,
+                    "pnl_pct": (unreal / cost * 100) if (unreal is not None and cost) else None,
+                }
+                if is_open:
+                    # 活跃单是当前真实持仓,无条件覆盖
+                    p.update(snapshot)
+                    p["_open"] = True
+                elif not p.get("_open") and p.get("holding_usd") is None:
+                    # 没有活跃单时才用已平仓单兜底(它给出的正是「剩余 $0.00」)。
+                    # 用 is None 判空:第一条已平仓单写完之后,更早的那些不该再覆盖
+                    p.update(snapshot)
+                # 已实现盈亏取**最近一次**平仓的那笔 —— closedTrades 按 closedAt 倒序返回,
+                # 所以只认第一条命中的,后面更早的不覆盖
+                if realized is not None and p.get("realized_pnl") is None:
+                    p["realized_pnl"] = realized
+                    p["realized_pnl_pct"] = (realized / cost * 100) if cost else None
+
+        # ---- 再吃 balances:市值只有它有;已被 trades 写过的键用 setdefault 保护 ----
         for uid, snap in snapshots.items():
             for b in (getattr(snap, "balances", None) or []):
                 if not isinstance(b, dict):
@@ -548,12 +602,17 @@ class Poller:
                 cost = _f(ut.get("currentCostBasisUsd"))
                 holding = _balance_usd(b)
                 pnl = (holding - cost) if (holding is not None and cost is not None) else None
-                pos[(uid, net, ca)] = {
-                    "holding_usd": holding,
-                    "avg_price": _f(ut.get("averageEntryPriceUsd")),
-                    "pnl": pnl,
-                    "pnl_pct": (pnl / cost * 100) if (pnl is not None and cost) else None,
-                }
+                # ⚠️ 只补 trades 没给出的字段,**不能整体覆盖** ——
+                #    trades 那份带已实现盈亏,且覆盖已平仓的单,信息严格更全。
+                p = pos.setdefault((uid, net, ca), {})
+                for k, v in (
+                    ("holding_usd", holding),
+                    ("avg_price", _f(ut.get("averageEntryPriceUsd"))),
+                    ("pnl", pnl),
+                    ("pnl_pct", (pnl / cost * 100) if (pnl is not None and cost) else None),
+                ):
+                    if p.get(k) is None:
+                        p[k] = v
         self._token_meta = meta
         self._positions = pos
         logger.debug("代币索引 {} 个 · 持仓索引 {} 条", len(meta), len(pos))
@@ -1002,6 +1061,7 @@ class Poller:
             event_ts=event_ts,
             raw_json=dump_raw(raw),
             handle=_row_get(user_row, "display_name") or _row_get(user_row, "handle"),
+            user_handle=_row_get(user_row, "handle"),
             network_id=net,
             token_address=ca,
             token_symbol=_clean_symbol(sym) or meta.get("symbol"),
@@ -1029,6 +1089,9 @@ class Poller:
                         or meta.get("market_cap")),
             unrealized_pnl=_f(pick(raw, *_K_PNL_USD)) or posn.get("pnl"),
             unrealized_pnl_pct=_f(pick(raw, *_K_PNL_PCT)) or posn.get("pnl_pct"),
+            # 已实现盈亏只对卖出有意义,来自 /trades(balances 里没有)
+            realized_pnl=posn.get("realized_pnl"),
+            realized_pnl_pct=posn.get("realized_pnl_pct"),
         )
 
     # --------------------------------------------------------
@@ -1113,6 +1176,7 @@ class Poller:
             event_ts=event_ts,
             raw_json=dump_raw(raw),
             handle=_row_get(user_row, "display_name") or _row_get(user_row, "handle"),
+            user_handle=_row_get(user_row, "handle"),
             network_id=net,
             token_address=ca,
             token_symbol=_clean_symbol(sym),
@@ -1189,6 +1253,7 @@ class Poller:
             event_ts=event_ts,
             raw_json=dump_raw(raw),
             handle=_row_get(user_row, "display_name") or _row_get(user_row, "handle"),
+            user_handle=_row_get(user_row, "handle"),
             network_id=net,
             token_address=ca,
             token_symbol=_clean_symbol(sym) or (self._token_meta.get((net, ca)) or {}).get("symbol"),

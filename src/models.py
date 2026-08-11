@@ -61,6 +61,31 @@ _NETWORK_ALIASES = {
     "bsc": "bsc", "bnb": "bsc", "bnb-chain": "bsc",
     "binance-smart-chain": "bsc", "binance": "bsc", "56": "bsc",
     "ethereum": "ethereum", "eth": "ethereum", "1": "ethereum",
+    "monad": "monad", "143": "monad",
+    "robinhood": "robinhood", "4663": "robinhood",
+    "hyperliquid": "hyperliquid", "1337": "hyperliquid",
+}
+
+# ============================================================
+# 链的展示名与 URL slug(抓自 fomo.family 前端 chains 模块,与官方一致)
+# ============================================================
+# ⚠️ 键是**我们内部的归一化值**,不是原始 networkId ——
+#    内部值一旦改动就会让 user_token_stats 的聚合键裂开,所以这两张表单独维护,
+#    不要图省事把内部值直接改成 FOMO 的 slug(bsc vs bnb 就是不一致的一例)。
+NETWORK_DISPLAY = {
+    "solana": "Solana", "base": "Base", "monad": "Monad", "bsc": "BNB Chain",
+    "ethereum": "Ethereum", "hyperliquid": "Hyperliquid", "robinhood": "Robinhood Chain",
+}
+# fomo.family 代币页的路径片段:https://fomo.family/tokens/{slug}/{address}
+NETWORK_SLUG = {
+    "solana": "solana", "base": "base", "monad": "monad", "bsc": "bnb",
+    "ethereum": "ethereum", "hyperliquid": "hyperliquid", "robinhood": "robinhood",
+}
+# GMGN 的链片段:https://gmgn.ai/{slug}/token/{address}
+# 只收录 GMGN 确实支持的链 —— 拼一个它不支持的链只会得到 404,
+# **错的链接比没有链接更糟**(设计 §10.3),所以未收录的链直接不出这个链接。
+GMGN_SLUG = {
+    "solana": "sol", "base": "base", "bsc": "bsc", "ethereum": "eth",
 }
 
 # ============================================================
@@ -75,6 +100,12 @@ QUOTE_TOKENS: frozenset[tuple[str, str]] = frozenset({
     ("solana", "So11111111111111111111111111111111111111112"),   # WSOL
     ("solana", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),   # USDC
     ("solana", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),   # USDT
+    # ---- Monad(143) / Robinhood(4663):抓自前端 chains 模块 ----
+    # ⚠️ Robinhood 链上的稳定币是 **USDG**,不是 USDC(前端 g() 函数按链返回不同符号)
+    ("monad", "0x754704bc059f8c67012fed69bc8a327a5aafb603"),      # USDC
+    ("monad", "0x3bd359c1119da7da1d913d1c4d2b7c461115433a"),      # WETH
+    ("robinhood", "0x5fc5360d0400a0fd4f2af552add042d716f1d168"),  # USDG
+    ("robinhood", "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),  # WETH
     # ---- Base (8453) ----
     ("base", "0x4200000000000000000000000000000000000006"),       # WETH
     ("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),       # USDC
@@ -295,7 +326,8 @@ class FomoEvent:
     user_id: str
     event_ts: str
     raw_json: str
-    handle: str | None = None
+    handle: str | None = None          # 展示名(displayName)
+    user_handle: str | None = None     # @handle,与展示名一起显示
     network_id: str | None = None
     token_address: str | None = None
     token_symbol: str | None = None
@@ -324,6 +356,8 @@ class FomoEvent:
     market_cap: float | None = None
     unrealized_pnl: float | None = None
     unrealized_pnl_pct: float | None = None
+    realized_pnl: float | None = None        # 已实现盈亏(卖出时才有意义)
+    realized_pnl_pct: float | None = None
     thesis_text: str | None = None
     counterparty_handle: str | None = None
     counterparty_is_watched: bool = False
@@ -359,6 +393,7 @@ class FomoEvent:
             "event_type": self.event_type,
             "user_id": self.user_id,
             "handle": self.handle,
+            "user_handle": self.user_handle,
             "network_id": self.network_id,
             "token_address": self.token_address,
             "token_symbol": self.token_symbol,

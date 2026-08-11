@@ -176,16 +176,20 @@ class CommandBot:
            基线由 poller 下一 tick 的 seed_next_pending_user() 建,
            期间事件照常推送、只是不打徽章(设计文档 A-1 / A-3)。
         """
-        handle = store.normalize_handle(arg)
+        # ⚠️ 查询用原始输入(FOMO 端点是否大小写敏感未知),不要先压小写
+        handle = store.clean_handle(arg)
         if not handle:
             return "用法: /add &lt;handle&gt;  例: /add maxpain"
 
         try:
-            user_id, display = self._client.resolve_handle(handle)
+            # 第三项是 API 侧的**规范大小写** handle —— 存它而不是用户敲进来的那个,
+            # 消息里才会显示成 @GakkiYuiTifa 而不是 @gakkiyuitifa
+            user_id, display, canonical = self._client.resolve_handle(handle)
         except Exception as e:  # noqa: BLE001
             return self._resolve_error(handle, e)
         if not user_id:
             return f"❌ 找不到用户 @{_esc(handle)}(handle 拼错?或该用户已改名)"
+        handle = canonical or handle
 
         with store.get_conn() as conn:
             # ⚠️ 只用 store 返回的布尔值,不直接转发它的文案 ——

@@ -386,12 +386,16 @@ def test_to_row只输出落库字段():
     ev = make_event(market_cap=1.9e7, holding_usd=2498.1, ts_fallback=True, side_unknown=True)
     row = ev.to_row()
     assert set(row) == {
-        "event_id", "event_type", "user_id", "handle", "network_id", "token_address",
-        "token_symbol", "amount_usd", "token_amount", "price_usd", "tx_hash",
-        "event_ts", "ingested_at", "badge", "badge_reason", "raw_json",
+        "event_id", "event_type", "user_id", "handle", "user_handle",
+        "network_id", "token_address", "token_symbol", "amount_usd", "token_amount",
+        "price_usd", "tx_hash", "event_ts", "ingested_at",
+        "badge", "badge_reason", "raw_json",
     }
     assert "market_cap" not in row
     assert "ts_fallback" not in row
+    # 盈亏是展示字段(每 tick 从 /trades 重新拿),不落库
+    assert "realized_pnl" not in row
+    assert "unrealized_pnl" not in row
 
 
 def test_徽章字段默认为空():
