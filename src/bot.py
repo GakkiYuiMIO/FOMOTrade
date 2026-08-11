@@ -71,6 +71,7 @@ _COMMAND_MENU = [
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
     ("del", "移出监控:/del <handle>"),
+    ("rebuild", "重建全部历史基线(回填逻辑改动后用)"),
     ("help", "命令说明"),
 ]
 
@@ -94,6 +95,7 @@ _HELP = (
     "/list — 查看监控名单与基线状态\n"
     "/status — 运行状态\n"
     "/who &lt;CA&gt; [链] — 名单里谁买过这个币\n"
+    "/rebuild — 重建全部历史基线(回填逻辑改动后用)\n"
     "/help — 本说明"
 )
 
@@ -278,6 +280,8 @@ class CommandBot:
             return self._cmd_top(arg)
         if cmd in ("/hot", "/coins", "/buys"):
             return self._cmd_hot(arg)
+        if cmd == "/rebuild":
+            return self._cmd_rebuild(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
         if cmd == "/list":
@@ -325,6 +329,37 @@ class CommandBot:
         return (
             f"✅ 已加入 <b>{name}</b>(@{_esc(handle)})\n"
             f"⏳ 正在建立历史基线,完成前的买入不打徽章、不显示共识"
+        )
+
+    def _cmd_rebuild(self, arg: str) -> str:
+        """
+        /rebuild confirm —— 重建全部历史基线。
+
+        什么时候需要:回填逻辑本身改好之后(比如分页参数修对了、回填条数上调了),
+        已建好的旧基线仍是按旧规则建的,不重建就一直用着不准的「首次建仓」判据。
+
+        ⚠️ 要打 confirm 才执行:重建期间(N 人 = N 轮)这些人不打徽章、不显示共识。
+           这是个有代价的操作,不该手滑就触发。
+        """
+        if (arg or "").strip().lower() != "confirm":
+            with store.get_conn() as conn:
+                users = store.list_active_users(conn)
+            interval = self._settings.fomo_poll_interval_sec
+            mins = len(users) * interval / 60
+            return (
+                f"⚠️ <b>重建历史基线</b>\n"
+                f"会把名单里 {len(users)} 人的基线全部重建,每轮建一个,"
+                f"约需 {mins:.0f} 分钟。\n"
+                f"期间这些人的买入<b>不打徽章、不显示共识</b>(推送照常,不会丢事件)。\n\n"
+                f"确认请发:<code>/rebuild confirm</code>"
+            )
+        with store.get_conn() as conn:
+            n = store.reset_all_baselines(conn)
+        interval = self._settings.fomo_poll_interval_sec
+        return (
+            f"✅ 已重置 {n} 人的基线,将逐轮重建(约 {n * interval / 60:.0f} 分钟)\n"
+            f"⏳ 期间不打徽章、不显示共识;每建好一个会有一条通知\n"
+            f"游标未改动 —— 不会漏推、也不会重推历史"
         )
 
     def _cmd_hot(self, arg: str) -> str:

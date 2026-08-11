@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import threading
+import time
 import unicodedata
 from datetime import UTC, datetime
 from urllib.parse import quote
@@ -712,7 +713,10 @@ def cmd_run() -> int:
     retry_tolerance = 5
     fail_streak = {"n": 0}
 
+    slow_warned = {"done": False}
+
     def _tick_job() -> None:
+        t0 = time.monotonic()
         try:
             n = poller.tick()
             # /status 要显示"最近一次 tick 时间"。Poller 契约里没有这个字段,
@@ -720,8 +724,22 @@ def cmd_run() -> int:
             # 失败时保持旧值不动,/status 上那个不再前进的时间戳本身就是"管道坏了"的信号。
             poller.last_tick_at = now_iso()
             fail_streak["n"] = 0
+            dt = time.monotonic() - t0
             if n:
-                logger.info("tick 完成,新事件 {} 条", n)
+                logger.info("tick 完成,新事件 {} 条 · 耗时 {:.0f}s", n, dt)
+            # ⚠️ 一轮跑不完一个间隔时,APScheduler 只会甩一句
+            #    "skipped: maximum number of running instances reached" ——
+            #    看着像出错,其实只是 tick 连轴转(coalesce 保证不堆积、不丢数据)。
+            #    这里给一句能照着做的话,且只说一次,免得刷屏。
+            if dt > s.fomo_poll_interval_sec and not slow_warned["done"]:
+                slow_warned["done"] = True
+                logger.warning(
+                    "单轮耗时 {:.0f}s > 轮询间隔 {}s —— tick 会连轴转。"
+                    "数据不会丢(coalesce 已开),但日志里会一直刷 'skipped ... max instances'。"
+                    "建议把 .env 的 FOMO_POLL_INTERVAL_SEC 调到 {} 以上后重启。"
+                    "(基线全部建好之后耗时会明显下降,届时可以再调回来)",
+                    dt, s.fomo_poll_interval_sec, int(dt * 1.5),
+                )
         except RetryableAuthError as e:
             # 网络抖动 / 代理断流 / Privy 5xx —— 不是"你被登出了"。
             # ⚠️ 直接当成 AuthError 停机是这条链上最贵的误判:

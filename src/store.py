@@ -343,6 +343,25 @@ def remove_watch_user(conn, handle_or_id: str) -> tuple[bool, str]:
     return True, f"✅ 已移除 {name}(相关代币共识数已下调)"
 
 
+def reset_all_baselines(conn) -> int:
+    """
+    把所有 active 用户的 stats_ready 置 0,让 seeding 重跑一遍。返回受影响人数。
+
+    用途:回填逻辑本身改好之后(比如分页参数修对了、回填条数上调了),
+    已经建好的旧基线仍是按旧规则建的,不重建就一直用着不准的判据。
+
+    ⚠️ **绝不碰游标**。游标只在真·新增用户时设为 now;这里动它等于把
+       上一轮之后发生的事件全部丢弃(_drop_before_cursor 的判据是 event_ts > cursor)。
+    ⚠️ 重建期间这些人不打徽章、不计入共识分子分母(stats_ready=0 的既定语义),
+       推送照常。每 tick 只建一个人,所以 N 人要 N 轮。
+    """
+    with tx(conn):
+        cur = conn.execute("UPDATE watch_users SET stats_ready = 0 WHERE active = 1")
+    n = cur.rowcount or 0
+    logger.info("已重置 {} 人的历史基线,将逐轮重建", n)
+    return n
+
+
 def pick_one_pending_user(conn):
     """
     取一个待建基线的用户。每 tick 只处理一个 ——
