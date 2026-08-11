@@ -132,6 +132,14 @@ _TS_GUARD_MIN_BATCH = 5
 # 那种情况下游标同样已经不可信了
 _TS_GUARD_DROP_RATIO = 0.5
 
+# ---- 观点采集(见 Poller._collect_thesis) ----
+# 每 tick 扫多少个代币。调用量恒定不随名单规模增长:币多时只是轮转一圈更慢。
+# 20s 一轮 × 25 个 = 一分钟覆盖 75 个币,对几十人的名单足够。
+_THESIS_TOKENS_PER_TICK = 25
+# afterTime 回看窗口(秒)。够覆盖轮转一圈的时间即可 —— 拉太久白费流量,
+# 拉太短会在轮转间隙漏掉观点。精确去重由 event_id + 游标负责,这里只是压 payload。
+_THESIS_LOOKBACK_SEC = 3600
+
 
 # ============================================================
 # 取值小工具
@@ -211,12 +219,41 @@ def _balance_key(b: dict) -> tuple[str | None, str | None]:
     """
     从一条 balances 记录里取出 (network_id, token_address) 聚合键。
 
-    TODO(probe #6): 确认 balances 是扁平结构还是 {token: {...}, usdValue: ...} 嵌套结构,
-                    以及**是否一次调用返回全部链**(分链调用会让 count_holders 的覆盖判据
-                    要改成按链粒度)。这里两种形态都兜住。
+    ⚠️ 实测(2026-08-11)真实结构顶层只有四个键,代币标识**一个都不在顶层**:
+          {"balance": {"tokenAddress": ..., "tokenId": "<addr>:<networkId>"},
+           "tokenFilterResult": {"token": {"networkId": ..., "symbol": ...}},
+           "userToken": {...}, "activeTrade": {...}}
+       原来只按扁平/｛token:…｝两种猜测取键,对真实结构恒返回 (None, None) ——
+       后果是 count_holders 一个都数不到、seeding 的持仓回填整个失效
+       (而后者正是堵"回填窗口外老仓位被误标 🌱"的那道防线)。
+       所以下面**先按实测路径取**,取不到再退回原来的通用猜测。
     """
     if not isinstance(b, dict):
         return None, None
+
+    # ---- 实测路径 ----
+    bal = b.get("balance") if isinstance(b.get("balance"), dict) else {}
+    tfr = b.get("tokenFilterResult") if isinstance(b.get("tokenFilterResult"), dict) else {}
+    tok = tfr.get("token") if isinstance(tfr.get("token"), dict) else {}
+    ut = b.get("userToken") if isinstance(b.get("userToken"), dict) else {}
+
+    ca = normalize_token_address(
+        _pick_str(bal, "tokenAddress") or _pick_str(tok, "address") or _pick_str(ut, "tokenAddress")
+    )
+    net = normalize_network(
+        _pick_str(tok, "networkId") or _pick_str(ut, "networkId") or _pick_str(tfr, "networkId")
+    )
+    # tokenId 是 "<address>:<networkId>" 的复合键,前两者都缺时用它兜底
+    if not (ca and net):
+        tid = _pick_str(bal, "tokenId") or _pick_str(tok, "id")
+        if tid and ":" in tid:
+            a, _, n = tid.rpartition(":")
+            ca = ca or normalize_token_address(a)
+            net = net or normalize_network(n)
+    if ca and net:
+        return net, ca
+
+    # ---- 兜底:原来的通用猜测(结构再变时还有一线机会) ----
     nested = b.get("token") if isinstance(b.get("token"), dict) else None
     if nested is None and isinstance(b.get("tokenInfo"), dict):
         nested = b["tokenInfo"]
@@ -226,18 +263,40 @@ def _balance_key(b: dict) -> tuple[str | None, str | None]:
     return net, ca
 
 
-def _balance_is_held(b: dict) -> bool:
+def _balance_usd(b: dict) -> float | None:
     """
-    这条持仓是否算"仍持有"(dust 以下不算)。
+    这条持仓值多少美元。
 
-    TODO(probe #6): 无 usdValue 时退化为"数量 > 0" —— 这会让灰尘仓位被算成持有,
-                    是已知的、可接受的副指标误差(holders 只是副指标)。
+    ⚠️ 实测响应里**没有现成的 usdValue 字段**,只能自己乘:
+         humanAmountRemaining(userToken) × priceUSD(tokenFilterResult)
+       这是 dust 判定与「📦 持仓」行的唯一来源。
+       注意这属于"把两个 API 字段相乘",不是"本地推算业务量"——
+       设计里禁止的是拿 buy_count 反推交易次数那种,两者性质不同。
     """
-    usd = _f(pick(b, *_K_BALANCE_USD))
+    if not isinstance(b, dict):
+        return None
+    direct = _f(pick(b, *_K_BALANCE_USD))
+    if direct is not None:
+        return direct
+    bal = b.get("balance") if isinstance(b.get("balance"), dict) else {}
+    ut = b.get("userToken") if isinstance(b.get("userToken"), dict) else {}
+    tfr = b.get("tokenFilterResult") if isinstance(b.get("tokenFilterResult"), dict) else {}
+    qty = _f(ut.get("humanAmountRemaining")) or _f(bal.get("shiftedBalance"))
+    price = _f(tfr.get("priceUSD"))
+    if qty is not None and price is not None:
+        return qty * price
+    return None
+
+
+def _balance_is_held(b: dict) -> bool:
+    """这条持仓是否算"仍持有"(dust 以下不算)。算不出金额时退化为"数量 > 0"。"""
+    usd = _balance_usd(b)
     if usd is not None:
         return usd >= store.HOLDING_MIN_USD
+    bal = b.get("balance") if isinstance(b.get("balance"), dict) else {}
     nested = b.get("token") if isinstance(b.get("token"), dict) else {}
-    amt = _f(pick(b, *_K_TOKEN_AMOUNT)) or _f(pick(nested, *_K_TOKEN_AMOUNT))
+    amt = (_f(bal.get("shiftedBalance")) or _f(pick(b, *_K_TOKEN_AMOUNT))
+           or _f(pick(nested, *_K_TOKEN_AMOUNT)))
     return bool(amt and amt > 0)
 
 
@@ -370,6 +429,10 @@ class Poller:
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
+        # 每 tick 从 balances 重建(见 _build_token_index)
+        self._token_meta: dict[tuple, dict] = {}    # (net, ca)        → symbol/市值/现价
+        self._positions: dict[tuple, dict] = {}     # (uid, net, ca)   → 持仓/均价/盈亏
+        self._thesis_rr = 0                         # 观点轮转扫描的游标(见 _collect_thesis)
 
     # --------------------------------------------------------
     # 主循环
@@ -392,11 +455,21 @@ class Poller:
                 return 0
             self._refresh_watched_index(users)
 
-            # --- 2) 采集:拉齐所有 active 用户的四类数据 ---
+            # --- 2) 采集 ---
             snapshots = self._fetch_snapshots(users)
+            # 先建代币/持仓索引:归一化时要用它补 symbol、市值、持仓、均价
+            self._build_token_index(snapshots)
 
             # --- 3) 归一化 + 游标过滤 ---
             events = self._collect_events(conn, users, snapshots)
+            # 观点单独走一条路:它按代币查,不按用户查(见 _collect_thesis)
+            try:
+                events.extend(self._collect_thesis(conn, users))
+            except AuthError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 观点挂了不能影响买卖推送 —— 后者才是主链路
+                logger.error("观点采集整体失败(买卖不受影响): {}", e)
 
             # ⚠️ 必须按事件时间升序。乱序时同一个币的第二笔买入可能先被判定,
             #    真正的第一笔反而拿到 ADD —— 徽章落库即冻结,永不重算,打错就是永久的。
@@ -436,6 +509,115 @@ class Poller:
                 snapshots[uid] = None
         return snapshots
 
+    def _build_token_index(self, snapshots: dict) -> None:
+        """
+        从本 tick 的 balances 建两张索引,供消息渲染补字段:
+
+            _token_meta[(net, ca)]      → symbol / 市值 / 现价      (全局共享)
+            _positions[(uid, net, ca)]  → 持仓额 / 均价 / 未实现盈亏 (按人)
+
+        ⚠️ swap 记录本身**不含** symbol、市值、持仓、均价 —— 消息里那几行全靠这张索引。
+           而 balances 每个 tick 本来就要拉(count_holders 依赖它),所以零额外 API 开销。
+        ⚠️ 索引里没有的币,对应行整行消失,绝不本地推算(§10.4 铁律 2)。
+           清仓后 balances 里就没这个币了,所以卖出消息的持仓行消失是**正确行为**。
+        """
+        meta: dict[tuple, dict] = {}
+        pos: dict[tuple, dict] = {}
+        for uid, snap in snapshots.items():
+            for b in (getattr(snap, "balances", None) or []):
+                if not isinstance(b, dict):
+                    continue
+                net, ca = _balance_key(b)
+                if not net or not ca:
+                    continue
+                tfr = b.get("tokenFilterResult") if isinstance(b.get("tokenFilterResult"), dict) else {}
+                tok = tfr.get("token") if isinstance(tfr.get("token"), dict) else {}
+                price = _f(tfr.get("priceUSD"))
+                m = meta.setdefault((net, ca), {})
+                # setdefault:同一个币多人持有时以先到的为准,值都一样,不必反复覆盖
+                m.setdefault("symbol", _clean_symbol(_pick_str(tok, "symbol")))
+                m.setdefault("market_cap", _f(tfr.get("marketCap")))
+                m.setdefault("price_usd", price)
+                # 拉 thesis 时要用**原始**数字 networkId(1399811149),
+                # 不能用归一化后的 "solana" —— 那是我们内部的聚合键,API 不认
+                m.setdefault("network_raw", tok.get("networkId"))
+
+                ut = b.get("userToken") if isinstance(b.get("userToken"), dict) else None
+                if not ut:
+                    continue
+                cost = _f(ut.get("currentCostBasisUsd"))
+                holding = _balance_usd(b)
+                pnl = (holding - cost) if (holding is not None and cost is not None) else None
+                pos[(uid, net, ca)] = {
+                    "holding_usd": holding,
+                    "avg_price": _f(ut.get("averageEntryPriceUsd")),
+                    "pnl": pnl,
+                    "pnl_pct": (pnl / cost * 100) if (pnl is not None and cost) else None,
+                }
+        self._token_meta = meta
+        self._positions = pos
+        logger.debug("代币索引 {} 个 · 持仓索引 {} 条", len(meta), len(pos))
+
+    def _collect_thesis(self, conn, users) -> list[FomoEvent]:
+        """
+        观点采集:遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象。
+
+        ⚠️ FOMO **没有**"按用户查观点"的端点(/feed/user/thesis 是 404),只能这么绕。
+           直接代价是调用量 = 持仓币数,所以做了三件事压住它:
+             1) 跨用户去重 —— 多人持有同一个币只拉一次(_token_meta 天然按币聚合)
+             2) 每 tick 最多拉 _THESIS_TOKENS_PER_TICK 个,**轮转覆盖**,
+                币多时延迟变长但调用量恒定,不会随名单规模爆炸
+             3) 带 afterTime 增量拉(单位**毫秒**,传秒会被服务端忽略)
+        ⚠️ 只能看到"监控用户当前持仓的币"下的观点。他对已清仓的币发的观点看不到 ——
+           这是本方案的已知盲区,写在这里免得日后当成 bug 查。
+        """
+        tokens = [k for k, v in self._token_meta.items() if v.get("network_raw") is not None]
+        if not tokens or not self._watched_ids:
+            return []
+        tokens.sort()                      # 固定顺序,轮转才有意义
+        n = len(tokens)
+        take = min(_THESIS_TOKENS_PER_TICK, n)
+        start = self._thesis_rr % n
+        batch = [tokens[(start + i) % n] for i in range(take)]
+        self._thesis_rr = (start + take) % n
+
+        after_ms = int((time.time() - _THESIS_LOOKBACK_SEC) * 1000)
+        by_user: dict[str, list[dict]] = {}
+        failed = 0
+        for net, ca in batch:
+            raw_net = (self._token_meta.get((net, ca)) or {}).get("network_raw")
+            try:
+                items = self.client.get_token_thesis(ca, raw_net, after_ms=after_ms)
+            except AuthError:
+                raise                       # 登录态问题是全局的,必须上抛
+            except Exception as e:          # noqa: BLE001
+                failed += 1
+                logger.debug("thesis 拉取失败 token={} err={}", ca[:16], e)
+                continue
+            for it in items:
+                if isinstance(it, dict) and it.get("userId") in self._watched_ids:
+                    by_user.setdefault(it["userId"], []).append(it)
+
+        if failed:
+            logger.warning("thesis 本轮 {}/{} 个代币拉取失败", failed, len(batch))
+        if not by_user:
+            return []
+
+        out: list[FomoEvent] = []
+        rows = {u["user_id"]: u for u in users}
+        for uid, items in by_user.items():
+            u = rows.get(uid)
+            if u is None:
+                continue
+            try:
+                evs = self.normalize_thesis(u, items)
+            except Exception as e:          # noqa: BLE001
+                logger.error("归一化 thesis 整批失败 user={} err={}", uid, e)
+                continue
+            out.extend(_drop_before_cursor(evs, store.get_cursor(conn, uid, "thesis")))
+        logger.debug("thesis 扫描 {} 个代币 → 命中 {} 条", len(batch), len(out))
+        return out
+
     def _collect_events(self, conn, users, snapshots: dict) -> list[FomoEvent]:
         events: list[FomoEvent] = []
         for u in users:
@@ -443,10 +625,13 @@ class Poller:
             snap = snapshots.get(uid)
             if snap is None:
                 continue
+            # ⚠️ 这里只处理 swaps。
+            #    - transfers 已砍掉:/v2/transfers/with/{uid} 是「**我**与该用户之间的转账」
+            #      (对自己调返回 400 "Cannot fetch transfers with self"),
+            #      拿不到别人与第三方的转账,FOMO 也没有别的入口。
+            #    - thesis 没有按用户查的端点,走 _collect_thesis 按代币采集后过滤。
             for kind, items, fn in (
                 ("swaps", getattr(snap, "swaps", None), self.normalize_swaps),
-                ("transfers", getattr(snap, "transfers", None), self.normalize_transfers),
-                ("thesis", getattr(snap, "thesis", None), self.normalize_thesis),
             ):
                 if items is None:
                     # None = 该项拉取失败(区别于空列表)。swaps 挂了不影响其余三类继续推
@@ -787,6 +972,11 @@ class Poller:
         seq = dup.get(dkey, 0)
         dup[dkey] = seq + 1
 
+        # swap 记录不含 symbol / 市值 / 持仓 / 均价 —— 从本 tick 的 balances 索引里补。
+        # 索引里没有(如已清仓的币)时保持 None,formatter 会让对应行整行消失。
+        meta = self._token_meta.get((net, ca)) or {}
+        posn = self._positions.get((user_row["user_id"], net, ca)) or {}
+
         native_id = _pick_str(raw, *_K_NATIVE_ID)
         # 一条双侧 swap 产出两条事件时,原生 id 相同 —— make_event_id 会加 kind 前缀
         # ("BUY:xxx" / "SELL:xxx")天然区分开,不需要额外后缀
@@ -803,7 +993,7 @@ class Poller:
             handle=_row_get(user_row, "display_name") or _row_get(user_row, "handle"),
             network_id=net,
             token_address=ca,
-            token_symbol=_clean_symbol(sym),
+            token_symbol=_clean_symbol(sym) or meta.get("symbol"),
             # ⚠️ 实测记录里 USD 金额是分侧的:humanUsdAmountIn / humanUsdAmountOut。
             #    要取**标的那一侧**的值:买入时标的在 out 侧,卖出时在 in 侧。
             #    跨链 swap 两侧数值会有细微差(手续费/滑点),取错侧显示的就不是这笔的成交额。
@@ -813,16 +1003,21 @@ class Poller:
                 or _f(pick(raw, *_K_AMOUNT_USD))
             ),
             token_amount=amount,
-            price_usd=_f(pick(src, *_K_PRICE_USD)) or _f(pick(raw, *_K_PRICE_USD)),
+            price_usd=(_f(pick(src, *_K_PRICE_USD)) or _f(pick(raw, *_K_PRICE_USD))
+                       or meta.get("price_usd")),
             tx_hash=tx_hash,
             ts_fallback=ts_fallback,
             side_unknown=side_unknown,
             api_trade_count=_i(pick(raw, *_K_TRADE_COUNT)),
-            holding_usd=_f(pick(raw, *_K_HOLDING_USD)),
-            avg_price=_f(pick(raw, *_K_AVG_PRICE)) or _f(pick(src, *_K_AVG_PRICE)),
-            market_cap=_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP)),
-            unrealized_pnl=_f(pick(raw, *_K_PNL_USD)),
-            unrealized_pnl_pct=_f(pick(raw, *_K_PNL_PCT)),
+            # 下面四项 swap 记录里一个都没有,全部来自 balances 索引(见 _build_token_index)。
+            # 索引里也没有(如已清仓的币)时保持 None → formatter 让对应行整行消失。
+            holding_usd=_f(pick(raw, *_K_HOLDING_USD)) or posn.get("holding_usd"),
+            avg_price=(_f(pick(raw, *_K_AVG_PRICE)) or _f(pick(src, *_K_AVG_PRICE))
+                       or posn.get("avg_price")),
+            market_cap=(_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP))
+                        or meta.get("market_cap")),
+            unrealized_pnl=_f(pick(raw, *_K_PNL_USD)) or posn.get("pnl"),
+            unrealized_pnl_pct=_f(pick(raw, *_K_PNL_PCT)) or posn.get("pnl_pct"),
         )
 
     # --------------------------------------------------------
@@ -943,14 +1138,22 @@ class Poller:
 
     def _thesis_to_event(self, user_row, raw: dict, dup: dict) -> FomoEvent | None:
         uid = user_row["user_id"]
-        nested = raw.get("token") if isinstance(raw.get("token"), dict) else None
+        # ⚠️ 实测结构:正文与代币标识都在嵌套的 comment 里,持仓与盈亏在 authorTrade 里。
+        #      {"id":…, "createdAt":…, "userId":…,
+        #       "comment": {"comment":"正文", "tokenAddress":…, "networkId":…},
+        #       "authorTrade": {"usdValue":…, "unrealizedPnlUsd":…, "percentageUnrealizedPnl":…}}
+        #    顶层 _K_THESIS_TEXT 里的 "comment" 命中的是**字典**而不是正文字符串,
+        #    所以这里必须先显式下钻,不能只靠通用候选键。
+        cmt = raw.get("comment") if isinstance(raw.get("comment"), dict) else None
+        trade = raw.get("authorTrade") if isinstance(raw.get("authorTrade"), dict) else {}
+        nested = cmt or (raw.get("token") if isinstance(raw.get("token"), dict) else None)
         src = nested or raw
-        # TODO(probe #12): 确认 thesis 是否同时返回 tokenAddress 和 networkId。
-        #                  缺 networkId 则观点事件无法显示共识,但照常落库照常推送
         net = normalize_network(_pick_str(src, *_K_NETWORK) or _pick_str(raw, *_K_NETWORK))
         ca = normalize_token_address(_pick_str(src, *_K_TOKEN_ADDR) or _pick_str(raw, *_K_TOKEN_ADDR))
         sym = _pick_str(src, *_K_TOKEN_SYMBOL) or _pick_str(raw, *_K_TOKEN_SYMBOL)
-        text = _pick_str(raw, *_K_THESIS_TEXT)
+        # 正文:先取 comment.comment,再退回顶层通用候选
+        text = (_pick_str(cmt or {}, "comment", "text", "content", "body")
+                or _pick_str(raw, *_K_THESIS_TEXT))
         # 观点的主体就是正文。正文和代币都拿不到时这条消息是纯空壳,不如不发
         if not text and not ca and not sym:
             logger.warning("thesis 无正文也无代币标识,跳过该条 | user={} raw={}", uid, dump_raw(raw)[:300])
@@ -977,10 +1180,16 @@ class Poller:
             handle=_row_get(user_row, "display_name") or _row_get(user_row, "handle"),
             network_id=net,
             token_address=ca,
-            token_symbol=_clean_symbol(sym),
+            token_symbol=_clean_symbol(sym) or (self._token_meta.get((net, ca)) or {}).get("symbol"),
             ts_fallback=ts_fallback,
-            holding_usd=_f(pick(raw, *_K_HOLDING_USD)),
-            market_cap=_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP)),
+            # 持仓与盈亏来自 authorTrade(实测字段名),拿不到再退回 balances 索引
+            holding_usd=(_f(trade.get("usdValue")) or _f(pick(raw, *_K_HOLDING_USD))
+                         or (self._positions.get((uid, net, ca)) or {}).get("holding_usd")),
+            unrealized_pnl=_f(trade.get("unrealizedPnlUsd")),
+            unrealized_pnl_pct=_f(trade.get("percentageUnrealizedPnl")),
+            market_cap=(_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP))
+                        or (self._token_meta.get((net, ca)) or {}).get("market_cap")),
+            token_amount=_s(trade.get("humanTokenAmount")),
             thesis_text=text,
         )
 

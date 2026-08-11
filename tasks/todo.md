@@ -54,6 +54,47 @@
 
 ---
 
+---
+
+## Phase 0 实测结论（2026-08-11，已完成）
+
+`--login` + `--probe` 已跑通，设计文档 §11 的字段假设被真实数据大幅修正：
+
+### 根因级发现
+
+| 发现 | 影响 |
+|---|---|
+| **`X-Supported-Chains` 必须是数字链 ID**（`1,56,143,4663,8453,1399811149`），不是链名 | 写错时服务端**不报错、直接把所有结果过滤成空数组**：swaps / trades / watchlist 全返回 0 条且 HTTP 200。这一个头就让整个项目看起来"能连通但没数据" |
+| **响应统一信封 `responseObject`** | 不剥离则 `get_swaps()` 恒返回 0，而 `raw_get()` 同一请求能拿到 100 条 |
+| **swap 是双侧扁平记录** `inTokenAddress` / `outTokenAddress` / `inHumanAmount` / `outHumanAmount` | 原按嵌套对象取，两侧都取不到 → 所有买卖降级成 `side_unknown` |
+| **balances 顶层只有 `balance` / `tokenFilterResult` / `userToken` / `activeTrade`** | `_balance_key` 原按扁平结构取，恒返回 `(None, None)` → `count_holders` 一个都数不到、seeding 持仓回填整个失效 |
+
+### 字段清单核对结果
+
+- ✅ `#1 networkId`：有，**数字**（`1399811149` = Solana）。`swap` 顶层有，分腿还有 `inNetworkId`/`outNetworkId`——**存在跨链 swap**，聚合键必须用分腿的
+- ✅ `#2 稳定 id`：`id` 字段稳定。**没有 txHash** → 兜底 hash 用不上，走原生 id 路径
+- ✅ `#3 时间戳`：`createdAt` 是 ISO 字符串（`2026-08-11T05:55:04.720Z`）
+- ✅ `#4 方向`：无显式 side 字段，靠**计价币位置**判定（设计 §6 的建模澄清正确）
+- ✅ `#5 分页`：`tokenAddress`（按币过滤）+ `lastSwapIdV2`（游标），**不是 offset**
+- ✅ `#9 均价`：`userToken.averageEntryPriceUsd`；成本 `currentCostBasisUsd`
+- ✅ `#13 计价币`：白名单命中，无需补充
+- ✅ `#17 Cloudflare`：带 Bearer 后全部放行 → **走轻量 `HttpFomoClient`**，不需要 Playwright 常驻
+- ❌ `#8 交易次数`：swap 记录里没有 → **Q3 的否决票无从启用**，`judge_badge` 里那段注释保持注释
+- ❌ `#11 转账`：端点语义是「我与该用户之间」→ **转入/转出砍掉**
+- ⚠️ `#12 观点`：**没有按用户查的端点**（`/feed/user/thesis` 是 404）。改为「遍历持仓币 → 按币拉 `/feed/token/thesis` → 按 userId 过滤」，`afterTime` 单位是**毫秒**
+
+### 端到端验证
+
+真实用户真实交易跑通：🌱 首次建仓 / 🟢 加仓 / 🔴 卖出 三种徽章全判对，
+同一个币第二次买入正确从 FIRST 变 ADD，共识计数与持仓/均价/市值全部正常。
+
+### 已知盲区
+
+- **观点只能看到"监控用户当前持仓的币"下的**。他对已清仓的币发的观点看不到 —— 这是按币查的必然结果
+- 链 `4663` 没有可读名，显示为数字
+
+---
+
 ## 下一步（需要用户操作）
 
 Phase 0 是硬门槛，**必须由用户本人完成登录**（程序绝不代填密码）：

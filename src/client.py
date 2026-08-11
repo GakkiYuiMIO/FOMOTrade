@@ -38,15 +38,14 @@ EP_USER_BY_HANDLE = "/v2/users/userHandle/{handle}"
 EP_USER = "/v2/users/{uid}"
 EP_SWAPS = "/v2/users/{uid}/swaps"
 EP_BALANCES = "/v2/users/{uid}/balances"
-EP_TRANSFERS = "/v2/transfers/with/{uid}"
-# ⚠️ 唯一确认过的 thesis 端点 /feed/token/thesis 是**按代币**查的,不是按用户。
-#    "某用户发过哪些观点"的端点没能从 bundle 里逆向出来,只能按候选依次探测。
-#    TODO(probe #12): 确认真实端点后把下面收敛成一条,并确认是否同时返回 tokenAddress + networkId
-EP_THESIS_CANDIDATES = (
-    "/v2/users/{uid}/thesis",
-    "/v2/users/{uid}/theses",
-    "/feed/user/thesis",
-)
+# ⚠️ 不提供转账查询。实测 /v2/transfers/with/{uid} 是「**我**与该用户之间的转账」——
+#    对自己调会返回 400 "Cannot fetch transfers with self",
+#    拿不到"某人与第三方之间的转账"。FOMO 没有别的转账查询入口,
+#    因此转入/转出监控在本平台上做不到(已与用户确认后砍掉)。
+# ⚠️ thesis 只能**按代币**查。实测 /feed/user/thesis → 404、/v2/users/{uid}/thesis → 不存在,
+#    FOMO 根本没有"按用户查观点"的端点。所以观点的采集方式是:
+#    遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象(见 poller._collect_thesis)。
+EP_TOKEN_THESIS = "/feed/token/thesis"
 
 # TODO(probe #15): 取值格式未实测。前端是 getChains() 的返回值,可能是逗号分隔 slug、
 #                  也可能是 JSON 数组或链 ID。改这个值还可能影响响应里 networkId 的表示(同 probe #10)。
@@ -105,8 +104,8 @@ class FomoClient(Protocol):
 
     def resolve_handle(self, handle: str) -> tuple[str, str]: ...
     def get_swaps(self, user_id: str, limit: int = 50) -> list[dict]: ...
-    def get_transfers(self, user_id: str, limit: int = 50) -> list[dict]: ...
-    def get_thesis(self, user_id: str, limit: int = 50) -> list[dict]: ...
+    def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
+                         limit: int = 100) -> list[dict]: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
@@ -342,38 +341,34 @@ class _BaseFomoClient:
         # TODO(probe #1/#2/#3/#4): networkId 是否存在、唯一 id 字段名、时间单位、买卖方向表示
         return _as_list(self._get(EP_SWAPS.format(uid=quote(user_id, safe="")), {"limit": limit}))
 
-    def get_transfers(self, user_id: str, limit: int = 50) -> list[dict]:
-        # TODO(probe #11): direction 字段、对手方地址、是否包含 swap 自身产生的 transfer
-        return _as_list(self._get(EP_TRANSFERS.format(uid=quote(user_id, safe="")), {"limit": limit}))
-
     def get_balances(self, user_id: str) -> list[dict]:
         # TODO(probe #6): tokenAddress/networkId/usdValue 是否齐全、是否一次返回全部链
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
 
-    def get_thesis(self, user_id: str, limit: int = 50) -> list[dict]:
+    def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
+                         limit: int = 100) -> list[dict]:
         """
-        按用户拉观点。
+        拉某个**代币**下的观点(thesis)。
 
-        ⚠️ 端点是猜的(见 EP_THESIS_CANDIDATES 的注释)。依次探测候选路径,
-           第一个返回 2xx 的模板会缓存到进程内,后续不再重复试错。
-           全部候选都失败 → 抛 FomoAPIError → fetch_snapshot 把 thesis 置 None,
-           买卖/转账三类照常推送(设计文档 §九 降级矩阵)。
+        ⚠️ FOMO 没有"按用户查观点"的端点 —— 实测 /feed/user/thesis 是 404,
+           /v2/users/{id}/thesis 也不存在。观点只能按币查,再按 userId 过滤出监控对象,
+           这是 poller._collect_thesis 的职责。
+        ⚠️ afterTime 单位是**毫秒**。实测传秒会被服务端忽略(返回全量),
+           增量拉取就退化成每轮重复拉 100 条,靠 event_id 去重兜住但白费流量。
+
+        每条记录形如:
+          {"type":"thesis", "id":..., "createdAt":"2026-08-11T05:16:28.216Z",
+           "userId":..., "userHandle":..., "comment":{"comment":"正文",
+           "tokenAddress":..., "networkId":...}, "authorTrade":{...持仓与盈亏...}}
         """
-        uid = quote(user_id, safe="")
-        templates = [self._thesis_tpl] if self._thesis_tpl else list(EP_THESIS_CANDIDATES)
-        last_err: Exception | None = None
-        for tpl in templates:
-            try:
-                payload = self._get(tpl.format(uid=uid), {"userId": user_id, "limit": limit})
-            except FomoAPIError as e:
-                last_err = e
-                logger.debug("thesis 候选端点不可用: {} | {}", tpl, e)
-                continue
-            if self._thesis_tpl != tpl:
-                logger.info("thesis 端点探测命中: {}", tpl)
-                self._thesis_tpl = tpl
-            return _as_list(payload)
-        raise FomoAPIError(f"thesis 端点全部候选均失败,最后一个错误: {last_err}")
+        params: dict = {
+            "tokenAddress": token_address,
+            "networkId": network_id,
+            "limit": limit,
+        }
+        if after_ms:
+            params["afterTime"] = int(after_ms)
+        return _as_list(self._get(EP_TOKEN_THESIS, params))
 
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]:
         """
@@ -428,13 +423,17 @@ class _BaseFomoClient:
 
     def fetch_snapshot(self, user_id: str) -> UserSnapshot:
         """
-        一次拉齐四类数据。**每一类单独 try/except**,失败的置 None 并 WARN。
+        按用户一次拉齐 swaps + balances。**每一类单独 try/except**,失败的置 None 并 WARN。
 
-        ⚠️ 绝不能让一类失败拖垮整个用户:thesis 端点是猜的、大概率一开始就 404,
-           若不隔离,买卖/转账推送会被一个猜错的端点整体带走。
+        ⚠️ 只拉这两类:
+          - transfers 已砍掉 —— /v2/transfers/with/{uid} 的语义是「我与该用户之间的转账」
+            (对自己调返回 400 "Cannot fetch transfers with self"),拿不到别人与第三方的转账。
+          - thesis 没有按用户查的端点,改由 poller._collect_thesis 按代币采集后过滤。
+        ⚠️ 绝不能让一类失败拖垮另一类:balances 挂了只是共识副指标降级,
+           swaps 照常推送。
         """
         snap = UserSnapshot(user_id=user_id)
-        for part in ("swaps", "transfers", "thesis", "balances"):
+        for part in ("swaps", "balances"):
             try:
                 setattr(snap, part, getattr(self, f"get_{part}")(user_id))
             except AuthError:
