@@ -220,8 +220,9 @@ def _as_obj(payload) -> dict:
 def _is_cloudflare_block(text: str) -> bool:
     """是不是 Cloudflare 的 WAF 拦截页(而不是 API 自己返回的 401 JSON)"""
     body = (text or "")[:4000].lower()
-    if "<html" not in body and "<!doctype" not in body:
-        return False
+    # ⚠️ 不能硬性要求 <html:Cloudflare 也会返回 JSON 错误体、1020 纯文本、
+    #    甚至空 body 的 403。硬卡 <html 会把这些漏判成"鉴权问题",
+    #    让用户白折腾 --login。标志词本身已经足够特异,单独匹配即可。
     return any(m in body for m in _CF_MARKERS)
 
 
@@ -242,12 +243,15 @@ def _item_identity(item: dict) -> str:
     return str(native) if native else json.dumps(item, sort_keys=True, default=str)[:512]
 
 
-def _next_cursor(payload) -> str | None:
-    """游标式分页的下一页标记(如果 API 是这种风格)"""
-    if not isinstance(payload, dict):
-        return None
-    c = pick(payload, "nextCursor", "next_cursor", "cursor", "nextPage", "next")
-    return str(c) if c else None
+def _pick_id(item: dict) -> str | None:
+    """
+    取一条记录的原生 id,用作分页游标(lastSwapIdV2)。
+
+    ⚠️ 只认真正的 id,**不接受 txHash 之类的兜底** —— 服务端拿它当游标查,
+       给错了会静默返回第一页,又退化成"永远只有 50 条"。
+    """
+    v = pick(item, "id", "_id", "swapId")
+    return str(v) if v else None
 
 
 # ============================================================
@@ -255,6 +259,12 @@ def _next_cursor(payload) -> str | None:
 # ============================================================
 class _BaseFomoClient:
     """端点拼装、重试策略、响应解析都在这里;子类只需实现 _request()。"""
+
+    # iter_swap_buys 上一次翻页是否走到底。False = 分页参数疑似失效、基线只覆盖了第一页,
+    # seeding 据此调整回执文案 —— 绝不能在只回填了 50 条时报"基线完成"
+    _last_paging_ok: bool = True
+    # http 实现天生可并发;playwright 每线程要开一整套浏览器,必须串行(见 poller._fetch_snapshots)
+    supports_concurrency: bool = True
 
     def __init__(self, token_provider: TokenProvider | None = None) -> None:
         self._tokens = token_provider or get_token_provider()
@@ -303,9 +313,15 @@ class _BaseFomoClient:
                 raise FomoAPIError(f"{path} 持续 429 限流")
 
             if status in (401, 403):
+                # ⚠️ 这两支都必须抛 AuthError,**不能抛 FomoAPIError**。
+                #    fetch_snapshot 只对 AuthError 显式上抛,FomoAPIError 会落进
+                #    `except Exception` 把三个分项置 None → tick 正常返回 0 →
+                #    last_tick_at 照常前进 → /status 显示"一切正常"。
+                #    结果是一个看起来完全健康的、死掉的监控 —— 这正是本函数
+                #    docstring 里说要避免的那种失效。
                 if _is_cloudflare_block(text):
                     # 换 token 解决不了 WAF,重试只是浪费时间,直接抛出并告诉用户怎么办
-                    raise FomoAPIError(
+                    raise AuthError(
                         f"{path} 被 Cloudflare WAF 拦截(HTTP {status})—— 不是鉴权问题。"
                         f"请把 .env 里的 FOMO_CLIENT_IMPL 改成 playwright 重试。"
                     )
@@ -314,7 +330,7 @@ class _BaseFomoClient:
                     logger.warning("HTTP {} 疑似 token 失效,续期后重试一次 | {}", status, path)
                     self._tokens.invalidate()
                     continue
-                raise FomoAPIError(
+                raise AuthError(
                     f"{path} 鉴权失败(HTTP {status},续期后仍失败,非 Cloudflare 拦截):"
                     f"{(text or '')[:200]} —— 请重新执行 --login"
                 )
@@ -468,25 +484,33 @@ class _BaseFomoClient:
         ⚠️ 名字里的 buys 是历史叫法,这里**吐的是原始 swap 字典、不做买卖方向过滤** ——
            方向判定要用 models 的归一化规则,那是 poller.normalize_swaps 的职责,
            client 层不碰业务语义(跨模块契约就是这么定的)。
-        ⚠️ TODO(probe #5): 分页参数名与单页上限未实测。这里先试 cursor、再退回 offset;
-           **一旦某页没有任何新条目就立刻停止** —— 若 offset 参数其实不生效,
-           API 会一直返回第一页,不停的话就是无限循环 + 无限重复数据。
+        ⚠️ 分页游标是 **lastSwapIdV2**(上一页最后一条的 id),不是 offset。
+           实测证据:改之前用 offset,真实日志里每个活跃用户都是
+           「第 2 页无新数据(分页参数可能不生效)」+「基线完成 · 扫描 50 条」,
+           而真的只有 24 笔的用户没有这条警告 —— 完美对照。
+           这个 API 对不认识的参数一律**静默忽略**,所以 offset 不报错、只是一直返回第一页。
+           后果:fomo_backfill_max_items=500 形同虚设,基线只覆盖最近 50 笔,
+           几个月前买过又清仓的币会被误判成 🌱 首次建仓 —— 而徽章落库即冻结、永不重算。
+        ⚠️ 仍然保留"某页无新条目就停"的兜底:万一服务端哪天又改了参数名,
+           不停就是无限循环 + 无限重复数据。
+
+        返回:通过 generator 正常结束表示翻到底;
+             若因分页参数疑似失效而提前停止,会把 self._last_paging_ok 置 False,
+             供 seeding 决定回执文案(不能无条件报"基线完成")。
         """
         uid = quote(user_id, safe="")
         path = EP_SWAPS.format(uid=uid)
         seen: set[str] = set()
         yielded = 0
-        offset = 0
-        cursor: str | None = None
+        last_id: str | None = None
+        self._last_paging_ok = True
 
         for page in range(_MAX_PAGES):
             if yielded >= max_items:
                 return
             params: dict = {"limit": _PAGE_SIZE}
-            if cursor:
-                params["cursor"] = cursor
-            elif offset:
-                params["offset"] = offset
+            if last_id:
+                params["lastSwapIdV2"] = last_id
             payload = self._get(path, params)
             items = _as_list(payload)
             if not items:
@@ -505,12 +529,23 @@ class _BaseFomoClient:
                     return
 
             if fresh == 0:
-                logger.warning("swaps 第 {} 页无新数据(分页参数可能不生效),停止翻页 | user={}", page + 1, user_id)
+                logger.warning(
+                    "swaps 第 {} 页无新数据(分页参数可能又变了),停止翻页 | user={}", page + 1, user_id
+                )
+                self._last_paging_ok = False
                 return
-            cursor = _next_cursor(payload)
-            offset += len(items)
-            if not cursor and len(items) < _PAGE_SIZE:
+            # 服务端明确告知还有没有下一页时以它为准
+            ro = _unwrap(payload)
+            if isinstance(ro, dict) and ro.get("hasNextPage") is False:
+                return
+            if len(items) < _PAGE_SIZE:
                 return  # 不满一页 = 已到底
+            nid = _pick_id(items[-1])
+            if not nid:
+                logger.warning("swaps 末条没有可用作游标的 id,停止翻页 | user={}", user_id)
+                self._last_paging_ok = False
+                return
+            last_id = nid
 
     def fetch_snapshot(self, user_id: str) -> UserSnapshot:
         """
@@ -640,7 +675,14 @@ class PlaywrightFomoClient(_BaseFomoClient):
        poller 线程和 bot 线程都会用 client,所以整套浏览器按**线程私有**创建。
        代价:bot 线程第一次 resolve_handle 会再拉起一个浏览器(约 +300MB),
        所以第二次创建时会打 WARNING。这比"跨线程静默挂死"好排查得多。
+
+    ⚠️ **绝不能并发**。poller 的线程池每 tick 建新线程,而本类按线程私有创建浏览器,
+       线程退出时浏览器不会被回收(close() 只关当前线程那份,且正常路径下无人调用)——
+       实测每 tick 泄漏 6 套 node driver + chromium,进程数单调递增直到机器 swap 卡死。
+       supports_concurrency=False 让 _fetch_snapshots 对本实现强制串行。
     """
+
+    supports_concurrency = False
 
     def __init__(self, token_provider: TokenProvider | None = None) -> None:
         super().__init__(token_provider)

@@ -470,6 +470,98 @@ def test_首次运行不走汇总模式(db):
         assert store.get_state(c, "last_tick_at"), "tick 结束后没有记录 last_tick_at"
 
 
+def _thesis_item(uid: str, ca: str, text: str = "看好") -> dict:
+    """一条 /feed/token/thesis 记录(实测结构:正文与代币标识都在嵌套的 comment 里)"""
+    return {
+        "type": "thesis",
+        "id": f"th-{uid}-{ca[:6]}",
+        "createdAt": _FUTURE.isoformat().replace("+00:00", "Z"),
+        "userId": uid,
+        "userHandle": "someone",
+        "comment": {"comment": text, "tokenAddress": ca, "networkId": 1399811149},
+        "authorTrade": {"usdValue": 100.0, "unrealizedPnlUsd": 5.0},
+    }
+
+
+class ThesisClient(FakeClient):
+    """记录 get_token_thesis 被问过哪些币,并按币返回预置的观点"""
+
+    def __init__(self, by_token=None, boom=None):
+        super().__init__({})
+        self.asked: list[str] = []
+        self.by_token = by_token or {}
+        self.boom = boom
+
+    def get_token_thesis(self, token_address, network_id, after_ms=None, limit=100):
+        self.asked.append(token_address)
+        if self.boom:
+            raise self.boom
+        return self.by_token.get(token_address, [])
+
+
+def _seed_meta(p, n: int) -> list[str]:
+    """预置 n 个代币的 _token_meta(network_raw 必须非 None,否则会被跳过)"""
+    cas = [f"CA{i:03d}" for i in range(n)]
+    p._token_meta = {("solana", ca): {"network_raw": 1399811149} for ca in cas}
+    return cas
+
+
+def test_观点轮转扫描不会漏币(db):
+    """
+    ⚠️ 持仓币数超过每轮上限时靠轮转覆盖。轮转游标若不前进,
+       后面那些币的观点**永远看不到**,而且没有任何报错 —— 只是安静地少了。
+    """
+    _add_ready("uA", "alice")
+    p = Poller(ThesisClient(), FakeNotifier())
+    _seed_meta(p, 60)
+
+    with store.get_conn() as c:
+        users = store.list_active_users(c)
+        p._collect_thesis(c, users)
+        first = list(p.client.asked)
+        p.client.asked.clear()
+        p._collect_thesis(c, users)
+        second = list(p.client.asked)
+
+    from src.poller import _THESIS_TOKENS_PER_TICK as N
+    assert len(first) == N and len(second) == N
+    assert first != second, "轮转游标没前进,每轮都在扫同一批币"
+    assert not (set(first) & set(second)), "两轮扫的币不该重叠(60 个币、每轮 25 个)"
+
+
+def test_观点必须按监控名单过滤(db):
+    """
+    ⚠️ 按币查观点会把**该币下所有人**的观点都拉回来(热门币一次 100 条)。
+       不按 userId 过滤就会把陌生人的观点当成监控对象推给用户。
+    """
+    _add_ready("uA", "alice")
+    p = Poller(ThesisClient(), FakeNotifier())
+    cas = _seed_meta(p, 1)
+    p.client.by_token = {
+        cas[0]: [
+            _thesis_item("uA", cas[0], "监控对象发的"),
+            _thesis_item("stranger", cas[0], "陌生人发的"),
+        ]
+    }
+    with store.get_conn() as c:
+        evs = p._collect_thesis(c, store.list_active_users(c))
+
+    assert len(evs) == 1, f"应当只留下监控对象那条,实际 {len(evs)} 条"
+    assert evs[0].user_id == "uA"
+    assert "监控对象" in (evs[0].thesis_text or "")
+
+
+def test_观点采集遇到登录态失效必须上抛(db):
+    """AuthError 若被 `failed+=1` 吞掉,登录态挂了也不会告警(与 poller 主路径同一个洞)"""
+    from src.auth import AuthError
+
+    _add_ready("uA", "alice")
+    p = Poller(ThesisClient(boom=AuthError("token 过期")), FakeNotifier())
+    _seed_meta(p, 3)
+    with store.get_conn() as c, pytest.raises(AuthError):
+        p._collect_thesis(c, store.list_active_users(c))
+
+
 def test_事件类型与去重键(db):
     """落库的事件类型必须是 BUY,且 event_id 用了原生 id"""
     _add_ready("uA", "alice")

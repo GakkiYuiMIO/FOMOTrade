@@ -569,7 +569,12 @@ class Poller:
         """
         snapshots: dict = {}
         auth_err: AuthError | None = None
-        workers = max(1, min(self.settings.fomo_fetch_workers, len(users)))
+        # ⚠️ playwright 实现必须串行:它按线程私有创建整套浏览器,而线程池每 tick 建新线程,
+        #    线程退出时浏览器不回收 —— 实测每 tick 泄漏 6 套 chromium,进程数单调递增到卡死。
+        if not getattr(self.client, "supports_concurrency", True):
+            workers = 1
+        else:
+            workers = max(1, min(self.settings.fomo_fetch_workers, len(users)))
 
         def one(u):
             uid = u["user_id"]
@@ -658,10 +663,16 @@ class Poller:
                     # 活跃单是当前真实持仓,无条件覆盖
                     p.update(snapshot)
                     p["_open"] = True
-                elif not p.get("_open") and p.get("holding_usd") is None:
+                elif not p.get("_open") and not p.get("_written"):
                     # 没有活跃单时才用已平仓单兜底(它给出的正是「剩余 $0.00」)。
-                    # 用 is None 判空:第一条已平仓单写完之后,更早的那些不该再覆盖
+                    # ⚠️ 哨兵必须是独立的布尔量,**不能拿 holding_usd is None 兼职** ——
+                    #    holding_usd = qty × price,而 tokenMetadata 缺 currentPrice 时它本身
+                    #    就是 None(真实响应里不罕见)。哨兵落不下闩,后面每条已平仓单都会
+                    #    整体覆盖 avg_price/pnl,而 closedTrades 是**倒序**返回的,
+                    #    于是"最早的胜出" —— 卖出消息会显示半年前那笔仓位的成本价,
+                    #    还跟同一条消息里的盈亏自相矛盾。
                     p.update(snapshot)
+                    p["_written"] = True
                 # 已实现盈亏取**最近一次**平仓的那笔 —— closedTrades 按 closedAt 倒序返回,
                 # 所以只认第一条命中的,后面更早的不覆盖
                 if realized is not None and p.get("realized_pnl") is None:
@@ -718,10 +729,14 @@ class Poller:
         ⚠️ 只覆盖名单里还有人持有的币 —— 清仓后不再更新,
            updated_at 就是它最后已知的时间,/hot 会据此标注数据是不是旧的。
         """
+        # ⚠️ 只收**有市值**的行。市值才是 /hot 算倍数的依据,而 updated_at 的语义是
+        #    "这个市值有多新"。带着 market_cap=None 的行(比如已清仓的币,
+        #    closedTrades 里仍有 currentPrice)照样写进来的话,会把时间戳一路刷新,
+        #    /hot 的「行情已过期」提示就永远触发不了。
         rows = [
             (net, ca, m.get("symbol"), m.get("price_usd"), m.get("market_cap"))
             for (net, ca), m in self._token_meta.items()
-            if m.get("price_usd") is not None or m.get("market_cap") is not None
+            if m.get("market_cap") is not None
         ]
         if not rows:
             return
@@ -745,8 +760,12 @@ class Poller:
         ⚠️ 只能看到"监控用户当前持仓的币"下的观点。他对已清仓的币发的观点看不到 ——
            这是本方案的已知盲区,写在这里免得日后当成 bug 查。
         """
+        # ⚠️ 名单直接从入参 users 取,不读 self._watched_ids ——
+        #    后者由 tick() 里的 _refresh_watched_index 设置,本函数收了 users 却依赖
+        #    另一处设的实例字段,是隐藏耦合:换个调用顺序就静默返回空,不报错。
+        watched = {u["user_id"] for u in users}
         tokens = [k for k, v in self._token_meta.items() if v.get("network_raw") is not None]
-        if not tokens or not self._watched_ids:
+        if not tokens or not watched:
             return []
         tokens.sort()                      # 固定顺序,轮转才有意义
         n = len(tokens)
@@ -769,7 +788,9 @@ class Poller:
                 logger.debug("thesis 拉取失败 token={} err={}", ca[:16], e)
                 continue
             for it in items:
-                if isinstance(it, dict) and it.get("userId") in self._watched_ids:
+                # 按币查会把该币下**所有人**的观点都拉回来(热门币一次 100 条),
+                # 不按 userId 过滤就会把陌生人的观点当成监控对象推给用户
+                if isinstance(it, dict) and it.get("userId") in watched:
                     by_user.setdefault(it["userId"], []).append(it)
 
         if failed:
@@ -1071,13 +1092,24 @@ class Poller:
 
             with store.get_conn() as conn:
                 total = store.stats_row_count(conn, uid)
-            logger.info("{} 基线完成 · 扫描 {} 条 · {} 个代币", handle, scanned, total)
+            # 分页疑似失效时**绝不能报"基线完成"** —— 那是明确的成功确认,
+            # 而实际只回填了第一页。用户看到"完成"就不会再查,
+            # 之后每一次误标的 🌱 都无从解释(徽章落库即冻结、永不重算)。
+            paged_ok = getattr(self.client, "_last_paging_ok", True)
+            logger.info("{} 基线{} · 扫描 {} 条 · {} 个代币",
+                        handle, "完成" if paged_ok else "部分完成(分页受限)", scanned, total)
             if not dry_run:
                 # ⚠️ handle 来自 API 透传的 display_name,是用户可控文本 —— 必须转义。
                 #    昵称里一个裸 '<' 就让这条回执 400(§10.4 铁律 4)。
-                self.notifier.send(
-                    f"✅ <b>{html.escape(str(handle))}</b> 基线完成 · {total} 个代币"
-                )
+                name = html.escape(str(handle))
+                if paged_ok:
+                    self.notifier.send(f"✅ <b>{name}</b> 基线完成 · {total} 个代币")
+                else:
+                    self.notifier.send(
+                        f"⚠️ <b>{name}</b> 基线**部分完成** · {total} 个代币\n"
+                        f"只回填了最近 {scanned} 笔交易(分页受限),更早的仓位靠当前持仓兜底。\n"
+                        f"极早期买过又清仓的币可能被误标为「首次建仓」。"
+                    )
 
         except AuthError:
             # 登录态失效要上抛让调度器停轮询,不能在这里降级成一句 warning

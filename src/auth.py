@@ -97,6 +97,18 @@ class AuthError(Exception):
     """登录态不可用(未登录 / 续期失败)。上层收到它应当告警「需要重新登录」并停止轮询,不要空转刷日志。"""
 
 
+class RetryableAuthError(AuthError):
+    """
+    续期**暂时**失败:网络抖动、代理断流、Privy 5xx。
+
+    ⚠️ 与 AuthError 的区别是致命性,不是场景:
+       AuthError → 发 TG 告警 + shutdown 调度器 + 进程退出(bot.ps1 无守护,退了就一直停着)
+       RetryableAuthError → 只 warn,本轮降级,下一轮自然重试
+    继承 AuthError 是为了让既有的 `except AuthError: raise` 上抛链保持不变 ——
+    调用方要区分时用 isinstance 判子类,漏判最坏也只是退回旧行为(停机告警),不会静默。
+    """
+
+
 # ============================================================
 # JWT / 会话文件
 # ============================================================
@@ -235,10 +247,20 @@ class TokenProvider:
             with httpx.Client(timeout=20.0, proxy=settings.fomo_proxy) as c:
                 resp = c.post(PRIVY_SESSIONS_URL, json={"refresh_token": self._refresh}, headers=headers)
         except Exception as e:  # noqa: BLE001
-            raise AuthError(f"Privy 续期请求失败(网络层): {e}") from e
+            # ⚠️ 网络层失败**绝不能**当成"登录态失效"。
+            #    代理抖一下、DNS 超时、Privy 502 —— 这些和"你被登出了"是两回事,
+            #    但上层对 AuthError 的处置是"发 TG 告警 + shutdown 调度器 + 进程退出",
+            #    而 bot.ps1 没有守护进程,退了就一直停着。
+            #    用户会收到"请重新 --login",但 session 文件根本没坏,重登是白做的。
+            raise RetryableAuthError(f"Privy 续期请求失败(网络层,可重试): {e}") from e
+
+        if resp.status_code >= 500:
+            # 5xx 是 Privy 自己的问题,同样可重试
+            logger.warning("Privy 续期返回 {},判为可重试", resp.status_code)
+            raise RetryableAuthError(f"Privy 续期失败 HTTP {resp.status_code}(服务端错误,可重试)")
 
         if resp.status_code >= 400:
-            # 完整 body 是这里唯一有用的诊断信息,截断到 2000 字符防止刷屏
+            # 4xx 才是真的"这个 refresh token 不好使了" —— 完整 body 是唯一有用的诊断信息
             logger.error("Privy 续期失败 status={} body={}", resp.status_code, (resp.text or "")[:2000])
             raise AuthError(f"Privy 续期失败 HTTP {resp.status_code},请重新执行 --login")
 

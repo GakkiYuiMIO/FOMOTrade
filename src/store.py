@@ -19,7 +19,7 @@ from src.config import DATA_DIR
 from src.models import (
     BADGE_ADD,
     BADGE_FIRST,
-    COUNTABLE_REASONS,
+    COUNTABLE_REASONS,  # noqa: F401  —— hot_tokens / token_buyers 的 SQL 参数用到
     EVENT_BUY,
     REASON_LOCAL_STATS,
     REASON_NO_BASELINE,
@@ -277,17 +277,21 @@ def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) ->
     """
     加入监控名单。返回 (是否需要建基线, 给用户的回执文案)。
 
-    ⚠️ 幂等:已 active 且基线就绪的用户重复 /add 只回"已在监控中",绝不重置 stats_ready ——
-       重置会让他退回不打徽章的状态,白白损失已建好的基线。
+    ⚠️ 幂等的判据是「**是否已 active**」,不是「基线是否就绪」。
+       两者混在一起会出事:68 人的基线要 68 轮(约 23 分钟)才全就绪,
+       这期间再跑一次 /following(第一次超时、或想确认结果),
+       那 67 个 stats_ready=0 的人就全落到 ON CONFLICT 分支、
+       四个游标被推到 now —— 上一轮 tick 之后发生的买卖**永久丢弃**,
+       因为游标只在这里前进,而 _drop_before_cursor 的判据是 event_ts > cursor。
+       所以只要还 active 就绝不动游标,只在真·回归(active 0→1)时才重置。
     ⚠️ /del 后回归必须重建基线:空窗期的买入本地无记录,
        不重建会让空窗期建的仓位在下次加仓时被误标 🌱。
     """
     # 存原始大小写(展示要用),去重靠 user_id 主键 —— 见 normalize_handle 的说明
     h = clean_handle(handle)
     existing = get_watch_user(conn, user_id)
-    if existing and existing["active"] and existing["stats_ready"]:
-        # 已在监控中:不重建基线,但**刷新名字** ——
-        # 用户在 FOMO 上改名、或早期版本存的是压过小写的 handle,都靠这一步纠正。
+    if existing and existing["active"]:
+        # 已在监控中(不论基线建没建好):不碰游标、不重置 stats_ready,只刷新名字。
         # 名字只是展示,更新它不影响任何判定。
         if (existing["handle"], existing["display_name"]) != (h, display_name):
             with tx(conn):
@@ -296,7 +300,10 @@ def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) ->
                     (h, display_name, user_id),
                 )
             logger.info("刷新名字 | {} → {} (@{})", existing["handle"], display_name, h)
-        return False, f"ℹ️ {display_name or h} 已在监控中"
+        if existing["stats_ready"]:
+            return False, f"ℹ️ {display_name or h} 已在监控中"
+        # 基线还在排队:返回 True 让调用方按"待建基线"计数,但游标一动没动
+        return True, f"ℹ️ {display_name or h} 已在监控中,历史基线仍在排队建立"
 
     with tx(conn):
         conn.execute(
@@ -663,7 +670,12 @@ def upsert_token_snapshots(conn, rows: list[tuple]) -> None:
             symbol     = COALESCE(excluded.symbol, symbol),
             price_usd  = COALESCE(excluded.price_usd, price_usd),
             market_cap = COALESCE(excluded.market_cap, market_cap),
-            updated_at = excluded.updated_at
+            -- ⚠️ 只有真的带来新市值才推进 updated_at。
+            --    否则清仓后的币仍会被 trades(closedTrades 里有 currentPrice)每轮刷新时间戳,
+            --    /hot 的「行情已超过 1 小时未更新」提示就永远触发不了,
+            --    用户会拿着一个早已过期的倍数当真。
+            updated_at = CASE WHEN excluded.market_cap IS NOT NULL
+                              THEN excluded.updated_at ELSE updated_at END
         """,
         [(n, c, s, p, m, ts) for n, c, s, p, m in rows],
     )
@@ -693,40 +705,63 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
             MIN(e.event_ts)                           AS first_ts,
             MAX(e.event_ts)                           AS last_ts,
             -- 窗口内最早一笔的市值/价格(SQLite 的 MIN(a), b 关联取值)
+            -- ⚠️ 必须 market_cap IS NOT NULL:最早那笔恰恰最可能没有市值
+            --    (市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
+            --     "名单第一个人抢到新币"的那一刻本人还没出现在自己的持仓里;
+            --     另外 ALTER TABLE 之前的历史行也全是 NULL)。
+            --    不过滤的话最早一行是 NULL 就整个返回 NULL、不往后找,
+            --    🚀 倍数对**最该显示的那些币**整体消失。
             (SELECT market_cap FROM fomo_events x
               WHERE x.network_id = e.network_id AND x.token_address = e.token_address
                 AND x.event_type = 'BUY' AND x.event_ts >= ?
+                AND x.market_cap IS NOT NULL
               ORDER BY x.event_ts LIMIT 1)            AS first_mcap,
             s.market_cap                              AS now_mcap,
             s.updated_at                              AS mcap_at
         FROM fomo_events e
+        -- ⚠️ 必须 JOIN watch_users 且与 count_consensus / list_buyers 同一谓词。
+        --    不 JOIN 的话:已被 /del 的人(软删除,历史事件仍在)会被算进人数、
+        --    handle 还会被列在 👤 行上;刚 /add 还在建基线的人也会被算进去。
+        --    结果是 /hot、/who、推送里的共识行三个"名单人数"互相矛盾。
+        JOIN watch_users w
+          ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
         LEFT JOIN token_snapshot s
                ON s.network_id = e.network_id AND s.token_address = e.token_address
         WHERE e.event_type = 'BUY'
           AND e.event_ts >= ?
           AND e.token_address IS NOT NULL
-          AND COALESCE(e.badge_reason, '') != 'quote_token'
+          -- 与 should_count 同一套判据:计价币、方向不明的都不算买入
+          AND COALESCE(e.badge_reason, '') IN ({countable})
         GROUP BY e.network_id, e.token_address
         ORDER BY buyers DESC, total_usd DESC
         LIMIT ?
-        """,
-        (since_iso, since_iso, int(limit)),
+        """.format(countable=",".join("?" * len(COUNTABLE_REASONS))),  # noqa: S608
+        (since_iso, since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
 
 
 def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
                  limit: int = 6) -> list[sqlite3.Row]:
-    """某个币在窗口内被谁买过(按首次买入时间正序 —— 谁先发现的排前面)"""
+    """
+    某个币在窗口内被谁买过(按首次买入时间正序 —— 谁先发现的排前面)。
+
+    ⚠️ 谓词必须与 hot_tokens / count_consensus 完全一致,否则「👥 5 人买入」
+       下面列出来的名字会对不上,甚至把已 /del 的人的 handle 摆在那里。
+    """
     return conn.execute(
         """
-        SELECT COALESCE(MAX(user_handle), MAX(handle)) AS who, MIN(event_ts) AS ts
-        FROM fomo_events
-        WHERE event_type = 'BUY' AND network_id = ? AND token_address = ? AND event_ts >= ?
-        GROUP BY user_id
+        SELECT COALESCE(MAX(e.user_handle), MAX(e.handle)) AS who, MIN(e.event_ts) AS ts
+        FROM fomo_events e
+        JOIN watch_users w
+          ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
+        WHERE e.event_type = 'BUY' AND e.network_id = ? AND e.token_address = ?
+          AND e.event_ts >= ?
+          AND COALESCE(e.badge_reason, '') IN ({countable})
+        GROUP BY e.user_id
         ORDER BY ts
         LIMIT ?
-        """,
-        (network_id, token_address, since_iso, int(limit)),
+        """.format(countable=",".join("?" * len(COUNTABLE_REASONS))),  # noqa: S608
+        (network_id, token_address, since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
 
 

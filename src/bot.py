@@ -422,8 +422,14 @@ class CommandBot:
             elif t.isdigit():
                 count = max(1, min(int(t), MAX_TOP_ROWS))
 
+        # ⚠️ following 必须拉满再本地排序。/v2/leaderboard/following 返回的是
+        #    **关注列表顺序**而不是排名(实测 -39.96K 排在 +37K 前面),
+        #    先截断到 15 条再排,等于"关注列表前 15 人里最赚的 15 个" ——
+        #    真正的第一名如果排在关注列表第 40 位就永远看不到,而且榜单看着单调递减、
+        #    无报错无 0 值,用户根本察觉不到。24h/7d/30d 服务端已排好序,不受影响。
+        api_limit = 100 if period == "following" else count
         try:
-            rows = self._client.get_leaderboard(period, limit=count)
+            rows = self._client.get_leaderboard(period, limit=api_limit)
         except Exception as e:  # noqa: BLE001
             return self._resolve_error(period, e)
         if not rows:

@@ -687,7 +687,7 @@ def cmd_run() -> int:
     """
     from apscheduler.schedulers.blocking import BlockingScheduler
 
-    from src.auth import AuthError
+    from src.auth import AuthError, RetryableAuthError
     from src.bot import CommandBot
     from src.client import build_client
     from src.poller import Poller
@@ -707,6 +707,11 @@ def cmd_run() -> int:
 
     sched = BlockingScheduler(timezone="UTC")
 
+    # 连续多少轮拿到"可重试的登录态错误"才真的当成失效。
+    # 网络抖一下就停机是不可接受的:bot.ps1 没有守护进程,停了就一直停着。
+    retry_tolerance = 5
+    fail_streak = {"n": 0}
+
     def _tick_job() -> None:
         try:
             n = poller.tick()
@@ -714,8 +719,25 @@ def cmd_run() -> int:
             # 由持有调度器的这里回填 —— 且**只记成功的 tick**:
             # 失败时保持旧值不动,/status 上那个不再前进的时间戳本身就是"管道坏了"的信号。
             poller.last_tick_at = now_iso()
+            fail_streak["n"] = 0
             if n:
                 logger.info("tick 完成,新事件 {} 条", n)
+        except RetryableAuthError as e:
+            # 网络抖动 / 代理断流 / Privy 5xx —— 不是"你被登出了"。
+            # ⚠️ 直接当成 AuthError 停机是这条链上最贵的误判:
+            #    用户收到"请重新 --login",但 session 文件根本没坏,重登是白做的,
+            #    而真实原因(一次网络抖动)被完全掩盖,监控在人工发现前一直停着。
+            fail_streak["n"] += 1
+            logger.warning("续期暂时失败({}/{} 轮),下一轮重试: {}",
+                           fail_streak["n"], retry_tolerance, e)
+            if fail_streak["n"] >= retry_tolerance:
+                logger.error("连续 {} 轮续期失败,按登录态失效处理", retry_tolerance)
+                notifier.send(
+                    f"🔐 <b>FOMO 登录态可能失效</b>\n"
+                    f"连续 {retry_tolerance} 轮续期失败,轮询已停止。\n"
+                    f"先确认网络/代理正常;仍不行就执行 <code>.\\bot.ps1 --login</code> 后重启。"
+                )
+                sched.shutdown(wait=False)
         except AuthError as e:
             # 设计文档 §3.5:续期失败 → TG 告警 + 停止轮询,不空转刷日志
             logger.error("登录态失效,停止轮询: {}", e)
