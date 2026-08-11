@@ -312,6 +312,10 @@ class FomoEvent:
     # ---- 内存标志(不落库) ----
     ts_fallback: bool = False    # 时间戳是兜底来的 → 不写 first_buy_at
     side_unknown: bool = False   # 买卖方向判不出 → 不写 stats、不打徽章、不显示共识
+    # 两侧都是计价币的兑换(USDT→USDC、SOL→USDC 等)。
+    # 既不是建仓也不是离场,没有信号价值 —— **落库但不推送**(用户决定)。
+    # 落库是为了保留"他当时是不是在备钱"的回溯能力。
+    quote_only: bool = False
     api_trade_count: int | None = None   # Q3 否决票用,probe 确认语义前不参与判定
 
     # ---- 展示字段(不落库,API 透传;缺失则对应行整行消失) ----

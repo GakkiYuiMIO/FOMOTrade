@@ -366,6 +366,41 @@ def test_同一事件重复轮询不会重复计数(db):
     assert row["buy_count"] == 1, f"重复轮询把 buy_count 累加到了 {row['buy_count']}"
 
 
+def test_稳定币互换落库但不推送(db):
+    """
+    两侧都是计价币的兑换(USDT→USDC 等)既不是建仓也不是离场,
+    「🟢 加仓 $USDC」零信号价值、纯占屏 —— 落库保留回溯能力,但不推 TG。
+
+    ⚠️ 关键在于落库时就要把 sent 置 1。只是"跳过发送"的话 sent 永远是 0,
+       补发队列会每 20 秒把它捞出来重试、连续捞 10 分钟,比推出去还费。
+    """
+    from tests.conftest import CA_USDC, CA_WSOL
+
+    _add_ready("uA", "alice")
+    two_leg = {
+        "id": "q1",
+        "networkId": "solana",
+        "inTokenAddress": CA_WSOL, "inNetworkId": "solana", "inHumanAmount": 1.0,
+        "outTokenAddress": CA_USDC, "outNetworkId": "solana", "outHumanAmount": 200.0,
+        "humanUsdAmountIn": 200.0, "humanUsdAmountOut": 200.0,
+        "timestamp": _FUTURE_MS,
+    }
+    client = FakeClient({
+        "uA": UserSnapshot("uA", swaps=[two_leg], transfers=[], thesis=[], balances=[]),
+    })
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+
+    assert notifier.sent == [], f"稳定币互换不该推送,实际发了:{notifier.sent}"
+    with store.get_conn() as c:
+        row = c.execute("SELECT sent, event_type FROM fomo_events").fetchone()
+        assert row is not None, "必须落库(要保留'他当时是不是在备钱'的回溯能力)"
+        assert row["sent"] == 1, "落库时就要标记已处理,否则会被补发队列反复捞"
+        assert store.load_unsent_recent(c, minutes=10) == [], "绝不能进补发队列"
+        n = c.execute("SELECT COUNT(*) n FROM user_token_stats").fetchone()["n"]
+        assert n == 0, "计价币不进 stats"
+
+
 def test_事件类型与去重键(db):
     """落库的事件类型必须是 BUY,且 event_id 用了原生 id"""
     _add_ready("uA", "alice")

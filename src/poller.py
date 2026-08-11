@@ -663,6 +663,13 @@ class Poller:
                     if store.insert_event(conn, ev):
                         if store.should_count(ev, reason):
                             store.upsert_stats(conn, ev)
+                        if ev.quote_only:
+                            # 稳定币互换:落库但不推送。
+                            # ⚠️ 必须在这里就把 sent 置 1 —— 只是"跳过发送"的话,
+                            #    sent 永远是 0,补发队列会每 20 秒把它捞出来重试一次、
+                            #    连续捞 10 分钟,比推出去还费。
+                            store.mark_sent(conn, ev.event_id, None, None)
+                            continue
                         new_events.append(ev)
         except Exception as e:  # noqa: BLE001
             # 事务已回滚,库里什么都没写 —— 必须同时丢弃 new_events,
@@ -930,9 +937,13 @@ class Poller:
                     self._make_swap_event(user_row, raw, dup, EVENT_BUY, leg_out,
                                           out_net, out_ca, out_sym),
                 ]
-            # 两侧皆计价币:产出一条,照常落库照常推送,但 is_quote 会挡住 stats 与共识
-            return [self._make_swap_event(user_row, raw, dup, EVENT_BUY, leg_out,
-                                          out_net, out_ca, out_sym)]
+            # 两侧皆计价币(USDT→USDC、SOL→USDC 等):产出一条并落库,但**不推送**。
+            # 稳定币互换既不是建仓也不是离场,"🟢 加仓 $USDC"这行字零信号价值、纯占屏;
+            # 落库是为了保留"他当时是不是在备钱"的回溯能力。
+            ev = self._make_swap_event(user_row, raw, dup, EVENT_BUY, leg_out,
+                                       out_net, out_ca, out_sym)
+            ev.quote_only = True
+            return [ev]
 
         if has_out:
             return [self._make_swap_event(user_row, raw, dup, EVENT_BUY, leg_out,
