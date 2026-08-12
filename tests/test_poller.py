@@ -567,6 +567,56 @@ def test_一轮内命中多个币不会捅穿当日金额上限(db):
     assert len(_signals()) == 2, "$40 一单,$100 上限 → 只能下 2 单"
 
 
+def test_无人值守时入队而不是推确认按钮(db, monkeypatch):
+    """
+    ⚠️ 自动模式**不能走 pending**:那样会同时存在「排队中」和「可点确认」两个入口,
+       人点一次、队列再跑一次,而两条路的终态会互相覆盖。
+    ⚠️ 也不能在 tick 里就地执行 —— 一笔买入几十秒,轮询间隔才 15s。
+    """
+    from src import copyworker
+
+    _add_ready("uA", "alice")
+    _enable_copy(paper_only=False, dry_run_execute=False, auto_execute=True,
+                 amount_usd=40.0, daily_spend_usd=200.0)
+    _stale_tick(0.01)
+
+    jobs = []
+    monkeypatch.setattr(copyworker.CopyWorker, "submit",
+                        lambda self, job: jobs.append(job) or True)
+
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_swap("s1")], transfers=[], thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+
+    assert len(jobs) == 1, "应当入队一单"
+    assert jobs[0].amount_usd == 40.0
+    assert _signals()[0]["status"] == copyworker.ST_QUEUED, "状态必须是 auto_queued,不是 pending"
+    assert not any("确认买入" in s for s in notifier.sent), "无人值守不该再推确认按钮"
+
+
+def test_队列满了要记failed并告警而不是安静丢掉(db, monkeypatch):
+    """
+    ⚠️ 留在 auto_queued 的话,这个币因为主键冲突**再也不会被跟**,
+       而没有任何人知道它丢了。
+    """
+    from src import copyworker
+
+    _add_ready("uA", "alice")
+    _enable_copy(paper_only=False, dry_run_execute=False, auto_execute=True,
+                 amount_usd=40.0, daily_spend_usd=200.0)
+    _stale_tick(0.01)
+    monkeypatch.setattr(copyworker.CopyWorker, "submit", lambda self, job: False)
+
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_swap("s1")], transfers=[], thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+
+    assert _signals()[0]["status"] == "failed"
+    assert any("未提交" in s for s in notifier.sent), f"必须告警:{notifier.sent}"
+
+
 def test_入场市值取事件里的成交价(db):
     """
     ⚠️ 名单里那个人**刚刚**就是在这个价位买的 —— 这是最贴近我们跟进去时

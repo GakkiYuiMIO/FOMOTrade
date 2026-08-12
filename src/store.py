@@ -1070,7 +1070,7 @@ def copy_taken_today(conn) -> int:
 # ⚠️ 'failed' 不在其中是有依据的:executor.py 里每一处 raise 都在
 #    submit.click() **之前** —— 抛异常就意味着那一下根本没点。
 #    这条依赖以后改 executor 时要一起看。
-SPENDING_STATUSES = ("pending", "executing", "auto_executing", "filled")
+SPENDING_STATUSES = ("pending", "executing", "auto_queued", "auto_executing", "filled")
 
 
 def copy_spent_today(conn) -> float:

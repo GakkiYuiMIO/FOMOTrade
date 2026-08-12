@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 from loguru import logger
 
-from src import store
+from src import copyworker, store
 from src.auth import AuthError
 from src.client import (
     NotSupportedError,
@@ -558,6 +558,8 @@ class Poller:
         self._swaps_attempted: set[str] = set()
         # 观点网络采集的后台线程。跨 tick 复用,懒建(见 _start_thesis)
         self._thesis_pool: ThreadPoolExecutor | None = None
+        # 无人值守买入的执行队列。懒建 —— 没开自动的人不该多一条线程
+        self._copy_worker: copyworker.CopyWorker | None = None
         # ---- 推送令牌桶(见 _throttle_send)。跨 tick 保持,不是每轮重置 ----
         self._send_tokens = float(_SEND_BURST)
         self._send_last = time.monotonic()
@@ -1167,6 +1169,13 @@ class Poller:
         pool, self._thesis_pool = self._thesis_pool, None
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
+        # ⚠️ 只叫停、**不等**在途的那一单:它可能还有一分钟才跑完,
+        #    而 Ctrl+C 之后进程挂着不走是用户已经反馈过一次的问题。
+        #    代价是那一单停在 auto_executing —— 由启动对账去认领,
+        #    绝不能在这里替它写 failed:点击可能已经发生,钱可能已经出去了。
+        worker, self._copy_worker = self._copy_worker, None
+        if worker is not None:
+            worker.close()
 
     def _start_thesis(self, batch: list[tuple]):
         """
@@ -1608,7 +1617,14 @@ class Poller:
             logger.debug("跟单跳过 | {} {} | {}", cand.token_symbol, ca[:10], d.reason)
             return
 
-        status = "paper" if cfg.paper_only else "pending"
+        # 三种落地方式,状态各不相同:
+        #   纸上   → paper        不花钱,不推按钮
+        #   人工   → pending      推一条带 [确认买入] 的消息,等人点
+        #   无人值守 → auto_queued  直接进买入队列,没人点
+        # ⚠️ 无人值守**不走 pending**:那样会同时存在"排队中"和"可点确认"两个入口,
+        #    人点一次、队列再跑一次 —— 而两条路的终态会互相覆盖。
+        auto = cfg.auto_execute and not cfg.paper_only
+        status = "paper" if cfg.paper_only else (copyworker.ST_QUEUED if auto else "pending")
         # ⚠️ 主键冲突 = 这个币已经跟过。用 INSERT OR IGNORE 的返回值判断,
         #    而不是先查一次 —— 先查后插在两个 tick 撞上时会重复建仓。
         if not store.record_copy_signal(
@@ -1622,8 +1638,36 @@ class Poller:
             used["usd"] += cfg.amount_usd
         logger.info("跟单信号 | {} · {} 人买过 · 入场市值 {} · {}",
                     cand.token_symbol, cand.buyers, cand.entry_mcap, status)
-        if not dry_run:
+        if dry_run:
+            return
+        if auto:
+            self._enqueue_buy(conn, cand, cfg)
+        else:
             self._send_copy_signal(cand, d, cfg, status)
+
+    def _enqueue_buy(self, conn, cand: Candidate, cfg) -> None:
+        """
+        把这一单丢进买入队列。⚠️ **不在这里执行** —— 见 copyworker 模块头:
+        一笔买入要几十秒,而这里跑在 15s 一轮的 tick 主线程上。
+        """
+        if self._copy_worker is None:
+            self._copy_worker = copyworker.CopyWorker(self.notifier)
+        job = copyworker.BuyJob(
+            network_id=cand.network_id, token_address=cand.token_address,
+            symbol=(cand.token_symbol or "?").lstrip("$"),
+            amount_usd=cfg.amount_usd, dry_run=cfg.dry_run_execute,
+            queued_at=time.monotonic(),
+        )
+        if self._copy_worker.submit(job):
+            return
+        # ⚠️ 没接下就必须当场记 failed 并说出来。留在 auto_queued 的话,
+        #    这个币因为主键冲突再也不会被跟 —— 而没有任何人知道它丢了。
+        store.set_copy_status(conn, cand.network_id, cand.token_address, "failed",
+                              "买入队列满,未提交", expect=copyworker.ST_QUEUED)
+        self.notifier.send(
+            f"⌛ <b>未提交</b> · 自动跟单 · ${html.escape(cand.token_symbol or '?')}\n"
+            f"买入队列已满(前面还有单子在跑),这一单直接放弃 —— 晚几分钟买进去是另一笔交易"
+        )
 
     def _send_copy_signal(self, cand: Candidate, d, cfg, status: str) -> None:
         """
