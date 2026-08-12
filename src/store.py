@@ -761,12 +761,13 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
        稳定币互换会让 $USDC 恒居榜首,整个榜就废了。
     ⚠️ 基准市值取窗口内**最早那笔买入**时的值 ——
        "名单开始买的时候多大" 才是算倍数的基准,取最近一笔就没意义了。
-    ⚠️ first_buyer / first_ts 取的是**真·最早那笔**,而 first_mcap 取的是
-       **最早那笔有市值的**。两者可能不是同一行:市值只来自 balances,
-       而 balances 快照晚于 swaps 索引 —— "名单第一个人抢到新币"的那一刻
-       他本人还没出现在自己的持仓里,那一行的 market_cap 就是 NULL。
-       所以展示时这两项必须**分行写**,不能写成"@某人在 $42K 时买入"
-       —— 那是在断言一件我们并不知道的事。
+    ⚠️ first_ts 是**真·最早那笔**的时间,而 first_mcap 取的是**最早那笔有市值的**。
+       两者可能不是同一行:市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
+       "名单第一个人抢到新币"的那一刻他本人还没出现在自己的持仓里,
+       那一行的 market_cap 就是 NULL。
+       所以展示时绝不能写成"@某人在 $42K 时买入" —— 那是在断言我们并不知道的事。
+    ⚠️ "谁先买的"由 token_buyers 提供(它按首笔时间正序,且**同一套谓词**)。
+       这里刻意不再另出一个 first_buyer 列:同一个事实两处算,迟早会不一致。
     """
     countable = ",".join("?" * len(COUNTABLE_REASONS))
     return conn.execute(
@@ -779,9 +780,6 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
             SELECT
                 e.network_id, e.token_address, e.token_symbol, e.user_id,
                 e.user_handle, e.handle, e.amount_usd, e.market_cap, e.event_ts,
-                ROW_NUMBER() OVER (
-                    PARTITION BY e.network_id, e.token_address ORDER BY e.event_ts
-                ) AS rn_first,
                 -- 最早**且有市值**的那一行:没市值的排到分区末尾
                 ROW_NUMBER() OVER (
                     PARTITION BY e.network_id, e.token_address
@@ -810,7 +808,6 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
         )
         SELECT
             a.*,
-            COALESCE(f.user_handle, f.handle)  AS first_buyer,
             m.market_cap                       AS first_mcap,
             m.event_ts                         AS first_mcap_at,
             s.market_cap                       AS now_mcap,
@@ -818,8 +815,6 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
             CASE WHEN s.market_cap IS NOT NULL AND m.market_cap > 0
                  THEN s.market_cap * 1.0 / m.market_cap END AS mult
         FROM agg a
-        LEFT JOIN scoped f ON f.network_id = a.network_id
-                          AND f.token_address = a.token_address AND f.rn_first = 1
         LEFT JOIN scoped m ON m.network_id = a.network_id
                           AND m.token_address = a.token_address AND m.rn_mcap = 1
         LEFT JOIN token_snapshot s ON s.network_id = a.network_id

@@ -764,8 +764,10 @@ def test_首买人取真正最早那笔(conn):
     _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=100, handle="alice")
 
     r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
-    assert r["first_buyer"] == "alice"
     assert r["first_ts"] == "2026-08-12T01:00:00+00:00"
+    # "谁先买的"由 token_buyers 给(展示用的就是它),不再另出一个 first_buyer 列
+    who = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
+    assert who[0]["who"] == "alice"
 
 
 def test_基准市值跳过最早那笔的空市值(conn):
@@ -781,8 +783,9 @@ def test_基准市值跳过最早那笔的空市值(conn):
     store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 150_000)])
 
     r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
-    assert r["first_buyer"] == "alice", "首买人仍是真正最早那个"
     assert r["first_mcap"] == 50_000, "基准市值要跳过空值往后找"
+    who = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
+    assert who[0]["who"] == "alice", "首买人仍是真正最早那个(与基准市值不同行)"
     assert round(r["mult"]) == 3
 
 
