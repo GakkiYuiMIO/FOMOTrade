@@ -18,6 +18,7 @@ from src import store
 from src.models import (
     BADGE_ADD,
     BADGE_FIRST,
+    EVENT_BUY,
     EVENT_SELL,
     EVENT_TRANSFER_IN,
     REASON_LOCAL_STATS,
@@ -695,3 +696,102 @@ def test_老库升级后自动补starred列(conn):
     assert "starred" in cols()
     store.add_watch_user(conn, "u1", "Alice", "Alice")
     assert store.starred_user_ids(conn) == set()
+
+
+# ============================================================
+# /hot 买入榜:按倍数排序 + 首买人 + 基准市值
+# ============================================================
+def _hot_buy(conn, uid, ca, ts, mcap=None, usd=100.0, handle=None):
+    """写一条"算数"的买入。⚠️ badge_reason 必须落在 COUNTABLE_REASONS 里,否则不进榜"""
+    from src.models import FomoEvent
+
+    ev = FomoEvent(
+        event_id=f"{uid}-{ca}-{ts}", event_type=EVENT_BUY, user_id=uid, event_ts=ts,
+        raw_json="{}", network_id="solana", token_address=ca, token_symbol=ca.upper(),
+        amount_usd=usd, market_cap=mcap, badge_reason=REASON_LOCAL_STATS,
+        user_handle=handle or uid,
+    )
+    store.insert_event(conn, ev)
+
+
+def _ready(conn, uid, handle):
+    store.add_watch_user(conn, uid, handle, handle)
+    store.mark_stats_ready(conn, uid)
+
+
+def test_买入榜按倍数排序(conn):
+    """
+    榜要回答的是"名单挖到了什么金狗",涨幅才是答案 ——
+    按人数排的话,一个 60 倍但只有一个人买的币会沉到看不见的地方。
+    """
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    # low:两个人买、基准 100 万 → 现在 200 万 = 2x
+    _hot_buy(conn, "u1", "low", "2026-08-12T01:00:00+00:00", mcap=1_000_000)
+    _hot_buy(conn, "u2", "low", "2026-08-12T02:00:00+00:00", mcap=1_500_000)
+    # high:只有一个人买、基准 1 万 → 现在 50 万 = 50x
+    _hot_buy(conn, "u1", "high", "2026-08-12T03:00:00+00:00", mcap=10_000)
+    store.upsert_token_snapshots(conn, [
+        ("solana", "low", "LOW", 1.0, 2_000_000),
+        ("solana", "high", "HIGH", 1.0, 500_000),
+    ])
+
+    rows = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")
+    assert [r["token_address"] for r in rows] == ["high", "low"]
+    assert round(rows[0]["mult"]) == 50
+    assert round(rows[1]["mult"]) == 2
+
+
+def test_算不出倍数的排最后而不是最前(conn):
+    """
+    ⚠️ SQLite 里 NULL 在 DESC 排序中会排到最后,但不能依赖它 ——
+       没有基准市值的币冒到榜首,整个榜就废了。
+    """
+    _ready(conn, "u1", "alice")
+    _hot_buy(conn, "u1", "nomcap", "2026-08-12T01:00:00+00:00", mcap=None, usd=99999.0)
+    _hot_buy(conn, "u1", "small", "2026-08-12T02:00:00+00:00", mcap=100_000)
+    store.upsert_token_snapshots(conn, [("solana", "small", "SMALL", 1.0, 110_000)])
+
+    rows = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")
+    assert [r["token_address"] for r in rows] == ["small", "nomcap"]
+    assert rows[-1]["mult"] is None
+
+
+def test_首买人取真正最早那笔(conn):
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _hot_buy(conn, "u2", "t", "2026-08-12T05:00:00+00:00", mcap=200, handle="bob")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=100, handle="alice")
+
+    r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
+    assert r["first_buyer"] == "alice"
+    assert r["first_ts"] == "2026-08-12T01:00:00+00:00"
+
+
+def test_基准市值跳过最早那笔的空市值(conn):
+    """
+    市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
+    "名单第一个人抢到新币"那一刻他还没出现在自己的持仓里,那一行 market_cap 就是 NULL。
+    不往后找的话,🚀 倍数对**最该显示的那些币**整体消失。
+    """
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=None, handle="alice")
+    _hot_buy(conn, "u2", "t", "2026-08-12T02:00:00+00:00", mcap=50_000, handle="bob")
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 150_000)])
+
+    r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
+    assert r["first_buyer"] == "alice", "首买人仍是真正最早那个"
+    assert r["first_mcap"] == 50_000, "基准市值要跳过空值往后找"
+    assert round(r["mult"]) == 3
+
+
+def test_买入榜不算已删除和未就绪的人(conn):
+    """与 count_consensus / list_buyers 同一谓词,三处人数不能互相矛盾"""
+    _ready(conn, "u1", "alice")
+    store.add_watch_user(conn, "u2", "bob", "bob")          # stats_ready = 0
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=100)
+    _hot_buy(conn, "u2", "t", "2026-08-12T02:00:00+00:00", mcap=100)
+
+    r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
+    assert r["buyers"] == 1

@@ -411,30 +411,46 @@ class CommandBot:
         for i, r in enumerate(rows, 1):
             sym = _esc(r["symbol"] or "?")
             buyers, buys = r["buyers"], r["buys"]
-            head = f"{i}. <b>${sym}</b> · 👥 {buyers} 人买入"
+            # 倍数是名次的依据,放进标题行 —— 排序键必须一眼可见,否则名次看着像随机的
+            head = f"{i}. <b>${sym}</b>"
+            mult = r["mult"]
+            if mult is not None:
+                x = _num(mult)
+                head += f" · <b>{'🚀' if x >= 1.1 else '📉'} {x:.1f}x</b>" if x >= 1.1 \
+                    else f" · 📉 {(x - 1) * 100:+.0f}%"
+            head += f" · 👥 {buyers} 人买入"
             if buys > buyers:
                 head += f"({buys} 笔)"
             lines.append(head)
 
-            seg = [f"💰 {_money(_num(r['total_usd']))}"]
-            now_mc, first_mc = r["now_mcap"], r["first_mcap"]
-            if now_mc:
-                seg.append(f"💎 {_money(_num(now_mc))}")
-            # 倍数:现在市值 ÷ 名单最早买入时的市值
-            if now_mc and first_mc and _num(first_mc) > 0:
-                x = _num(now_mc) / _num(first_mc)
-                if x >= 1.1:
-                    seg.append(f"🚀 {x:.1f}x")
-                elif x <= 0.9:
-                    seg.append(f"📉 {(x - 1) * 100:+.0f}%")
+            # 市值:名单开始买时 → 现在。倍数就是这两个数的比
+            first_mc, now_mc = r["first_mcap"], r["now_mcap"]
+            if first_mc and now_mc:
+                seg = [f"💎 {_money(_num(first_mc))} → {_money(_num(now_mc))}"]
+            elif now_mc:
+                seg = [f"💎 {_money(_num(now_mc))}"]
+            else:
+                seg = []
+            seg.append(f"💰 名单买入 {_money(_num(r['total_usd']))}")
             lines.append("   " + " · ".join(seg))
 
+            # ⚠️ 首买人与"买入市值"分行写,绝不合成「@某人在 $42K 时买入」——
+            #    两者可能来自不同的行(见 store.hot_tokens 的说明),合起来就是在
+            #    断言一件我们并不知道的事。
+            first_buyer = r["first_buyer"]
+            if first_buyer:
+                lines.append(f"   🥇 @{_esc(first_buyer)} {_ago(r['first_ts'])}首买")
+
             who = detail.get((r["network_id"], r["token_address"])) or []
-            names = " ".join(f"@{_esc(w['who'])}" for w in who if w["who"])
-            if names:
-                more = buyers - len(who)
-                lines.append(f"   👤 {names}" + (f" +{more}" if more > 0 else ""))
-            lines.append(f"   🧬 {_esc(_chain_name(r['network_id']))} · {_ago(r['first_ts'])}开始买")
+            # 首买人已经单独一行了,👤 行里不再重复他
+            rest = [w["who"] for w in who if w["who"] and w["who"] != first_buyer]
+            if rest:
+                # ⚠️ 已点名人数 = 👤 行里的 + 🥇 那一个。max 兜底:改过名的人
+                #    在两处取到不同字符串时会被算成两个人,宁可少显示也不能出现 "+-1"
+                more = max(buyers - len(rest) - (1 if first_buyer else 0), 0)
+                names = " ".join(f"@{_esc(n)}" for n in rest)
+                lines.append(f"   👤 {names}" + (f" +{more}" if more else ""))
+            lines.append(f"   🧬 {_esc(_chain_name(r['network_id']))}")
             lines.append(f"   <code>{_esc(r['token_address'])}</code>")
 
         # 行情新鲜度:清仓后 token_snapshot 就不再更新,倍数会失真,必须让用户知道
@@ -442,7 +458,12 @@ class CommandBot:
         if stale:
             lines.append(f"\n{_esc('⚠️')} {len(stale)} 个币的行情已超过 1 小时未更新"
                          f"(名单里没人持有了,倍数仅供参考)")
-        lines.append(f"\n按买入人数排序 · 名单 {ready} 人 · /hot 今日|3日|7日")
+        n_nomult = sum(1 for r in rows if r["mult"] is None)
+        foot = f"\n按倍数排序(现在市值 ÷ 名单最早买入时市值) · 名单 {ready} 人"
+        if n_nomult:
+            # 不说明的话,榜尾那几个没有倍数的看着像 bug
+            foot += f"\n{_esc('·')} 末尾 {n_nomult} 个币缺基准市值,按人数排"
+        lines.append(foot + "\n/hot 今日|3日|7日")
         # 3日/7日 的数据要靠 bot 持续运行积累:每轮只拉每人最近 50 笔 swaps,
         # 刚跑起来时更长的窗口和"今日"看着会差不多。不说明的话用户会以为是 bug。
         if days > 1:

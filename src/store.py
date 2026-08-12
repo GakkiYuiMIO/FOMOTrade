@@ -751,58 +751,83 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
     """
     【买入榜】给定时间窗内,名单里的人买了哪些币。
 
-    排序:先按**买入人数**(这才是共识信号),再按总买入额。
-    单人反复加仓不会把一个币刷到榜首 —— COUNT(DISTINCT user_id) 决定名次。
+    排序:**按倍数**(现在市值 ÷ 名单最早买入时的市值)从高到低 ——
+    这个榜要回答的是"名单挖到了什么金狗",涨幅才是答案。
+    算不出倍数的排在最后(按人数 + 总额),而不是排在最前:
+    ⚠️ SQLite 里 NULL 在 DESC 排序中会排到最后,但**不能依赖它** ——
+       显式写 `mult IS NULL` 做第一排序键,意图才留在代码里。
 
     ⚠️ 只统计 BUY 且**排除掉计价币**(badge_reason='quote_token' 的那些):
        稳定币互换会让 $USDC 恒居榜首,整个榜就废了。
-    ⚠️ 市值取窗口内**最早那笔买入**时的值(first_mcap)——
+    ⚠️ 基准市值取窗口内**最早那笔买入**时的值 ——
        "名单开始买的时候多大" 才是算倍数的基准,取最近一笔就没意义了。
+    ⚠️ first_buyer / first_ts 取的是**真·最早那笔**,而 first_mcap 取的是
+       **最早那笔有市值的**。两者可能不是同一行:市值只来自 balances,
+       而 balances 快照晚于 swaps 索引 —— "名单第一个人抢到新币"的那一刻
+       他本人还没出现在自己的持仓里,那一行的 market_cap 就是 NULL。
+       所以展示时这两项必须**分行写**,不能写成"@某人在 $42K 时买入"
+       —— 那是在断言一件我们并不知道的事。
     """
+    countable = ",".join("?" * len(COUNTABLE_REASONS))
     return conn.execute(
-        """
+        f"""
+        WITH scoped AS (
+            -- 窗口内所有"算数"的买入。⚠️ 必须 JOIN watch_users 且与 count_consensus /
+            --    list_buyers 同一谓词:不 JOIN 的话,已被 /del 的人(软删除,历史事件仍在)
+            --    会被算进人数、handle 还会被列在 👤 行上;刚 /add 还在建基线的人也会被算进去。
+            --    结果是 /hot、/who、推送里的共识行三个"名单人数"互相矛盾。
+            SELECT
+                e.network_id, e.token_address, e.token_symbol, e.user_id,
+                e.user_handle, e.handle, e.amount_usd, e.market_cap, e.event_ts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY e.network_id, e.token_address ORDER BY e.event_ts
+                ) AS rn_first,
+                -- 最早**且有市值**的那一行:没市值的排到分区末尾
+                ROW_NUMBER() OVER (
+                    PARTITION BY e.network_id, e.token_address
+                    ORDER BY CASE WHEN e.market_cap IS NULL THEN 1 ELSE 0 END, e.event_ts
+                ) AS rn_mcap
+            FROM fomo_events e
+            JOIN watch_users w
+              ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
+            WHERE e.event_type = 'BUY'
+              AND e.event_ts >= ?
+              AND e.token_address IS NOT NULL
+              -- 与 should_count 同一套判据:计价币、方向不明的都不算买入
+              AND COALESCE(e.badge_reason, '') IN ({countable})
+        ),
+        agg AS (
+            SELECT
+                network_id, token_address,
+                MAX(token_symbol)              AS symbol,
+                COUNT(DISTINCT user_id)        AS buyers,
+                COUNT(*)                       AS buys,
+                SUM(COALESCE(amount_usd, 0))   AS total_usd,
+                MIN(event_ts)                  AS first_ts,
+                MAX(event_ts)                  AS last_ts
+            FROM scoped
+            GROUP BY network_id, token_address
+        )
         SELECT
-            e.network_id,
-            e.token_address,
-            MAX(e.token_symbol)                       AS symbol,
-            COUNT(DISTINCT e.user_id)                 AS buyers,
-            COUNT(*)                                  AS buys,
-            SUM(COALESCE(e.amount_usd, 0))            AS total_usd,
-            MIN(e.event_ts)                           AS first_ts,
-            MAX(e.event_ts)                           AS last_ts,
-            -- 窗口内最早一笔的市值/价格(SQLite 的 MIN(a), b 关联取值)
-            -- ⚠️ 必须 market_cap IS NOT NULL:最早那笔恰恰最可能没有市值
-            --    (市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
-            --     "名单第一个人抢到新币"的那一刻本人还没出现在自己的持仓里;
-            --     另外 ALTER TABLE 之前的历史行也全是 NULL)。
-            --    不过滤的话最早一行是 NULL 就整个返回 NULL、不往后找,
-            --    🚀 倍数对**最该显示的那些币**整体消失。
-            (SELECT market_cap FROM fomo_events x
-              WHERE x.network_id = e.network_id AND x.token_address = e.token_address
-                AND x.event_type = 'BUY' AND x.event_ts >= ?
-                AND x.market_cap IS NOT NULL
-              ORDER BY x.event_ts LIMIT 1)            AS first_mcap,
-            s.market_cap                              AS now_mcap,
-            s.updated_at                              AS mcap_at
-        FROM fomo_events e
-        -- ⚠️ 必须 JOIN watch_users 且与 count_consensus / list_buyers 同一谓词。
-        --    不 JOIN 的话:已被 /del 的人(软删除,历史事件仍在)会被算进人数、
-        --    handle 还会被列在 👤 行上;刚 /add 还在建基线的人也会被算进去。
-        --    结果是 /hot、/who、推送里的共识行三个"名单人数"互相矛盾。
-        JOIN watch_users w
-          ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
-        LEFT JOIN token_snapshot s
-               ON s.network_id = e.network_id AND s.token_address = e.token_address
-        WHERE e.event_type = 'BUY'
-          AND e.event_ts >= ?
-          AND e.token_address IS NOT NULL
-          -- 与 should_count 同一套判据:计价币、方向不明的都不算买入
-          AND COALESCE(e.badge_reason, '') IN ({countable})
-        GROUP BY e.network_id, e.token_address
-        ORDER BY buyers DESC, total_usd DESC
+            a.*,
+            COALESCE(f.user_handle, f.handle)  AS first_buyer,
+            m.market_cap                       AS first_mcap,
+            m.event_ts                         AS first_mcap_at,
+            s.market_cap                       AS now_mcap,
+            s.updated_at                       AS mcap_at,
+            CASE WHEN s.market_cap IS NOT NULL AND m.market_cap > 0
+                 THEN s.market_cap * 1.0 / m.market_cap END AS mult
+        FROM agg a
+        LEFT JOIN scoped f ON f.network_id = a.network_id
+                          AND f.token_address = a.token_address AND f.rn_first = 1
+        LEFT JOIN scoped m ON m.network_id = a.network_id
+                          AND m.token_address = a.token_address AND m.rn_mcap = 1
+        LEFT JOIN token_snapshot s ON s.network_id = a.network_id
+                                  AND s.token_address = a.token_address
+        ORDER BY (mult IS NULL), mult DESC, buyers DESC, total_usd DESC
         LIMIT ?
-        """.format(countable=",".join("?" * len(COUNTABLE_REASONS))),  # noqa: S608
-        (since_iso, since_iso, *COUNTABLE_REASONS, int(limit)),
+        """,  # noqa: S608
+        (since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
 
 
