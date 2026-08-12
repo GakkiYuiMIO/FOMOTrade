@@ -153,10 +153,19 @@ _BALANCE_ROTATE_PER_TICK = 8
 # 上限就是 100(传 200 直接 400)。
 _FEED_LIMIT = 100
 # 兜底扫描:每 tick 无条件拉多少个人的 swaps。
-# ⚠️ 这不是优化项而是**正确性要求** —— 活动流只覆盖「当前登录账号关注的人」,
-#    名单里若有没关注的人,他的交易永远不会出现在流里。12 个/轮 → 69 人 6 轮扫一圈,
-#    最坏延迟约 1.5 分钟,仍好于改造前的全员 45~85s。
+# ⚠️ 这是给「活动流理论上看得见、但这一刻恰好没出现」的情况兜底的最后一道网。
+#    结构性看不见的那批人不走这里,走 _feed_blind(每轮必拉),否则延迟是不可接受的。
 SWEEP_PER_TICK = 12
+# 多久重算一次「活动流看不见谁」。关注关系不常变,10 分钟足够;
+# 每次重算 = 1 次 current + 若干次 following 翻页
+_FEED_BLIND_REFRESH_SEC = 600
+# 观点优先扫描的保留名额:活动流看不见的人**刚动过**的币,优先扫。
+# ⚠️ 观点几乎总是发在刚买的币上 —— 实测用户 10:05 买入、10:05 发观点。
+#    不留这个名额的话,只能等轮转扫到(约 400 个币 / 每轮 12 个 ≈ 6 分钟),
+#    用户的实际观感就是"观点没被监控到"。
+_THESIS_PRIORITY_SLOTS = 6
+# 优先名额里一个币保留多久(秒)。买入后发观点通常在几分钟内
+_THESIS_PRIORITY_TTL_SEC = 1800
 # 观点扫描的并发上限。这一段是纯 IO,串行 25 个币实测 4.1s,并发 8 降到 2.2s。
 # ⚠️ 但它与 fomo_fetch_workers **同时在跑**(观点在后台线程,快照在主线程池),
 #    真实峰值并发是两者相加。实测 12+8=20 会真的撞上限流:
@@ -505,6 +514,11 @@ class Poller:
         self._sweep_rr = 0                          # 全员 swaps 兜底扫描的游标
         self._feed_seen: set[str] = set()           # 上一轮活动流里见过的条目 id
         self._feed_thesis: list[dict] = []          # 活动流里捡到的观点,交给 _collect_thesis
+        # 活动流**结构上看不见**的名单成员(自己 + 没关注的人),每轮必拉。见 _refresh_feed_blind
+        self._feed_blind: set[str] = set()
+        self._feed_blind_at = 0.0                   # 上次重算的 monotonic 时刻
+        # 这些人刚动过的币 → 观点优先扫描。{(net, ca): 过期 monotonic 时刻}
+        self._thesis_priority: dict[tuple, float] = {}
         # 本轮真的去拉过 swaps 的人。⚠️ 用来区分"拉取失败"和"本轮压根没排到他",
         #    否则 _collect_events 会对没排到的五十几个人每轮刷一条 WARNING
         self._swaps_attempted: set[str] = set()
@@ -573,6 +587,9 @@ class Poller:
             # --- 5) 第二循环:事务外统一渲染 + 串行发送 ---
             self._dispatch(conn, snapshots, new_events, dry_run=dry_run)
 
+            # 活动流看不见的人刚碰过的币 → 下一轮优先扫它的观点(观点几乎总是发在刚买的币上)
+            self._note_thesis_priority(new_events)
+
             # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
             # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
             if not dry_run:
@@ -638,6 +655,8 @@ class Poller:
         """
         uids = [u["user_id"] for u in users]
         handles = {u["user_id"]: _row_get(u, "handle") for u in users}
+        # 谁是活动流照不到的(自己 + 没关注的人)。带缓存,不是每轮真去查
+        self._refresh_feed_blind(uids)
         # ⚠️ playwright 实现必须串行:它按线程私有创建整套浏览器,而线程池每 tick 建新线程,
         #    线程退出时浏览器不回收 —— 实测每 tick 泄漏 6 套 chromium,进程数单调递增到卡死。
         if not getattr(self.client, "supports_concurrency", True):
@@ -677,11 +696,23 @@ class Poller:
         # ⚠️ cold 必须在 _hot_users 之前取:那一步会把 _swap_seen 填满。
         #    冷启动没有差集基准,_hot_users 会把**所有人**判成 hot —— 那不是"所有人刚交易过"。
         cold = not self._swap_seen
-        if not feed_ok or cold:
-            # 活动流挂了、或冷启动还没有基准 → 退回全员扫描,宁可慢一轮也不能漏
+        if cold:
+            # 冷启动:建立差集基准,每个进程只做一次
             need_swaps = uids
+        elif not feed_ok:
+            # ⚠️ 活动流挂了**不等于会漏事件**:swaps 端点仍然返回最近 50 笔,
+            #    兜底轮转迟早扫到,只是晚几轮 —— 游标不推进 + event_id 去重保证不丢不重。
+            #    而"一失败就全员扫 70 个"正是最坏的反应:活动流持续失败的头号原因就是**被限流**,
+            #    这时候把请求量翻五倍只会让限流更严重,越滚越大(实测就是这么滚起来的)。
+            #    所以扩大轮转而不是放弃增量:3 倍切片 → 两轮覆盖全名单(约 20s)。
+            need_swaps = sorted(self._feed_blind
+                                | self._rotate(uids, SWEEP_PER_TICK * 3, "_sweep_rr"))
         else:
-            need_swaps = sorted(feed_hot | self._rotate(uids, SWEEP_PER_TICK, "_sweep_rr"))
+            # ⚠️ _feed_blind 必须每轮都拉:这些人(自己 + 没关注的人)结构上不会出现在
+            #    活动流里,只靠兜底轮转的话延迟是平均 36s / 最坏 72s —— 用户实测到的
+            #    「下单到推送 30s 以上」就是这么来的。
+            need_swaps = sorted(feed_hot | self._feed_blind
+                                | self._rotate(uids, SWEEP_PER_TICK, "_sweep_rr"))
         self._swaps_attempted = set(need_swaps)
 
         # ---- 第二段:一个池子里同时打三类请求 ----
@@ -713,10 +744,16 @@ class Poller:
         # ⚠️ 这一段必须有:活动流只覆盖当前登录账号关注的人,名单里没关注的那些人
         #    只会在这里现身。稳态下 extra 基本是空集,不花钱。
         hot = self._hot_users(swaps)
+        # ⚠️ 冷启动那轮的 hot 是"全员"(没有差集基准),不代表全员刚交易过。
+        #    照它去补 trades 会在**启动瞬间**多打 70 个请求 —— 冷启动本来就是
+        #    单轮请求量的峰值(全员 swaps + 全员 balances),再叠一份 trades 就是 210 个,
+        #    实测足以把限流窗口打爆,接着连活动流自己都 429、退回全员扫描,越滚越大。
+        #    冷启动时改用 feed_hot:活动流才真正知道谁刚动过。
+        acted = feed_hot if cold else hot
         # ⚠️ 要按**第一池实际拉过谁**来扣,不能按 feed_hot 扣:冷启动时 feed_hot 是空集,
         #    而第一池已经把全员 balances 拉过一遍了 —— 按 feed_hot 扣会整整重拉 69 次。
-        extra_bal = sorted(hot - set(need_bal))
-        extra_trd = sorted(hot - set(need_trd))
+        extra_bal = sorted(acted - set(need_bal))
+        extra_trd = sorted(acted - set(need_trd))
         if extra_bal or extra_trd:
             res2 = run([("balances", u) for u in extra_bal] + [("trades", u) for u in extra_trd])
             bal_now.update(zip(extra_bal, res2[:len(extra_bal)], strict=True))
@@ -731,7 +768,8 @@ class Poller:
         self._bal_dirty = feed_hot if cold else (set(hot) | feed_hot)
         logger.debug("采集 | 名单 {} 人 · 活动流{} · swaps {} 人 · 有新动作 {} 人"
                      " · balances {} 人 · 补漏 {} 人",
-                     len(uids), "命中" if feed_ok else "失败(退回全员扫描)",
+                     len(uids),
+                     "命中" if feed_ok else ("失败(冷启动全员扫描)" if cold else "失败(扩大轮转)"),
                      len(need_swaps), len(hot), len(need_bal) + len(extra_bal), len(extra_bal))
 
         # ---- 组装。本轮没拉的读缓存,保证 count_holders 拿到全员覆盖 ----
@@ -831,6 +869,82 @@ class Poller:
         #    一直累积就是无界增长。滚出去又意外重现的代价只是多拉一次,不会漏。
         self._feed_seen = current
         return hot, True
+
+    def _refresh_feed_blind(self, uids: list[str]) -> None:
+        """
+        算出「活动流结构上看不见」的名单成员,这些人必须**每轮都拉**。
+
+        活动流是「当前登录账号关注的人」的流,于是有两类人永远不出现在里面:
+          1) **自己** —— 人不关注自己。实测自己在 100 条流里出现 0 次,
+             而自己的账号恰恰是用户最在意的那一个。
+          2) 名单里加过、但这个账号没关注的人。
+
+        不特殊处理的话,这些人只能靠 SWEEP_PER_TICK 的兜底轮转捞到 ——
+        70 人 / 每轮 12 个 = 6 轮,12s 一轮就是最坏 72s、平均 36s。
+        用户实测「从下单到收到推送 30s 以上」就是这么来的;
+        观点更糟,要等按币轮转扫到(约 400 个币 / 每轮 12 个 ≈ 6 分钟),
+        观感就是"观点根本没被监控到"。
+
+        ⚠️ 拿不到关注列表时按**全体**处理,不是按空集:
+           宁可退回"每轮全拉"(慢但正确),也不能悄悄漏掉某个人的交易。
+        ⚠️ 结果缓存 _FEED_BLIND_REFRESH_SEC 秒 —— 关注关系不常变,
+           但也不能永不刷新:用户随时可能 /add 一个没关注的人。
+        ⚠️ 结果只写进 self._feed_blind,**没有返回值** —— 调用方读的是那个字段。
+           早先的写法在失败分支里 `return watched` 却没写字段,下一轮读到的是空集,
+           于是"拿不到关注列表就全员直拉"这条安全网当场失效,而且完全静默。
+        """
+        now = time.monotonic()
+        watched = set(uids)
+        if self._feed_blind_at and now - self._feed_blind_at < _FEED_BLIND_REFRESH_SEC:
+            self._feed_blind &= watched                # 名单可能已变,收敛到当前名单
+            return
+
+        try:
+            me = self.client.get_current_user() or {}
+            my_id = _pick_str(me, "id", "userId", "_id")
+            if not my_id:
+                raise ValueError("current user 响应里没有 id")
+            following = {
+                i for i in (_pick_str(u, "id", "userId") for u in self.client.get_following(my_id))
+                if i
+            }
+        except AuthError:
+            raise                                      # 登录态是全局问题,必须上抛
+        except Exception as e:                         # noqa: BLE001
+            if not self._feed_blind_at:
+                # 从来没成功过 → 谁都可能被活动流漏掉,全员按"看不见"处理。
+                # 刻意**不**记 _feed_blind_at:下一轮继续重试,好尽快回到快路径。
+                logger.warning("拿不到关注列表,暂时全员每轮直拉(慢但不漏) | {}", e)
+                self._feed_blind = watched
+                return
+            logger.warning("关注列表刷新失败,沿用上次结果 | {}", e)
+            self._feed_blind_at = now                  # 有旧结果可用,等下个刷新窗口再试
+            self._feed_blind &= watched
+            return
+
+        self._feed_blind = {u for u in watched if u not in following}
+        self._feed_blind_at = now
+        logger.info("活动流覆盖 {}/{} 人;看不见的 {} 人改为每轮直拉{}",
+                    len(watched) - len(self._feed_blind), len(watched), len(self._feed_blind),
+                    "(含你自己)" if my_id in self._feed_blind else "")
+
+    def _note_thesis_priority(self, events: list[FomoEvent]) -> None:
+        """
+        把「活动流看不见的人刚动过的币」记进观点优先扫描名额。
+
+        ⚠️ 观点几乎总是发在刚买的币上(实测:10:05 买入、10:05 发观点)。
+           这些人的观点不会出现在活动流里,只能按币查 —— 而按币轮转一圈要几分钟。
+           留几个优先名额给他们刚碰过的币,观点就能在下一轮被抓到。
+        """
+        if not self._feed_blind:
+            return
+        deadline = time.monotonic() + _THESIS_PRIORITY_TTL_SEC
+        for ev in events:
+            if ev.user_id in self._feed_blind and ev.token_key is not None:
+                self._thesis_priority[ev.token_key] = deadline
+        now = time.monotonic()
+        for k in [k for k, exp in self._thesis_priority.items() if exp <= now]:
+            del self._thesis_priority[k]
 
     def _rotate(self, uids: list[str], n: int, cursor_attr: str) -> set[str]:
         """
@@ -1014,12 +1128,27 @@ class Poller:
         if not tokens:
             return []
         meta = self._token_meta          # 定住这一版,循环里不再重新解引用
+
+        # ---- 优先名额:活动流看不见的人刚动过的币 ----
+        # ⚠️ 这些人的观点不会出现在活动流里,只能按币查。而轮转一圈要几分钟 ——
+        #    用户实测「10:05 发观点、10:09 才收到」正是这么来的。
+        now = time.monotonic()
+        picked = [k for k, exp in sorted(self._thesis_priority.items())
+                  if exp > now and k in meta][:_THESIS_PRIORITY_SLOTS]
+
+        # ---- 其余名额按轮转填满 ----
         n = len(tokens)
-        take = min(_THESIS_TOKENS_PER_TICK, n)
-        start = self._thesis_rr % n
-        self._thesis_rr = (start + take) % n
-        return [(*tokens[(start + i) % n], meta[tokens[(start + i) % n]]["network_raw"])
-                for i in range(take)]
+        take = min(_THESIS_TOKENS_PER_TICK - len(picked), n)
+        if take > 0:
+            start = self._thesis_rr % n
+            self._thesis_rr = (start + take) % n
+            seen = set(picked)
+            for i in range(take):
+                k = tokens[(start + i) % n]
+                if k not in seen:
+                    seen.add(k)
+                    picked.append(k)
+        return [(*k, meta[k]["network_raw"]) for k in picked]
 
     def _start_thesis(self, batch: list[tuple]):
         """

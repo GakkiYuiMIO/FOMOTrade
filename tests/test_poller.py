@@ -69,18 +69,36 @@ class FakeClient:
     """
 
     def __init__(self, snaps: dict | None = None, *, seed_supported: bool = False,
-                 feed: list | None = None, feed_boom: Exception | None = None):
+                 feed: list | None = None, feed_boom: Exception | None = None,
+                 me: str = "ME", following: list | None = None,
+                 following_boom: Exception | None = None):
         self.snaps = snaps or {}
         self.seed_supported = seed_supported
         self.feed = feed if feed is not None else []
         self.feed_boom = feed_boom
         self.feed_calls = 0
+        # 默认:自己是 "ME"、关注了 snaps 里的所有人 —— 也就是"活动流全覆盖"的理想情况。
+        # ⚠️ 真实世界里**自己一定不在自己的关注列表里**(人不关注自己),
+        #    要复现线上那条路径,把自己的 uid 也放进 snaps、但不放进 following。
+        self.me = me
+        self.following = following if following is not None else list(self.snaps)
+        self.following_boom = following_boom
+        self.following_calls = 0
 
     def get_activity_feed(self, limit: int = 100) -> list:
         self.feed_calls += 1
         if self.feed_boom:
             raise self.feed_boom
         return list(self.feed)
+
+    def get_current_user(self) -> dict:
+        return {"id": self.me, "userHandle": "me"}
+
+    def get_following(self, user_id: str, max_items: int = 300) -> list:
+        self.following_calls += 1
+        if self.following_boom:
+            raise self.following_boom
+        return [{"id": u} for u in self.following]
 
     def fetch_snapshot(self, user_id: str) -> UserSnapshot:
         return self.snaps.get(user_id) or UserSnapshot(
@@ -870,7 +888,12 @@ def test_活动流失败必须退回全员扫描(db):
     client.calls = {"swaps": [], "balances": [], "trades": []}
     client.feed_boom = RuntimeError("活动流 503")
     p.tick()
-    assert set(client.calls["swaps"]) == {f"u{i}" for i in range(5)}
+    # ⚠️ 不是"全员扫"而是"扩大轮转":活动流持续失败的头号原因就是被限流,
+    #    这时把请求量翻几倍只会越滚越大。两轮之内覆盖全名单即可。
+    swept = set(client.calls["swaps"])
+    p.tick()
+    swept |= set(client.calls["swaps"])
+    assert swept == {f"u{i}" for i in range(5)}, "两轮之内必须覆盖到每个人"
 
 
 def test_活动流登录态失效必须上抛(db):
@@ -1113,3 +1136,133 @@ def test_冷启动不把全员挂成脏(db):
     p.tick()
     assert len(client.calls["balances"]) < 20, \
         f"第二轮不该重拉全员 balances,实际 {len(client.calls['balances'])} 次"
+
+
+# ============================================================
+# 活动流照不到的人(自己 + 没关注的人)
+# ⚠️ 这是用户实测「下单到推送 30s+」「观点等了 4 分钟」的根因:
+#    活动流是"我关注的人"的流,而人不关注自己 —— 自己的动作永远不在里面。
+# ============================================================
+def test_自己的交易必须每轮直拉而不是等兜底轮转(db):
+    """
+    实测:自己在 100 条活动流里出现 0 次。只靠兜底轮转的话
+    70 人 / 每轮 12 个 = 6 轮 × 12s = 最坏 72s、平均 36s —— 正是用户量到的 30s+。
+    """
+    for i in range(30):
+        _add_ready(f"u{i:02d}", f"h{i:02d}")
+    _add_ready("SELF", "myself")
+    snaps = {f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)}
+    snaps["SELF"] = _snap("SELF")
+    # 关注了所有人,**除了自己** —— 这就是线上的真实形态
+    client = CountingClient(snaps, me="SELF", following=[f"u{i:02d}" for i in range(30)])
+    p = Poller(client, FakeNotifier())
+    p.tick()                                       # 冷启动:全员
+
+    assert "SELF" in p._feed_blind, "自己必须被认成'活动流看不见'"
+    for _ in range(3):                             # 连续几轮都必须直拉,不能靠轮转碰运气
+        client.calls["swaps"] = []
+        p.tick()
+        assert "SELF" in client.calls["swaps"], "自己必须每轮都拉"
+
+
+def test_没关注的人也每轮直拉(db):
+    """/add 进来但账号没关注的人,处境与自己完全一样"""
+    for i in range(20):
+        _add_ready(f"u{i:02d}", f"h{i:02d}")
+    snaps = {f"u{i:02d}": _snap(f"u{i:02d}") for i in range(20)}
+    # 只关注前 10 个
+    client = CountingClient(snaps, me="ME", following=[f"u{i:02d}" for i in range(10)])
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    assert p._feed_blind == {f"u{i:02d}" for i in range(10, 20)}
+
+    client.calls["swaps"] = []
+    p.tick()
+    for i in range(10, 20):
+        assert f"u{i:02d}" in client.calls["swaps"]
+
+
+def test_拿不到关注列表就退回全员每轮拉(db):
+    """
+    ⚠️ 宁可慢(每轮全拉)也不能漏。返回空集会让所有人都被当成"活动流看得见",
+       而活动流恰恰可能一条都不覆盖他们 —— 那就是静默漏推。
+    """
+    for i in range(10):
+        _add_ready(f"u{i}", f"h{i}")
+    snaps = {f"u{i}": _snap(f"u{i}") for i in range(10)}
+    client = CountingClient(snaps, following_boom=RuntimeError("关注列表 500"))
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    assert p._feed_blind == set(snaps) or len(p._feed_blind) == 10
+
+    client.calls["swaps"] = []
+    p.tick()
+    assert set(client.calls["swaps"]) == set(snaps), "拿不到关注关系时必须全员每轮拉"
+
+
+def test_关注列表带缓存不是每轮都查(db):
+    """关注关系不常变;每轮查一次 = 每轮多两个请求,白白吃掉刚省下来的时间"""
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA")}, following=["uA"])
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    p.tick()
+    p.tick()
+    assert client.following_calls == 1, f"应当只查一次,实际 {client.following_calls} 次"
+
+
+def test_看不见的人刚买的币下一轮优先扫观点(db):
+    """
+    观点几乎总是发在刚买的币上(实测:10:05 买入、10:05 发观点)。
+    这些人的观点不在活动流里,只能按币查;而轮转一圈约 400 个币 / 每轮 12 个 ≈ 6 分钟
+    —— 用户等了 4 分钟才收到,观感就是"没监控到"。
+    """
+    _add_ready("SELF", "myself")
+    snaps = {"SELF": _snap("SELF", swaps=[_swap("s1")])}
+    client = CountingClient(snaps, me="SELF", following=[])
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    assert "SELF" in p._feed_blind
+
+    key = ("solana", CA_TOAD)
+    assert key in p._thesis_priority, "刚买的币必须进优先名额"
+
+    # 造一批"别的币"塞满轮转池,验证优先名额确实能插队
+    p._token_meta = {key: {"network_raw": 1399811149}}
+    for i in range(200):
+        p._token_meta[("solana", f"OTHER{i:03d}")] = {"network_raw": 1399811149}
+    batch = p._pick_thesis_batch()
+    assert any(b[0] == "solana" and b[1] == CA_TOAD for b in batch), \
+        "刚买的币必须出现在本轮扫描批次里,而不是等轮转慢慢转到"
+
+
+def test_优先名额不会撑大每轮扫描总量(db):
+    """插队可以,但不能把每轮的调用量顶上去 —— 峰值并发是有上限的"""
+    from src.poller import _THESIS_TOKENS_PER_TICK
+
+    _add_ready("uA", "alice")
+    p = Poller(CountingClient({"uA": _snap("uA")}), FakeNotifier())
+    p._token_meta = {("solana", f"CA{i:03d}"): {"network_raw": 1399811149} for i in range(100)}
+    deadline = time.monotonic() + 600
+    for i in range(50):                            # 优先名额远超保留数
+        p._thesis_priority[("solana", f"CA{i:03d}")] = deadline
+    assert len(p._pick_thesis_batch()) <= _THESIS_TOKENS_PER_TICK
+
+
+def test_冷启动不给全员补拉trades(db):
+    """
+    ⚠️ 冷启动本来就是单轮请求量的峰值(全员 swaps + 全员 balances)。
+       再按"全员 hot"叠一份 trades 就是 3N 个请求砸在启动瞬间 —— 实测足以打爆限流窗口,
+       接着连活动流自己都 429、退回全员扫描,越滚越大。
+       而冷启动的 hot 只是"没有差集基准"的产物,并不代表这些人刚交易过。
+    """
+    for i in range(20):
+        _add_ready(f"u{i:02d}", f"h{i:02d}")
+    snaps = {f"u{i:02d}": _snap(f"u{i:02d}", swaps=[_swap(f"s{i}")]) for i in range(20)}
+    client = CountingClient(snaps)
+    Poller(client, FakeNotifier()).tick()
+
+    assert len(client.calls["swaps"]) == 20, "冷启动的全员 swaps 是必须的"
+    assert len(client.calls["balances"]) == 20, "冷启动要把持仓缓存填满"
+    assert len(client.calls["trades"]) <= 1, \
+        f"冷启动不该给全员补 trades,实际 {len(client.calls['trades'])} 次"

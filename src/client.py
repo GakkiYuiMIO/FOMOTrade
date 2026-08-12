@@ -36,6 +36,9 @@ FOMO_ORIGIN = "https://fomo.family"
 
 # ---- 端点(逆向前端 bundle 得到,设计文档 §2.1) ----
 EP_USER_BY_HANDLE = "/v2/users/userHandle/{handle}"
+# 当前登录账号自己。⚠️ 是 current 不是 me:/v2/users/me 会被当成 userId 校验(400),
+# /me、/users/me、/auth/me、/v2/profile 全是 404。
+EP_CURRENT_USER = "/v2/users/current"
 EP_USER = "/v2/users/{uid}"
 EP_SWAPS = "/v2/users/{uid}/swaps"
 EP_BALANCES = "/v2/users/{uid}/balances"
@@ -133,6 +136,7 @@ class FomoClient(Protocol):
     """两个实现的公共协议。上层 poller / bot 只依赖这个,换实现只改一行配置。"""
 
     def resolve_handle(self, handle: str) -> tuple[str, str, str]: ...
+    def get_current_user(self) -> dict: ...
     def get_swaps(self, user_id: str, limit: int = 50) -> list[dict]: ...
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
@@ -465,6 +469,20 @@ class _BaseFomoClient:
                 break
             last_id = str(fresh[-1]["id"])
         return out[:max_items]
+
+    def get_current_user(self) -> dict:
+        """
+        当前登录账号自己。返回 responseObject(含 id / userHandle / displayName / following …)。
+
+        ⚠️ 这是判断「活动流看得见谁」的起点:活动流只覆盖**这个账号关注的人**,
+           而人不会关注自己 —— 所以自己的交易和观点永远不出现在流里。
+           实测:自己在 100 条流里出现 0 次,而自己的账号恰恰是用户最在意的那一个。
+           详见 poller._refresh_feed_blind。
+        ⚠️ 端点是 /v2/users/current。/v2/users/me 会被当成 userId 校验(400 "must be a uuid"),
+           /me、/users/me、/auth/me、/v2/profile 全是 404。
+        """
+        ro = _unwrap(self._get(EP_CURRENT_USER))
+        return ro if isinstance(ro, dict) else {}
 
     def get_activity_feed(self, limit: int = 100) -> list[dict]:
         """
