@@ -201,6 +201,8 @@ _TOKEN_AGE_MIN_TS = 1420070400
 
 # runtime_state 里记录上一轮时间的键。用来识别"关机了一晚上"这类长间断
 _LAST_TICK_KEY = "last_tick_at"
+# 跟单日报最后报到哪一天(UTC 日期串)。跨日的第一轮据此补报前一天
+_COPY_SUMMARY_KEY = "copy_summary_day"
 
 
 def _num_fmt(v) -> str:
@@ -632,6 +634,10 @@ class Poller:
                 self._check_copytrade(conn, new_events, dry_run=dry_run)
             except Exception as e:  # noqa: BLE001
                 logger.error("跟单信号判定失败(不影响推送): {}", e)
+            try:
+                self._maybe_copy_summary(conn, dry_run=dry_run)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("跟单日报失败(不影响推送): {}", e)
 
             # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
             # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
@@ -1669,6 +1675,43 @@ class Poller:
             self._enqueue_buy(conn, cand, cfg)
         else:
             self._send_copy_signal(cand, d, cfg, status)
+
+    def _maybe_copy_summary(self, conn, *, dry_run: bool) -> None:
+        """
+        跨 UTC 日的第一轮,推一条前一天的跟单对账。
+
+        ⚠️ 挂在 tick 上而不是另起一个定时任务:重启、关机过夜都不会漏 ——
+           只要下次跑起来发现"上次报的还是更早那天",就补上。
+        ⚠️ 无人值守最需要的就是这条:没人点按钮,也就没人知道今天到底花了多少。
+        """
+        if dry_run:
+            return
+        today = now_iso()[:10]
+        last = store.get_state(conn, _COPY_SUMMARY_KEY)
+        if last == today:
+            return
+        # 首次运行只记下今天,不去补一条空的昨天
+        if last is not None and last < today:
+            s = store.copy_day_summary(conn, last)
+            if s["total"]:
+                self.notifier.send(self._render_copy_summary(s))
+        with store.tx(conn):
+            store.set_state(conn, _COPY_SUMMARY_KEY, today)
+
+    @staticmethod
+    def _render_copy_summary(s: dict) -> str:
+        label = {"paper": "🧪 纸上", "filled": "✅ 已成交", "failed": "❌ 未成交",
+                 "rejected": "🚫 已忽略", "expired": "⌛ 已作废",
+                 "pending": "⏳ 待确认", "unknown": "❔ 结果未知",
+                 "auto_queued": "📥 排队中", "auto_executing": "🔄 执行中"}
+        lines = [f"📒 <b>跟单日报</b> · {s['day']}(UTC)",
+                 f"共 {s['total']} 单 · 真实出账 {s['spent_usd']:,.2f} 美元"]
+        for st, v in sorted(s["by_status"].items(), key=lambda kv: -kv[1]["n"]):
+            lines.append(f"· {label.get(st, st)} {v['n']} 单")
+        if s["unclear"]:
+            # ⚠️ 单独一行、放最后 —— 这是唯一需要你**动手去核对**的一格
+            lines.append(f"\n⚠️ 有 <b>{s['unclear']}</b> 单结果不确定,请到 APP 核对持仓")
+        return "\n".join(lines)
 
     def _enqueue_buy(self, conn, cand: Candidate, cfg) -> None:
         """

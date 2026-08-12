@@ -1098,6 +1098,60 @@ def test_太老的待确认信号会作废(conn):
     assert got == {"old": "expired", "fresh": "pending"}
 
 
+def test_日报把待核对单独算一格(conn):
+    """
+    ⚠️ 「待核对」是**钱可能出去了但程序不知道**的那些。
+       混在总数里等于没报 —— 而这是唯一需要人动手去核对的一格。
+    """
+    from src.models import now_iso
+
+    day = now_iso()[:10]
+    for i, (st, note) in enumerate([
+        ("filled", "已成交 $40"),
+        ("filled", "已点击成交,但 45s 内没读到仓位变化"),
+        ("unknown", "进程重启时仍在执行中"),
+        ("paper", None),
+        ("failed", "浏览器起不来"),
+    ]):
+        store.record_copy_signal(
+            conn, network_id="solana", token_address=f"ca{i}", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status=st)
+        if note:
+            store.set_copy_status(conn, "solana", f"ca{i}", st, note)
+
+    s = store.copy_day_summary(conn, day)
+    assert s["total"] == 5
+    assert s["unclear"] == 2, "没读到仓位变化的 + 结果未知的,都要算进待核对"
+    # paper 和 failed 不出账;两条 filled + unknown 出账
+    assert s["spent_usd"] == 120.0, f"实得 {s['spent_usd']}"
+
+
+def test_日报只统计那一天(conn):
+    from src.models import iso_minutes_ago, now_iso
+
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="today", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="old", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+    with store.tx(conn):
+        conn.execute("UPDATE copytrade_signals SET triggered_at = ? WHERE token_address='old'",
+                     (iso_minutes_ago(60 * 72),))
+    assert store.copy_day_summary(conn, now_iso()[:10])["total"] == 1
+
+
+def test_台账带出行情时间(conn):
+    """/paper 靠它标注「这个 2.5x 可能是三天前的 2.5x」"""
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 5000.0)])
+    r = store.copy_ledger(conn)[0]
+    assert r["now_mcap"] == 5000.0
+    assert r["mcap_at"], "必须带出快照时间,否则 /paper 分不出实时价和冻住的价"
+
+
 def test_金额上限只数真的会出账的状态(conn):
     """纸上信号不该吃真金额度;失败单也不该占住上限(executor 的 raise 全在点击之前)"""
     for i, (st, amt) in enumerate([("paper", 40.0), ("filled", 40.0),

@@ -1070,7 +1070,10 @@ def copy_taken_today(conn) -> int:
 # ⚠️ 'failed' 不在其中是有依据的:executor.py 里每一处 raise 都在
 #    submit.click() **之前** —— 抛异常就意味着那一下根本没点。
 #    这条依赖以后改 executor 时要一起看。
-SPENDING_STATUSES = ("pending", "executing", "auto_queued", "auto_executing", "filled")
+# ⚠️ unknown 也算。它的定义就是"钱可能已经出去了但程序不知道" ——
+#    对**上限**而言,不确定必须按花了算,否则重启一次就能把额度洗掉一遍。
+SPENDING_STATUSES = ("pending", "executing", "auto_queued", "auto_executing",
+                     "filled", "unknown")
 
 
 def copy_spent_today(conn) -> float:
@@ -1170,11 +1173,46 @@ def expire_stale_pending(conn, max_age_hours: int = 24) -> int:
     return cur.rowcount
 
 
+def copy_day_summary(conn, day_iso: str | None = None) -> dict:
+    """
+    某一天(UTC)的跟单对账:各状态几单、花了多少、几单结果待核对。
+
+    ⚠️ 「待核对」单独算一格 —— 那是**钱可能出去了但程序不知道**的那些,
+       混在总数里等于没报。
+    """
+    day = (day_iso or now_iso())[:10]
+    lo, hi = f"{day}T00:00:00+00:00", f"{day}T23:59:59+00:00"
+    rows = conn.execute(
+        "SELECT status, COUNT(*) n, COALESCE(SUM(amount_usd), 0) usd "
+        "FROM copytrade_signals WHERE triggered_at BETWEEN ? AND ? GROUP BY status",
+        (lo, hi),
+    ).fetchall()
+    by = {r["status"]: {"n": r["n"], "usd": float(r["usd"])} for r in rows}
+    marks = ",".join("?" * len(SPENDING_STATUSES))
+    spent = conn.execute(
+        f"SELECT COALESCE(SUM(amount_usd), 0) s FROM copytrade_signals "  # noqa: S608
+        f"WHERE triggered_at BETWEEN ? AND ? AND status IN ({marks})",
+        (lo, hi, *SPENDING_STATUSES),
+    ).fetchone()["s"]
+    # note 里带「待核对」的是 executor 那条 confirmed=False 的分支
+    unclear = conn.execute(
+        "SELECT COUNT(*) n FROM copytrade_signals WHERE triggered_at BETWEEN ? AND ? "
+        "AND (status = 'unknown' OR (status = 'filled' AND COALESCE(note,'') LIKE '%没读到%'))",
+        (lo, hi),
+    ).fetchone()["n"]
+    return {"day": day, "by_status": by, "spent_usd": float(spent),
+            "total": sum(v["n"] for v in by.values()), "unclear": int(unclear)}
+
+
 def copy_ledger(conn, limit: int = 20) -> list[sqlite3.Row]:
     """跟单台账 + 当前市值(算盈亏用)。按触发时间倒序"""
+    # ⚠️ 一并带出 now_mcap 的时间。这张快照只覆盖"名单里还有人持有"的币,
+    #    清仓后就冻住了 —— 而 /paper 拿它算盈亏。不把新鲜度暴露出来的话,
+    #    一个三天前的价会和实时价长得一模一样。
     return conn.execute(
         """
-        SELECT g.*, s.market_cap AS now_mcap, s.max_market_cap AS peak_mcap
+        SELECT g.*, s.market_cap AS now_mcap, s.max_market_cap AS peak_mcap,
+               s.updated_at AS mcap_at
         FROM copytrade_signals g
         LEFT JOIN token_snapshot s
                ON s.network_id = g.network_id AND s.token_address = g.token_address

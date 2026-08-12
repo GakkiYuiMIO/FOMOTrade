@@ -160,6 +160,27 @@ def _ago(iso: str | None) -> str:
     return f"{int(mins // 1440)} 天前"
 
 
+# 行情多旧就算"冻住了"。1 小时:轮询是 15 秒一轮,只要名单里还有人持有,
+# 这个值几分钟就会刷新一次 —— 超过一小时基本只意味着"大家都清仓了"。
+_STALE_MCAP_MIN = 60
+
+
+def _stale_mark(iso: str | None) -> str:
+    """行情太旧时的标记。⚠️ 够新就返回空串 —— 正常情况不该占屏"""
+    if not iso:
+        return "⚠️行情缺失"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    mins = (datetime.now(UTC) - dt).total_seconds() / 60
+    if mins <= _STALE_MCAP_MIN:
+        return ""
+    return f"⚠️行情停在 {_ago_short(iso)} 前"
+
+
 def _ago_short(iso: str | None) -> str:
     """
     紧凑相对时间:8m / 3h / 5d。/hot 的买家行一行要塞名字+市值+金额+时间,
@@ -905,10 +926,18 @@ class CommandBot:
             taken = store.copy_taken_today(conn)
             spent = store.copy_spent_today(conn)
 
-        mode = ("🧪 纸上跟单(不花钱)" if cfg.paper_only
-                else ("🎭 演练下单(走流程但不成交)" if cfg.dry_run_execute
-                      else ("🤖 <b>无人值守自动成交</b>" if cfg.auto_execute
-                            else "🛒 <b>真实成交</b>(仍需你点确认)")))
+        # ⚠️ 模式按"实际会发生什么"算,不是按开关名字堆:
+        #    paper 盖过一切,dry_run 盖过 auto —— 开了 auto 但还在演练时,
+        #    显示"无人值守自动成交"就是撒谎(它一分钱都不会花)。
+        if cfg.paper_only:
+            mode = "🧪 纸上跟单(不花钱)"
+        elif cfg.dry_run_execute:
+            mode = ("🎭 演练下单 · 自动触发(走流程但不成交)" if cfg.auto_execute
+                    else "🎭 演练下单(走流程但不成交)")
+        elif cfg.auto_execute:
+            mode = "🤖 <b>无人值守自动成交</b>(没有人会被问)"
+        else:
+            mode = "🛒 <b>真实成交</b>(仍需你点确认)"
         age = f"≤ {cfg.max_age_hours} 小时" if cfg.max_age_hours is not None else "不限"
         mcap = _money(cfg.max_entry_mcap) if cfg.max_entry_mcap is not None else "不限"
         # ⚠️ daily_max=0 是「不限」(与 age/mcap 的 off 同义)。渲染成 "今日 3/0 单"
@@ -951,6 +980,12 @@ class CommandBot:
                 n += 1
                 seg.append(f"{'📈' if x >= 1 else '📉'} {x:.2f}x")
                 seg.append(f"{_money(r['amount_usd'])} → {_money(value)}")
+                # ⚠️ 行情冻住了要说出来。token_snapshot 只覆盖"名单里还有人持有"
+                #    的币,清仓后不再更新 —— 那个 2.5x 可能是三天前的 2.5x,
+                #    而不带标记的话它和实时价长得一模一样。
+                stale = _stale_mark(r["mcap_at"] if "mcap_at" in r.keys() else None)
+                if stale:
+                    seg.append(stale)
             else:
                 # 拿不到现价(名单里已经没人持有了)—— 说清楚,别显示成 0
                 seg.append(f"{_money(r['amount_usd'])} · 现价未知")

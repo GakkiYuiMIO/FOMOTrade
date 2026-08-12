@@ -1,4 +1,4 @@
-"""
+﻿"""
 跟单判定的单测。
 
 ⚠️ 这个文件盯的是**会让人亏钱的那一类错误**:
@@ -311,6 +311,19 @@ def test_台账里每个状态都有自己的符号(monkeypatch, tmp_path):
     assert "•" not in out, f"有状态没配符号:\n{out}"
 
 
+def test_开了自动但还在演练时不能说成自动成交(monkeypatch, tmp_path):
+    """⚠️ 它一分钱都不会花,说「无人值守自动成交」就是撒谎"""
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, replace_cfg(
+            store_.load_copy_config(c), enabled=True, paper_only=False,
+            dry_run_execute=True, auto_execute=True))
+    out = b._cmd_copy("")
+    assert "演练" in out and "自动触发" in out
+    assert "无人值守自动成交" not in out
+
+
 def test_面板不能把不限渲染成已限住(monkeypatch, tmp_path):
     """⚠️ 「今日 3/0 单」读起来像限住了,实际是闸门开着 —— 这是最危险的一种误读"""
     from dataclasses import replace as _replace
@@ -511,6 +524,157 @@ def test_profile有cookie时报出新鲜度(monkeypatch, tmp_path):
     assert ok is True and "小时前" in why
 
 
+def test_行情冻住了要在台账里标出来(monkeypatch, tmp_path):
+    """
+    ⚠️ token_snapshot 对已清仓的币不再更新。不标的话,一个三天前的 2.5x
+       和实时的 2.5x 长得一模一样 —— 而前者根本不是"现在赚了 2.5 倍"。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.record_copy_signal(
+            c, network_id="solana", token_address="ca1", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+        store_.upsert_token_snapshots(c, [("solana", "ca1", "X", 1.0, 5000.0)])
+        with store_.tx(c):
+            c.execute("UPDATE token_snapshot SET updated_at = ?",
+                      ((datetime.now(UTC) - timedelta(days=3)).isoformat(timespec="seconds"),))
+    assert "行情停在" in b._cmd_paper()
+
+
+def test_行情够新时不要占屏(monkeypatch, tmp_path):
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.record_copy_signal(
+            c, network_id="solana", token_address="ca1", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+        store_.upsert_token_snapshots(c, [("solana", "ca1", "X", 1.0, 5000.0)])
+    assert "行情停在" not in b._cmd_paper()
+
+
+# ============================================================
+# 执行器:急停只能打在点击之前
+# ============================================================
+class _FakeLoc:
+    def __init__(self, n=1, val="40.00"):
+        self._n, self._val = n, val
+        self.clicked = 0
+
+    def count(self):
+        return self._n
+
+    def click(self):
+        self.clicked += 1
+
+    def fill(self, v):
+        self._val = v
+
+    def input_value(self):
+        return self._val
+
+    def wait_for(self, **kw):
+        pass
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+
+class _BuyPage:
+    """够 _do_buy 跑完的最小页面。⚠️ 不开浏览器"""
+
+    def __init__(self, ca):
+        self.url = f"https://fomo.family/tokens/solana/{ca}"
+        self.submit = _FakeLoc()
+        self._amount = _FakeLoc()
+
+    def set_default_timeout(self, ms): pass
+    def goto(self, url, **kw): pass
+    def wait_for_timeout(self, ms): pass
+    def wait_for_function(self, *a, **kw): pass
+    def screenshot(self, **kw): pass
+    def evaluate(self, js): return None
+
+    def locator(self, sel, **kw):
+        if "Sign in" in sel:            # 已登录 → 找不到登录引导
+            return _FakeLoc(n=0)
+        if "input" in sel:
+            return self._amount
+        return self.submit
+
+    def get_by_role(self, *a, **kw):
+        return _FakeLoc(n=0)
+
+
+class _FakeCtx:
+    def __init__(self, page):
+        self.pages = [page]
+
+
+def _run_do_buy(stop_after: int | None, ca="CA123"):
+    """stop_after: 第几次调用 should_stop 时返回 True(None = 永不停)"""
+    from src import executor as ex
+
+    page = _BuyPage(ca)
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return stop_after is not None and calls["n"] >= stop_after
+
+    return page, calls, ex, should_stop
+
+
+def test_急停能在点成交之前拦下(monkeypatch):
+    from src.executor import ExecutorError, _do_buy
+
+    page, calls, ex, should_stop = _run_do_buy(stop_after=1)
+    with pytest.raises(ExecutorError, match="停止指令"):
+        _do_buy(_FakeCtx(page), page.url, "TOAD", 40.0, "CA123",
+                dry_run=False, screenshot_dir=None, should_stop=should_stop)
+    assert page.submit.clicked == 0, "急停之后绝不能点成交"
+
+
+def test_急停检查点必须在点击之前用完(monkeypatch):
+    """
+    ⚠️ 检查点绝不能出现在 click 之后。过了那一下,「停」只会让程序不去读回执 ——
+       钱花了、状态没写、你还以为停住了。这是最坏的结果。
+    """
+    from src.executor import _do_buy
+
+    page, calls, ex, should_stop = _run_do_buy(stop_after=None)
+    _do_buy(_FakeCtx(page), page.url, "TOAD", 40.0, "CA123",
+            dry_run=False, screenshot_dir=None, should_stop=should_stop)
+    assert page.submit.clicked == 1
+    before_click = calls["n"]
+
+    # 再跑一次,这次让 should_stop 在**最后一个**检查点才为真 ——
+    # 如果实现里 click 之后还查,这个数会对不上
+    page2, calls2, _, stop2 = _run_do_buy(stop_after=before_click)
+    from src.executor import ExecutorError
+    with pytest.raises(ExecutorError):
+        _do_buy(_FakeCtx(page2), page2.url, "TOAD", 40.0, "CA123",
+                dry_run=False, screenshot_dir=None, should_stop=stop2)
+    assert page2.submit.clicked == 0, "最后一个检查点必须仍在 click 之前"
+
+
+def test_不传急停回调时照常执行():
+    """人工确认那条路不需要急停 —— 不能因为参数是 None 就炸"""
+    from src.executor import _do_buy
+
+    page = _BuyPage("CA123")
+    _do_buy(_FakeCtx(page), page.url, "TOAD", 40.0, "CA123",
+            dry_run=False, screenshot_dir=None)
+    assert page.submit.clicked == 1
+
+
 # ============================================================
 # 成交回读:从页面持仓块里解析结果
 # ============================================================
@@ -571,3 +735,4 @@ def test_页面结构变了也不抛异常():
     assert _read_position(_Boom()) is None
     p = _read_position(_FakePage("Invested\nAvg entry"))  # 有锚点词但没数字
     assert p is not None and p.invested is None
+
