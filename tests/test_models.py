@@ -388,7 +388,7 @@ def test_to_row只输出落库字段():
     assert set(row) == {
         "event_id", "event_type", "user_id", "handle", "user_handle",
         "network_id", "token_address", "token_symbol", "amount_usd", "token_amount",
-        "price_usd", "market_cap", "tx_hash", "event_ts", "ingested_at",
+        "price_usd", "market_cap", "token_created_at", "tx_hash", "event_ts", "ingested_at",
         "badge", "badge_reason", "raw_json",
     }
     assert "ts_fallback" not in row

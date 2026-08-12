@@ -70,6 +70,8 @@ _COMMAND_MENU = [
     ("list", "查看监控名单与基线状态"),
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
+    ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
+    ("unstar", "取消特别关注:/unstar <handle>"),
     ("del", "移出监控:/del <handle>"),
     ("rebuild", "重建全部历史基线(回填逻辑改动后用)"),
     ("help", "命令说明"),
@@ -91,8 +93,10 @@ _HELP = (
     "/add &lt;handle&gt; — 加入监控(立即生效,历史基线由下一轮建立)\n"
     "/following &lt;handle&gt; — 把这个人关注的所有人批量加入监控\n"
     "/top [24h|7d|30d|following] [条数] — 交易员榜单,默认今日前 15\n"
+    "/star &lt;handle&gt; — 特别关注:他的推送带 ⭐、币名加【】\n"
+    "/unstar &lt;handle&gt; — 取消特别关注\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
-    "/list — 查看监控名单与基线状态\n"
+    "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
     "/status — 运行状态\n"
     "/who &lt;CA&gt; [链] — 名单里谁买过这个币\n"
     "/rebuild — 重建全部历史基线(回填逻辑改动后用)\n"
@@ -284,6 +288,10 @@ class CommandBot:
             return self._cmd_rebuild(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
+        if cmd in ("/star", "/fav"):
+            return self._cmd_star(arg, on=True)
+        if cmd in ("/unstar", "/unfav"):
+            return self._cmd_star(arg, on=False)
         if cmd == "/list":
             return self._cmd_list()
         if cmd == "/status":
@@ -636,18 +644,33 @@ class CommandBot:
             return f"⚠️ 未在监控名单中: {_esc(key)}"
         return f"✅ 已移除 <b>{_esc(name)}</b>(相关代币共识数已下调)"
 
+    def _cmd_star(self, arg: str, on: bool) -> str:
+        """/star | /unstar <handle> —— 特别关注。纯展示开关,不影响任何判定"""
+        key = (arg or "").strip()
+        if not key:
+            return f"用法: /{'star' if on else 'unstar'} &lt;handle&gt;"
+        with store.get_conn() as conn:
+            _, msg = store.set_starred(conn, key, on)
+        return _esc(msg)
+
     def _cmd_list(self) -> str:
         with store.get_conn() as conn:
             rows = store.list_active_users(conn)
             if not rows:
                 return "📋 监控名单为空,用 /add &lt;handle&gt; 添加"
-            lines = [f"📋 <b>监控名单</b>({len(rows)} 人)"]
+            # ⚠️ 特别关注的人排在最前:名单几十人时,/list 的价值就在于一眼看到重点
+            rows = sorted(rows, key=lambda r: (0 if r["starred"] else 1, r["added_at"]))
+            n_star = sum(1 for r in rows if r["starred"])
+            head = f"📋 <b>监控名单</b>({len(rows)} 人"
+            head += f" · ⭐ {n_star} 人)" if n_star else ")"
+            lines = [head]
             for i, r in enumerate(rows[:MAX_LIST_ROWS], 1):
                 ready = "✅就绪" if r["stats_ready"] else "⏳建立中"
                 n_token = store.stats_row_count(conn, r["user_id"])
                 name = r["display_name"] or r["handle"]
+                star = "⭐ " if r["starred"] else ""
                 lines.append(
-                    f"{i}. <b>{_esc(name)}</b> @{_esc(r['handle'])} · {ready} · "
+                    f"{i}. {star}<b>{_esc(name)}</b> @{_esc(r['handle'])} · {ready} · "
                     f"{n_token} 币 · {_day_str(r['added_at'])}"
                 )
             if len(rows) > MAX_LIST_ROWS:

@@ -361,6 +361,9 @@ class FomoEvent:
     thesis_text: str | None = None
     counterparty_handle: str | None = None
     counterparty_is_watched: bool = False
+    # 代币合约创建时间(unix 秒)→ 消息里的「币龄」。
+    # ⚠️ 落库:补发的消息也要能显示它,而 formatter 是纯函数、不查库(§10.4 铁律 7)
+    token_created_at: int | None = None
 
     @property
     def token_key(self) -> tuple[str, str] | None:
@@ -402,6 +405,8 @@ class FomoEvent:
             "price_usd": self.price_usd,
             # 市值是时点值、事后无法重算 —— /hot 的"买入时市值 → 现在"倍数靠它
             "market_cap": self.market_cap,
+            # 币龄基准。落库是为了补发的消息也能显示(formatter 不查库)
+            "token_created_at": self.token_created_at,
             "tx_hash": self.tx_hash,
             "event_ts": self.event_ts,
             "ingested_at": self.ingested_at,

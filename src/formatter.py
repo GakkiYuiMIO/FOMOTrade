@@ -21,7 +21,9 @@ FomoEvent → Telegram HTML 消息渲染(设计文档 §10)
 from __future__ import annotations
 
 import html
+import math
 import re
+import time
 from decimal import Decimal, InvalidOperation, localcontext
 
 from loguru import logger
@@ -49,6 +51,9 @@ EMOJI_THESIS = "💭"          # 发表观点
 EMOJI_TRANSFER_IN = "📥"     # 收到转入
 EMOJI_TRANSFER_OUT = "📤"    # 转出
 
+# 特别关注标记。⚠️ 它跟在事件 emoji **后面**,不占行首(见 _title_line 里的说明)
+STAR_MARK = "⭐"
+
 LABEL_FIRST = "首次建仓"
 LABEL_ADD = "加仓"
 LABEL_SELL = "卖出"
@@ -67,6 +72,7 @@ EMOJI_HOLDING = "📦"
 EMOJI_AVG_PRICE = "📊"
 EMOJI_TRADE_COUNT = "🔄"
 EMOJI_MARKET_CAP = "💎"
+EMOJI_TOKEN_AGE = "🕐"
 EMOJI_CONSENSUS = "👥"
 EMOJI_NETWORK = "🧬"
 EMOJI_COUNTERPARTY = "👤"
@@ -321,14 +327,33 @@ def _title_anchor(ev: FomoEvent) -> tuple[str, str]:
     return EMOJI_ADD, LABEL_ADD
 
 
-def _title_line(ev: FomoEvent) -> str:
+def _title_line(ev: FomoEvent, starred: bool = False) -> str:
     emoji, label = _title_anchor(ev)
+    # ⚠️ 星标只能放在**事件 emoji 之后**,绝不能顶到行首(铁律 1):
+    #    行首那个字符是聊天列表预览里唯一的扫描锚点。被 ⭐ 顶掉之后,
+    #    所有特别关注的消息在列表预览里长得一模一样,买入卖出当场分不出来。
+    mark = f"{STAR_MARK} " if starred else ""
     # 只给展示名加粗:@handle 是辅助信息,一起加粗会把行首锚点的视觉重量冲散
-    parts = [f"{emoji} <b>{_display_name(ev)}</b>{_handle_suffix(ev)}", label]
+    parts = [f"{emoji} {mark}<b>{_display_name(ev)}</b>{_handle_suffix(ev)}", label]
     sym = _symbol_plain(ev)
     if sym is not None:
-        parts.append(f"<b>${_esc(sym)}</b>")
+        parts.append(_style_symbol(sym, starred))
     return SEP.join(parts)
+
+
+def _style_symbol(sym: str, starred: bool) -> str:
+    """
+    币名的样式。特别关注的人要更醒目。
+
+    ⚠️ Telegram 的 Bot API **不支持任意文字颜色** —— 允许的标签只有
+       b / i / u / s / code / pre / a / blockquote / tg-spoiler,没有 font、没有 style。
+       真能出颜色的只有两条:diff 代码块(加号行绿、减号行红)和彩色 emoji;
+       而前者是等宽的块级元素,会把标题行整个拆开、还吃掉行内链接。
+       所以这里用「加粗 + 方括号」做强调,颜色交给行首的 🌱/🟢/🔴 承担 ——
+       那本来就是这条消息的颜色锚点。改样式只需要动这一个函数。
+    """
+    body = f"${_esc(sym)}"
+    return f"<b>【{body}】</b>" if starred else f"<b>{body}</b>"
 
 
 def _thesis_line(ev: FomoEvent) -> str | None:
@@ -446,6 +471,48 @@ def _market_cap_line(ev: FomoEvent) -> str | None:
     return f"{EMOJI_MARKET_CAP} 市值 {mc}" if mc is not None else None
 
 
+def fmt_token_age(created_at: int | float | None, now: float | None = None) -> str | None:
+    """
+    币龄:8M / 3H / 5D / 2MO / 1.4Y。拿不到就返回 None(整行消失,铁律 2)。
+
+    ⚠️ 分钟用 M、月份用 MO —— 单独一个 M 在币圈语境里会被读成市值(market cap)。
+    ⚠️ 未来时间戳返回 None 而不是负数:宁可不显示,也不能出现「币龄 -3H」。
+    ⚠️ 天数以内不做小数(3.7H 没有意义),超过一年才给一位小数 ——
+       "1.4Y" 比 "511D" 好读。
+    """
+    if created_at is None:
+        return None
+    try:
+        age = (time.time() if now is None else now) - float(created_at)
+    except (TypeError, ValueError):
+        return None
+    # ⚠️ 必须显式挡 NaN/Inf:`age < 0` 对 NaN 恒为 False,会一路落到最后一支
+    #    渲染成 "nanY" —— 一条一眼假的信息比没有这一行糟得多(铁律 2)。
+    if not math.isfinite(age) or age < 0:
+        return None
+    if age < 3600:
+        return f"{max(int(age // 60), 1)}M"
+    if age < 86400:
+        return f"{int(age // 3600)}H"
+    if age < 86400 * 30:
+        return f"{int(age // 86400)}D"
+    if age < 86400 * 365:
+        return f"{int(age // (86400 * 30))}MO"
+    return f"{age / (86400 * 365):.1f}Y"
+
+
+def _token_age_line(ev: FomoEvent) -> str | None:
+    """
+    🕐 币龄 3H。新币是这个项目最关心的信号,而"多新"只有这一行能回答。
+
+    ⚠️ 数据只来自 balances 里的 token.createdAt。名单里没人持有的币(比如刚清仓的)
+       拿不到,那就整行消失 —— 绝不本地推算、也绝不用交易对创建时间凑数
+       (后者对老币差几年,见 poller._token_created_at)。
+    """
+    age = fmt_token_age(ev.token_created_at)
+    return f"{EMOJI_TOKEN_AGE} 币龄 {age}" if age else None
+
+
 def _consensus_line(buyers: int | None, watchlist: int | None, holders: int | None) -> str | None:
     """
     功能 B:👥 名单内 3/12 人买过 · 2 人仍持有
@@ -554,6 +621,7 @@ def render(
     watchlist: int | None = None,
     holders: int | None = None,
     baseline_pending: bool = False,
+    starred: bool = False,
 ) -> str:
     """
     渲染一条 Telegram HTML 消息。
@@ -563,12 +631,14 @@ def render(
         buyers/watchlist 功能 B 主指标;任一为 None → 共识行整段消失
         holders          功能 B 副指标;None → 只掉「N 人仍持有」这一段
         baseline_pending 基线未就绪 → 末尾追加 ⏳ 尾行
+        starred          特别关注 → 标题加 ⭐、币名加方括号。**纯展示**,
+                         不影响徽章、共识、采集的任何判定
 
     ⚠️ 本函数**不得抛异常**。它在 poller 的发送循环里被调用,
        一条脏数据把渲染炸掉会连带整个 tick 停摆 —— 宁可发一条降级消息。
     """
     try:
-        return _render(ev, buyers, watchlist, holders, baseline_pending)
+        return _render(ev, buyers, watchlist, holders, baseline_pending, starred)
     except Exception as e:  # noqa: BLE001
         # 走到这里一定是本模块的 bug(所有字段级异常都已在下游吃掉),必须留痕
         logger.exception("消息渲染失败,降级为最简文本 | event_id={} | {}", getattr(ev, "event_id", "?"), e)
@@ -581,10 +651,11 @@ def _render(
     watchlist: int | None,
     holders: int | None,
     baseline_pending: bool,
+    starred: bool = False,
 ) -> str:
     # 行序固定,缺失的行整行消失。这个顺序逐条对齐设计文档 §10.2 的七个场景
     candidates = [
-        _title_line(ev),
+        _title_line(ev, starred),
         _thesis_line(ev),
         _amount_line(ev),
         _counterparty_line(ev),
@@ -598,6 +669,7 @@ def _render(
         _pnl_line(ev),                           # 卖出看已实现,其余看未实现
         _trade_count_line(ev),
         _market_cap_line(ev),
+        _token_age_line(ev),
         _consensus_line(buyers, watchlist, holders),
         _network_line(ev),
         _links_line(ev),                         # 链接在 CA 之前 —— CA 必须独占最后一行

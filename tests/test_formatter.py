@@ -321,3 +321,92 @@ def test_超长观点正文被截断但CA仍然完整():
     msg = render(make_event(event_type=EVENT_THESIS, thesis_text="观" * 3000))
     assert msg.splitlines()[-1] == f"<code>{CA_TOAD}</code>"
     assert len(msg) < 4000
+
+
+# ============================================================
+# 特别关注的醒目标识
+# ============================================================
+def test_星标不能顶掉行首的事件锚点():
+    """
+    ⚠️ 铁律 1:行首那个字符是聊天列表预览里唯一的扫描锚点。
+       ⭐ 一旦顶到行首,所有特别关注的消息在列表预览里长得一模一样,
+       买入卖出当场分不出来 —— 那正是最需要一眼看出方向的那批人。
+    """
+    ev = make_event(event_type=EVENT_BUY, badge=BADGE_FIRST, token_symbol="TOAD")
+    msg = render(ev, starred=True)
+    assert msg[0] == "🌱", f"行首必须仍是事件 emoji,实际 {msg[:4]!r}"
+    assert "⭐" in msg.split("\n")[0], "星标要出现在标题行里"
+
+
+def test_星标只改样式不改内容():
+    """加星前后,除了 ⭐ 和币名的方括号,其余每一行必须逐字相同"""
+    ev = make_event(event_type=EVENT_BUY, badge=BADGE_FIRST, token_symbol="TOAD")
+    plain = render(ev, buyers=3, watchlist=10, holders=2)
+    starred = render(ev, buyers=3, watchlist=10, holders=2, starred=True)
+    assert plain != starred
+    assert starred.replace("⭐ ", "").replace("【", "").replace("】", "") == plain
+
+
+def test_未加星的消息完全不变():
+    """默认参数必须与改造前逐字一致,否则等于给全部推送换了样式"""
+    ev = make_event(event_type=EVENT_SELL, token_symbol="TOAD")
+    assert render(ev) == render(ev, starred=False)
+    assert "⭐" not in render(ev)
+    assert "【" not in render(ev)
+
+
+def test_星标币名照样转义():
+    """样式包装绝不能绕过 escape —— 一个 '<' 就让整条 400"""
+    ev = make_event(event_type=EVENT_BUY, token_symbol="<b>x")
+    msg = render(ev, starred=True)
+    assert "&lt;b&gt;x" in msg and "<b>x" not in msg.replace("<b>$", "")
+
+
+# ============================================================
+# 币龄
+# ============================================================
+@pytest.mark.parametrize(("age_sec", "want"), [
+    (0, "1M"),                    # 刚创建也显示 1M,不显示 0M
+    (59, "1M"),
+    (60 * 8, "8M"),
+    (3600 - 1, "59M"),
+    (3600, "1H"),
+    (3600 * 3 + 1800, "3H"),      # 天以内不给小数:3.5H 没有意义
+    (86400 - 1, "23H"),
+    (86400, "1D"),
+    (86400 * 5, "5D"),
+    (86400 * 30 - 1, "29D"),
+    (86400 * 30, "1MO"),
+    (86400 * 365 - 1, "12MO"),
+    (86400 * 365, "1.0Y"),
+    (86400 * 365 * 5.2, "5.2Y"),
+])
+def test_币龄格式(age_sec, want):
+    now = 1_800_000_000
+    assert formatter.fmt_token_age(now - age_sec, now=now) == want
+
+
+def test_分钟用M月份用MO():
+    """⚠️ 单独一个 M 在币圈语境里会被读成市值(market cap),月份必须是 MO"""
+    now = 1_800_000_000
+    assert formatter.fmt_token_age(now - 60 * 30, now=now).endswith("M")
+    assert formatter.fmt_token_age(now - 86400 * 60, now=now).endswith("MO")
+
+
+@pytest.mark.parametrize("bad", [None, "", "abc", float("nan"), float("inf")])
+def test_币龄脏值一律整行消失(bad):
+    """宁可不显示,也不能出现「币龄 nanY」这种一眼假的东西"""
+    assert formatter.fmt_token_age(bad) is None
+
+
+def test_未来时间戳不显示负币龄():
+    now = 1_800_000_000
+    assert formatter.fmt_token_age(now + 86400, now=now) is None
+
+
+def test_有币龄就出行没有就整行消失():
+    import time as _t
+
+    ev = make_event(event_type=EVENT_BUY, token_created_at=int(_t.time()) - 86400 * 5)
+    assert "🕐 币龄 5D" in render(ev)
+    assert "币龄" not in render(make_event(event_type=EVENT_BUY))

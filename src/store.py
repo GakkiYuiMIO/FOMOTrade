@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS watch_users (
     removed_at   TEXT,
     -- 【功能 A/B】历史基线是否已建立。0 = 不打徽章、不计入共识分子分母
     stats_ready  INTEGER NOT NULL DEFAULT 0,
+    -- 特别关注:这个人的推送要加醒目标识。纯展示,**不影响任何判定**
+    -- (不改徽章、不改共识分子分母、不改采集频率),所以哪怕它错了也只是不好看
+    starred      INTEGER NOT NULL DEFAULT 0,
     note         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_watch_users_active ON watch_users(active);
@@ -88,6 +91,9 @@ CREATE TABLE IF NOT EXISTS fomo_events (
     --   而"名单买入时 $1M → 现在 $15M"正是判断金狗的核心依据。
     --   price_usd 已经在上面存了,两者合起来才能算倍数。
     market_cap    REAL,
+    -- 代币合约创建时间(unix 秒)→ 消息里的「币龄」。落库是为了让补发的消息也能显示它
+    -- (formatter 是纯函数、不查库),而且它是恒定值,不像市值那样会过期
+    token_created_at INTEGER,
     sent          INTEGER NOT NULL DEFAULT 0,  -- 0=未发出;每 tick 末尾补发 10 分钟内未发出项
     raw_json      TEXT NOT NULL       -- 原始报文全量留存,便于日后离线回填
 );
@@ -198,10 +204,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     所以新增列必须在这里 ALTER,否则老库升级后直接报 no such column。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(fomo_events)").fetchall()}
-    for col, ddl in (("user_handle", "TEXT"), ("market_cap", "REAL")):
+    for col, ddl in (("user_handle", "TEXT"), ("market_cap", "REAL"),
+                     ("token_created_at", "INTEGER")):
         if cols and col not in cols:
             conn.execute(f"ALTER TABLE fomo_events ADD COLUMN {col} {ddl}")  # noqa: S608
             logger.info("迁移:fomo_events 补列 {}", col)
+
+    wcols = {r["name"] for r in conn.execute("PRAGMA table_info(watch_users)").fetchall()}
+    if wcols and "starred" not in wcols:
+        conn.execute("ALTER TABLE watch_users ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
+        logger.info("迁移:watch_users 补列 starred(特别关注)")
 
     for old, new in _NETWORK_RENAMES.items():
         for table in ("fomo_events", "user_token_stats"):
@@ -271,6 +283,41 @@ def ready_user_ids(conn) -> list[str]:
         "SELECT user_id FROM watch_users WHERE active = 1 AND stats_ready = 1"
     ).fetchall()
     return [r["user_id"] for r in rows]
+
+
+def starred_user_ids(conn) -> set[str]:
+    """特别关注的人。纯展示用途,拿不到就当没有 —— 绝不能因此挡住推送"""
+    rows = conn.execute(
+        "SELECT user_id FROM watch_users WHERE active = 1 AND starred = 1"
+    ).fetchall()
+    return {r["user_id"] for r in rows}
+
+
+def set_starred(conn, handle_or_id: str, on: bool) -> tuple[bool, str]:
+    """
+    设/取消特别关注。返回 (是否改动了, 回执文案)。
+
+    ⚠️ 与 /del 一样按 handle 或 user_id 找人,且**只认 active 的** ——
+       给一个已经移出名单的人加星标没有任何意义,只会让 /list 的星标数对不上。
+    """
+    key = (handle_or_id or "").strip()
+    if not key:
+        return False, "❓ 用法:/star <handle>"
+    row = conn.execute(
+        "SELECT user_id, handle, display_name, starred FROM watch_users "
+        "WHERE active = 1 AND (lower(handle) = ? OR user_id = ?)",
+        (normalize_handle(key), key),
+    ).fetchone()
+    if row is None:
+        return False, f"❓ 名单里没有 {clean_handle(key)}(先 /add 加进来)"
+
+    who = row["display_name"] or row["handle"]
+    if bool(row["starred"]) == on:
+        return False, f"ℹ️ {who} 已经{'在' if on else '不在'}特别关注里了"
+    with tx(conn):
+        conn.execute("UPDATE watch_users SET starred = ? WHERE user_id = ?",
+                     (1 if on else 0, row["user_id"]))
+    return True, (f"⭐ 已把 {who} 加入特别关注" if on else f"☆ 已把 {who} 移出特别关注")
 
 
 def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) -> tuple[bool, str]:
@@ -446,11 +493,11 @@ def insert_event(conn, ev: FomoEvent) -> bool:
         """
         INSERT OR IGNORE INTO fomo_events
             (event_id, event_type, user_id, handle, user_handle, network_id, token_address,
-             token_symbol, amount_usd, token_amount, price_usd, market_cap, tx_hash,
-             event_ts, ingested_at, badge, badge_reason, raw_json)
+             token_symbol, amount_usd, token_amount, price_usd, market_cap, token_created_at,
+             tx_hash, event_ts, ingested_at, badge, badge_reason, raw_json)
         VALUES (:event_id, :event_type, :user_id, :handle, :user_handle, :network_id,
                 :token_address, :token_symbol, :amount_usd, :token_amount, :price_usd,
-                :market_cap, :tx_hash, :event_ts, :ingested_at,
+                :market_cap, :token_created_at, :tx_hash, :event_ts, :ingested_at,
                 :badge, :badge_reason, :raw_json)
         """,
         r,

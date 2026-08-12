@@ -652,3 +652,46 @@ def test_stats主键三元组唯一(conn):
             "(user_id, network_id, token_address, buy_count, updated_at) VALUES (?,?,?,1,'x')",
             ("u1", "solana", CA_TOAD),
         )
+
+
+# ============================================================
+# 特别关注(纯展示开关)
+# ============================================================
+def test_特别关注开关(conn):
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    assert store.starred_user_ids(conn) == set()
+
+    ok, msg = store.set_starred(conn, "alice", True)       # handle 大小写不敏感
+    assert ok and "⭐" in msg
+    assert store.starred_user_ids(conn) == {"u1"}
+
+    ok, msg = store.set_starred(conn, "alice", True)       # 幂等
+    assert not ok and "已经" in msg
+
+    ok, _ = store.set_starred(conn, "u1", False)           # 也认 user_id
+    assert ok and store.starred_user_ids(conn) == set()
+
+
+def test_给名单外的人加星标要报错而不是静默(conn):
+    """静默成功会让 /list 的星标数对不上,用户以为设好了其实没有"""
+    ok, msg = store.set_starred(conn, "nobody", True)
+    assert not ok and "没有" in msg
+
+
+def test_移出名单的人不再算特别关注(conn):
+    """软删除后 starred 位还在,但 starred_user_ids 只认 active —— 否则数字对不上"""
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    store.set_starred(conn, "alice", True)
+    store.remove_watch_user(conn, "alice")
+    assert store.starred_user_ids(conn) == set()
+
+
+def test_老库升级后自动补starred列(conn):
+    """CREATE TABLE IF NOT EXISTS 不会给已存在的表补列,必须靠 _migrate"""
+    conn.execute("ALTER TABLE watch_users DROP COLUMN starred")
+    cols = lambda: {r["name"] for r in conn.execute("PRAGMA table_info(watch_users)")}  # noqa: E731
+    assert "starred" not in cols()
+    store.init_db(conn)
+    assert "starred" in cols()
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    assert store.starred_user_ids(conn) == set()

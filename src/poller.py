@@ -179,6 +179,9 @@ _THESIS_WORKERS = 4
 # 改成令牌桶 —— 桶里的令牌可以立刻发完,之后才退化成匀速,稳态速率仍受 send_interval 约束。
 _SEND_BURST = 5
 
+# 币龄的合理下界(2015-01-01)。比这更早的一律当脏数据 —— 以太坊主网才 2015 年上线
+_TOKEN_AGE_MIN_TS = 1420070400
+
 # runtime_state 里记录上一轮时间的键。用来识别"关机了一晚上"这类长间断
 _LAST_TICK_KEY = "last_tick_at"
 
@@ -317,6 +320,20 @@ def _balance_key(b: dict) -> tuple[str | None, str | None]:
     return net, ca
 
 
+def _token_created_at(tok: dict) -> int | None:
+    """
+    代币合约的创建时间(unix 秒)。用来算「币龄」。
+
+    ⚠️ 只认合理区间 [2015-01-01, 现在+1天]:这个值直接决定消息里那行「币龄」,
+       而一个 0 或者毫秒级的时间戳会渲染成"币龄 56Y"这种一眼假的东西,
+       比不显示糟得多。区间外一律当没有(整行消失,§10.4 铁律 2)。
+    """
+    v = _i(tok.get("createdAt"))
+    if v is None:
+        return None
+    return v if _TOKEN_AGE_MIN_TS <= v <= time.time() + 86400 else None
+
+
 def _fill(d: dict, key: str, value) -> None:
     """
     只在**当前值为空**时写入。
@@ -453,6 +470,8 @@ def _event_from_row(row) -> FomoEvent | None:
             ingested_at=_row_get(row, "ingested_at", now_iso()),
             badge=_row_get(row, "badge"),
             badge_reason=_row_get(row, "badge_reason"),
+            # 币龄是恒定值(不像市值会过期),落了库补发时就能照常显示
+            token_created_at=_row_get(row, "token_created_at"),
             # side_unknown 不落库,但 badge_reason 已经把它记下来了 —— 补发时必须还原,
             # 否则一条方向不明的事件会被 formatter 当成正常买入渲染
             side_unknown=_row_get(row, "badge_reason") == REASON_NO_SIDE,
@@ -974,6 +993,12 @@ class Poller:
                 # 拉 thesis 时要用**原始**数字 networkId(1399811149),
                 # 不能用归一化后的 "solana" —— 那是我们内部的聚合键,API 不认
                 _fill(m, "network_raw", tok.get("networkId"))
+                # 币龄。⚠️ 取 token.createdAt(**合约创建**),不是 tokenFilterResult.createdAt
+                #    —— 后者是**交易对/池子**的创建时间,两者对新币几乎一样,对老币差得离谱:
+                #    实测 USDC 的 token.createdAt 是 2020-10-13(对),
+                #    而 tfr.createdAt 是 2024-03-20(那只是某个池子建的时间)。
+                #    拿错字段的话,一个五年的老币会显示成"币龄 5D"。
+                _fill(m, "created_at", _token_created_at(tok))
 
                 ut = b.get("userToken") if isinstance(b.get("userToken"), dict) else None
                 if not ut:
@@ -1361,6 +1386,12 @@ class Poller:
             return
 
         ready = store.ready_user_ids(conn)
+        # ⚠️ 星标是纯展示。查不出来就当没有 —— 绝不能让它挡住任何一条推送
+        try:
+            starred = store.starred_user_ids(conn)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
+            starred = set()
         for ev in pending:
             buyers = watchlist = holders = None
             baseline_pending = False
@@ -1383,6 +1414,7 @@ class Poller:
                     watchlist=watchlist,
                     holders=holders,
                     baseline_pending=baseline_pending,
+                    starred=ev.user_id in starred,
                 )
             except Exception as e:  # noqa: BLE001
                 # 渲染炸了只丢这一条,后面的照发。sent 保持 0,下一 tick 会再试
@@ -1718,6 +1750,7 @@ class Poller:
                        or posn.get("avg_price")),
             market_cap=(_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP))
                         or meta.get("market_cap")),
+            token_created_at=meta.get("created_at"),
             unrealized_pnl=_f(pick(raw, *_K_PNL_USD)) or posn.get("pnl"),
             unrealized_pnl_pct=_f(pick(raw, *_K_PNL_PCT)) or posn.get("pnl_pct"),
             # 已实现盈亏只对卖出有意义,来自 /trades(balances 里没有)
@@ -1896,6 +1929,7 @@ class Poller:
             unrealized_pnl_pct=_f(trade.get("percentageUnrealizedPnl")),
             market_cap=(_f(pick(src, *_K_MARKET_CAP)) or _f(pick(raw, *_K_MARKET_CAP))
                         or (self._token_meta.get((net, ca)) or {}).get("market_cap")),
+            token_created_at=(self._token_meta.get((net, ca)) or {}).get("created_at"),
             token_amount=_s(trade.get("humanTokenAmount")),
             thesis_text=text,
         )
