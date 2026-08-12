@@ -827,3 +827,39 @@ def test_买家按买入先后排不是按金额(conn):
 
     rows = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
     assert [r["who"] for r in rows] == ["early_small", "late_whale"]
+
+
+def test_买家行给出各自的进场市值(conn):
+    """"谁在什么位置进的"是这一行的核心 —— 先摸到的和追高的差着一个数量级"""
+    _ready(conn, "u1", "early")
+    _ready(conn, "u2", "late")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=40_000, handle="early")
+    _hot_buy(conn, "u2", "t", "2026-08-12T09:00:00+00:00", mcap=4_000_000, handle="late")
+
+    rows = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
+    assert [(r["who"], r["mcap"]) for r in rows] == [("early", 40_000), ("late", 4_000_000)]
+
+
+def test_进场市值跳过自己那笔的空市值(conn):
+    """
+    市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
+    抢到新币的那一刻本人还没出现在自己的持仓里,那行 market_cap 就是 NULL。
+    不往后找的话,恰恰是"抢得最早的人"没有进场市值可显示。
+    """
+    _ready(conn, "u1", "alice")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=None, handle="alice")
+    _hot_buy(conn, "u1", "t", "2026-08-12T02:00:00+00:00", mcap=60_000, handle="alice")
+
+    r = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")[0]
+    assert r["mcap"] == 60_000
+    assert r["ts"] == "2026-08-12T01:00:00+00:00", "ts 仍是他真正的第一笔"
+    assert r["buys"] == 2
+
+
+def test_全程没有市值时进场市值为空(conn):
+    """拿不到就整段消失,绝不显示 $0.00 —— 那会被读成「零市值买入」"""
+    _ready(conn, "u1", "alice")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=None, handle="alice")
+
+    r = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")[0]
+    assert r["mcap"] is None

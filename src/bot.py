@@ -151,6 +151,29 @@ def _ago(iso: str | None) -> str:
     return f"{int(mins // 1440)} 天前"
 
 
+def _ago_short(iso: str | None) -> str:
+    """
+    紧凑相对时间:8m / 3h / 5d。/hot 的买家行一行要塞名字+市值+金额+时间,
+    「15 小时前」四个汉字在手机上就是换行的那根稻草。与币龄行用同一套单位。
+    """
+    if not iso:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    mins = (datetime.now(UTC) - dt).total_seconds() / 60
+    if mins < 1:
+        return "刚刚"
+    if mins < 60:
+        return f"{int(mins)}m"
+    if mins < 60 * 24:
+        return f"{int(mins // 60)}h"
+    return f"{int(mins // 1440)}d"
+
+
 def _chain_name(net: str | None) -> str:
     """链的展示名。未收录时原样透传(该值来自 API,调用方负责 escape)"""
     return NETWORK_DISPLAY.get((net or "").strip(), (net or "").strip() or "?")
@@ -451,10 +474,15 @@ class CommandBot:
                 if not w["who"]:
                     continue
                 seg = [f"{_MEDALS[rank]} @{_esc(w['who'])}"]
+                # 💎 = 他**进场时**的市值。⚠️ 多笔建仓时它只代表第一笔的位置,
+                #    所以后面的笔数必须留着 —— 只看一个市值会把"分五笔从 40K 加到 200K"
+                #    读成"他在 40K 一把梭"。
+                if w["mcap"]:
+                    seg.append(f"💎{_money(_num(w['mcap']))}")
                 usd = _num(w["usd"])
                 if usd > 0:                       # 0 = 这几笔都没解析出金额,整段消失
                     seg.append(_money(usd) + (f"({w['buys']} 笔)" if w["buys"] > 1 else ""))
-                seg.append(_ago(w["ts"]))
+                seg.append(_ago_short(w["ts"]))
                 lines.append("   " + " · ".join(seg))
 
             tail = [f"🧬 {_esc(_chain_name(r['network_id']))}"]

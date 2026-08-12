@@ -831,29 +831,50 @@ def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
     """
     某个币在窗口内被谁买过(按首次买入时间正序 —— 谁先发现的排前面)。
 
-    每行:who(@handle)/ ts(他第一笔的时间)/ usd(窗口内累计买入额)/ buys(笔数)。
+    每行:who(@handle)/ ts(他第一笔的时间)/ usd(窗口内累计买入额)/ buys(笔数)/
+          mcap(他**进场时**的市值)。
     ⚠️ usd 是**累计**不是首笔:一个人分五笔建仓,只报首笔会把他的实际投入
        低报成五分之一,而"谁下的注最大"正是这一行的价值所在。
+    ⚠️ mcap 取的是他**最早一笔有市值**的那笔,不是最早那笔:
+       市值只来自 balances,而 balances 快照晚于 swaps 索引 ——
+       抢到新币的那一刻本人还没出现在自己的持仓里,那行 market_cap 就是 NULL。
+       不往后找的话,恰恰是"抢得最早的人"没有进场市值可显示。
+       多笔建仓时它只代表**第一笔**的位置,所以展示时旁边必须带上笔数。
 
     ⚠️ 谓词必须与 hot_tokens / count_consensus 完全一致,否则「👥 5 人买入」
        下面列出来的名字会对不上,甚至把已 /del 的人的 handle 摆在那里。
     """
+    countable = ",".join("?" * len(COUNTABLE_REASONS))
     return conn.execute(
-        """
-        SELECT COALESCE(MAX(e.user_handle), MAX(e.handle)) AS who,
-               MIN(e.event_ts)                             AS ts,
-               SUM(COALESCE(e.amount_usd, 0))              AS usd,
-               COUNT(*)                                    AS buys
-        FROM fomo_events e
-        JOIN watch_users w
-          ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
-        WHERE e.event_type = 'BUY' AND e.network_id = ? AND e.token_address = ?
-          AND e.event_ts >= ?
-          AND COALESCE(e.badge_reason, '') IN ({countable})
-        GROUP BY e.user_id
-        ORDER BY ts
+        f"""
+        WITH scoped AS (
+            SELECT e.user_id, e.user_handle, e.handle, e.event_ts, e.amount_usd, e.market_cap,
+                   -- 该用户最早**且有市值**的那一行:没市值的排到分区末尾
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.user_id
+                       ORDER BY CASE WHEN e.market_cap IS NULL THEN 1 ELSE 0 END, e.event_ts
+                   ) AS rn_mcap
+            FROM fomo_events e
+            JOIN watch_users w
+              ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
+            WHERE e.event_type = 'BUY' AND e.network_id = ? AND e.token_address = ?
+              AND e.event_ts >= ?
+              AND COALESCE(e.badge_reason, '') IN ({countable})
+        ),
+        agg AS (
+            SELECT user_id,
+                   COALESCE(MAX(user_handle), MAX(handle)) AS who,
+                   MIN(event_ts)                           AS ts,
+                   SUM(COALESCE(amount_usd, 0))            AS usd,
+                   COUNT(*)                                AS buys
+            FROM scoped GROUP BY user_id
+        )
+        SELECT a.who, a.ts, a.usd, a.buys, m.market_cap AS mcap
+        FROM agg a
+        LEFT JOIN scoped m ON m.user_id = a.user_id AND m.rn_mcap = 1
+        ORDER BY a.ts
         LIMIT ?
-        """.format(countable=",".join("?" * len(COUNTABLE_REASONS))),  # noqa: S608
+        """,  # noqa: S608
         (network_id, token_address, since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
 
