@@ -91,6 +91,8 @@ HOT_TOP_BUYERS = 3
 MAX_HOT_ROWS = 10
 # 买入先后的名次标。第 4 名之后不展开,所以只要三个
 _MEDALS = ("🥇", "🥈", "🥉")
+# 峰值比现在高出这么多倍才值得单独写一笔 —— 差不多的时候写出来只是噪音
+_PEAK_MIN_RATIO = 1.15
 
 _HELP = (
     "🤖 <b>FOMO 监控 Bot</b>\n"
@@ -452,14 +454,20 @@ class CommandBot:
                 head += f"({buys} 笔)"
             lines.append(head)
 
-            # 市值:名单开始买时 → 现在。倍数就是这两个数的比
-            first_mc, now_mc = r["first_mcap"], r["now_mcap"]
+            # 市值:名单开始买时 → 现在。倍数就是这两个数的比。
+            # ⚠️ "现在"两个字不能省:光写 `$41.9K → $2.9M` 会被读成"起点 → 最高点",
+            #    于是下面某个在 $4.19M 进场的买家看着像不可能。
+            #    真相是这个币冲到 4.19M 之后回落了 —— 那正是最该看见的信息,见 peak。
+            first_mc, now_mc, peak_mc = r["first_mcap"], r["now_mcap"], r["peak_mcap"]
             if first_mc and now_mc:
-                seg = [f"💎 {_money(_num(first_mc))} → {_money(_num(now_mc))}"]
+                seg = [f"💎 {_money(_num(first_mc))} → 现在 {_money(_num(now_mc))}"]
             elif now_mc:
-                seg = [f"💎 {_money(_num(now_mc))}"]
+                seg = [f"💎 现在 {_money(_num(now_mc))}"]
             else:
                 seg = []
+            # 明显回落过才提峰值:等于现在的时候写出来只是噪音
+            if seg and peak_mc and now_mc and _num(peak_mc) >= _num(now_mc) * _PEAK_MIN_RATIO:
+                seg.append(f"峰值 {_money(_num(peak_mc))}")
             seg.append(f"💰 名单买入 {_money(_num(r['total_usd']))}")
             lines.append("   " + " · ".join(seg))
 

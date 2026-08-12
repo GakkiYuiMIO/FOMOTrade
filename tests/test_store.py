@@ -863,3 +863,56 @@ def test_全程没有市值时进场市值为空(conn):
 
     r = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")[0]
     assert r["mcap"] is None
+
+
+def test_峰值市值只增不减(conn):
+    """
+    没有峰值的话,"$41.9K → $2.9M" 会被读成"起点→最高",
+    于是一个在 $4.19M 进场的买家看着像不可能 —— 而真相是币冲到 4.19M 后回落了。
+    """
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 1_000_000)])
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 4.0, 4_000_000)])
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 2.0, 2_000_000)])  # 回落
+
+    r = conn.execute("SELECT * FROM token_snapshot WHERE token_address='t'").fetchone()
+    assert r["market_cap"] == 2_000_000, "现在市值跟着最新一次走"
+    assert r["max_market_cap"] == 4_000_000, "峰值只增不减"
+
+
+def test_没有市值的那轮不会把峰值抹掉(conn):
+    """清仓后的币仍会被 trades 带着进来,但那时没有市值 —— 不能让它清掉已有峰值"""
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 4.0, 4_000_000)])
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", None, None)])
+
+    r = conn.execute("SELECT * FROM token_snapshot WHERE token_address='t'").fetchone()
+    assert r["max_market_cap"] == 4_000_000
+    assert r["market_cap"] == 4_000_000
+
+
+def test_迁移用历史买入记录回填峰值(conn):
+    """
+    已经冲高回落的币恰恰是最该看到峰值的那些,而它多半不会再冲了 ——
+    不回填的话它永远没有峰值可显示。fomo_events.market_cap 天然采样了上涨过程。
+    """
+    _ready(conn, "u1", "alice")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=100_000)
+    _hot_buy(conn, "u1", "t", "2026-08-12T02:00:00+00:00", mcap=4_000_000)   # 冲到这里
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 900_000)])  # 现在回落到 900K
+    # 模拟老库:把列清空后重跑迁移
+    conn.execute("UPDATE token_snapshot SET max_market_cap = NULL")
+    conn.execute("ALTER TABLE token_snapshot DROP COLUMN max_market_cap")
+    store.init_db(conn)
+
+    r = conn.execute("SELECT * FROM token_snapshot WHERE token_address='t'").fetchone()
+    assert r["max_market_cap"] == 4_000_000
+
+
+def test_hot_tokens带出峰值(conn):
+    _ready(conn, "u1", "alice")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=100_000)
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 500_000)])
+    store.upsert_token_snapshots(conn, [("solana", "t", "T", 1.0, 300_000)])
+
+    r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
+    assert r["now_mcap"] == 300_000
+    assert r["peak_mcap"] == 500_000

@@ -149,6 +149,13 @@ CREATE TABLE IF NOT EXISTS token_snapshot (
     symbol        TEXT,
     price_usd     REAL,
     market_cap    REAL,
+    -- 我们**观测到的**最高市值(每轮取 max,只增不减)。
+    -- ⚠️ 不是真 ATH:只在名单里有人持有、且轮询到的时刻才采样,币在我们看它之前
+    --    冲过多高无从知道。所以文案写「峰值」而不是「ATH」。
+    -- 存在的理由:没有它,"$41.9K → $2.9M" 会被读成"起点→最高",
+    --    于是一个在 $4.19M 进场的买家看着像不可能 —— 而真相是这个币冲到 4.19M 后回落了,
+    --    追高的那批人正套着。这恰恰是最该看见的信息。
+    max_market_cap REAL,
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (network_id, token_address)
 );
@@ -214,6 +221,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if wcols and "starred" not in wcols:
         conn.execute("ALTER TABLE watch_users ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
         logger.info("迁移:watch_users 补列 starred(特别关注)")
+
+    tcols = {r["name"] for r in conn.execute("PRAGMA table_info(token_snapshot)").fetchall()}
+    if tcols and "max_market_cap" not in tcols:
+        conn.execute("ALTER TABLE token_snapshot ADD COLUMN max_market_cap REAL")
+        # ⚠️ 用历史买入记录里的最高市值**回填**,而不是从今天开始重新攒:
+        #    fomo_events.market_cap 是每笔买入的时点市值,它天然采样了这个币涨的过程。
+        #    不回填的话,已经冲高回落的币(恰恰是最该看到峰值的那些)要等下一次冲高
+        #    才有数 —— 而它多半不会再冲了。
+        conn.execute("""
+            UPDATE token_snapshot SET max_market_cap = MAX(
+                COALESCE(market_cap, 0),
+                COALESCE((SELECT MAX(e.market_cap) FROM fomo_events e
+                           WHERE e.network_id = token_snapshot.network_id
+                             AND e.token_address = token_snapshot.token_address), 0))
+            WHERE max_market_cap IS NULL
+        """)
+        logger.info("迁移:token_snapshot 补列 max_market_cap(峰值,已用历史买入记录回填)")
 
     for old, new in _NETWORK_RENAMES.items():
         for table in ("fomo_events", "user_token_stats"):
@@ -730,12 +754,17 @@ def upsert_token_snapshots(conn, rows: list[tuple]) -> None:
     conn.executemany(
         """
         INSERT INTO token_snapshot (network_id, token_address, symbol, price_usd,
-                                    market_cap, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+                                    market_cap, max_market_cap, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(network_id, token_address) DO UPDATE SET
             symbol     = COALESCE(excluded.symbol, symbol),
             price_usd  = COALESCE(excluded.price_usd, price_usd),
             market_cap = COALESCE(excluded.market_cap, market_cap),
+            -- 峰值只增不减。⚠️ MAX 在两个都非空时才有意义,所以先各自 COALESCE 兜底
+            max_market_cap = CASE
+                WHEN excluded.market_cap IS NULL THEN max_market_cap
+                WHEN max_market_cap IS NULL      THEN excluded.market_cap
+                ELSE MAX(max_market_cap, excluded.market_cap) END,
             -- ⚠️ 只有真的带来新市值才推进 updated_at。
             --    否则清仓后的币仍会被 trades(closedTrades 里有 currentPrice)每轮刷新时间戳,
             --    /hot 的「行情已超过 1 小时未更新」提示就永远触发不了,
@@ -743,7 +772,7 @@ def upsert_token_snapshots(conn, rows: list[tuple]) -> None:
             updated_at = CASE WHEN excluded.market_cap IS NOT NULL
                               THEN excluded.updated_at ELSE updated_at END
         """,
-        [(n, c, s, p, m, ts) for n, c, s, p, m in rows],
+        [(n, c, s, p, m, m, ts) for n, c, s, p, m in rows],
     )
 
 
@@ -811,6 +840,7 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
             m.market_cap                       AS first_mcap,
             m.event_ts                         AS first_mcap_at,
             s.market_cap                       AS now_mcap,
+            s.max_market_cap                   AS peak_mcap,
             s.updated_at                       AS mcap_at,
             CASE WHEN s.market_cap IS NOT NULL AND m.market_cap > 0
                  THEN s.market_cap * 1.0 / m.market_cap END AS mult
