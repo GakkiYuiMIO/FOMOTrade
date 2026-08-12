@@ -916,3 +916,25 @@ def test_hot_tokens带出峰值(conn):
     r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
     assert r["now_mcap"] == 300_000
     assert r["peak_mcap"] == 500_000
+
+
+def test_倍数按峰值算不按现价(conn):
+    """
+    这个榜要回答"名单挖到了什么金狗",而金狗的价值在于它**跑出来过**多少。
+    按现价排的话,一个冲到 100x 又回落到 60x 的币会排在稳在 70x 的币后面 ——
+    而前者才是那次真正抓住了的机会。
+    """
+    _ready(conn, "u1", "alice")
+    # spike:1 万进,冲到 100 万(100x)后回落到 60 万
+    _hot_buy(conn, "u1", "spike", "2026-08-12T01:00:00+00:00", mcap=10_000)
+    store.upsert_token_snapshots(conn, [("solana", "spike", "SPIKE", 1.0, 1_000_000)])
+    store.upsert_token_snapshots(conn, [("solana", "spike", "SPIKE", 1.0, 600_000)])
+    # steady:1 万进,稳在 70 万(70x)
+    _hot_buy(conn, "u1", "steady", "2026-08-12T02:00:00+00:00", mcap=10_000)
+    store.upsert_token_snapshots(conn, [("solana", "steady", "STEADY", 1.0, 700_000)])
+
+    rows = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")
+    assert [r["token_address"] for r in rows] == ["spike", "steady"], \
+        "冲到 100x 又回落的币,应当排在稳在 70x 的前面"
+    assert round(rows[0]["mult"]) == 100, "倍数取峰值,不是现价"
+    assert rows[0]["now_mcap"] == 600_000, "现价照常带出来,回撤自己看得见"

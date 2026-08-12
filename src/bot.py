@@ -447,7 +447,10 @@ class CommandBot:
             mult = r["mult"]
             if mult is not None:
                 x = _num(mult)
-                head += f" · <b>{'🚀' if x >= 1.1 else '📉'} {x:.1f}x</b>" if x >= 1.1 \
+                # ⚠️ 写「最高」两个字:这是**峰值**倍数,不是现在的倍数。
+                #    不写的话,一个回撤过的币会被当成"现在还有这么多",
+                #    而下面 💎 行明明写着现价更低 —— 两个数打架,用户只会当是 bug。
+                head += f" · <b>🚀 最高 {x:.1f}x</b>" if x >= 1.1 \
                     else f" · 📉 {(x - 1) * 100:+.0f}%"
             head += f" · 👥 {buyers} 人买入"
             if buys > buyers:
@@ -508,8 +511,8 @@ class CommandBot:
         n_nomult = sum(1 for r in rows if r["mult"] is None)
         # ⚠️ 必须点明奖牌是**买入先后**:🥇🥈🥉 通常被读成"金额最大",
         #    而榜里经常出现 🥈 比 🥇 买得多的情况(先摸到的人未必下注最重)。
-        foot = (f"\n🥇🥈🥉 = 买入先后 · 按倍数排序(现在市值 ÷ 名单最早买入时市值)"
-                f" · 名单 {ready} 人")
+        foot = (f"\n🥇🥈🥉 = 买入先后 · 按<b>最高倍数</b>排序"
+                f"(峰值 ÷ 名单最早买入时市值) · 名单 {ready} 人")
         if n_nomult:
             # 不说明的话,榜尾那几个没有倍数的看着像 bug
             foot += f"\n{_esc('·')} 末尾 {n_nomult} 个币缺基准市值,按人数排"

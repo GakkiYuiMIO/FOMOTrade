@@ -780,8 +780,10 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
     """
     【买入榜】给定时间窗内,名单里的人买了哪些币。
 
-    排序:**按倍数**(现在市值 ÷ 名单最早买入时的市值)从高到低 ——
-    这个榜要回答的是"名单挖到了什么金狗",涨幅才是答案。
+    排序:**按最高倍数**(峰值市值 ÷ 名单最早买入时的市值)从高到低 ——
+    这个榜要回答的是"名单挖到了什么金狗",而金狗的价值在于它**跑出来过**多少。
+    用现价排的话,一个冲到 100x 又回落到 60x 的币会排在稳在 70x 的币后面,
+    而前者才是那次真正抓住了的机会。现价照常在结果里(now_mcap),回撤自己看得见。
     算不出倍数的排在最后(按人数 + 总额),而不是排在最前:
     ⚠️ SQLite 里 NULL 在 DESC 排序中会排到最后,但**不能依赖它** ——
        显式写 `mult IS NULL` 做第一排序键,意图才留在代码里。
@@ -842,8 +844,14 @@ def hot_tokens(conn, since_iso: str, limit: int = 12) -> list[sqlite3.Row]:
             s.market_cap                       AS now_mcap,
             s.max_market_cap                   AS peak_mcap,
             s.updated_at                       AS mcap_at,
-            CASE WHEN s.market_cap IS NOT NULL AND m.market_cap > 0
-                 THEN s.market_cap * 1.0 / m.market_cap END AS mult
+            -- 倍数 = **峰值** ÷ 名单最早买入时的市值,也就是"名单摸到之后最多涨过多少倍"。
+            -- ⚠️ 刻意不用现价:这个榜要回答"名单挖到了什么金狗",而金狗的价值在于
+            --    它跑出来过多少 —— 一个冲到 100x 又回落到 60x 的币,排在一个稳在 70x 的
+            --    币后面是不合理的。现价照常在 💎 行里显示,回撤自己看得见。
+            -- ⚠️ COALESCE 兜底:老库里 max_market_cap 可能还没回填上
+            CASE WHEN COALESCE(s.max_market_cap, s.market_cap) IS NOT NULL AND m.market_cap > 0
+                 THEN COALESCE(s.max_market_cap, s.market_cap) * 1.0 / m.market_cap
+            END AS mult
         FROM agg a
         LEFT JOIN scoped m ON m.network_id = a.network_id
                           AND m.token_address = a.token_address AND m.rn_mcap = 1
