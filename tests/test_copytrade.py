@@ -293,6 +293,24 @@ def test_copy_auto条件齐了才能开(monkeypatch, tmp_path):
         assert store_.load_copy_config(c).auto_execute is True
 
 
+def test_台账里每个状态都有自己的符号(monkeypatch, tmp_path):
+    """
+    ⚠️ 落到默认的「•」意味着「结果未知、钱可能已经出去了」这种最该被看见的行,
+       看起来和别的一模一样。
+    """
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    states = ("paper", "pending", "filled", "rejected", "failed",
+              "expired", "executing", "auto_queued", "auto_executing", "unknown")
+    with store_.get_conn() as c:
+        for i, st in enumerate(states):
+            store_.record_copy_signal(
+                c, network_id="solana", token_address=f"ca{i}", token_symbol="X",
+                buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status=st)
+    out = b._cmd_paper()
+    assert "•" not in out, f"有状态没配符号:\n{out}"
+
+
 def test_面板不能把不限渲染成已限住(monkeypatch, tmp_path):
     """⚠️ 「今日 3/0 单」读起来像限住了,实际是闸门开着 —— 这是最危险的一种误读"""
     from dataclasses import replace as _replace

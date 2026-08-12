@@ -937,8 +937,12 @@ class CommandBot:
         for r in rows:
             sym = _esc((r["token_symbol"] or "?").lstrip("$"))
             got = pnl(r["entry_mcap"], r["now_mcap"], r["amount_usd"])
+            # ⚠️ 每个状态都要有自己的符号。落到默认的 "•" 就意味着
+            #    「结果未知、请去核对」这种最需要被看见的行,看起来和别的一模一样。
             tag = {"paper": "🧪", "pending": "⏳", "filled": "✅",
-                   "rejected": "🚫", "failed": "❌"}.get(r["status"], "•")
+                   "rejected": "🚫", "failed": "❌", "expired": "⌛",
+                   "executing": "🔄", "auto_queued": "📥", "auto_executing": "🔄",
+                   "unknown": "❔"}.get(r["status"], "•")
             seg = [f"{tag} <b>${sym}</b>"]
             if got:
                 value, x = got

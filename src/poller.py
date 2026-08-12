@@ -1565,22 +1565,47 @@ class Poller:
                 ev_mcap[e.token_key] = e.market_cap   # 同一轮多笔时取最后一笔
 
         since = iso_minutes_ago(cfg.window_hours * 60)
+        # ⚠️ **按信号强弱排,不是按合约地址排。**
+        #    原来是 sorted(keys),排序键是 (network_id, token_address) 的字典序 ——
+        #    与信号质量、时间先后毫无关系。有人盯着的时候这只影响按钮顺序;
+        #    自动之后额度是有限的,这个顺序**决定当天的钱买了哪几个币**,
+        #    而"按链名 + CA 首字母花钱"显然不是任何人想要的。
+        #    买家数降序;同样多的按最早那笔买入的时间升序(先动的先跟)。
+        # ⚠️ 这一步在 per-token try 的**外面**,所以它自己必须逐个兜底 ——
+        #    否则一个币查询出错就又能掀掉整轮,把 A5 那道防线从背后绕过去。
+        #    (这正是被 test_单个币处理失败不影响本轮其余币 抓到的一次回归。)
+        #    失败按 0 计:0 一定小于 min_buyers,也就是"这个币本轮不跟" —— 安全的那一侧。
+        buyers = {}
+        for k in keys:
+            try:
+                buyers[k] = store.count_recent_buyers(conn, k[0], k[1], since, cfg.starred_only)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("买家数查询失败,本轮跳过这个币 | {} {} | {}", k[0], k[1][:10], e)
+                buyers[k] = 0
+        first_ts = {}
+        for e in new_events:
+            if e.event_type == EVENT_BUY and e.token_key:
+                k = e.token_key
+                if k not in first_ts or e.event_ts < first_ts[k]:
+                    first_ts[k] = e.event_ts
+        ordered = sorted(keys, key=lambda k: (-buyers[k], first_ts.get(k, ""), k))
+
         # ⚠️ 两个上限的分子。查一次、循环内自增 —— 每个币都重查一遍库不但浪费,
         #    也挡不住同一轮内的累计(record 是逐个提交的,重查反而看起来"对")。
         used = {"n": store.copy_taken_today(conn), "usd": store.copy_spent_today(conn)}
-        for net, ca in sorted(keys):
+        for net, ca in ordered:
             # ⚠️ 每个币独立兜底。循环体里马上要接真实下单,而执行器有十几处 raise
             #    (profile 被占、会话过期、页面改版、报价超时 —— 全是常态)。
             #    没有这道 try,一个币出事会掀掉**本轮剩下所有币**的判定,
             #    而外层那句"跟单信号判定失败(不影响推送)"会把它伪装成无害。
             try:
                 self._copy_one(conn, net, ca, cfg, since, used,
-                               ev_mcap.get((net, ca)), dry_run=dry_run)
+                               ev_mcap.get((net, ca)), buyers[(net, ca)], dry_run=dry_run)
             except Exception as e:  # noqa: BLE001
                 logger.exception("跟单单币处理失败,跳过这个币继续 | {} {} | {}", net, ca[:10], e)
 
-    def _copy_one(self, conn, net: str, ca: str, cfg, since: str,
-                  used: dict, event_mcap: float | None, *, dry_run: bool) -> None:
+    def _copy_one(self, conn, net: str, ca: str, cfg, since: str, used: dict,
+                  event_mcap: float | None, buyers: int, *, dry_run: bool) -> None:
         """
         判定并记账**一个**币。异常由调用方按币兜底,见 _check_copytrade。
 
@@ -1605,7 +1630,7 @@ class Poller:
             network_id=net,
             token_address=ca,
             token_symbol=meta.get("symbol"),
-            buyers=store.count_recent_buyers(conn, net, ca, since, cfg.starred_only),
+            buyers=buyers,          # 排序时已经查过,不再查第二遍
             entry_mcap=entry_mcap,
             token_created_at=meta.get("created_at"),
             already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下

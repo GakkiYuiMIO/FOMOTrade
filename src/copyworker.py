@@ -63,11 +63,12 @@ class BuyJob:
         return (self.network_id, self.token_address)
 
 
-def _default_execute(job: BuyJob):
+def _default_execute(job: BuyJob, should_stop=None):
     from src.executor import buy as execute_buy
 
     return execute_buy(job.network_id, job.token_address, job.symbol, job.amount_usd,
-                       dry_run=job.dry_run, screenshot_dir=str(PROBE_DIR))
+                       dry_run=job.dry_run, screenshot_dir=str(PROBE_DIR),
+                       should_stop=should_stop)
 
 
 class CopyWorker:
@@ -75,6 +76,7 @@ class CopyWorker:
     单线程买入队列。线程懒建(第一次 submit 时才起),close() 之后不再接单。
 
     execute 可注入 —— 单测绝不能真开浏览器。
+    注入的可调用对象签名固定为 `(job, should_stop) -> BuyResult`。
     """
 
     def __init__(self, notifier, execute=None):
@@ -158,7 +160,10 @@ class CopyWorker:
 
         logger.warning("开始自动买入 | {} ${:.2f} · 排队 {:.0f}s", job.symbol, job.amount_usd, waited)
         try:
-            res = self._execute(job)
+            # ⚠️ 急停传进执行器,让它在**点成交之前**的几个节点上还能被拦下。
+            #    过了那一下就拦不住了,也不该拦 —— 钱已经出去,这时候"停"
+            #    只会让程序不去读回执:钱花了、状态没写、你还以为停住了。
+            res = self._call_execute(job)
         except Exception as e:  # noqa: BLE001
             logger.exception("自动买入失败 | {} {}", job.symbol, ca[:10])
             self._finish(job, "failed", str(e)[:300], emoji="❌", title="未成交")
@@ -173,6 +178,30 @@ class CopyWorker:
             # ⚠️ 「点了但没读到仓位变化」是独立的一档:报成功会让人以为没事,
             #    报失败又会诱使人手动再买一次。这一档恰恰最需要人去看一眼。
             self._finish(job, "filled", res.message, emoji="⚠️", title="已点击 · 结果待核对")
+
+    def _call_execute(self, job: BuyJob):
+        """调执行器,把急停回调传进去。注入的 execute 必须收 (job, should_stop)"""
+        return self._execute(job, self._should_stop)
+
+    def _should_stop(self) -> bool:
+        """
+        执行途中要不要停手。**只在点成交之前被查**(见 executor._abort_if_stopped)。
+
+        ⚠️ 每次都重查一遍配置,不用 tick 里那份快照:「立刻停手」的意思就是
+           `/copy off` 敲下去之后**正在跑的这一单**也要停,而不是只对下一单生效。
+           代价是几次 runtime_state 单行读,可以忽略。
+        ⚠️ 查库出错时返回 False(继续买):停手判断本身挂掉不该变成"永远停手",
+           那会让跟单在数据库抖一下之后静默失效。真要停,用 close()。
+        """
+        if self._stop.is_set():
+            return True
+        try:
+            with store.get_conn() as conn:
+                cfg = store.load_copy_config(conn)
+            return not (cfg.enabled and cfg.auto_execute and not cfg.paper_only)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("急停判断查库失败,按继续处理: {}", e)
+            return False
 
     def _finish(self, job: BuyJob, status: str, note: str, *, emoji: str, title: str) -> None:
         """写终态 + 发回执。⚠️ 无人值守下没人点按钮,不发就等于什么都没发生过"""

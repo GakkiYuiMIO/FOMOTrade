@@ -35,6 +35,7 @@ FOMO 的 swap 是**链上交易**(swap 记录里有 recipient / platformFeeAddre
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -115,12 +116,17 @@ def _read_position(page) -> Position | None:
 
 def buy(network_id: str, token_address: str, token_symbol: str | None,
         amount_usd: float, *, dry_run: bool = True,
-        screenshot_dir: str | None = None) -> BuyResult:
+        screenshot_dir: str | None = None,
+        should_stop: Callable[[], bool] | None = None) -> BuyResult:
     """
-    在 fomo.family 上买入。**只应由 TG 确认按钮的回调调用。**
+    在 fomo.family 上买入。由 TG 确认按钮的回调、或无人值守的买入队列调用。
 
     dry_run=True(默认)会走完所有步骤但**不点成交按钮**,并截图 ——
     先用它确认自动化点对了地方,再谈真实成交。
+
+    should_stop: 急停。⚠️ **只在点成交之前查**。点下去之后钱已经出去了,
+                 这时候"停"只会让程序不去读回执 —— 那是最坏的结果:
+                 钱花了、状态没写、你还以为停住了。
     """
     slug = NETWORK_SLUG.get((network_id or "").strip())
     if not slug:
@@ -139,7 +145,8 @@ def buy(network_id: str, token_address: str, token_symbol: str | None,
         ctx = _launch(p)
         try:
             return _do_buy(ctx, url, sym, amount_usd, token_address,
-                           dry_run=dry_run, screenshot_dir=screenshot_dir)
+                           dry_run=dry_run, screenshot_dir=screenshot_dir,
+                           should_stop=should_stop)
         finally:
             ctx.close()
 
@@ -231,12 +238,20 @@ def check_login(timeout_ms: int = 45_000) -> tuple[bool, str]:
 
 
 def _do_buy(ctx, url: str, sym: str, amount_usd: float, ca: str,
-            *, dry_run: bool, screenshot_dir: str | None) -> BuyResult:
+            *, dry_run: bool, screenshot_dir: str | None,
+            should_stop: Callable[[], bool] | None = None) -> BuyResult:
+    def _abort_if_stopped(where: str) -> None:
+        """急停检查点。⚠️ 只允许出现在 submit.click() **之前**"""
+        if should_stop is not None and should_stop():
+            raise ExecutorError(f"执行中途收到停止指令({where}),未下单")
+
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.set_default_timeout(_STEP_TIMEOUT_MS)
     logger.info("执行器打开 {}", url)
+    _abort_if_stopped("开页面前")
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_timeout(_RENDER_MS)
+    _abort_if_stopped("页面加载后")
 
     shot = None
     if screenshot_dir:
@@ -316,6 +331,10 @@ def _do_buy(ctx, url: str, sym: str, amount_usd: float, ca: str,
     #    "有仓位"的页面,分不清是这一单买的还是本来就有的。
     before = _read_position(page)
     base = before.invested if before and before.invested is not None else 0.0
+
+    # ⚠️ **最后一次**急停检查。再往下一行钱就出去了 ——
+    #    过了这一行,任何"停止"都只会让程序不去读回执,而不会让钱回来。
+    _abort_if_stopped("点成交前")
 
     logger.warning("执行真实买入 | {} ${:.2f}(点下去即成交)", sym or ca[:8], amount_usd)
     submit.click()

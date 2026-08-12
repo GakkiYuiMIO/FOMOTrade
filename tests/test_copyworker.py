@@ -1,4 +1,4 @@
-"""
+﻿"""
 买入队列的单测。
 
 ⚠️ 这个文件盯的是**无人值守下没人看着时**才会发生的那类错误:
@@ -89,7 +89,7 @@ def test_成交后写filled并发回执(db):
     _cfg_auto()
     _queued()
     n = _Notif()
-    w = CopyWorker(n, execute=lambda job: _Res("已成交 $40.00 · 持仓 661 TOAD"))
+    w = CopyWorker(n, execute=lambda job, stop=None: _Res("已成交 $40.00 · 持仓 661 TOAD"))
     assert w.submit(_job())
     _drain(w)
     w.close()
@@ -107,7 +107,7 @@ def test_点了但没读到仓位变化要单独一档(db):
     _cfg_auto()
     _queued()
     n = _Notif()
-    w = CopyWorker(n, execute=lambda job: _Res("已点击但没读到仓位变化", confirmed=False))
+    w = CopyWorker(n, execute=lambda job, stop=None: _Res("已点击但没读到仓位变化", confirmed=False))
     w.submit(_job())
     _drain(w)
     w.close()
@@ -120,7 +120,7 @@ def test_演练模式绝不记filled(db):
     _cfg_auto()
     _queued()
     n = _Notif()
-    w = CopyWorker(n, execute=lambda job: _Res("演练通过"))
+    w = CopyWorker(n, execute=lambda job, stop=None: _Res("演练通过"))
     w.submit(_job(dry_run=True))
     _drain(w)
     w.close()
@@ -135,7 +135,7 @@ def test_执行抛异常时记failed并告警(db):
     _queued()
     n = _Notif()
 
-    def boom(job):
+    def boom(job, stop=None):
         raise RuntimeError("浏览器起不来")
 
     w = CopyWorker(n, execute=boom)
@@ -160,7 +160,7 @@ def test_排队太久就不买了(db):
     _queued()
     n = _Notif()
     calls = []
-    w = CopyWorker(n, execute=lambda job: calls.append(job) or _Res())
+    w = CopyWorker(n, execute=lambda job, stop=None: calls.append(job) or _Res())
     w.submit(_job(age_sec=999))
     _drain(w)
     w.close()
@@ -179,7 +179,7 @@ def test_执行前重查配置_停手要拦得住已入队的单(db):
     _queued()
     n = _Notif()
     calls = []
-    w = CopyWorker(n, execute=lambda job: calls.append(job) or _Res())
+    w = CopyWorker(n, execute=lambda job, stop=None: calls.append(job) or _Res())
 
     # 入队之后、执行之前被关掉
     with store.get_conn() as c:
@@ -202,7 +202,7 @@ def test_队列满了返回False而不是排着等(db):
     n = _Notif()
     started, release = [], []
 
-    def slow(job):
+    def slow(job, stop=None):
         started.append(job)
         while not release:
             time.sleep(0.01)
@@ -231,7 +231,7 @@ def test_只有从auto_queued抢到的才执行(db):
 
     n = _Notif()
     calls = []
-    w = CopyWorker(n, execute=lambda job: calls.append(job) or _Res())
+    w = CopyWorker(n, execute=lambda job, stop=None: calls.append(job) or _Res())
     w.submit(_job())
     _drain(w)
     w.close()
@@ -243,9 +243,55 @@ def test_只有从auto_queued抢到的才执行(db):
 def test_close之后不再接单(db):
     _cfg_auto()
     n = _Notif()
-    w = CopyWorker(n, execute=lambda job: _Res())
+    w = CopyWorker(n, execute=lambda job, stop=None: _Res())
     w.close()
     assert w.submit(_job()) is False
+
+
+def test_执行途中关掉跟单_急停回调要能拦下(db):
+    """
+    ⚠️ 「立刻停手」的意思是**正在跑的这一单**也要停,不是只对下一单生效。
+       所以 should_stop 每次都重查配置,不能用 tick 里那份快照。
+    """
+    _cfg_auto()
+    _queued()
+    n = _Notif()
+    seen = []
+
+    def watch(job, stop):
+        # 模拟执行器:走到"点成交前"那个检查点时,配置已经被改掉了
+        with store.get_conn() as c:
+            store.save_copy_config(c, replace(store.load_copy_config(c), auto_execute=False))
+        seen.append(stop())
+        if stop():
+            raise RuntimeError("执行中途收到停止指令(点成交前),未下单")
+        return _Res()
+
+    w = CopyWorker(n, execute=watch)
+    w.submit(_job())
+    _drain(w)
+    w.close()
+
+    assert seen == [True], f"执行途中改了配置,急停必须为真:{seen}"
+    assert _status()[0] == "failed"
+
+
+def test_急停查库出错时不要变成永远停手(db):
+    """停手判断本身挂掉不该让跟单静默失效 —— 真要停有 close()"""
+    _cfg_auto()
+    _queued()
+    n = _Notif()
+    got = []
+
+    def watch(job, stop):
+        got.append(stop())
+        return _Res()
+
+    w = CopyWorker(n, execute=watch)
+    w.submit(_job())
+    _drain(w)
+    w.close()
+    assert got == [False], "配置正常时不该停"
 
 
 def test_一条单炸了不会让整条线程死掉(db):
@@ -256,7 +302,7 @@ def test_一条单炸了不会让整条线程死掉(db):
     n = _Notif()
     seen = []
 
-    def flaky(job):
+    def flaky(job, stop=None):
         seen.append(job.token_address)
         if job.token_address == "ca1":
             raise RuntimeError("第一单炸了")
@@ -270,3 +316,4 @@ def test_一条单炸了不会让整条线程死掉(db):
 
     assert seen == ["ca1", "ca2"], f"第二单必须照常执行,实际 {seen}"
     assert _status("ca2")[0] == "filled"
+

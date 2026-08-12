@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import sys
@@ -695,6 +696,41 @@ def cmd_dry_run() -> int:
     return 0
 
 
+def _reconcile_copytrade(notifier) -> None:
+    """
+    启动对账:认领上一个进程留下的在途跟单。
+
+    ⚠️ 整段包 try:跟单是附加功能,对账失败绝不能挡住监控启动。
+    ⚠️ 「结果未知」这一档必须**主动推给用户**。它的定义就是"钱可能已经出去了
+       但程序不知道" —— 只写进库里等人去翻 /paper 的话,等于没有认领。
+    """
+    try:
+        with store.get_conn() as conn:
+            unknown, dropped = store.reconcile_inflight(conn)
+            expired = store.expire_stale_pending(conn)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("跟单启动对账失败(不影响监控): {}", e)
+        return
+
+    if dropped:
+        logger.info("跟单对账:{} 单还在排队时进程就退了,判定为未执行", dropped)
+    if expired:
+        logger.info("跟单对账:{} 条待确认信号超过 24 小时,已作废", expired)
+    if not unknown:
+        return
+
+    logger.warning("跟单对账:{} 单在上次退出时正在成交中,结果未知", len(unknown))
+    lines = [f"⚠️ <b>有 {len(unknown)} 单结果未知</b> · 跟单启动对账",
+             "上次退出时它们正在成交中 —— <b>钱可能已经出去了</b>,请到 APP 核对:"]
+    for r in unknown[:10]:
+        sym = html.escape((r["token_symbol"] or "?").lstrip("$"))
+        lines.append(f"· ${sym} ${r['amount_usd']:,.0f} · <code>{html.escape(r['token_address'])}</code>")
+    if len(unknown) > 10:
+        lines.append(f"…还有 {len(unknown) - 10} 单,见 /paper")
+    with suppress(Exception):
+        notifier.send("\n".join(lines))
+
+
 def cmd_run() -> int:
     """
     正式运行:poller 跑在主线程的 BlockingScheduler 上,bot 命令层跑 daemon 线程。
@@ -717,6 +753,7 @@ def cmd_run() -> int:
         logger.exception("client 初始化失败: {}", e)
         return 1
     poller = Poller(client, notifier)
+    _reconcile_copytrade(notifier)
 
     stop_event = threading.Event()
     bot = CommandBot(client, notifier, poller=poller)

@@ -1109,6 +1109,67 @@ def record_copy_signal(conn, *, network_id: str, token_address: str, token_symbo
     return cur.rowcount == 1
 
 
+# 进程一启动,这两个状态就**必然是孤儿** —— 中间态只存在于某个正在跑的进程里,
+# 而那个进程已经没了。区别在于钱有没有可能已经出去。
+_INFLIGHT_SPENT = ("executing", "auto_executing")   # 可能已点成交 → 只能人工核对
+_INFLIGHT_CLEAN = ("auto_queued",)                  # 还没轮到执行 → 确定没花钱
+
+
+def reconcile_inflight(conn) -> tuple[list[sqlite3.Row], int]:
+    """
+    启动对账。返回 (需要人工核对的行, 已判定为未执行的条数)。
+
+    ⚠️ 为什么必须有这一步:关闭时**不等**在途的买入(那可能要一分钟),
+       所以强杀/Ctrl+C 必然留下 auto_executing。不认领的话:
+       ① 没人知道那一单到底成没成;
+       ② 这个币因主键冲突再也不会被跟,而且没有任何迹象。
+
+    ⚠️ auto_executing **绝不能**自动判成 failed:CAS 抢占发生在点击之前,
+       但点击之后到写终态之间也有一段 —— 钱可能已经出去了。
+       只有 auto_queued 是安全的:worker 会先 CAS 成 auto_executing 再执行,
+       所以还停在 auto_queued 就一定没开始跑。
+    """
+    marks = ",".join("?" * len(_INFLIGHT_SPENT))
+    rows = conn.execute(
+        f"SELECT * FROM copytrade_signals WHERE status IN ({marks}) "  # noqa: S608
+        "ORDER BY triggered_at",
+        _INFLIGHT_SPENT,
+    ).fetchall()
+    with tx(conn):
+        for r in rows:
+            conn.execute(
+                "UPDATE copytrade_signals SET status = 'unknown', decided_at = ?, "
+                "note = COALESCE(note, '') || ' | 进程重启时仍在执行中,结果未知' "
+                "WHERE network_id = ? AND token_address = ?",
+                (now_iso(), r["network_id"], r["token_address"]),
+            )
+        cur = conn.execute(
+            "UPDATE copytrade_signals SET status = 'failed', decided_at = ?, "
+            "note = '进程重启时还在排队,未执行' "
+            f"WHERE status IN ({','.join('?' * len(_INFLIGHT_CLEAN))})",  # noqa: S608
+            (now_iso(), *_INFLIGHT_CLEAN),
+        )
+    return list(rows), cur.rowcount
+
+
+def expire_stale_pending(conn, max_age_hours: int = 24) -> int:
+    """
+    把太老的待确认信号作废。返回作废条数。
+
+    ⚠️ TG 里的按钮**不会过期**。三天前那条消息上的 [确认买入] 现在点下去,
+       买的是今天的价、依据的是三天前的判定 —— 而这个信号的全部前提就是"刚刚"。
+       与其指望人记得别点,不如让它点不动。
+    """
+    with tx(conn):
+        cur = conn.execute(
+            "UPDATE copytrade_signals SET status = 'expired', decided_at = ?, "
+            "note = '超过 ' || ? || ' 小时未确认,已作废' "
+            "WHERE status = 'pending' AND triggered_at < ?",
+            (now_iso(), max_age_hours, iso_minutes_ago(max_age_hours * 60)),
+        )
+    return cur.rowcount
+
+
 def copy_ledger(conn, limit: int = 20) -> list[sqlite3.Row]:
     """跟单台账 + 当前市值(算盈亏用)。按触发时间倒序"""
     return conn.execute(

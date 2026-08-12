@@ -1033,6 +1033,71 @@ def test_快照太旧就查不到市值(conn):
     assert store.fresh_snapshot_mcap(conn, "solana", "ca1", max_age_min=60 * 24) == 50_000.0
 
 
+def test_启动对账_在途的不能自动判成失败(conn):
+    """
+    ⚠️ auto_executing 的含义是「抢占之后」—— 而点击就发生在那之后。
+       自动判 failed 等于宣称「没花钱」,而钱可能已经出去了。
+       只能标成 unknown 并让人去核对。
+    """
+    for st in ("auto_executing", "executing"):
+        store.record_copy_signal(
+            conn, network_id="solana", token_address=f"ca_{st}", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status=st)
+
+    rows, dropped = store.reconcile_inflight(conn)
+    assert {r["token_address"] for r in rows} == {"ca_auto_executing", "ca_executing"}
+    assert dropped == 0
+    got = {r["token_address"]: r["status"] for r in
+           conn.execute("SELECT token_address, status FROM copytrade_signals")}
+    assert set(got.values()) == {"unknown"}, f"必须是 unknown 而不是 failed:{got}"
+
+
+def test_启动对账_还在排队的可以判成未执行(conn):
+    """worker 会先 CAS 成 auto_executing 再执行,所以停在 auto_queued 就一定没开始跑"""
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="auto_queued")
+    rows, dropped = store.reconcile_inflight(conn)
+    assert rows == [] and dropped == 1
+    st = conn.execute("SELECT status, note FROM copytrade_signals").fetchone()
+    assert st["status"] == "failed" and "未执行" in st["note"]
+
+
+def test_启动对账_不碰已经终结的行(conn):
+    for st in ("filled", "failed", "paper", "rejected"):
+        store.record_copy_signal(
+            conn, network_id="solana", token_address=f"ca_{st}", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status=st)
+    rows, dropped = store.reconcile_inflight(conn)
+    assert rows == [] and dropped == 0
+    got = {r["token_address"]: r["status"] for r in
+           conn.execute("SELECT token_address, status FROM copytrade_signals")}
+    assert got == {f"ca_{s}": s for s in ("filled", "failed", "paper", "rejected")}
+
+
+def test_太老的待确认信号会作废(conn):
+    """
+    ⚠️ TG 里的按钮不会过期。三天前那条消息上的 [确认买入] 现在点下去,
+       买的是今天的价、依据的是三天前的判定 —— 而这个信号的全部前提是「刚刚」。
+    """
+    from src.models import iso_minutes_ago
+
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="old", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="pending")
+    with store.tx(conn):
+        conn.execute("UPDATE copytrade_signals SET triggered_at = ? WHERE token_address = 'old'",
+                     (iso_minutes_ago(60 * 48),))
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="fresh", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="pending")
+
+    assert store.expire_stale_pending(conn, max_age_hours=24) == 1
+    got = {r["token_address"]: r["status"] for r in
+           conn.execute("SELECT token_address, status FROM copytrade_signals")}
+    assert got == {"old": "expired", "fresh": "pending"}
+
+
 def test_金额上限只数真的会出账的状态(conn):
     """纸上信号不该吃真金额度;失败单也不该占住上限(executor 的 raise 全在点击之前)"""
     for i, (st, amt) in enumerate([("paper", 40.0), ("filled", 40.0),
