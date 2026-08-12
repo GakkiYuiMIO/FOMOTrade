@@ -461,6 +461,39 @@ def test_读到成交才说已成交_否则说待核对(monkeypatch, tmp_path):
 
 
 # ============================================================
+# 浏览器凭据:第二套登录态
+# ============================================================
+def test_profile为空时要指出cdp这条路不写它(monkeypatch, tmp_path):
+    """
+    ⚠️ `--login --cdp` attach 的是用户自己的 Chrome,从不写 PROFILE_DIR,
+       而 README 恰恰把它推荐成「最可靠」。于是"登录成功了"和"能不能下单"
+       悄悄分了岔 —— 提示里必须点名 --cdp,否则用户只会反复重登。
+    """
+    from src import executor as ex
+
+    monkeypatch.setattr(ex, "PROFILE_DIR", tmp_path / "nope")
+    ok, why = ex.profile_looks_present()
+    assert ok is False and "profile 不存在" in why
+
+    # 目录在、但没有 cookie —— 正是 cdp 登录之后的样子
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setattr(ex, "PROFILE_DIR", tmp_path / "empty")
+    ok, why = ex.profile_looks_present()
+    assert ok is False and "--cdp" in why, f"必须点名 --cdp:{why}"
+
+
+def test_profile有cookie时报出新鲜度(monkeypatch, tmp_path):
+    from src import executor as ex
+
+    ck = tmp_path / "p" / "Default" / "Network"
+    ck.mkdir(parents=True)
+    (ck / "Cookies").write_bytes(b"x")
+    monkeypatch.setattr(ex, "PROFILE_DIR", tmp_path / "p")
+    ok, why = ex.profile_looks_present()
+    assert ok is True and "小时前" in why
+
+
+# ============================================================
 # 成交回读:从页面持仓块里解析结果
 # ============================================================
 _POS_TEXT = """661.89 Plumber

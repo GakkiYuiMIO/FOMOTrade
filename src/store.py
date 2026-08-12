@@ -1033,6 +1033,27 @@ def count_recent_buyers(conn, network_id: str, token_address: str,
     return int(row["n"] or 0)
 
 
+# 入场市值允许有多旧。⚠️ 这个值同时是**筛选闸门**和**台账成本**,
+#    而 token_snapshot 只覆盖"名单里还有人持有"的币 —— 清仓后就冻在那儿不动了。
+#    拿一个几小时前的低市值当"现在的价",会让 max_entry_mcap 放行本该拦掉的币,
+#    还会在真实仓位上凭空记出一笔纸面盈利。
+#    实测:snapshot 有 90% 在 1 小时内,所以 60 分钟这道线几乎不损失覆盖率。
+SNAPSHOT_FRESH_MIN = 60
+
+
+def fresh_snapshot_mcap(conn, network_id: str, token_address: str,
+                        max_age_min: int = SNAPSHOT_FRESH_MIN) -> float | None:
+    """够新的快照市值;太旧或没有都返回 None(由调用方决定要不要因此不跟)"""
+    row = conn.execute(
+        """
+        SELECT market_cap FROM token_snapshot
+        WHERE network_id = ? AND token_address = ? AND updated_at >= ?
+        """,
+        (network_id, token_address, iso_minutes_ago(max_age_min)),
+    ).fetchone()
+    return None if row is None else row["market_cap"]
+
+
 def copy_taken_today(conn) -> int:
     """今天(UTC)已经触发了几单 —— 每日**笔数**上限的分子(含纸上跟单)"""
     row = conn.execute(
@@ -1103,14 +1124,31 @@ def copy_ledger(conn, limit: int = 20) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def set_copy_status(conn, network_id: str, token_address: str,
-                    status: str, note: str | None = None) -> bool:
+def set_copy_status(conn, network_id: str, token_address: str, status: str,
+                    note: str | None = None, *, expect: str | tuple[str, ...] | None = None) -> bool:
+    """
+    改一条信号的状态。返回 True 表示**这次真的改到了**。
+
+    expect 给了就是一次 CAS(compare-and-swap):只有当前状态在 expect 里才会改。
+    ⚠️ 抢占语义必须靠它,不能靠"先 SELECT 判断、再 UPDATE" ——
+       那两步不在同一个事务里,而 poller(主线程)和 bot(daemon 线程)是两条独立连接,
+       WAL 挡不住这种读改写竞态。
+    ⚠️ 后果不是"买两次"(浏览器 profile 锁天然互斥),而是**状态互相覆盖**:
+       买入成功写了 filled,另一条路径把它盖成 rejected/failed ——
+       钱花出去了、台账写着"未成交"、TG 还弹个 ❌ 反过来诱导人再点一次。
+    """
+    if expect is None:
+        sql = ("UPDATE copytrade_signals SET status = ?, decided_at = ?, note = ? "
+               "WHERE network_id = ? AND token_address = ?")
+        args: tuple = (status, now_iso(), note, network_id, token_address)
+    else:
+        want = (expect,) if isinstance(expect, str) else tuple(expect)
+        marks = ",".join("?" * len(want))
+        sql = ("UPDATE copytrade_signals SET status = ?, decided_at = ?, note = ? "
+               f"WHERE network_id = ? AND token_address = ? AND status IN ({marks})")  # noqa: S608
+        args = (status, now_iso(), note, network_id, token_address, *want)
     with tx(conn):
-        cur = conn.execute(
-            "UPDATE copytrade_signals SET status = ?, decided_at = ?, note = ? "
-            "WHERE network_id = ? AND token_address = ?",
-            (status, now_iso(), note, network_id, token_address),
-        )
+        cur = conn.execute(sql, args)
     return cur.rowcount == 1
 
 

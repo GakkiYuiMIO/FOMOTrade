@@ -980,6 +980,59 @@ def test_配置里的字符串数字能收回来(conn):
     assert cfg.daily_max == 3
 
 
+def test_状态抢占用CAS而不是先查后改(conn):
+    """
+    ⚠️ poller(主线程)与 bot(daemon 线程)是两条独立连接,「先 SELECT 判断、
+       再 UPDATE」中间没有事务保护。抢不到的一方必须**看得出来自己没抢到**。
+    """
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="pending")
+
+    assert store.set_copy_status(conn, "solana", "ca1", "executing", expect="pending") is True
+    assert store.set_copy_status(conn, "solana", "ca1", "executing", expect="pending") is False, \
+        "第二次抢占必须失败 —— 否则连点两次就是买两次"
+    with conn:
+        st = conn.execute("SELECT status FROM copytrade_signals").fetchone()["status"]
+    assert st == "executing"
+
+
+def test_失败回执不能盖掉已经成交的状态(conn):
+    """钱花出去了、台账写「未成交」、TG 还弹 ❌ 诱导人再点一次 —— 最坏的一种失效"""
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="pending")
+    store.set_copy_status(conn, "solana", "ca1", "executing", expect="pending")
+    store.set_copy_status(conn, "solana", "ca1", "filled", "已成交 $40", expect="executing")
+
+    # 另一条路径的失败回执迟到了
+    assert store.set_copy_status(conn, "solana", "ca1", "failed", "炸了",
+                                 expect="executing") is False
+    st = conn.execute("SELECT status FROM copytrade_signals").fetchone()["status"]
+    assert st == "filled", "已成交的状态不能被迟到的失败回执盖掉"
+
+
+def test_不给expect时保持原来的无条件覆盖语义(conn):
+    """启动对账那类场景需要无条件改 —— 别把老调用点的行为改掉"""
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="X",
+        buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
+    assert store.set_copy_status(conn, "solana", "ca1", "unknown") is True
+
+
+def test_快照太旧就查不到市值(conn):
+    from datetime import UTC, datetime, timedelta
+
+    with store.tx(conn):
+        conn.execute(
+            "INSERT INTO token_snapshot(network_id, token_address, symbol, price_usd,"
+            " market_cap, updated_at) VALUES (?,?,?,?,?,?)",
+            ("solana", "ca1", "X", 1.0, 50_000.0,
+             (datetime.now(UTC) - timedelta(hours=3)).isoformat(timespec="seconds")))
+    assert store.fresh_snapshot_mcap(conn, "solana", "ca1") is None
+    assert store.fresh_snapshot_mcap(conn, "solana", "ca1", max_age_min=60 * 24) == 50_000.0
+
+
 def test_金额上限只数真的会出账的状态(conn):
     """纸上信号不该吃真金额度;失败单也不该占住上限(executor 的 raise 全在点击之前)"""
     for i, (st, amt) in enumerate([("paper", 40.0), ("filled", 40.0),

@@ -599,6 +599,19 @@ def cmd_check() -> int:
         problems.append("未登录:先跑 --login")
         logger.error("❌ 找不到 {},先跑 --login", SESSION_FILE)
 
+    # 浏览器 profile 是**第二套凭据**,与上面那份 API token 完全独立:
+    # 跟单的真实下单只认它,而全项目没有任何代码会自动续期它。
+    # ⚠️ 只做不开浏览器的粗查 —— --check 要能在几秒内跑完。
+    #    真要确认还登录着,跟单开自动之前会跑 executor.check_login()。
+    from src.executor import profile_looks_present
+
+    ok, why = profile_looks_present()
+    if ok:
+        logger.info("✅ 买入用的浏览器 profile:{}", why)
+    else:
+        # 不进 problems:没打算用跟单的人不该因为这个看到"自检未通过"
+        logger.warning("⚠️ 买入用的浏览器 profile:{}(只影响跟单下单,不影响监控)", why)
+
     # --- 3/4 DB ---
     logger.info("--- 3/4 数据库 ---")
     try:

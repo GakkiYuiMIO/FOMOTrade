@@ -1547,6 +1547,14 @@ class Poller:
         if not keys:
             return
 
+        # 本轮买入事件自带的成交市值 —— 这是**最新鲜**的入场价来源。
+        # ⚠️ 它就是"名单里那个人刚刚是在什么价位买的",比 balances 快照更贴近
+        #    我们跟进去时的实际价位。实测覆盖率 84%,高于任何其他来源。
+        ev_mcap: dict[tuple, float] = {}
+        for e in new_events:
+            if e.event_type == EVENT_BUY and e.token_key and e.market_cap is not None:
+                ev_mcap[e.token_key] = e.market_cap   # 同一轮多笔时取最后一笔
+
         since = iso_minutes_ago(cfg.window_hours * 60)
         # ⚠️ 两个上限的分子。查一次、循环内自增 —— 每个币都重查一遍库不但浪费,
         #    也挡不住同一轮内的累计(record 是逐个提交的,重查反而看起来"对")。
@@ -1557,12 +1565,13 @@ class Poller:
             #    没有这道 try,一个币出事会掀掉**本轮剩下所有币**的判定,
             #    而外层那句"跟单信号判定失败(不影响推送)"会把它伪装成无害。
             try:
-                self._copy_one(conn, net, ca, cfg, since, used, dry_run=dry_run)
+                self._copy_one(conn, net, ca, cfg, since, used,
+                               ev_mcap.get((net, ca)), dry_run=dry_run)
             except Exception as e:  # noqa: BLE001
                 logger.exception("跟单单币处理失败,跳过这个币继续 | {} {} | {}", net, ca[:10], e)
 
     def _copy_one(self, conn, net: str, ca: str, cfg, since: str,
-                  used: dict, *, dry_run: bool) -> None:
+                  used: dict, event_mcap: float | None, *, dry_run: bool) -> None:
         """
         判定并记账**一个**币。异常由调用方按币兜底,见 _check_copytrade。
 
@@ -1570,16 +1579,25 @@ class Poller:
         ⚠️ 不自增的话,一个 tick 里命中 15 个币会 15 单全过,当日上限形同虚设。
         """
         meta = self._token_meta.get((net, ca)) or {}
-        snap = conn.execute(
-            "SELECT market_cap FROM token_snapshot WHERE network_id = ? AND token_address = ?",
-            (net, ca),
-        ).fetchone()
+        # 入场市值按**新鲜度**取,不是按哪张表方便:
+        #   1) 本轮买入事件自带的成交市值 —— 名单里那个人刚刚就是在这个价位买的
+        #   2) 本轮 balances 的快照
+        #   3) 够新的 token_snapshot(≤60min)
+        # ⚠️ 原来的写法是 token_snapshot **优先**,正好反了。而 token_snapshot
+        #    只覆盖"名单里还有人持有"的币,清仓后就冻住不动 —— 拿几小时前的低市值
+        #    当"现在的价",会让 max_entry_mcap 放行本该拦掉的币,
+        #    还会在真实仓位上凭空记出一笔纸面盈利。
+        entry_mcap = event_mcap
+        if entry_mcap is None:
+            entry_mcap = meta.get("market_cap")
+        if entry_mcap is None:
+            entry_mcap = store.fresh_snapshot_mcap(conn, net, ca)
         cand = Candidate(
             network_id=net,
             token_address=ca,
             token_symbol=meta.get("symbol"),
             buyers=store.count_recent_buyers(conn, net, ca, since, cfg.starred_only),
-            entry_mcap=(snap["market_cap"] if snap else None) or meta.get("market_cap"),
+            entry_mcap=entry_mcap,
             token_created_at=meta.get("created_at"),
             already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下
             taken_today=used["n"],

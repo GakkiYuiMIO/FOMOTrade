@@ -562,4 +562,15 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
 
     save_session(access, refresh, source=source)
     get_token_provider.cache_clear()  # 同进程内后续调用要拿到新会话
+
+    # ⚠️ cdp 模式 attach 的是**用户自己的 Chrome**,PROFILE_DIR 从头到尾没被写过
+    #    (见 _open_login_context 的 cdp 分支:它在 PROFILE_DIR.mkdir 之前就 return 了)。
+    #    监控照常能跑(那只要 API token),但跟单的真实下单只认 PROFILE_DIR ——
+    #    于是"登录成功了"和"能不能下单"在这里悄悄分了岔。必须说出来。
+    if cdp_url and not (PROFILE_DIR / "Default" / "Network" / "Cookies").exists():
+        logger.warning(
+            "⚠️ 你走的是 --cdp,它只借用你自己的 Chrome,**没有写 {} **。"
+            "监控不受影响;但跟单的真实下单用的是那个 profile,现在还是空的。"
+            "要用跟单下单的话,请再跑一次**不带 --cdp** 的 --login。", PROFILE_DIR,
+        )
     return True

@@ -338,14 +338,23 @@ class CommandBot:
                 return f"已经处理过了({row['status']})", None
 
             sym = (row["token_symbol"] or "?").lstrip("$")
+            # ⚠️ 抢占必须用 CAS(expect="pending"),不能靠上面那个 SELECT ——
+            #    读和写不在同一个事务里,而 poller(主线程)与 bot(daemon 线程)是
+            #    两条独立连接。上面那句 `status != pending` 只挡得住慢速的连点,
+            #    挡不住真正的竞态;WAL 也不提供跨连接的读改写互斥。
+            #    抢到的那一方才有权执行,没抢到的直接退出。
             if action == "skip":
-                store.set_copy_status(conn, row["network_id"], row["token_address"], "rejected")
+                if not store.set_copy_status(conn, row["network_id"], row["token_address"],
+                                             "rejected", expect="pending"):
+                    return "已经处理过了", None
                 return f"已忽略 ${sym}", f"🚫 <b>已忽略</b> · ${_esc(sym)}"
 
             cfg = store.load_copy_config(conn)
-            # ⚠️ **先抢占状态再执行**:executing 是个中间态,连点第二次会被上面
-            #    `status != pending` 挡住。先执行后改状态的话,连点两次就是买两次。
-            store.set_copy_status(conn, row["network_id"], row["token_address"], "executing")
+            # ⚠️ **先抢占状态再执行**:executing 是个中间态,抢不到就说明别人已经在跑了。
+            #    先执行后改状态的话,连点两次就是买两次。
+            if not store.set_copy_status(conn, row["network_id"], row["token_address"],
+                                         "executing", expect="pending"):
+                return "已经处理过了", None
 
         net, ca = row["network_id"], row["token_address"]
         try:
@@ -354,8 +363,10 @@ class CommandBot:
                               screenshot_dir=str(PROBE_DIR))
         except Exception as e:  # noqa: BLE001
             logger.exception("买入执行失败 | {} {}", sym, ca[:10])
+            # ⚠️ 只覆盖自己抢到的那个 executing。不加 expect 的话,这条失败
+            #    能把另一条路径写好的 filled 盖掉 —— 钱花了、台账写"未成交"。
             with store.get_conn() as conn:
-                store.set_copy_status(conn, net, ca, "failed", str(e)[:200])
+                store.set_copy_status(conn, net, ca, "failed", str(e)[:200], expect="executing")
             return (f"没有成交:{e}"[:180],
                     f"❌ <b>未成交</b> · ${_esc(sym)}\n{_esc(str(e)[:300])}\n"
                     f"<code>{_esc(ca)}</code>")
@@ -364,7 +375,7 @@ class CommandBot:
         with store.get_conn() as conn:
             store.set_copy_status(conn, net, ca,
                                   "rejected" if cfg.dry_run_execute else "filled",
-                                  res.message[:200])
+                                  res.message[:200], expect="executing")
         if cfg.dry_run_execute:
             return ("演练通过(未真实成交)",
                     f"🧪 <b>演练通过 · 未成交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"

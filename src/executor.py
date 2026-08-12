@@ -135,6 +135,17 @@ def buy(network_id: str, token_address: str, token_symbol: str | None,
 
     from playwright.sync_api import sync_playwright
 
+    with sync_playwright() as p:
+        ctx = _launch(p)
+        try:
+            return _do_buy(ctx, url, sym, amount_usd, token_address,
+                           dry_run=dry_run, screenshot_dir=screenshot_dir)
+        finally:
+            ctx.close()
+
+
+def _launch(p):
+    """按 PROFILE_DIR 起一个有头浏览器。⚠️ 起不来一律抛 ExecutorError = 没有成交"""
     from src.auth import _DROP_DEFAULT_ARGS, _LOGIN_CHANNELS, _STEALTH_ARGS
 
     settings = get_settings()
@@ -148,26 +159,73 @@ def buy(network_id: str, token_address: str, token_symbol: str | None,
     if settings.fomo_proxy:
         base["proxy"] = {"server": settings.fomo_proxy}
 
-    with sync_playwright() as p:
-        ctx = None
-        for ch in _LOGIN_CHANNELS:
-            try:
-                kw = dict(base)
-                if ch:
-                    kw["channel"] = ch
-                ctx = p.chromium.launch_persistent_context(**kw)
-                break
-            except Exception as e:  # noqa: BLE001
-                last = e
-        if ctx is None:
-            # ⚠️ 最常见的原因是**这个 profile 已经被另一个浏览器占用**
-            #    (比如你自己开着 --login 那个窗口)。说清楚,别让人去查代理和网络。
-            raise ExecutorError(
-                f"浏览器起不来(profile 可能正被另一个窗口占用,关掉再试): {last}"
-            ) from last
+    last: Exception | None = None
+    for ch in _LOGIN_CHANNELS:
         try:
-            return _do_buy(ctx, url, sym, amount_usd, token_address,
-                           dry_run=dry_run, screenshot_dir=screenshot_dir)
+            kw = dict(base)
+            if ch:
+                kw["channel"] = ch
+            return p.chromium.launch_persistent_context(**kw)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    # ⚠️ 最常见的原因是**这个 profile 已经被另一个浏览器占用**
+    #    (比如你自己开着 --login 那个窗口)。说清楚,别让人去查代理和网络。
+    raise ExecutorError(
+        f"浏览器起不来(profile 可能正被另一个窗口占用,关掉再试): {last}"
+    ) from last
+
+
+def profile_looks_present() -> tuple[bool, str]:
+    """
+    **不开浏览器**的粗查:PROFILE_DIR 里到底有没有东西。
+
+    ⚠️ 只用来快速否定,不能用来肯定 —— cookie 文件在、内容过期是常态。
+       要确认真的还登录着必须 check_login()(那个会开浏览器,十几秒)。
+    ⚠️ 存在的理由是 `--login --cdp` 这条路:它 attach 到你自己的 Chrome,
+       **从头到尾不写 PROFILE_DIR**(见 auth._open_login_context 的 cdp 分支)。
+       而 README 恰恰把 --cdp 推荐成"最可靠" —— 于是登录看起来成功了,
+       买入执行器却拿到一个空 profile。无人值守下这会静默失败好几天。
+    """
+    if not PROFILE_DIR.exists():
+        return False, f"浏览器 profile 不存在({PROFILE_DIR})"
+    cookies = PROFILE_DIR / "Default" / "Network" / "Cookies"
+    if not cookies.exists():
+        return False, ("浏览器 profile 里没有 cookie —— "
+                       "如果你是用 `--login --cdp` 登录的,那条路**不写这个目录**,"
+                       "买入执行器用不了。请再跑一次不带 --cdp 的 `--login`")
+    import time as _t
+
+    age_h = (_t.time() - cookies.stat().st_mtime) / 3600
+    return True, f"profile 存在,cookie 最后更新于 {age_h:.1f} 小时前"
+
+
+def check_login(timeout_ms: int = 45_000) -> tuple[bool, str]:
+    """
+    真开一次浏览器,确认 fomo.family 还认这个 profile。返回 (是否登录着, 说明)。
+
+    ⚠️ 这是**第二套凭据**,和 data/fomo_session.json 那套 API token 完全独立,
+       而且全项目没有任何代码会自动续期它。API 那侧失效有 TG 告警 + 停机,
+       浏览器这侧原本一点提示都没有 —— 无人值守时会静默失血好几天。
+    """
+    ok, why = profile_looks_present()
+    if not ok:
+        return False, why
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        ctx = _launch(p)
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.set_default_timeout(timeout_ms)
+            page.goto("https://fomo.family/", wait_until="domcontentloaded")
+            page.wait_for_timeout(_RENDER_MS)
+            if page.locator("text=/Sign in|Log in/i").count() > 0:
+                return False, "浏览器登录态已失效,跑一次 `.\\bot.ps1 --login`(别带 --cdp)"
+            return True, "浏览器登录态正常"
+        except Exception as e:  # noqa: BLE001
+            # ⚠️ 查不出来 ≠ 没登录。报成"未登录"会让人白跑一趟登录流程
+            return False, f"登录态查不出来(网络/代理?): {e}"
         finally:
             ctx.close()
 

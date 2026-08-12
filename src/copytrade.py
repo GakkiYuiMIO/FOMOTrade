@@ -169,11 +169,15 @@ def decide(c: Candidate, cfg: CopyConfig, now: float | None = None) -> Decision:
     elif c.token_created_at is not None:
         age = int(now - c.token_created_at)
 
-    if cfg.max_entry_mcap is not None:
-        if c.entry_mcap is None:
-            return Decision(False, SKIP_NO_MCAP, age)
-        if c.entry_mcap > cfg.max_entry_mcap:
-            return Decision(False, SKIP_MCAP, age)
+    # ⚠️ 入场市值**无条件必需**,不是只有配了上限才检查。
+    #    它同时是筛选闸门和台账成本:拿不到就意味着"不知道在什么价位建的仓" ——
+    #    /paper 算不出盈亏,max_entry_mcap 也形同虚设。
+    #    与"拿不到币龄就不跟"是同一条原则:宁可漏一单,不可蒙着眼建仓。
+    #    (实测缺失率约 2%:本轮 balances 覆盖 84%,够新的快照再补上大半。)
+    if c.entry_mcap is None:
+        return Decision(False, SKIP_NO_MCAP, age)
+    if cfg.max_entry_mcap is not None and c.entry_mcap > cfg.max_entry_mcap:
+        return Decision(False, SKIP_MCAP, age)
 
     # ⚠️ 当日上限放在**最后**:它是"今天不跟了"而不是"这个币不合格"。
     #    放前面的话,达到上限之后所有币的原因都变成"已达当日上限",

@@ -567,6 +567,64 @@ def test_一轮内命中多个币不会捅穿当日金额上限(db):
     assert len(_signals()) == 2, "$40 一单,$100 上限 → 只能下 2 单"
 
 
+def test_入场市值取事件里的成交价(db):
+    """
+    ⚠️ 名单里那个人**刚刚**就是在这个价位买的 —— 这是最贴近我们跟进去时
+       实际价位的数。原实现优先读 token_snapshot,而那张表清仓后就冻住了。
+    """
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(0.01)
+    # 快照里塞一个明显不同的旧值,证明取的不是它
+    with store.get_conn() as c:
+        store.upsert_token_snapshots(c, [("solana", CA_TOAD, "TOAD", 1.0, 999_999_999)])
+
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_swap("s1")], transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    with store.get_conn() as c:
+        got = c.execute("SELECT entry_mcap FROM copytrade_signals").fetchone()["entry_mcap"]
+    assert got == 19_140_000, f"应取事件里的成交市值,实得 {got}"
+
+
+def test_快照太旧就不拿来当入场价(db):
+    """拿几小时前的低市值当「现在的价」,会让市值上限放行本该拦掉的币"""
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(0.01)
+    with store.get_conn() as c, store.tx(c):
+        # 一条 3 小时前的快照 —— 超过 SNAPSHOT_FRESH_MIN
+        c.execute(
+            "INSERT INTO token_snapshot(network_id, token_address, symbol, price_usd,"
+            " market_cap, updated_at) VALUES (?,?,?,?,?,?)",
+            ("solana", CA_TOAD, "TOAD", 1.0, 50_000.0,
+             (datetime.now(UTC) - timedelta(hours=3)).isoformat(timespec="seconds")))
+
+    swap = _swap("s1")
+    del swap["marketCap"]           # 事件里也没有 → 只剩那条旧快照
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[swap], transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    assert _signals() == [], "只有过期快照时应当不跟,而不是拿旧价建仓"
+
+
+def test_拿不到入场市值就不跟(db):
+    """与「拿不到币龄就不跟」同一条原则:宁可漏一单,不可蒙着眼建仓"""
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(0.01)
+
+    swap = _swap("s1")
+    del swap["marketCap"]
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[swap], transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    assert _signals() == []
+
+
 def test_单个币处理失败不影响本轮其余币(db, monkeypatch):
     """
     ⚠️ 循环体里马上要接真实下单,而执行器有十几处 raise。没有 per-token 兜底的话,
