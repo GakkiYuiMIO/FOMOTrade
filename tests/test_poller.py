@@ -840,159 +840,6 @@ def test_推送间隔配成0时不等待(db):
     assert time.monotonic() - t0 < 0.2
 
 
-# ============================================================
-# 活动流(/feed/tradingActivity)当变更检测器
-# ⚠️ 这条路省掉的是"每轮 69 次 swaps"。它一旦静默失效,
-#    表现是"监控还在跑但再也不报新交易" —— 比直接报错难查得多。
-# ============================================================
-def _feed_swap(fid: str, uid: str, ca: str = CA_TOAD) -> dict:
-    return {"type": "swap_buy", "id": fid, "userId": uid, "createdAt": "2026-08-11T15:00:00.000Z",
-            "tokenAddress": ca, "networkId": 1399811149, "ticker": "TOAD", "usdAmount": 100.0}
-
-
-def _feed_thesis(fid: str, uid: str, text: str = "看好这个", ca: str = CA_TOAD) -> dict:
-    return {"type": "thesis", "id": fid, "userId": uid, "createdAt": "2026-08-11T15:00:00.000Z",
-            "comment": {"comment": text, "tokenAddress": ca, "networkId": 1399811149},
-            "authorTrade": {"usdValue": 500.0}}
-
-
-def test_活动流命中时不再全员拉swaps(db):
-    """这一步是整轮提速的大头:69 次 swaps(3~5s)压成 1 次活动流(0.35s)"""
-    for i in range(30):
-        _add_ready(f"u{i:02d}", f"h{i:02d}")
-    client = CountingClient({f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)})
-    p = Poller(client, FakeNotifier())
-    p.tick()                                     # 冷启动:全员扫一遍建基准
-    assert len(client.calls["swaps"]) == 30
-
-    client.calls = {"swaps": [], "balances": [], "trades": []}
-    client.feed = [_feed_swap("f1", "u07")]      # 只有 u07 有动作
-    p.tick()
-    asked = set(client.calls["swaps"])
-    assert "u07" in asked, "活动流点名的人必须拉"
-    assert len(asked) < 30, "其余人不该再全员拉一遍"
-    assert client.feed_calls >= 2
-
-
-def test_活动流失败必须退回全员扫描(db):
-    """
-    ⚠️ "流挂了"与"没人有动作"绝不能是同一个返回值 ——
-       混在一起的表现就是监控静悄悄地停止工作,日志上还一切正常。
-    """
-    for i in range(5):
-        _add_ready(f"u{i}", f"h{i}")
-    client = CountingClient({f"u{i}": _snap(f"u{i}") for i in range(5)})
-    p = Poller(client, FakeNotifier())
-    p.tick()
-
-    client.calls = {"swaps": [], "balances": [], "trades": []}
-    client.feed_boom = RuntimeError("活动流 503")
-    p.tick()
-    # ⚠️ 不是"全员扫"而是"扩大轮转":活动流持续失败的头号原因就是被限流,
-    #    这时把请求量翻几倍只会越滚越大。两轮之内覆盖全名单即可。
-    swept = set(client.calls["swaps"])
-    p.tick()
-    swept |= set(client.calls["swaps"])
-    assert swept == {f"u{i}" for i in range(5)}, "两轮之内必须覆盖到每个人"
-
-
-def test_活动流登录态失效必须上抛(db):
-    from src.auth import AuthError
-
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")}, feed_boom=AuthError("token 过期"))
-    with pytest.raises(AuthError):
-        Poller(client, FakeNotifier()).tick()
-
-
-def test_兜底轮转能捞到活动流看不见的人(db):
-    """
-    活动流只覆盖"当前登录账号关注的人"。名单里没关注的人永远不出现在流里,
-    只能靠兜底轮转扫描捞回来 —— 这不是优化项,是正确性要求。
-    """
-    for i in range(30):
-        _add_ready(f"u{i:02d}", f"h{i:02d}")
-    client = CountingClient({f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)})
-    p = Poller(client, FakeNotifier())
-    p.tick()
-
-    swept: set[str] = set()
-    for _ in range(10):                          # 30 人 / 每轮 12 个 → 几轮内必须全覆盖
-        client.calls["swaps"] = []
-        p.tick()
-        swept |= set(client.calls["swaps"])
-    assert swept == {f"u{i:02d}" for i in range(30)}, f"漏扫: {30 - len(swept)} 人"
-
-
-def test_活动流里的观点不额外调用就能成事件(db):
-    """观点从"轮转扫币最坏 4 分钟才轮到"变成"下一轮就推",且不多打一个请求"""
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")})
-    notifier = FakeNotifier()
-    p = Poller(client, notifier)
-    p.tick()
-
-    client.feed = [_feed_thesis("th-1", "uA", "这个币要起飞")]
-    p.tick()
-    assert any("这个币要起飞" in m for m in notifier.sent), \
-        f"活动流里的观点必须直接成事件,实际发出:{notifier.sent}"
-
-
-def test_同一条观点两条路都抓到也只推一次(db):
-    """活动流与按币扫描会重叠。两边都用原生 id 生成 event_id,靠主键去重"""
-    _add_ready("uA", "alice")
-    raw = _feed_thesis("th-dup", "uA", "重复的观点")
-    client = CountingClient({"uA": _snap("uA")}, feed=[raw])
-    notifier = FakeNotifier()
-    p = Poller(client, notifier)
-    p.tick()
-    n_first = len(notifier.sent)
-
-    # 第二轮:同一条既在活动流里、又被按币扫描捞到
-    p._token_meta = {("solana", CA_TOAD): {"network_raw": 1399811149}}
-    client.get_token_thesis = lambda ca, net, after_ms=None, limit=100: [raw]
-    p.tick()
-    assert len(notifier.sent) == n_first, "同一条观点绝不能推两遍"
-
-
-def test_活动流里已见过的条目不再重复触发(db):
-    """流是滚动窗口,同一条会在里面待很久。不记 id 的话每轮都当成新动作,提速全白做"""
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")}, feed=[_feed_swap("f1", "uA")])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    p.tick()                                     # 让记忆稳定下来
-
-    client.calls["trades"] = []
-    p.tick()                                     # 流里还是那条 f1
-    assert client.calls["trades"] == [], "旧条目不该再被当成新动作"
-
-
-def test_活动流记忆不会无界增长(db):
-    """滚动窗口里滚出去的 id 必须一起忘掉,否则跑几天就是一个只增不减的集合"""
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")}, feed=[_feed_swap(f"f{i}", "uA") for i in range(50)])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    p.tick()
-    assert len(p._feed_seen) == 50
-
-    client.feed = [_feed_swap("f99", "uA")]      # 窗口整个滚过去了
-    p.tick()
-    assert p._feed_seen == {"f99"}
-
-
-def test_活动流里名单外的人一律忽略(db):
-    """流里理论上只有关注的人,但绝不能因此就不过滤 —— 多一层不值钱,少一层会推错人"""
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")}, feed=[_feed_swap("f1", "stranger")])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    client.calls = {"swaps": [], "balances": [], "trades": []}
-    p.tick()
-    assert "stranger" not in client.calls["swaps"]
-    assert "stranger" not in client.calls["trades"]
-
 
 def test_同一轮不会把同一个人的balances拉两遍(db):
     """
@@ -1022,17 +869,17 @@ def test_有新交易的人下一轮必须重拉balances(db):
     """
     for i in range(30):
         _add_ready(f"u{i:02d}", f"h{i:02d}")
-    client = CountingClient({f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)})
+    snaps = {f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)}
+    client = CountingClient(snaps)
     p = Poller(client, FakeNotifier())
     p.tick()                                          # 冷启动
 
-    client.feed = [_feed_swap("f1", "u07")]           # u07 买入
+    snaps["u07"] = _snap("u07", swaps=[_swap("new-1")])   # u07 买入
     p.tick()
     assert "u07" in p._bal_dirty, "有新动作的人必须被挂上脏标记"
 
-    client.feed = []                                  # 下一轮他已经不 hot 了
     client.calls["balances"] = []
-    p.tick()
+    p.tick()                                          # 这一轮他已经不 hot 了
     assert "u07" in client.calls["balances"], \
         "上一轮有交易的人,这一轮必须重拉一次 balances,否则错误持仓会被冻结一整圈"
 
@@ -1138,115 +985,6 @@ def test_冷启动不把全员挂成脏(db):
         f"第二轮不该重拉全员 balances,实际 {len(client.calls['balances'])} 次"
 
 
-# ============================================================
-# 活动流照不到的人(自己 + 没关注的人)
-# ⚠️ 这是用户实测「下单到推送 30s+」「观点等了 4 分钟」的根因:
-#    活动流是"我关注的人"的流,而人不关注自己 —— 自己的动作永远不在里面。
-# ============================================================
-def test_自己的交易必须每轮直拉而不是等兜底轮转(db):
-    """
-    实测:自己在 100 条活动流里出现 0 次。只靠兜底轮转的话
-    70 人 / 每轮 12 个 = 6 轮 × 12s = 最坏 72s、平均 36s —— 正是用户量到的 30s+。
-    """
-    for i in range(30):
-        _add_ready(f"u{i:02d}", f"h{i:02d}")
-    _add_ready("SELF", "myself")
-    snaps = {f"u{i:02d}": _snap(f"u{i:02d}") for i in range(30)}
-    snaps["SELF"] = _snap("SELF")
-    # 关注了所有人,**除了自己** —— 这就是线上的真实形态
-    client = CountingClient(snaps, me="SELF", following=[f"u{i:02d}" for i in range(30)])
-    p = Poller(client, FakeNotifier())
-    p.tick()                                       # 冷启动:全员
-
-    assert "SELF" in p._feed_blind, "自己必须被认成'活动流看不见'"
-    for _ in range(3):                             # 连续几轮都必须直拉,不能靠轮转碰运气
-        client.calls["swaps"] = []
-        p.tick()
-        assert "SELF" in client.calls["swaps"], "自己必须每轮都拉"
-
-
-def test_没关注的人也每轮直拉(db):
-    """/add 进来但账号没关注的人,处境与自己完全一样"""
-    for i in range(20):
-        _add_ready(f"u{i:02d}", f"h{i:02d}")
-    snaps = {f"u{i:02d}": _snap(f"u{i:02d}") for i in range(20)}
-    # 只关注前 10 个
-    client = CountingClient(snaps, me="ME", following=[f"u{i:02d}" for i in range(10)])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    assert p._feed_blind == {f"u{i:02d}" for i in range(10, 20)}
-
-    client.calls["swaps"] = []
-    p.tick()
-    for i in range(10, 20):
-        assert f"u{i:02d}" in client.calls["swaps"]
-
-
-def test_拿不到关注列表就退回全员每轮拉(db):
-    """
-    ⚠️ 宁可慢(每轮全拉)也不能漏。返回空集会让所有人都被当成"活动流看得见",
-       而活动流恰恰可能一条都不覆盖他们 —— 那就是静默漏推。
-    """
-    for i in range(10):
-        _add_ready(f"u{i}", f"h{i}")
-    snaps = {f"u{i}": _snap(f"u{i}") for i in range(10)}
-    client = CountingClient(snaps, following_boom=RuntimeError("关注列表 500"))
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    assert p._feed_blind == set(snaps) or len(p._feed_blind) == 10
-
-    client.calls["swaps"] = []
-    p.tick()
-    assert set(client.calls["swaps"]) == set(snaps), "拿不到关注关系时必须全员每轮拉"
-
-
-def test_关注列表带缓存不是每轮都查(db):
-    """关注关系不常变;每轮查一次 = 每轮多两个请求,白白吃掉刚省下来的时间"""
-    _add_ready("uA", "alice")
-    client = CountingClient({"uA": _snap("uA")}, following=["uA"])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    p.tick()
-    p.tick()
-    assert client.following_calls == 1, f"应当只查一次,实际 {client.following_calls} 次"
-
-
-def test_看不见的人刚买的币下一轮优先扫观点(db):
-    """
-    观点几乎总是发在刚买的币上(实测:10:05 买入、10:05 发观点)。
-    这些人的观点不在活动流里,只能按币查;而轮转一圈约 400 个币 / 每轮 12 个 ≈ 6 分钟
-    —— 用户等了 4 分钟才收到,观感就是"没监控到"。
-    """
-    _add_ready("SELF", "myself")
-    snaps = {"SELF": _snap("SELF", swaps=[_swap("s1")])}
-    client = CountingClient(snaps, me="SELF", following=[])
-    p = Poller(client, FakeNotifier())
-    p.tick()
-    assert "SELF" in p._feed_blind
-
-    key = ("solana", CA_TOAD)
-    assert key in p._thesis_priority, "刚买的币必须进优先名额"
-
-    # 造一批"别的币"塞满轮转池,验证优先名额确实能插队
-    p._token_meta = {key: {"network_raw": 1399811149}}
-    for i in range(200):
-        p._token_meta[("solana", f"OTHER{i:03d}")] = {"network_raw": 1399811149}
-    batch = p._pick_thesis_batch()
-    assert any(b[0] == "solana" and b[1] == CA_TOAD for b in batch), \
-        "刚买的币必须出现在本轮扫描批次里,而不是等轮转慢慢转到"
-
-
-def test_优先名额不会撑大每轮扫描总量(db):
-    """插队可以,但不能把每轮的调用量顶上去 —— 峰值并发是有上限的"""
-    from src.poller import _THESIS_TOKENS_PER_TICK
-
-    _add_ready("uA", "alice")
-    p = Poller(CountingClient({"uA": _snap("uA")}), FakeNotifier())
-    p._token_meta = {("solana", f"CA{i:03d}"): {"network_raw": 1399811149} for i in range(100)}
-    deadline = time.monotonic() + 600
-    for i in range(50):                            # 优先名额远超保留数
-        p._thesis_priority[("solana", f"CA{i:03d}")] = deadline
-    assert len(p._pick_thesis_batch()) <= _THESIS_TOKENS_PER_TICK
 
 
 def test_冷启动不给全员补拉trades(db):
@@ -1266,3 +1004,129 @@ def test_冷启动不给全员补拉trades(db):
     assert len(client.calls["balances"]) == 20, "冷启动要把持仓缓存填满"
     assert len(client.calls["trades"]) <= 1, \
         f"冷启动不该给全员补 trades,实际 {len(client.calls['trades'])} 次"
+
+
+# ============================================================
+# 全员每轮拉 swaps —— 用户实测「下单到推送 30s+」之后的定论
+# ⚠️ 曾经用 /feed/tradingActivity 当"谁动了"的探针来省掉这一步。得不偿失,已回退:
+#      · 只省 1~2s(实测全员 swaps 70 人 12 线程 1.2~3.6s)
+#      · 却换来那个端点独立且严格的限流(每 10s 一次跑两分钟就持续 429)
+#      · 而且它只覆盖"当前账号关注的人" —— 自己永远不在流里(实测 100 条中 0 条),
+#        自己的交易只能靠兜底轮转,延迟 30~70s,正是用户量到的那个数
+#    这一节钉死"没有例外、没有轮转、没有盲区"。
+# ============================================================
+def _feed_thesis_item(fid: str, uid: str, text: str = "看好这个", ca: str = CA_TOAD) -> dict:
+    return {"type": "thesis", "id": fid, "userId": uid, "createdAt": "2026-08-11T15:00:00.000Z",
+            "comment": {"comment": text, "tokenAddress": ca, "networkId": 1399811149},
+            "authorTrade": {"usdValue": 500.0}}
+
+
+def test_每轮都拉全员swaps没有例外(db):
+    """谁都不许被"优化"掉 —— 包括自己、包括这一刻看起来没动静的人"""
+    for i in range(30):
+        _add_ready(f"u{i:02d}", f"h{i:02d}")
+    everyone = {f"u{i:02d}" for i in range(30)}
+    client = CountingClient({u: _snap(u) for u in everyone})
+    p = Poller(client, FakeNotifier())
+    for _ in range(3):
+        client.calls["swaps"] = []
+        p.tick()
+        assert set(client.calls["swaps"]) == everyone, \
+            f"少拉了 {sorted(everyone - set(client.calls['swaps']))}"
+
+
+def test_活动流是低频补充不是每轮都调(db):
+    """
+    ⚠️ /feed/tradingActivity 的限流和 /v2/users/* 完全不是一个量级:
+       每 10s 调一次跑两分钟就开始持续 429(retry-after: 0,重试也没用)。
+       它现在只负责捞"发在老仓位上的观点",必须降频。
+    """
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA")})
+    p = Poller(client, FakeNotifier())
+    for _ in range(6):
+        p.tick()
+    assert client.feed_calls == 1, f"6 轮里只该调一次活动流,实际 {client.feed_calls} 次"
+
+
+def test_活动流挂了不影响买卖推送(db):
+    """买卖判定完全不依赖活动流 —— 它挂了只是少捞一批观点,不该有任何告警或降级"""
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA", swaps=[_swap("s1")])},
+                            feed_boom=RuntimeError("活动流 429"))
+    notifier = FakeNotifier()
+    n = Poller(client, notifier).tick()
+    assert n == 1 and len(notifier.sent) == 1
+    assert set(client.calls["swaps"]) == {"uA"}
+
+
+def test_活动流登录态失效仍然上抛(db):
+    """限流可以吞,登录态不行 —— 吞掉就是一个看起来健康的、死掉的监控"""
+    from src.auth import AuthError
+
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA")}, feed_boom=AuthError("token 过期"))
+    with pytest.raises(AuthError):
+        Poller(client, FakeNotifier()).tick()
+
+
+def test_活动流捡到的观点能直接成事件(db):
+    """流里的观点条目与 /feed/token/thesis 同形,normalize_thesis 直接吃得下"""
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA")},
+                            feed=[_feed_thesis_item("th-1", "uA", "这个币要起飞")])
+    notifier = FakeNotifier()
+    Poller(client, notifier).tick()
+    assert any("这个币要起飞" in m for m in notifier.sent), f"实际发出:{notifier.sent}"
+
+
+def test_同一条观点两条路都抓到也只推一次(db):
+    """活动流与按币扫描会重叠。两边都用原生 id 生成 event_id,靠主键去重"""
+    _add_ready("uA", "alice")
+    raw = _feed_thesis_item("th-dup", "uA", "重复的观点")
+    client = CountingClient({"uA": _snap("uA")}, feed=[raw])
+    notifier = FakeNotifier()
+    p = Poller(client, notifier)
+    p.tick()
+    n_first = len(notifier.sent)
+
+    p._token_meta = {("solana", CA_TOAD): {"network_raw": 1399811149}}
+    client.get_token_thesis = lambda ca, net, after_ms=None, limit=100: [raw]
+    p.tick()
+    assert len(notifier.sent) == n_first, "同一条观点绝不能推两遍"
+
+
+def test_刚买的币下一轮优先扫观点(db):
+    """
+    ⚠️ 观点几乎总是发在刚买的币上(实测:用户 10:05 买入、10:05 发观点)。
+       按币轮转一圈约 400 个币 / 每轮 12 个 ≈ 6 分钟 —— 用户 10:09 才收到,
+       观感就是"观点没被监控到"。优先名额就是为这个场景留的。
+    """
+    _add_ready("uA", "alice")
+    client = CountingClient({"uA": _snap("uA", swaps=[_swap("s1")])})
+    p = Poller(client, FakeNotifier())
+    p.tick()
+
+    key = ("solana", CA_TOAD)
+    assert key in p._thesis_priority, "刚买的币必须进优先名额"
+
+    # 塞满轮转池,验证优先名额确实能插队
+    p._token_meta = {key: {"network_raw": 1399811149}}
+    for i in range(200):
+        p._token_meta[("solana", f"OTHER{i:03d}")] = {"network_raw": 1399811149}
+    batch = p._pick_thesis_batch()
+    assert any(b[1] == CA_TOAD for b in batch), \
+        "刚买的币必须出现在本轮批次里,而不是等轮转慢慢转到"
+
+
+def test_优先名额不会撑大每轮扫描总量(db):
+    """插队可以,但不能把每轮调用量顶上去 —— 峰值并发是有上限的"""
+    from src.poller import _THESIS_TOKENS_PER_TICK
+
+    _add_ready("uA", "alice")
+    p = Poller(CountingClient({"uA": _snap("uA")}), FakeNotifier())
+    p._token_meta = {("solana", f"CA{i:03d}"): {"network_raw": 1399811149} for i in range(100)}
+    deadline = time.monotonic() + 600
+    for i in range(50):
+        p._thesis_priority[("solana", f"CA{i:03d}")] = deadline
+    assert len(p._pick_thesis_batch()) <= _THESIS_TOKENS_PER_TICK

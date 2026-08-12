@@ -19,7 +19,6 @@ Telegram 命令层 —— getUpdates 长轮询 + 命令分发(设计文档 §3.4
 from __future__ import annotations
 
 import html
-import math
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -29,7 +28,6 @@ from loguru import logger
 from src import store
 from src.config import get_settings
 from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
-from src.poller import SWEEP_PER_TICK
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
 POLL_TIMEOUT_SEC = 30
@@ -43,9 +41,8 @@ STALE_COMMAND_SEC = 300
 MAX_LIST_ROWS = 50
 
 # /following 一次最多导入多少人。超出部分按"交易活跃度"取前 N。
-# ⚠️ 改成活动流增量采集后,稳态单轮成本已经**不随名单规模线性增长**了
-#    (见 poller._fetch_snapshots),这个上限现在约束的是另外两件事:
-#    兜底轮转扫一圈的周期,以及进程重启后那一轮全量采集的耗时。
+# 每轮给每个人拉一次 swaps(实测 p50 0.27s、12 线程并发),名单规模直接决定单轮耗时;
+# balances/trades 不随名单线性增长(见 poller._fetch_snapshots)。
 MAX_FOLLOWING_IMPORT = 80
 
 # 榜单一次最多列这么多行(TG 单条 4096 字符硬上限;每行约 70 字符)
@@ -579,18 +576,18 @@ class CommandBot:
                 f"{_esc('⚠️')} 对方关注 {total} 人,只取了交易最活跃的 {len(picked)} 人"
                 f"(上限 {MAX_FOLLOWING_IMPORT},再多会拖垮轮询)"
             )
-        # ⚠️ 改成"活动流点名 + 固定切片兜底扫描"之后,稳态单轮成本**不再随名单线性增长**
-        #    (见 poller._fetch_snapshots),所以这里不能再按 N 报耗时 —— 会把人吓住,
-        #    也会让那条"调大轮询间隔"的建议无端触发。
-        #    真正随 N 变长的是两件事:兜底扫描转一圈的周期,和进程重启后的首轮。
+        # 每轮成本 = 全员 swaps(实测 p50 0.27s/人)+ 十来个 balances,后者不随名单增长
+        # (见 poller._fetch_snapshots)。观点扫描与采集并行,不计入。
         s = get_settings()
-        sweep_rounds = math.ceil(active_total / max(1, SWEEP_PER_TICK))
+        workers = max(1, s.fomo_fetch_workers)
+        est = active_total * 0.27 / workers + 10 * 1.22 / workers + 1
         interval = s.fomo_poll_interval_sec
-        lines.append(f"📋 当前名单 {active_total} 人 · 稳态单轮约 3-5s(间隔 {interval}s)")
-        lines.append(
-            f"{_esc('🔁')} 没被活动流点到的人靠兜底轮转扫描覆盖,"
-            f"转一圈约 {sweep_rounds} 轮({sweep_rounds * interval}s)"
-        )
+        lines.append(f"📋 当前名单 {active_total} 人 · 预计每轮约 {est:.0f}s(间隔 {interval}s)")
+        if est > interval * 0.8:
+            lines.append(
+                f"{_esc('⚠️')} 单轮耗时已接近轮询间隔,建议把 .env 的 "
+                f"FOMO_POLL_INTERVAL_SEC 调到 {int(est * 2)} 以上后重启"
+            )
         lines.append(f"{_esc('⏳')} 历史基线每轮建一个人,约 {active_total} 轮后全部就绪")
         return "\n".join(lines)
 
