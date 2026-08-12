@@ -688,3 +688,46 @@ def _fallback(ev: FomoEvent) -> str:
         return f"{EMOJI_WARN} <b>{who}</b>{SEP}{et}{SEP}消息渲染异常"
     except Exception:  # noqa: BLE001
         return f"{EMOJI_WARN} 消息渲染异常"
+
+
+# ============================================================
+# 跟单信号
+# ============================================================
+def render_copy_signal(cand, d, cfg, status: str) -> str:
+    """
+    跟单信号消息。
+
+    ⚠️ 必须把**入场市值**和**币龄**摆在最显眼的位置:这两个数决定这一单是"早"还是"追高",
+       而信号本身("N 个人买了")对两者一无所知 —— 光看人数会把 $4.19M 的追高
+       和 $41.9K 的埋伏读成同一件事。
+    ⚠️ 纸上模式必须写明「未真实成交」。含糊的措辞会让人以为钱已经出去了。
+    """
+    sym = _esc((cand.token_symbol or "?").lstrip("$"))
+    head = "🧪 <b>纸上跟单</b>" if status == "paper" else "🛒 <b>跟单信号</b>"
+    lines = [f"{head} · <b>${sym}</b> · 👥 {cand.buyers} 人买过"]
+
+    seg = []
+    if cand.entry_mcap:
+        seg.append(f"💎 入场市值 {_fmt_usd_compact(cand.entry_mcap)}")
+    age = fmt_token_age(cand.token_created_at)
+    if age:
+        seg.append(f"{EMOJI_TOKEN_AGE} 币龄 {age}")
+    if seg:
+        lines.append(" · ".join(seg))
+
+    lines.append(f"💰 跟单金额 ${cfg.amount_usd:,.2f}"
+                 + ("(仅记账,<b>未真实成交</b>)" if status == "paper" else ""))
+    net = (cand.network_id or "").strip()
+    if net:
+        lines.append(f"{EMOJI_NETWORK} {_esc(NETWORK_DISPLAY.get(net, net))}")
+    link = _links_line(_fake_ev(net, cand.token_address))
+    if link:
+        lines.append(link)
+    lines.append(f"<code>{_esc(cand.token_address)}</code>")
+    return "\n".join(lines)
+
+
+def _fake_ev(net: str, ca: str):
+    """_links_line 只用到这两个字段 —— 复用它,免得链接拼装出现第二份实现"""
+    return FomoEvent(event_id="", event_type=EVENT_BUY, user_id="", event_ts="", raw_json="",
+                     network_id=net or None, token_address=ca)

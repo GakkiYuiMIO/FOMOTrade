@@ -10,12 +10,14 @@ SQLite 持久化 —— 监控名单 / 事件流水 / 游标 / 用户×代币聚
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 
 from loguru import logger
 
 from src.config import DATA_DIR
+from src.copytrade import CopyConfig
 from src.models import (
     BADGE_ADD,
     BADGE_FIRST,
@@ -137,6 +139,29 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- ============ 【跟单】信号台账 ============
+-- 命中"N 个关注的人买了同一个币"时记一行。纸上跟单与真实下单共用这张表,
+-- 靠 status 区分 —— 两套表会立刻产生"纸上赚了但实际没买"这类对不上的账。
+--
+-- ⚠️ 主键就是 (network_id, token_address):"单币只跟一次"这条规则由主键保证,
+--    而不是靠代码里先 SELECT 再 INSERT —— 后者在两个 tick 撞上时会重复建仓。
+CREATE TABLE IF NOT EXISTS copytrade_signals (
+    network_id     TEXT NOT NULL,
+    token_address  TEXT NOT NULL,
+    token_symbol   TEXT,
+    triggered_at   TEXT NOT NULL,      -- UTC ISO
+    trigger_buyers INTEGER NOT NULL,   -- 触发那一刻已有多少个名单成员买过
+    entry_mcap     REAL,               -- 触发那一刻的市值 = 纸上建仓成本基准
+    token_age_sec  INTEGER,            -- 触发时的币龄,用来事后复盘"跟太老的币是不是更差"
+    amount_usd     REAL NOT NULL,      -- 跟单金额(纸上或真实)
+    status         TEXT NOT NULL,      -- paper=纸上 / pending=等确认 / filled=已成交
+                                       -- / rejected=你按了忽略 / failed=下单失败
+    decided_at     TEXT,
+    note           TEXT,
+    PRIMARY KEY (network_id, token_address)
+);
+CREATE INDEX IF NOT EXISTS idx_copy_time ON copytrade_signals(triggered_at);
 
 -- ============ 【买入榜】代币行情快照 ============
 -- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
@@ -915,6 +940,122 @@ def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
         """,  # noqa: S608
         (network_id, token_address, since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
+
+
+# ============================================================
+# 【跟单】配置与台账
+# ============================================================
+_COPY_KEY = "copytrade_config"
+
+
+def load_copy_config(conn) -> CopyConfig:
+    """
+    从 runtime_state 读跟单配置,读不到 / 坏了都退回默认值(enabled=False)。
+
+    ⚠️ 任何异常都必须退回**默认值**而不是上抛:配置读坏了就把整个 tick 打挂,
+       等于一个展示性功能能停掉主推送。而默认值是"不启用",最坏情况是不跟单,安全。
+    """
+    try:
+        raw = get_state(conn, _COPY_KEY)
+        if not raw:
+            return CopyConfig()
+        d = json.loads(raw)
+        base = CopyConfig()
+        return CopyConfig(**{f: d.get(f, getattr(base, f)) for f in base.__dataclass_fields__})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("跟单配置读取失败,按未启用处理: {}", e)
+        return CopyConfig()
+
+
+def save_copy_config(conn, cfg: CopyConfig) -> None:
+    d = {f: getattr(cfg, f) for f in cfg.__dataclass_fields__}
+    d["networks"] = list(cfg.networks)          # tuple 不是 JSON 类型
+    with tx(conn):
+        set_state(conn, _COPY_KEY, json.dumps(d, ensure_ascii=False))
+
+
+def count_recent_buyers(conn, network_id: str, token_address: str,
+                        since_iso: str, starred_only: bool = False) -> int:
+    """
+    窗口内买过这个币的**名单成员**数(去重到人)。跟单信号的分子。
+
+    ⚠️ 必须带时间窗:一个币被 3 个人在三个月里分别买过,不构成"大家在抢"。
+    ⚠️ 谓词与 count_consensus / hot_tokens 完全一致(active=1 AND stats_ready=1
+       + COUNTABLE_REASONS),否则 /hot 上写着 5 人、跟单却按 3 人算。
+    """
+    star = " AND w.starred = 1" if starred_only else ""
+    countable = ",".join("?" * len(COUNTABLE_REASONS))
+    row = conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT e.user_id) AS n
+        FROM fomo_events e
+        JOIN watch_users w
+          ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1{star}
+        WHERE e.event_type = 'BUY' AND e.network_id = ? AND e.token_address = ?
+          AND e.event_ts >= ?
+          AND COALESCE(e.badge_reason, '') IN ({countable})
+        """,  # noqa: S608
+        (network_id, token_address, since_iso, *COUNTABLE_REASONS),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def copy_taken_today(conn) -> int:
+    """今天(UTC)已经建了几个仓 —— 每日上限的分子"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM copytrade_signals WHERE triggered_at >= ?",
+        (now_iso()[:10] + "T00:00:00+00:00",),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def record_copy_signal(conn, *, network_id: str, token_address: str, token_symbol: str | None,
+                       buyers: int, entry_mcap: float | None, age_sec: int | None,
+                       amount_usd: float, status: str) -> bool:
+    """
+    记一条跟单信号。返回 True 表示**这次真的新建了**(而不是撞上已有的)。
+
+    ⚠️ 靠主键冲突保证"单币只跟一次",不是先 SELECT 再 INSERT ——
+       后者在两个 tick 撞上时会重复建仓,而重复建仓在真实下单模式下就是真的多花一份钱。
+    """
+    with tx(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO copytrade_signals
+                (network_id, token_address, token_symbol, triggered_at, trigger_buyers,
+                 entry_mcap, token_age_sec, amount_usd, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (network_id, token_address, token_symbol, now_iso(), buyers,
+             entry_mcap, age_sec, amount_usd, status),
+        )
+    return cur.rowcount == 1
+
+
+def copy_ledger(conn, limit: int = 20) -> list[sqlite3.Row]:
+    """跟单台账 + 当前市值(算盈亏用)。按触发时间倒序"""
+    return conn.execute(
+        """
+        SELECT g.*, s.market_cap AS now_mcap, s.max_market_cap AS peak_mcap
+        FROM copytrade_signals g
+        LEFT JOIN token_snapshot s
+               ON s.network_id = g.network_id AND s.token_address = g.token_address
+        ORDER BY g.triggered_at DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+
+def set_copy_status(conn, network_id: str, token_address: str,
+                    status: str, note: str | None = None) -> bool:
+    with tx(conn):
+        cur = conn.execute(
+            "UPDATE copytrade_signals SET status = ?, decided_at = ?, note = ? "
+            "WHERE network_id = ? AND token_address = ?",
+            (status, now_iso(), note, network_id, token_address),
+        )
+    return cur.rowcount == 1
 
 
 def list_buyers(conn, network_id: str, token_address: str) -> list[sqlite3.Row]:

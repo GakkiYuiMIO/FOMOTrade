@@ -36,7 +36,8 @@ from src.client import (
     take_transient_errors,
 )
 from src.config import get_settings
-from src.formatter import render
+from src.copytrade import Candidate, decide
+from src.formatter import render, render_copy_signal
 from src.models import (
     EVENT_BUY,
     EVENT_SELL,
@@ -47,6 +48,7 @@ from src.models import (
     FomoEvent,
     dump_raw,
     is_quote_token,
+    iso_minutes_ago,
     make_event_id,
     normalize_network,
     normalize_token_address,
@@ -621,6 +623,13 @@ class Poller:
 
             # 活动流看不见的人刚碰过的币 → 下一轮优先扫它的观点(观点几乎总是发在刚买的币上)
             self._note_thesis_priority(new_events)
+
+            # --- 6) 跟单信号。⚠️ 放在最后、整段包 try:它是附加功能,
+            #        任何问题都不该影响主推送(推送才是这个项目的本体)
+            try:
+                self._check_copytrade(conn, new_events, dry_run=dry_run)
+            except Exception as e:  # noqa: BLE001
+                logger.error("跟单信号判定失败(不影响推送): {}", e)
 
             # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
             # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
@@ -1507,6 +1516,67 @@ class Poller:
             if ok:
                 # ⚠️ 只能在 TG 确认收到之后才置 sent=1。"发之前就标已发"会在崩溃时永久丢消息
                 store.mark_sent(conn, ev.event_id, buyers, watchlist)
+
+    def _check_copytrade(self, conn, new_events: list[FomoEvent], dry_run: bool) -> None:
+        """
+        跟单信号:本轮有新买入的币,够不够"N 个名单成员买过"的门槛。
+
+        ⚠️ 只看**本轮有新买入**的币,不是全表扫描:信号的语义是"刚刚又多了一个人买",
+           全表扫会在配置放宽的那一刻把历史上所有够格的币一次性全建仓。
+        ⚠️ 判定逻辑全在 copytrade.decide()(纯函数、可单测),这里只负责取事实和记账。
+        ⚠️ 真实下单**永远**由用户点 TG 按钮触发,这里最多把状态记成 pending 并推一条待确认。
+        """
+        cfg = store.load_copy_config(conn)
+        if not cfg.enabled:
+            return
+        keys = {e.token_key for e in new_events if e.event_type == EVENT_BUY and e.token_key}
+        if not keys:
+            return
+
+        since = iso_minutes_ago(cfg.window_hours * 60)
+        taken_today = store.copy_taken_today(conn)
+        for net, ca in sorted(keys):
+            meta = self._token_meta.get((net, ca)) or {}
+            snap = conn.execute(
+                "SELECT market_cap FROM token_snapshot WHERE network_id = ? AND token_address = ?",
+                (net, ca),
+            ).fetchone()
+            cand = Candidate(
+                network_id=net,
+                token_address=ca,
+                token_symbol=meta.get("symbol"),
+                buyers=store.count_recent_buyers(conn, net, ca, since, cfg.starred_only),
+                entry_mcap=(snap["market_cap"] if snap else None) or meta.get("market_cap"),
+                token_created_at=meta.get("created_at"),
+                already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下
+                taken_today=taken_today,
+            )
+            d = decide(cand, cfg)
+            if not d.take:
+                logger.debug("跟单跳过 | {} {} | {}", cand.token_symbol, ca[:10], d.reason)
+                continue
+
+            status = "paper" if cfg.paper_only else "pending"
+            # ⚠️ 主键冲突 = 这个币已经跟过。用 INSERT OR IGNORE 的返回值判断,
+            #    而不是先查一次 —— 先查后插在两个 tick 撞上时会重复建仓。
+            if not store.record_copy_signal(
+                conn, network_id=net, token_address=ca, token_symbol=cand.token_symbol,
+                buyers=cand.buyers, entry_mcap=cand.entry_mcap, age_sec=d.age_sec,
+                amount_usd=cfg.amount_usd, status=status,
+            ):
+                continue
+            taken_today += 1
+            logger.info("跟单信号 | {} · {} 人买过 · 入场市值 {} · {}",
+                        cand.token_symbol, cand.buyers, cand.entry_mcap, status)
+            if not dry_run:
+                self._send_copy_signal(cand, d, cfg, status)
+
+    def _send_copy_signal(self, cand: Candidate, d, cfg, status: str) -> None:
+        """推一条跟单信号。⚠️ 发送失败不能上抛 —— 台账已经记了,推送只是通知"""
+        try:
+            self.notifier.send(render_copy_signal(cand, d, cfg, status))
+        except Exception as e:  # noqa: BLE001
+            logger.error("跟单信号推送失败(台账已记录): {}", e)
 
     def _throttle_send(self) -> None:
         """

@@ -21,12 +21,14 @@ from __future__ import annotations
 import html
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
 from src import store
 from src.config import get_settings
+from src.copytrade import pnl
 from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
@@ -70,6 +72,8 @@ _COMMAND_MENU = [
     ("list", "查看监控名单与基线状态"),
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
+    ("copy", "跟单参数:/copy 查看 · /copy <项> <值> 修改"),
+    ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
     ("unstar", "取消特别关注:/unstar <handle>"),
     ("del", "移出监控:/del <handle>"),
@@ -100,6 +104,8 @@ _HELP = (
     "/add &lt;handle&gt; — 加入监控(立即生效,历史基线由下一轮建立)\n"
     "/following &lt;handle&gt; — 把这个人关注的所有人批量加入监控\n"
     "/top [24h|7d|30d|following] [条数] — 交易员榜单,默认今日前 15\n"
+    "/copy — 跟单参数(默认<b>纸上跟单,不花钱</b>);/copy on 开启\n"
+    "/paper — 跟单台账:每一单现在赚亏多少\n"
     "/star &lt;handle&gt; — 特别关注:他的推送带 ⭐、币名加【】\n"
     "/unstar &lt;handle&gt; — 取消特别关注\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
@@ -318,6 +324,10 @@ class CommandBot:
             return self._cmd_rebuild(arg)
         if cmd in ("/del", "/rm", "/remove"):
             return self._cmd_del(arg)
+        if cmd == "/copy":
+            return self._cmd_copy(arg)
+        if cmd in ("/paper", "/positions"):
+            return self._cmd_paper()
         if cmd in ("/star", "/fav"):
             return self._cmd_star(arg, on=True)
         if cmd in ("/unstar", "/unfav"):
@@ -717,6 +727,98 @@ class CommandBot:
         if not ok:
             return f"⚠️ 未在监控名单中: {_esc(key)}"
         return f"✅ 已移除 <b>{_esc(name)}</b>(相关代币共识数已下调)"
+
+    # ============================================================
+    # 跟单
+    # ============================================================
+    # /copy 能改的项。值一律走这里的解析器 —— 直接 int()/float() 的话
+    # `/copy amount abc` 会抛异常、命令层只回一句"处理异常",用户不知道错在哪。
+    _COPY_FIELDS = {
+        "on":      ("enabled", lambda v: True),
+        "off":     ("enabled", lambda v: False),
+        "real":    ("paper_only", lambda v: False),
+        "paper":   ("paper_only", lambda v: True),
+        "buyers":  ("min_buyers", lambda v: max(1, int(v))),
+        "window":  ("window_hours", lambda v: max(1, int(v))),
+        "age":     ("max_age_hours", lambda v: None if v in ("off", "0") else max(1, int(v))),
+        "mcap":    ("max_entry_mcap", lambda v: None if v in ("off", "0") else float(v)),
+        "amount":  ("amount_usd", lambda v: max(0.0, float(v))),
+        "daily":   ("daily_max", lambda v: max(0, int(v))),
+        "starred": ("starred_only", lambda v: v in ("1", "on", "true", "yes")),
+    }
+    _COPY_SWITCHES = ("on", "off", "paper", "real")
+
+    def _cmd_copy(self, arg: str) -> str:
+        """/copy 查看 · /copy <项> <值> 改。⚠️ 接真实下单必须显式 /copy real"""
+        parts = (arg or "").split()
+        with store.get_conn() as conn:
+            cfg = store.load_copy_config(conn)
+            if parts:
+                key = parts[0].strip().lower()
+                spec = self._COPY_FIELDS.get(key)
+                if not spec:
+                    return ("❓ 可改:on/off · paper/real · buyers · window · age · mcap"
+                            " · amount · daily · starred\n"
+                            "例:<code>/copy buyers 2</code>")
+                field, parse = spec
+                raw = parts[1].strip().lower() if len(parts) > 1 else ""
+                if key not in self._COPY_SWITCHES and not raw:
+                    return f"❓ 用法:<code>/copy {_esc(key)} &lt;值&gt;</code>"
+                try:
+                    val = parse(raw)
+                except (TypeError, ValueError):
+                    return f"❓ <code>{_esc(raw)}</code> 不是合法的值"
+                cfg = replace(cfg, **{field: val})
+                store.save_copy_config(conn, cfg)
+            taken = store.copy_taken_today(conn)
+
+        mode = "🧪 纸上跟单(不花钱)" if cfg.paper_only else "🛒 <b>真实下单</b>(仍需你点确认)"
+        age = f"≤ {cfg.max_age_hours} 小时" if cfg.max_age_hours is not None else "不限"
+        mcap = _money(cfg.max_entry_mcap) if cfg.max_entry_mcap is not None else "不限"
+        return "\n".join([
+            f"🤖 <b>跟单</b> · {'✅ 已开启' if cfg.enabled else '⛔ 未开启'} · {mode}",
+            f"👥 触发人数 ≥ <b>{cfg.min_buyers}</b>(窗口 {cfg.window_hours}h)"
+            + ("· 只数 ⭐" if cfg.starred_only else ""),
+            f"🕐 币龄 {age} · 💎 入场市值 {mcap}",
+            f"💰 每单 {_money(cfg.amount_usd)} · 📅 今日 {taken}/{cfg.daily_max} 单",
+            "同一个币只跟一次 · 改:<code>/copy buyers 2</code> "
+            "<code>/copy age 24</code> <code>/copy amount 50</code>",
+        ])
+
+    def _cmd_paper(self) -> str:
+        """跟单台账 + 现在的盈亏"""
+        with store.get_conn() as conn:
+            rows = store.copy_ledger(conn, limit=15)
+        if not rows:
+            return "🧪 <b>跟单台账</b>\n还没有信号。/copy 看当前参数(默认未开启)"
+
+        lines, total_in, total_now, n = ["🧪 <b>跟单台账</b>"], 0.0, 0.0, 0
+        for r in rows:
+            sym = _esc((r["token_symbol"] or "?").lstrip("$"))
+            got = pnl(r["entry_mcap"], r["now_mcap"], r["amount_usd"])
+            tag = {"paper": "🧪", "pending": "⏳", "filled": "✅",
+                   "rejected": "🚫", "failed": "❌"}.get(r["status"], "•")
+            seg = [f"{tag} <b>${sym}</b>"]
+            if got:
+                value, x = got
+                total_in += r["amount_usd"]
+                total_now += value
+                n += 1
+                seg.append(f"{'📈' if x >= 1 else '📉'} {x:.2f}x")
+                seg.append(f"{_money(r['amount_usd'])} → {_money(value)}")
+            else:
+                # 拿不到现价(名单里已经没人持有了)—— 说清楚,别显示成 0
+                seg.append(f"{_money(r['amount_usd'])} · 现价未知")
+            seg.append(_ago_short(r["triggered_at"]))
+            lines.append("  ".join(seg))
+
+        if n:
+            x = total_now / total_in if total_in else 0
+            lines.append(f"\n合计 {n} 单 · {_money(total_in)} → {_money(total_now)}"
+                         f" · <b>{x:.2f}x</b>")
+        lines.append(f"{_esc('⚠️')} 纸上盈亏按市值折算,"
+                     f"<b>没算手续费/滑点/gas</b>,真实结果只会更差")
+        return "\n".join(lines)
 
     def _cmd_star(self, arg: str, on: bool) -> str:
         """/star | /unstar <handle> —— 特别关注。纯展示开关,不影响任何判定"""
