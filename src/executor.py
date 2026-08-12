@@ -19,11 +19,23 @@ FOMO 的 swap 是**链上交易**(swap 记录里有 recipient / platformFeeAddre
     [$10] [$100] [$500] [$1000]
     $47.90 available   [Max]
     [ Buy <Symbol> ]              ← 最终成交按钮
-⚠️ 点下去之后**有没有二次确认弹窗未知** —— 那要真买一次才知道。
-   所以这里按"点下去就是成交"设计:最后那一步之前的所有校验都必须已经通过。
+    ─────────────────────────────
+    <button> 661.89 Plumber  +$0.01 ▲0.78%
+             Invested   $1.90
+             Avg entry  $2.7M MC   ← 持仓块,成交回读就读它
+
+⚠️ **点下去就是成交,没有二次确认弹窗**(2026-08-12 由用户真实买入 $1.90 验证)。
+   一度以为点完还有个滑块要拖 —— 没有。所以"点最后那个按钮"= 钱已经出去了,
+   在此之前的所有校验必须已经全部通过,点下去之后没有任何后悔的余地。
+
+⚠️ 持仓块**在买入之前就可能存在**(你已经持有这个币的时候)。
+   所以"看到持仓块"**不能**当作成交证据 —— 必须点之前存一份 Invested,
+   点之后等它**变大**。把"页面上有仓位"当成"我这单成了",在已有仓位时永远误报成功。
 """
 from __future__ import annotations
 
+import re
+from contextlib import suppress
 from dataclasses import dataclass
 
 from loguru import logger
@@ -39,6 +51,31 @@ _RENDER_MS = 8000
 _STEP_TIMEOUT_MS = 30_000
 # 等报价算出来、成交按钮变可点的时间。实测填完金额约 1~2s 变绿,给足余量
 _QUOTE_TIMEOUT_MS = 20_000
+# 点完之后等页面上的持仓数字变化的时间。链上确认 + 前端刷新,实测几秒;给足余量。
+# ⚠️ 等超时**不等于没成交** —— 只是没等到证据,回执必须照实这么说。
+_FILL_TIMEOUT_MS = 45_000
+_FILL_POLL_MS = 1000
+
+# 持仓块:文字里同时有 Invested 和 Avg entry 的那个 button
+_POSITION_JS = """() => {
+  const b = [...document.querySelectorAll('button')].filter(e => {
+    const t = e.innerText || '';
+    return t.includes('Invested') && t.includes('Avg entry');
+  });
+  return b.length ? b[b.length - 1].innerText : null;
+}"""
+_RE_INVESTED = re.compile(r"Invested\s*\$\s*([\d,]+(?:\.\d+)?)", re.I)
+_RE_QTY = re.compile(r"^\s*([\d,]+(?:\.\d+)?)\s+(\S+)", re.M)
+_RE_ENTRY = re.compile(r"Avg entry\s*(\$[\d.,]+\s*[KMB]?)\s*MC", re.I)
+
+
+@dataclass
+class Position:
+    """页面上读到的持仓快照。字段可能缺 —— 缺就是 None,不要拿 0 顶替"""
+    invested: float | None = None
+    qty: float | None = None
+    symbol: str | None = None
+    avg_entry: str | None = None
 
 
 @dataclass
@@ -46,10 +83,34 @@ class BuyResult:
     ok: bool
     message: str
     screenshot: str | None = None
+    # 是否**读到了**成交证据(Invested 变大)。⚠️ False 只代表"没等到证据",
+    # 不代表"没成交" —— 上层措辞必须区分这两件事。
+    confirmed: bool = False
 
 
 class ExecutorError(Exception):
     """执行器无法安全地继续。⚠️ 一律当成"没有成交"处理"""
+
+
+def _read_position(page) -> Position | None:
+    """读右侧面板的持仓块。读不到返回 None(没持仓,或结构变了)"""
+    try:
+        txt = page.evaluate(_POSITION_JS)
+    except Exception:  # noqa: BLE001
+        return None
+    if not txt:
+        return None
+    pos = Position()
+    if m := _RE_INVESTED.search(txt):
+        with suppress(ValueError):
+            pos.invested = float(m.group(1).replace(",", ""))
+    if m := _RE_QTY.search(txt):
+        with suppress(ValueError):
+            pos.qty = float(m.group(1).replace(",", ""))
+        pos.symbol = m.group(2)
+    if m := _RE_ENTRY.search(txt):
+        pos.avg_entry = re.sub(r"\s+", "", m.group(1))
+    return pos
 
 
 def buy(network_id: str, token_address: str, token_symbol: str | None,
@@ -192,12 +253,45 @@ def _do_buy(ctx, url: str, sym: str, amount_usd: float, ca: str,
         logger.info("[dry-run] 一切就绪但**不点成交** | {} ${:.2f}", sym or ca[:8], amount_usd)
         return BuyResult(True, f"演练通过:${amount_usd:.2f} 已填入、成交按钮可点(未点)", shot)
 
-    logger.warning("执行真实买入 | {} ${:.2f}", sym or ca[:8], amount_usd)
+    # ---- 点之前先把现有仓位记下来 ----
+    # ⚠️ 必须在点击**之前**读。已经持有这个币的时候,点完再读只会看到一个
+    #    "有仓位"的页面,分不清是这一单买的还是本来就有的。
+    before = _read_position(page)
+    base = before.invested if before and before.invested is not None else 0.0
+
+    logger.warning("执行真实买入 | {} ${:.2f}(点下去即成交)", sym or ca[:8], amount_usd)
     submit.click()
-    page.wait_for_timeout(6000)
+
+    # ---- 等成交证据:Invested 变大 ----
+    after: Position | None = None
+    waited = 0
+    while waited < _FILL_TIMEOUT_MS:
+        page.wait_for_timeout(_FILL_POLL_MS)
+        waited += _FILL_POLL_MS
+        cur = _read_position(page)
+        if cur and cur.invested is not None and cur.invested > base + 0.005:
+            after = cur
+            break
+
     if shot:
         page.screenshot(path=shot)
-    # ⚠️ 这里**不敢断言成交成功**:链上确认要时间,页面上的 toast 文案也未实测。
-    #    所以回执写"已提交,请到 APP 核对",而不是"已成交" ——
-    #    在没有回执的情况下报成功,是这个功能最坏的一种失效。
-    return BuyResult(True, f"已提交买入 ${amount_usd:.2f},**请到 APP 核对是否成交**", shot)
+
+    if after is not None:
+        delta = after.invested - base
+        bits = [f"已成交 ${delta:.2f}"]
+        if after.qty is not None and after.symbol:
+            bits.append(f"持仓 {after.qty:,.2f} {after.symbol}")
+        if after.avg_entry:
+            bits.append(f"均价 {after.avg_entry} MC")
+        logger.info("成交已回读 | {} 投入 {:.2f} → {:.2f}", sym or ca[:8], base, after.invested)
+        return BuyResult(True, " · ".join(bits), shot, confirmed=True)
+
+    # ⚠️ 没等到证据**不等于没成交** —— 链可能还在确认、前端可能没刷新。
+    #    这种时候报"失败"会诱使你再点一次 = 买两次。所以只说"没等到",并让你自己核对。
+    logger.warning("买入已点击但 {}s 内没读到仓位变化 | {}", _FILL_TIMEOUT_MS // 1000, sym or ca[:8])
+    return BuyResult(
+        True,
+        f"已点击成交 ${amount_usd:.2f},但 {_FILL_TIMEOUT_MS // 1000}s 内没读到仓位变化。"
+        f"**可能已成交,请到 APP 核对后再决定是否重试** —— 别直接再点一次",
+        shot,
+    )

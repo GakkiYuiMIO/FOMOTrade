@@ -369,8 +369,14 @@ class CommandBot:
             return ("演练通过(未真实成交)",
                     f"🧪 <b>演练通过 · 未成交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
                     f"确认无误后 <code>/copy live</code> 开真实成交")
-        return ("已提交,请到 APP 核对",
-                f"✅ <b>已提交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
+        # ⚠️ "读到仓位变大"和"点了但没读到"是两件事,措辞必须分开。
+        #    后者报成"已成交"会让人以为没事;报成"失败"又会诱使人再点一次 = 买两次。
+        if res.confirmed:
+            return (f"已成交 · {res.message}"[:180],
+                    f"✅ <b>已成交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
+                    f"<code>{_esc(ca)}</code>")
+        return ("已点击,但没读到仓位变化 —— 请到 APP 核对",
+                f"⚠️ <b>已点击 · 结果待核对</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
                 f"<code>{_esc(ca)}</code>")
 
     # ============================================================

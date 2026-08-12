@@ -327,3 +327,84 @@ def test_callback_data不超TG的64字节上限():
     for prefix in ("buy", "skip"):
         data = f"{prefix}:solana:{ca[:12]}"
         assert len(data.encode()) <= 64, data
+
+
+def test_读到成交才说已成交_否则说待核对(monkeypatch, tmp_path):
+    """
+    ⚠️ "点了"和"成了"是两件事。没读到仓位变化时说"已成交"会让人以为没事;
+       说"失败"又会诱使人再点一次 = 买两次。措辞必须是第三种。
+    """
+    from src import bot as bot_mod
+    from src.executor import BuyResult
+
+    for confirmed, want in ((True, "已成交"), (False, "待核对")):
+        n = _Notif()
+        b, store_ = _bot(monkeypatch, tmp_path / str(confirmed), n)
+        key = _pending(store_)
+        _set_dry(store_, False)
+        monkeypatch.setattr(bot_mod, "execute_buy",
+                            lambda *a, **kw: BuyResult(True, "x", confirmed=confirmed))
+        _click_buy(b, key)
+        assert want in n.edits[0], f"confirmed={confirmed} 时回执应含 {want}:{n.edits[0]}"
+
+
+# ============================================================
+# 成交回读:从页面持仓块里解析结果
+# ============================================================
+_POS_TEXT = """661.89 Plumber
++$0.01
+▲
+0.78%
+Invested
+$1.90
+Avg entry
+$2.7M MC"""
+
+
+class _FakePage:
+    def __init__(self, text):
+        self._text = text
+
+    def evaluate(self, _js):
+        return self._text
+
+
+def test_持仓块能解析出投入数量和均价():
+    from src.executor import _read_position
+
+    p = _read_position(_FakePage(_POS_TEXT))
+    assert p.invested == 1.90
+    assert p.qty == 661.89
+    assert p.symbol == "Plumber"
+    assert p.avg_entry == "$2.7M"
+
+
+def test_持仓块带千分位也能解析():
+    """$1,234.56 / 45,678.90 —— 逗号不处理会解析成 1.0"""
+    from src.executor import _read_position
+
+    txt = _POS_TEXT.replace("661.89", "45,678.90").replace("$1.90", "$1,234.56")
+    p = _read_position(_FakePage(txt))
+    assert p.invested == 1234.56
+    assert p.qty == 45678.90
+
+
+def test_没持仓时返回None而不是空仓位():
+    """⚠️ 返回一个 invested=None 的空对象会让"有没有仓位"这个判断变含糊"""
+    from src.executor import _read_position
+
+    assert _read_position(_FakePage(None)) is None
+    assert _read_position(_FakePage("")) is None
+
+
+def test_页面结构变了也不抛异常():
+    """执行器已经点完了成交按钮,这时候抛异常只会让上层记成 failed —— 但钱已经出去了"""
+    from src.executor import _read_position
+
+    class _Boom:
+        def evaluate(self, _js):
+            raise RuntimeError("页面没了")
+
+    assert _read_position(_Boom()) is None
+    p = _read_position(_FakePage("Invested\nAvg entry"))  # 有锚点词但没数字
+    assert p is not None and p.invested is None
