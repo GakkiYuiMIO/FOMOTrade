@@ -28,7 +28,7 @@ from loguru import logger
 
 from src import store
 from src.config import PROBE_DIR, get_settings
-from src.copytrade import pnl
+from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
 from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
 
@@ -853,9 +853,15 @@ class CommandBot:
         "mcap":    ("max_entry_mcap", lambda v: None if v in ("off", "0") else float(v)),
         "amount":  ("amount_usd", lambda v: max(0.0, float(v))),
         "daily":   ("daily_max", lambda v: max(0, int(v))),
+        "spend":   ("daily_spend_usd", lambda v: None if v in ("off", "0") else float(v)),
+        # ⚠️ auto 单独一档,**不跟 real/live 联动**:那两个是"验证自动化点对了没有"
+        #    的流程开关,用户会按引导一个个关掉。自动成交要是搭在它们身上,
+        #    用户走完验证流程的那一刻就变成无人值守了 —— 而他没打算开这个。
+        "auto":    ("auto_execute", lambda v: True),
+        "manual":  ("auto_execute", lambda v: False),
         "starred": ("starred_only", lambda v: v in ("1", "on", "true", "yes")),
     }
-    _COPY_SWITCHES = ("on", "off", "paper", "real", "live", "rehearse")
+    _COPY_SWITCHES = ("on", "off", "paper", "real", "live", "rehearse", "auto", "manual")
 
     def _cmd_copy(self, arg: str) -> str:
         """/copy 查看 · /copy <项> <值> 改。⚠️ 接真实下单必须显式 /copy real"""
@@ -866,8 +872,8 @@ class CommandBot:
                 key = parts[0].strip().lower()
                 spec = self._COPY_FIELDS.get(key)
                 if not spec:
-                    return ("❓ 可改:on/off · paper/real · buyers · window · age · mcap"
-                            " · amount · daily · starred\n"
+                    return ("❓ 可改:on/off · paper/real · rehearse/live · manual/auto"
+                            " · buyers · window · age · mcap · amount · daily · spend · starred\n"
                             "例:<code>/copy buyers 2</code>")
                 field, parse = spec
                 raw = parts[1].strip().lower() if len(parts) > 1 else ""
@@ -877,21 +883,34 @@ class CommandBot:
                     val = parse(raw)
                 except (TypeError, ValueError):
                     return f"❓ <code>{_esc(raw)}</code> 不是合法的值"
-                cfg = replace(cfg, **{field: val})
+                new_cfg = replace(cfg, **{field: val})
+                # ⚠️ 开无人值守要**当场**告诉用户还差什么,而不是让他开完之后
+                #    在某个凌晨发现「怎么一单没跟」或者「怎么花了这么多」。
+                if key == "auto" and (blockers := auto_blockers(new_cfg)):
+                    return ("⛔ <b>还不能开无人值守</b>,先补齐:\n"
+                            + "\n".join(f"· {_esc(b)}" for b in blockers))
+                cfg = new_cfg
                 store.save_copy_config(conn, cfg)
             taken = store.copy_taken_today(conn)
+            spent = store.copy_spent_today(conn)
 
         mode = ("🧪 纸上跟单(不花钱)" if cfg.paper_only
                 else ("🎭 演练下单(走流程但不成交)" if cfg.dry_run_execute
-                      else "🛒 <b>真实成交</b>(仍需你点确认)"))
+                      else ("🤖 <b>无人值守自动成交</b>" if cfg.auto_execute
+                            else "🛒 <b>真实成交</b>(仍需你点确认)")))
         age = f"≤ {cfg.max_age_hours} 小时" if cfg.max_age_hours is not None else "不限"
         mcap = _money(cfg.max_entry_mcap) if cfg.max_entry_mcap is not None else "不限"
+        # ⚠️ daily_max=0 是「不限」(与 age/mcap 的 off 同义)。渲染成 "今日 3/0 单"
+        #    会被读成「已经限住了」—— 恰恰相反,那是闸门开着。
+        cnt = f"{taken}/{cfg.daily_max} 单" if cfg.daily_max > 0 else f"{taken} 单(笔数不限)"
+        spend = (f"{_money(spent)}/{_money(cfg.daily_spend_usd)}"
+                 if cfg.daily_spend_usd is not None else f"{_money(spent)}(金额不限)")
         return "\n".join([
             f"🤖 <b>跟单</b> · {'✅ 已开启' if cfg.enabled else '⛔ 未开启'} · {mode}",
             f"👥 触发人数 ≥ <b>{cfg.min_buyers}</b>(窗口 {cfg.window_hours}h)"
             + ("· 只数 ⭐" if cfg.starred_only else ""),
             f"🕐 币龄 {age} · 💎 入场市值 {mcap}",
-            f"💰 每单 {_money(cfg.amount_usd)} · 📅 今日 {taken}/{cfg.daily_max} 单",
+            f"💰 每单 {_money(cfg.amount_usd)} · 📅 今日 {cnt} · 💸 今日 {spend}",
             "同一个币只跟一次 · 改:<code>/copy buyers 2</code> "
             "<code>/copy age 24</code> <code>/copy amount 50</code>",
         ])

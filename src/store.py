@@ -948,12 +948,42 @@ def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
 _COPY_KEY = "copytrade_config"
 
 
+# 这几项的 None 是**合法值**(= 不限);其余字段的 None 一律当成坏数据。
+# ⚠️ 区分它俩是必须的:daily_max 若为 None,decide() 里的 `None > 0` 会抛 TypeError,
+#    被 tick 那层 try 吞掉 —— 表现是跟单**静默停摆**,日志里只有一行"判定失败"。
+_COPY_NULLABLE = frozenset({"max_age_hours", "max_entry_mcap", "daily_spend_usd"})
+_COPY_TYPES = {
+    "enabled": bool, "paper_only": bool, "dry_run_execute": bool, "auto_execute": bool,
+    "starred_only": bool,
+    "min_buyers": int, "window_hours": int, "daily_max": int, "max_age_hours": int,
+    "amount_usd": float, "max_entry_mcap": float, "daily_spend_usd": float,
+    "networks": tuple,
+}
+
+
+def _coerce_copy_field(name: str, val, default):
+    """把 JSON 里读到的值收敛成字段该有的类型;收不动就退回默认值"""
+    if val is None:
+        return None if name in _COPY_NULLABLE else default
+    t = _COPY_TYPES.get(name)
+    try:
+        if t is tuple:
+            return tuple(str(x) for x in val)
+        if t is not None:
+            return t(val)
+    except (TypeError, ValueError):
+        return default
+    return val
+
+
 def load_copy_config(conn) -> CopyConfig:
     """
     从 runtime_state 读跟单配置,读不到 / 坏了都退回默认值(enabled=False)。
 
     ⚠️ 任何异常都必须退回**默认值**而不是上抛:配置读坏了就把整个 tick 打挂,
        等于一个展示性功能能停掉主推送。而默认值是"不启用",最坏情况是不跟单,安全。
+    ⚠️ 逐字段收敛类型,不要直接把 JSON 灌进 dataclass:坏掉的**单个**字段
+       不该让整份配置退回默认(那会把用户调好的参数悄悄换掉),更不该在下游抛异常。
     """
     try:
         raw = get_state(conn, _COPY_KEY)
@@ -961,7 +991,10 @@ def load_copy_config(conn) -> CopyConfig:
             return CopyConfig()
         d = json.loads(raw)
         base = CopyConfig()
-        return CopyConfig(**{f: d.get(f, getattr(base, f)) for f in base.__dataclass_fields__})
+        return CopyConfig(**{
+            f: _coerce_copy_field(f, d.get(f, getattr(base, f)), getattr(base, f))
+            for f in base.__dataclass_fields__
+        })
     except Exception as e:  # noqa: BLE001
         logger.warning("跟单配置读取失败,按未启用处理: {}", e)
         return CopyConfig()
@@ -1001,12 +1034,35 @@ def count_recent_buyers(conn, network_id: str, token_address: str,
 
 
 def copy_taken_today(conn) -> int:
-    """今天(UTC)已经建了几个仓 —— 每日上限的分子"""
+    """今天(UTC)已经触发了几单 —— 每日**笔数**上限的分子(含纸上跟单)"""
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM copytrade_signals WHERE triggered_at >= ?",
         (now_iso()[:10] + "T00:00:00+00:00",),
     ).fetchone()
     return int(row["n"] or 0)
+
+
+# 「钱已经出去或正在出去」的状态。每日**金额**上限只数这些。
+# ⚠️ 与 copy_taken_today 的口径**故意不同**:那个数的是"今天触发了几个信号"
+#    (纸上跟单也算,因为它就是用来限制信号量的);这个数的是真金白银。
+#    两者混用会出两种错:要么纸上信号吃掉真实额度,要么失败单白白占住上限。
+# ⚠️ 'failed' 不在其中是有依据的:executor.py 里每一处 raise 都在
+#    submit.click() **之前** —— 抛异常就意味着那一下根本没点。
+#    这条依赖以后改 executor 时要一起看。
+SPENDING_STATUSES = ("pending", "executing", "auto_executing", "filled")
+
+
+def copy_spent_today(conn) -> float:
+    """今天(UTC)真实花掉(或正在花)多少美元 —— 每日金额上限的分子"""
+    marks = ",".join("?" * len(SPENDING_STATUSES))
+    row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(amount_usd), 0) AS s FROM copytrade_signals
+        WHERE triggered_at >= ? AND status IN ({marks})
+        """,  # noqa: S608
+        (now_iso()[:10] + "T00:00:00+00:00", *SPENDING_STATUSES),
+    ).fetchone()
+    return float(row["s"] or 0.0)
 
 
 def record_copy_signal(conn, *, network_id: str, token_address: str, token_symbol: str | None,

@@ -1525,51 +1525,87 @@ class Poller:
            全表扫会在配置放宽的那一刻把历史上所有够格的币一次性全建仓。
         ⚠️ 判定逻辑全在 copytrade.decide()(纯函数、可单测),这里只负责取事实和记账。
         ⚠️ 真实下单**永远**由用户点 TG 按钮触发,这里最多把状态记成 pending 并推一条待确认。
+        ⚠️ **停机补数那一轮整段跳过** —— 见下面 _catchup_since 那道守卫。
         """
         cfg = store.load_copy_config(conn)
         if not cfg.enabled:
             return
+
+        # ⚠️ 停机补数轮:new_events 是**整段积压**,不是"刚刚发生的事"。
+        #    推送侧早就承认了这一点并降级成一条汇总(见 _dispatch 里的同款守卫,
+        #    理由写在 _detect_gap:"那时候的信息早就过期了")。跟单侧更不能放行 ——
+        #    窗口是 24h,积压里大把币满足"≥N 人买过",而 entry_mcap 取的是**现在**的
+        #    市值。结果就是拿今天拉升后的价,去买昨晚那批已经走完的信号。
+        #    ($Plumber 就是这么个例子:第 2 个人进是 31.62x,第 5 个人进是 0.74x。)
+        # ⚠️ 别指望"冷启动那轮 balances 没拉全、多数币拿不到币龄"来兜底 ——
+        #    那是巧合不是防线:max_age_hours 一设成 None 就没了。
+        if self._catchup_since:
+            logger.info("停机补数轮,跟单判定整段跳过(积压信号已过期)")
+            return
+
         keys = {e.token_key for e in new_events if e.event_type == EVENT_BUY and e.token_key}
         if not keys:
             return
 
         since = iso_minutes_ago(cfg.window_hours * 60)
-        taken_today = store.copy_taken_today(conn)
+        # ⚠️ 两个上限的分子。查一次、循环内自增 —— 每个币都重查一遍库不但浪费,
+        #    也挡不住同一轮内的累计(record 是逐个提交的,重查反而看起来"对")。
+        used = {"n": store.copy_taken_today(conn), "usd": store.copy_spent_today(conn)}
         for net, ca in sorted(keys):
-            meta = self._token_meta.get((net, ca)) or {}
-            snap = conn.execute(
-                "SELECT market_cap FROM token_snapshot WHERE network_id = ? AND token_address = ?",
-                (net, ca),
-            ).fetchone()
-            cand = Candidate(
-                network_id=net,
-                token_address=ca,
-                token_symbol=meta.get("symbol"),
-                buyers=store.count_recent_buyers(conn, net, ca, since, cfg.starred_only),
-                entry_mcap=(snap["market_cap"] if snap else None) or meta.get("market_cap"),
-                token_created_at=meta.get("created_at"),
-                already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下
-                taken_today=taken_today,
-            )
-            d = decide(cand, cfg)
-            if not d.take:
-                logger.debug("跟单跳过 | {} {} | {}", cand.token_symbol, ca[:10], d.reason)
-                continue
+            # ⚠️ 每个币独立兜底。循环体里马上要接真实下单,而执行器有十几处 raise
+            #    (profile 被占、会话过期、页面改版、报价超时 —— 全是常态)。
+            #    没有这道 try,一个币出事会掀掉**本轮剩下所有币**的判定,
+            #    而外层那句"跟单信号判定失败(不影响推送)"会把它伪装成无害。
+            try:
+                self._copy_one(conn, net, ca, cfg, since, used, dry_run=dry_run)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("跟单单币处理失败,跳过这个币继续 | {} {} | {}", net, ca[:10], e)
 
-            status = "paper" if cfg.paper_only else "pending"
-            # ⚠️ 主键冲突 = 这个币已经跟过。用 INSERT OR IGNORE 的返回值判断,
-            #    而不是先查一次 —— 先查后插在两个 tick 撞上时会重复建仓。
-            if not store.record_copy_signal(
-                conn, network_id=net, token_address=ca, token_symbol=cand.token_symbol,
-                buyers=cand.buyers, entry_mcap=cand.entry_mcap, age_sec=d.age_sec,
-                amount_usd=cfg.amount_usd, status=status,
-            ):
-                continue
-            taken_today += 1
-            logger.info("跟单信号 | {} · {} 人买过 · 入场市值 {} · {}",
-                        cand.token_symbol, cand.buyers, cand.entry_mcap, status)
-            if not dry_run:
-                self._send_copy_signal(cand, d, cfg, status)
+    def _copy_one(self, conn, net: str, ca: str, cfg, since: str,
+                  used: dict, *, dry_run: bool) -> None:
+        """
+        判定并记账**一个**币。异常由调用方按币兜底,见 _check_copytrade。
+
+        used 是本轮共享的当日用量 {n: 笔数, usd: 金额},命中后就地自增 ——
+        ⚠️ 不自增的话,一个 tick 里命中 15 个币会 15 单全过,当日上限形同虚设。
+        """
+        meta = self._token_meta.get((net, ca)) or {}
+        snap = conn.execute(
+            "SELECT market_cap FROM token_snapshot WHERE network_id = ? AND token_address = ?",
+            (net, ca),
+        ).fetchone()
+        cand = Candidate(
+            network_id=net,
+            token_address=ca,
+            token_symbol=meta.get("symbol"),
+            buyers=store.count_recent_buyers(conn, net, ca, since, cfg.starred_only),
+            entry_mcap=(snap["market_cap"] if snap else None) or meta.get("market_cap"),
+            token_created_at=meta.get("created_at"),
+            already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下
+            taken_today=used["n"],
+            spent_today=used["usd"],
+        )
+        d = decide(cand, cfg)
+        if not d.take:
+            logger.debug("跟单跳过 | {} {} | {}", cand.token_symbol, ca[:10], d.reason)
+            return
+
+        status = "paper" if cfg.paper_only else "pending"
+        # ⚠️ 主键冲突 = 这个币已经跟过。用 INSERT OR IGNORE 的返回值判断,
+        #    而不是先查一次 —— 先查后插在两个 tick 撞上时会重复建仓。
+        if not store.record_copy_signal(
+            conn, network_id=net, token_address=ca, token_symbol=cand.token_symbol,
+            buyers=cand.buyers, entry_mcap=cand.entry_mcap, age_sec=d.age_sec,
+            amount_usd=cfg.amount_usd, status=status,
+        ):
+            return
+        used["n"] += 1
+        if status in store.SPENDING_STATUSES:
+            used["usd"] += cfg.amount_usd
+        logger.info("跟单信号 | {} · {} 人买过 · 入场市值 {} · {}",
+                    cand.token_symbol, cand.buyers, cand.entry_mcap, status)
+        if not dry_run:
+            self._send_copy_signal(cand, d, cfg, status)
 
     def _send_copy_signal(self, cand: Candidate, d, cfg, status: str) -> None:
         """

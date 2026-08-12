@@ -472,6 +472,129 @@ def test_停机后只发一条汇总而不是逐条推送(db):
         assert c.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 6
 
 
+# ============================================================
+# 跟单:护栏(这些是无人值守自动成交的前提,见 tasks/todo.md A 档)
+# ============================================================
+_CA2 = "BBa9TZMK9Q3VUSkhZgX76YAQBjqQd1dPxkBnZojFpum2"
+_CA3 = "CCa9TZMK9Q3VUSkhZgX76YAQBjqQd1dPxkBnZojFpum3"
+_CA4 = "DDa9TZMK9Q3VUSkhZgX76YAQBjqQd1dPxkBnZojFpum4"
+
+
+def _enable_copy(**kw) -> None:
+    from src.copytrade import CopyConfig
+
+    with store.get_conn() as c:
+        store.save_copy_config(c, CopyConfig(
+            **{"enabled": True, "paper_only": True, "min_buyers": 1,
+               "max_age_hours": None, **kw}))
+
+
+def _signals() -> list[dict]:
+    with store.get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT token_address, status, amount_usd FROM copytrade_signals")]
+
+
+def _stale_tick(hours: float) -> None:
+    with store.get_conn() as c, store.tx(c):
+        store.set_state(c, "last_tick_at",
+                        (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds"))
+
+
+def test_停机补数那一轮不生成跟单信号(db):
+    """
+    ⚠️ 推送侧承认积压过期、降级成一条汇总;跟单侧要是照常判定,
+       就是拿**今天**的市值去买**昨晚**那批已经走完的信号。
+       ($Plumber:第 2 个人进 31.62x,第 5 个人进 0.74x —— 晚一步是完全不同的生意)
+    """
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(8)
+
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_swap("s1")], transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    assert _signals() == [], "补数轮必须整段跳过跟单"
+
+
+def test_正常轮照常生成跟单信号(db):
+    """上一条的对照组 —— 否则「不生成」可能只是因为压根没跑通"""
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(0.01)     # 半分钟前,远低于 45 分钟阈值
+
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_swap("s1")], transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    assert len(_signals()) == 1, "正常轮必须能跟出信号,否则上一条测试是假绿"
+
+
+def test_一轮内命中多个币不会捅穿当日笔数上限(db):
+    """
+    ⚠️ taken_today 是循环**外**查的。不在循环里同步自增的话,
+       一个 tick 命中 15 个币就是 15 单全过 —— 当日上限形同虚设。
+    """
+    _add_ready("uA", "alice")
+    _enable_copy(daily_max=2)
+    _stale_tick(0.01)
+
+    swaps = [_swap("s1", ca=CA_TOAD), _swap("s2", ca=_CA2),
+             _swap("s3", ca=_CA3), _swap("s4", ca=_CA4)]
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=swaps, transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    assert len(_signals()) == 2, f"上限 2 单,实际 {len(_signals())} 单"
+
+
+def test_一轮内命中多个币不会捅穿当日金额上限(db):
+    """笔数上限管不住钱:改了单笔金额忘了改笔数,当天敞口就是静默翻倍"""
+    _add_ready("uA", "alice")
+    # 纸上模式不出账,所以这里用 paper_only=False 让状态落到 pending(计入 SPENDING_STATUSES)
+    _enable_copy(paper_only=False, daily_max=0, amount_usd=40.0, daily_spend_usd=100.0)
+    _stale_tick(0.01)
+
+    swaps = [_swap("s1", ca=CA_TOAD), _swap("s2", ca=_CA2),
+             _swap("s3", ca=_CA3), _swap("s4", ca=_CA4)]
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=swaps, transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    spent = sum(s["amount_usd"] for s in _signals())
+    assert spent <= 100.0, f"当日上限 $100,实际记了 ${spent}"
+    assert len(_signals()) == 2, "$40 一单,$100 上限 → 只能下 2 单"
+
+
+def test_单个币处理失败不影响本轮其余币(db, monkeypatch):
+    """
+    ⚠️ 循环体里马上要接真实下单,而执行器有十几处 raise。没有 per-token 兜底的话,
+       一个币出事会掀掉本轮剩下所有币,而外层那句「不影响推送」把它伪装成无害。
+    """
+    _add_ready("uA", "alice")
+    _enable_copy()
+    _stale_tick(0.01)
+
+    real = store.count_recent_buyers
+
+    def boom(conn, net, ca, *a, **kw):
+        if ca == CA_TOAD:
+            raise RuntimeError("模拟执行器炸了")
+        return real(conn, net, ca, *a, **kw)
+
+    monkeypatch.setattr(store, "count_recent_buyers", boom)
+
+    swaps = [_swap("s1", ca=CA_TOAD), _swap("s2", ca=_CA2), _swap("s3", ca=_CA3)]
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=swaps, transfers=[], thesis=[], balances=[])})
+    Poller(client, FakeNotifier()).tick()
+
+    got = {s["token_address"] for s in _signals()}
+    assert CA_TOAD not in got, "炸掉的那个币不该有信号"
+    assert got == {_CA2, _CA3}, f"其余币必须照常处理,实际 {got}"
+
+
 def test_间隔正常时不走汇总模式(db):
     """刚跑过一轮(1 分钟前)就该正常逐条推,别把日常推送误当成积压吞掉"""
     _add_ready("uA", "alice")

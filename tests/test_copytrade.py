@@ -16,6 +16,7 @@ import pytest
 from src.copytrade import (
     SKIP_ALREADY,
     SKIP_DAILY,
+    SKIP_DAILY_SPEND,
     SKIP_DISABLED,
     SKIP_MCAP,
     SKIP_NETWORK,
@@ -25,6 +26,7 @@ from src.copytrade import (
     SKIP_TOO_OLD,
     Candidate,
     CopyConfig,
+    auto_blockers,
     decide,
     pnl,
 )
@@ -46,11 +48,75 @@ def _cfg(**kw) -> CopyConfig:
     return CopyConfig(**{"enabled": True, **kw})
 
 
+def replace_cfg(cfg: CopyConfig, **kw) -> CopyConfig:
+    from dataclasses import replace
+
+    return replace(cfg, **kw)
+
+
 def test_默认不启用():
     """⚠️ 升级一版就自己开始跟单是绝对不能发生的事"""
     assert CopyConfig().enabled is False
     assert CopyConfig().paper_only is True, "默认必须是纸上跟单"
+    assert CopyConfig().auto_execute is False, "无人值守默认必须是关的"
     assert decide(_cand(), CopyConfig(), now=NOW).reason == SKIP_DISABLED
+
+
+# ============================================================
+# 无人值守:开关与金额闸门
+# ============================================================
+def test_自动执行不能被real和live顺带打开():
+    """
+    ⚠️ 这是 auto_execute 存在的**全部理由**。验证自动化的流程是
+       /copy real → /copy live,用户会照着做。要是自动成交挂在这两个标志上,
+       他走完验证流程的那一刻就变成了无人值守 —— 而他根本没打算开这个。
+    """
+    walked_through = _cfg(paper_only=False, dry_run_execute=False)
+    assert walked_through.auto_execute is False, "走完 real+live 不能顺带把无人值守打开"
+
+
+def test_开自动之前必须先有当日金额上限():
+    """⚠️ 有人盯着时「不限」可以;没人盯着时不行 —— daily_max 只数笔数,不数钱"""
+    cfg = _cfg(paper_only=False, dry_run_execute=False, amount_usd=40.0)
+    assert any("金额上限" in b for b in auto_blockers(cfg))
+    assert auto_blockers(replace_cfg(cfg, daily_spend_usd=200.0)) == []
+
+
+def test_上限比单笔还小要当场说明白():
+    """一单都下不了却不报错 = 半夜查「为什么一单没跟」"""
+    cfg = _cfg(paper_only=False, dry_run_execute=False,
+               amount_usd=40.0, daily_spend_usd=10.0)
+    assert any("比单笔" in b for b in auto_blockers(cfg))
+
+
+def test_还在纸上或演练时不许开自动():
+    assert any("纸上" in b for b in auto_blockers(_cfg(paper_only=True)))
+    assert any("演练" in b for b in auto_blockers(_cfg(paper_only=False, dry_run_execute=True)))
+
+
+def test_金额上限判的是这一单下完会不会超():
+    """
+    ⚠️ 判「现在超没超」会让最后一单把上限捅穿:
+       上限 100、已花 99、单笔 40 → 放行到 139。
+    """
+    cfg = _cfg(amount_usd=40.0, daily_spend_usd=100.0)
+    assert decide(_cand(spent_today=0.0), cfg, now=NOW).take
+    assert decide(_cand(spent_today=60.0), cfg, now=NOW).take, "60+40=100 正好到顶,应放行"
+    d = decide(_cand(spent_today=99.0), cfg, now=NOW)
+    assert not d.take and d.reason == SKIP_DAILY_SPEND
+
+
+def test_没设金额上限时不拦():
+    """None = 不限。人工模式下这是合法配置(auto_blockers 才是拦它的地方)"""
+    assert decide(_cand(spent_today=99999.0), _cfg(daily_spend_usd=None), now=NOW).take
+
+
+def test_笔数上限和金额上限口径互不干扰():
+    """纸上信号不该吃掉真金额度,失败单也不该占住金额上限"""
+    cfg = _cfg(daily_max=10, amount_usd=40.0, daily_spend_usd=100.0)
+    assert decide(_cand(taken_today=9, spent_today=0.0), cfg, now=NOW).take
+    assert decide(_cand(taken_today=0, spent_today=80.0), cfg, now=NOW).reason == SKIP_DAILY_SPEND
+    assert decide(_cand(taken_today=10, spent_today=0.0), cfg, now=NOW).reason == SKIP_DAILY
 
 
 def test_人数够了才跟():
@@ -193,6 +259,52 @@ def test_非管理员点按钮一律拒绝(monkeypatch, tmp_path):
     assert n.answers == ["无权限"]
     with store_.get_conn() as c:
         assert c.execute("SELECT status FROM copytrade_signals").fetchone()["status"] == "pending"
+
+
+def test_copy_auto在条件不满足时拒绝开启且不落库(monkeypatch, tmp_path):
+    """
+    ⚠️ 「开完了才发现没生效」和「开完了半夜花超」是同一个失败:
+       开关那一刻就得把还差什么说清楚,而且**不能把 auto 存进去**。
+    """
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+
+    out = b._cmd_copy("auto")
+    assert "还不能开" in out
+    for want in ("纸上", "金额上限"):
+        assert want in out, f"该提示 {want}:{out}"
+    with store_.get_conn() as c:
+        assert store_.load_copy_config(c).auto_execute is False, "被拒绝时绝不能落库"
+
+
+def test_copy_auto条件齐了才能开(monkeypatch, tmp_path):
+    from dataclasses import replace as _replace
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, _replace(
+            store_.load_copy_config(c), enabled=True, paper_only=False,
+            dry_run_execute=False, amount_usd=40.0, daily_spend_usd=120.0))
+
+    out = b._cmd_copy("auto")
+    assert "无人值守" in out, out
+    with store_.get_conn() as c:
+        assert store_.load_copy_config(c).auto_execute is True
+
+
+def test_面板不能把不限渲染成已限住(monkeypatch, tmp_path):
+    """⚠️ 「今日 3/0 单」读起来像限住了,实际是闸门开着 —— 这是最危险的一种误读"""
+    from dataclasses import replace as _replace
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, _replace(store_.load_copy_config(c),
+                                            daily_max=0, daily_spend_usd=None))
+    out = b._cmd_copy("")
+    assert "/0 单" not in out, f"不限不能渲染成 x/0:{out}"
+    assert "不限" in out
 
 
 def test_点忽略只改状态不成交(monkeypatch, tmp_path):

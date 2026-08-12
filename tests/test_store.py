@@ -938,3 +938,56 @@ def test_倍数按峰值算不按现价(conn):
         "冲到 100x 又回落的币,应当排在稳在 70x 的前面"
     assert round(rows[0]["mult"]) == 100, "倍数取峰值,不是现价"
     assert rows[0]["now_mcap"] == 600_000, "现价照常带出来,回撤自己看得见"
+
+
+# ============================================================
+# 跟单配置:类型收敛与额度口径
+# ============================================================
+def _save_raw_copy_cfg(conn, d: dict) -> None:
+    import json
+
+    with store.tx(conn):
+        store.set_state(conn, "copytrade_config", json.dumps(d))
+
+
+def test_配置里的null不会让跟单静默停摆(conn):
+    """
+    ⚠️ daily_max 若读成 None,decide() 里的 `None > 0` 会抛 TypeError,
+       被 tick 那层 try 吞掉 —— 表现是跟单**整个不工作**,
+       而日志里只有一句"判定失败(不影响推送)"。这种失效方式最难查。
+    """
+    _save_raw_copy_cfg(conn, {"enabled": True, "daily_max": None, "min_buyers": None})
+    cfg = store.load_copy_config(conn)
+    assert cfg.daily_max == 10, "非 nullable 字段的 null 必须退回默认值"
+    assert cfg.min_buyers == 2
+    assert cfg.enabled is True, "⚠️ 单个字段坏掉不该把整份配置退回默认"
+
+
+def test_不限的null要保住不能被顶成默认值(conn):
+    """max_age_hours / max_entry_mcap / daily_spend_usd 的 None 是**合法值**"""
+    _save_raw_copy_cfg(conn, {"enabled": True, "max_age_hours": None,
+                              "max_entry_mcap": None, "daily_spend_usd": None})
+    cfg = store.load_copy_config(conn)
+    assert cfg.max_age_hours is None, "用户显式设的「不限」不能被默认值 24 顶掉"
+    assert cfg.max_entry_mcap is None
+    assert cfg.daily_spend_usd is None
+
+
+def test_配置里的字符串数字能收回来(conn):
+    _save_raw_copy_cfg(conn, {"enabled": True, "amount_usd": "40", "daily_max": "3"})
+    cfg = store.load_copy_config(conn)
+    assert cfg.amount_usd == 40.0 and isinstance(cfg.amount_usd, float)
+    assert cfg.daily_max == 3
+
+
+def test_金额上限只数真的会出账的状态(conn):
+    """纸上信号不该吃真金额度;失败单也不该占住上限(executor 的 raise 全在点击之前)"""
+    for i, (st, amt) in enumerate([("paper", 40.0), ("filled", 40.0),
+                                   ("failed", 40.0), ("rejected", 40.0),
+                                   ("pending", 25.0)]):
+        store.record_copy_signal(
+            conn, network_id="solana", token_address=f"ca{i}", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=amt, status=st)
+
+    assert store.copy_spent_today(conn) == 65.0, "只该数 filled(40) + pending(25)"
+    assert store.copy_taken_today(conn) == 5, "笔数口径含全部,与金额口径故意不同"

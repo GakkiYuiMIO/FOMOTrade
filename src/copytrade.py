@@ -6,7 +6,15 @@
 它不查库、不发请求、更不下单。理由和 formatter 一样 ——
 判定逻辑是这个功能里唯一会让人亏钱的地方,它必须能被完整单测。
 
-真实下单永远由**用户点击**触发(TG 确认按钮),本项目不做无人值守自动成交。
+下单有两条路,默认走第一条:
+  1. **人工确认**(默认):推一条带 [确认买入] 按钮的消息,用户点了才下单。
+  2. **无人值守**(auto_execute):信号命中直接下单,没有人在中间看一眼。
+
+⚠️ 第 2 条把「人的手指」这道护栏拆掉了,所以它有独立开关 auto_execute,
+   且**不复用** paper_only / dry_run_execute —— 那两个是「验证自动化点对了没有」
+   的流程开关,用户会按顺序把它们一个个关掉。要是自动成交挂在它们上面,
+   用户走完验证流程的那一刻就变成了无人值守,而他根本没打算开这个。
+   开自动必须显式再点一次头,见 auto_blockers()。
 
 ============ 这个信号的已知弱点(用真实数据量过)============
 在用户自己 50 个币的记录上回测「第 N 个人买入时跟单、持有到现在」:
@@ -46,12 +54,21 @@ class CopyConfig:
     # ⚠️ 就算开了真实下单,默认也只**演练**:走完全部步骤但不点最后那个成交按钮。
     #    这是验证"自动化点对了没有"的唯一安全方式。确认无误后 /copy live 关掉它。
     dry_run_execute: bool = True
+    # ⚠️ 无人值守自动成交:命中即下单,中间没有人看一眼。
+    #    独立开关、默认 False、且与上面两个**互不蕴含** —— 理由见模块头。
+    #    开之前必须过 auto_blockers() 那几道。
+    auto_execute: bool = False
     min_buyers: int = 2                 # 几个名单成员买过就触发
     window_hours: int = 24              # 在多长的窗口内数这些人
     max_age_hours: int | None = 24      # 币龄上限;None = 不限
     max_entry_mcap: float | None = None  # 入场市值上限;None = 不限
     amount_usd: float = 50.0            # 每单金额
-    daily_max: int = 10                 # 每天最多跟几单
+    daily_max: int = 10                 # 每天最多跟几单;0 = 不限(与 age/mcap 的 off 同义)
+    # 每天最多花多少美元。None = 不限。
+    # ⚠️ 有人盯着的时候「不限」是可以的(每单都要点一次);无人值守时不行 ——
+    #    daily_max 只数**笔数**,而笔数 × 单笔金额才是钱。改了 amount_usd 忘了改
+    #    daily_max,当天敞口就是静默翻倍。所以 auto_execute 强制要求这一项有值。
+    daily_spend_usd: float | None = None
     networks: tuple[str, ...] = ()      # 链白名单;空 = 不限
     starred_only: bool = False          # 只数 ⭐ 特别关注的人
 
@@ -67,7 +84,34 @@ SKIP_MCAP = "入场市值超上限"
 SKIP_NO_MCAP = "拿不到入场市值"
 SKIP_NETWORK = "链不在白名单"
 SKIP_DAILY = "已达当日上限"
+SKIP_DAILY_SPEND = "已达当日金额上限"
 TAKE = "命中"
+
+
+def auto_blockers(cfg: CopyConfig) -> list[str]:
+    """
+    还差什么才能开无人值守。返回空列表 = 可以开。
+
+    ⚠️ 这是**开关那一刻**的检查,不是下单时的检查 —— 目的是让用户在按下
+       「开自动」时就看见还差哪几步,而不是开完之后在某个凌晨静默地花错钱。
+    ⚠️ 顺序即引导顺序:先验证自动化点对了地方(real → live),再谈上限。
+    """
+    out = []
+    if not cfg.enabled:
+        out.append("跟单本身没开(/copy on)")
+    if cfg.paper_only:
+        out.append("还在纸上跟单(/copy real)")
+    if cfg.dry_run_execute:
+        out.append("还在演练模式,不会真的点成交(/copy live)")
+    if cfg.amount_usd <= 0:
+        out.append("单笔金额是 0(/copy amount <美元>)")
+    if cfg.daily_spend_usd is None:
+        # 无人值守下"不限"不是一个可接受的选项 —— 见 daily_spend_usd 的注释
+        out.append("没设当日金额上限(/copy spend <美元>)")
+    elif cfg.daily_spend_usd < cfg.amount_usd:
+        # 上限比单笔还小 = 一单都下不了。与其让人半夜查"为什么一单没跟",不如现在说
+        out.append(f"当日上限 ${cfg.daily_spend_usd:g} 比单笔 ${cfg.amount_usd:g} 还小")
+    return out
 
 
 @dataclass(frozen=True)
@@ -82,6 +126,9 @@ class Candidate:
     token_created_at: int | None       # unix 秒
     already_taken: bool                # 这个币是否已经跟过
     taken_today: int                   # 今天已经跟了几单
+    # 今天已经花掉多少美元。⚠️ 只统计**真的会出账**的那些状态,
+    #    别把演练/已忽略/失败的也算进来 —— 口径不一致会让上限提前封死。
+    spent_today: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -133,6 +180,12 @@ def decide(c: Candidate, cfg: CopyConfig, now: float | None = None) -> Decision:
     #    看不出哪些币其实本来也不符合条件。
     if cfg.daily_max > 0 and c.taken_today >= cfg.daily_max:
         return Decision(False, SKIP_DAILY, age)
+
+    # ⚠️ 金额上限判"这一单下完会不会超",不是"现在超没超" ——
+    #    后者会让最后一单把上限捅穿(上限 $100、已花 $99、单笔 $40 → 放行到 $139)。
+    if (cfg.daily_spend_usd is not None
+            and c.spent_today + cfg.amount_usd > cfg.daily_spend_usd + 1e-9):
+        return Decision(False, SKIP_DAILY_SPEND, age)
 
     return Decision(True, TAKE, age)
 
