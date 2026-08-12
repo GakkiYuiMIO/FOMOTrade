@@ -836,12 +836,19 @@ def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
     """
     某个币在窗口内被谁买过(按首次买入时间正序 —— 谁先发现的排前面)。
 
+    每行:who(@handle)/ ts(他第一笔的时间)/ usd(窗口内累计买入额)/ buys(笔数)。
+    ⚠️ usd 是**累计**不是首笔:一个人分五笔建仓,只报首笔会把他的实际投入
+       低报成五分之一,而"谁下的注最大"正是这一行的价值所在。
+
     ⚠️ 谓词必须与 hot_tokens / count_consensus 完全一致,否则「👥 5 人买入」
        下面列出来的名字会对不上,甚至把已 /del 的人的 handle 摆在那里。
     """
     return conn.execute(
         """
-        SELECT COALESCE(MAX(e.user_handle), MAX(e.handle)) AS who, MIN(e.event_ts) AS ts
+        SELECT COALESCE(MAX(e.user_handle), MAX(e.handle)) AS who,
+               MIN(e.event_ts)                             AS ts,
+               SUM(COALESCE(e.amount_usd, 0))              AS usd,
+               COUNT(*)                                    AS buys
         FROM fomo_events e
         JOIN watch_users w
           ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1

@@ -85,7 +85,12 @@ _HOT_WINDOWS = {
 }
 # ⚠️ 是**滚动窗口**不是自然日:"今日"写成"近 24 小时"才不会被误读成"从今天零点起"
 _HOT_LABEL = {1: "近 24 小时", 3: "近 3 日", 7: "近 7 日"}
-MAX_HOT_ROWS = 12
+# 每个币展开几个买家。⚠️ 每多一个就是每个币多一行,乘以 MAX_HOT_ROWS 直接顶 TG 的
+#    4096 字符硬上限 —— 两者是绑在一起调的,改一个必须重算总长度。
+HOT_TOP_BUYERS = 3
+MAX_HOT_ROWS = 10
+# 买入先后的名次标。第 4 名之后不展开,所以只要三个
+_MEDALS = ("🥇", "🥈", "🥉")
 
 _HELP = (
     "🤖 <b>FOMO 监控 Bot</b>\n"
@@ -396,7 +401,8 @@ class CommandBot:
             ready = len([r for r in store.list_active_users(conn) if r["stats_ready"]])
             detail = {
                 (r["network_id"], r["token_address"]):
-                    store.token_buyers(conn, r["network_id"], r["token_address"], since, limit=4)
+                    store.token_buyers(conn, r["network_id"], r["token_address"], since,
+                                       limit=HOT_TOP_BUYERS)
                 for r in rows
             }
 
@@ -434,23 +440,28 @@ class CommandBot:
             seg.append(f"💰 名单买入 {_money(_num(r['total_usd']))}")
             lines.append("   " + " · ".join(seg))
 
-            # ⚠️ 首买人与"买入市值"分行写,绝不合成「@某人在 $42K 时买入」——
-            #    两者可能来自不同的行(见 store.hot_tokens 的说明),合起来就是在
-            #    断言一件我们并不知道的事。
-            first_buyer = r["first_buyer"]
-            if first_buyer:
-                lines.append(f"   🥇 @{_esc(first_buyer)} {_ago(r['first_ts'])}首买")
-
+            # 前 3 个买的人:名次 · 名字 · 累计买入额 · 首笔时间。
+            # ⚠️ 名次是**买入先后**,不是金额大小 —— 这个榜的价值在于"谁先摸到",
+            #    金额只是佐证他下了多大的注。
+            # ⚠️ 绝不把这一行与上面的「💎 基准市值」合成「@某人在 $42K 时买入」:
+            #    基准市值取的是最早**有市值**那笔,可能不是这个人那笔
+            #    (见 store.hot_tokens 的说明),合起来就是在断言我们并不知道的事。
             who = detail.get((r["network_id"], r["token_address"])) or []
-            # 首买人已经单独一行了,👤 行里不再重复他
-            rest = [w["who"] for w in who if w["who"] and w["who"] != first_buyer]
-            if rest:
-                # ⚠️ 已点名人数 = 👤 行里的 + 🥇 那一个。max 兜底:改过名的人
-                #    在两处取到不同字符串时会被算成两个人,宁可少显示也不能出现 "+-1"
-                more = max(buyers - len(rest) - (1 if first_buyer else 0), 0)
-                names = " ".join(f"@{_esc(n)}" for n in rest)
-                lines.append(f"   👤 {names}" + (f" +{more}" if more else ""))
-            lines.append(f"   🧬 {_esc(_chain_name(r['network_id']))}")
+            for rank, w in enumerate(who[:HOT_TOP_BUYERS]):
+                if not w["who"]:
+                    continue
+                seg = [f"{_MEDALS[rank]} @{_esc(w['who'])}"]
+                usd = _num(w["usd"])
+                if usd > 0:                       # 0 = 这几笔都没解析出金额,整段消失
+                    seg.append(_money(usd) + (f"({w['buys']} 笔)" if w["buys"] > 1 else ""))
+                seg.append(_ago(w["ts"]))
+                lines.append("   " + " · ".join(seg))
+
+            tail = [f"🧬 {_esc(_chain_name(r['network_id']))}"]
+            more = max(buyers - min(len(who), HOT_TOP_BUYERS), 0)
+            if more:
+                tail.insert(0, f"👤 另有 {more} 人")
+            lines.append("   " + " · ".join(tail))
             lines.append(f"   <code>{_esc(r['token_address'])}</code>")
 
         # 行情新鲜度:清仓后 token_snapshot 就不再更新,倍数会失真,必须让用户知道
@@ -459,7 +470,10 @@ class CommandBot:
             lines.append(f"\n{_esc('⚠️')} {len(stale)} 个币的行情已超过 1 小时未更新"
                          f"(名单里没人持有了,倍数仅供参考)")
         n_nomult = sum(1 for r in rows if r["mult"] is None)
-        foot = f"\n按倍数排序(现在市值 ÷ 名单最早买入时市值) · 名单 {ready} 人"
+        # ⚠️ 必须点明奖牌是**买入先后**:🥇🥈🥉 通常被读成"金额最大",
+        #    而榜里经常出现 🥈 比 🥇 买得多的情况(先摸到的人未必下注最重)。
+        foot = (f"\n🥇🥈🥉 = 买入先后 · 按倍数排序(现在市值 ÷ 名单最早买入时市值)"
+                f" · 名单 {ready} 人")
         if n_nomult:
             # 不说明的话,榜尾那几个没有倍数的看着像 bug
             foot += f"\n{_esc('·')} 末尾 {n_nomult} 个币缺基准市值,按人数排"

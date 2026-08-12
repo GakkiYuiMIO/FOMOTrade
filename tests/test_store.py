@@ -795,3 +795,32 @@ def test_买入榜不算已删除和未就绪的人(conn):
 
     r = store.hot_tokens(conn, "2026-08-12T00:00:00+00:00")[0]
     assert r["buyers"] == 1
+
+
+def test_买家行给出累计买入额而不是首笔(conn):
+    """
+    一个人分五笔建仓,只报首笔会把他的实际投入低报成五分之一 ——
+    而"谁下的注最大"正是这一行的价值。
+    """
+    _ready(conn, "u1", "alice")
+    for i, usd in enumerate([100.0, 200.0, 700.0]):
+        _hot_buy(conn, "u1", "t", f"2026-08-12T0{i+1}:00:00+00:00", mcap=1000, usd=usd)
+
+    rows = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
+    assert len(rows) == 1
+    assert rows[0]["usd"] == 1000.0
+    assert rows[0]["buys"] == 3
+    assert rows[0]["ts"] == "2026-08-12T01:00:00+00:00", "ts 是他**第一笔**的时间"
+
+
+def test_买家按买入先后排不是按金额(conn):
+    """🥇🥈🥉 标的是"谁先摸到",不是"谁买得多" —— 两者经常不一致"""
+    _ready(conn, "u1", "early_small")
+    _ready(conn, "u2", "late_whale")
+    _hot_buy(conn, "u1", "t", "2026-08-12T01:00:00+00:00", mcap=1000, usd=10.0,
+             handle="early_small")
+    _hot_buy(conn, "u2", "t", "2026-08-12T09:00:00+00:00", mcap=1000, usd=99999.0,
+             handle="late_whale")
+
+    rows = store.token_buyers(conn, "solana", "t", "2026-08-12T00:00:00+00:00")
+    assert [r["who"] for r in rows] == ["early_small", "late_whale"]
