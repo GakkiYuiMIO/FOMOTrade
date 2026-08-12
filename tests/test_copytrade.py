@@ -131,3 +131,119 @@ def test_now_默认取当前时间():
     """不传 now 时必须走真实时间,否则线上永远按某个固定时刻判币龄"""
     c = _cand(token_created_at=int(time.time()) - 3600)
     assert decide(c, _cfg(max_age_hours=24)).take
+
+
+# ============================================================
+# TG 确认按钮
+# ⚠️ 这条路径会**花钱**,每一条都是"点两次会不会买两次"这类问题
+# ============================================================
+class _Notif:
+    def __init__(self):
+        self.enabled = True
+        self.sent: list[tuple[str, list | None]] = []
+        self.answers: list[str] = []
+        self.edits: list[str] = []
+
+    def send(self, text, parse_mode="HTML", chat_id=None, buttons=None):
+        self.sent.append((text, buttons))
+        return True
+
+    def answer_callback(self, cb_id, text=""):
+        self.answers.append(text)
+        return True
+
+    def edit_message(self, chat_id, message_id, text):
+        self.edits.append(text)
+        return True
+
+    def get_updates(self, offset=None, timeout=30):
+        return []
+
+
+def _bot(monkeypatch, tmp_path, notif):
+    from src import store
+    from src.bot import CommandBot
+
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "cb.db")
+    store.init_db()
+    monkeypatch.setenv("FOMO_TELEGRAM_CHAT_ID", "999")
+    b = CommandBot(client=None, notifier=notif)
+    monkeypatch.setattr(type(b._settings), "admin_chat_id", property(lambda s: "999"))
+    return b, store
+
+
+def _pending(store, ca="GCa9TZMK9Q3VUSkh1234", sym="TOAD"):
+    with store.get_conn() as c:
+        store.record_copy_signal(c, network_id="solana", token_address=ca, token_symbol=sym,
+                                 buyers=2, entry_mcap=50_000.0, age_sec=3600,
+                                 amount_usd=50.0, status="pending")
+    return f"solana:{ca[:12]}"
+
+
+def test_非管理员点按钮一律拒绝(monkeypatch, tmp_path):
+    """
+    ⚠️ 消息可能被转发到别的群,那里的人点按钮同样会产生 callback。
+       这条路径会花钱,门不能比命令层松。
+    """
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    b._handle_callback({"id": "1", "data": f"buy:{key}",
+                        "message": {"message_id": 1, "chat": {"id": "12345"}}})
+    assert n.answers == ["无权限"]
+    with store_.get_conn() as c:
+        assert c.execute("SELECT status FROM copytrade_signals").fetchone()["status"] == "pending"
+
+
+def test_点忽略只改状态不成交(monkeypatch, tmp_path):
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    b._handle_callback({"id": "1", "data": f"skip:{key}",
+                        "message": {"message_id": 1, "chat": {"id": "999"}}})
+    with store_.get_conn() as c:
+        assert c.execute("SELECT status FROM copytrade_signals").fetchone()["status"] == "rejected"
+    assert n.edits and "已忽略" in n.edits[0]
+
+
+def test_连点两次不会重复处理(monkeypatch, tmp_path):
+    """连点、或消息被转发后两个人各点一次 —— 都必须只生效一次"""
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    ev = {"id": "1", "data": f"skip:{key}", "message": {"message_id": 1, "chat": {"id": "999"}}}
+    b._handle_callback(ev)
+    b._handle_callback(ev)
+    assert "已经处理过了" in n.answers[1]
+
+
+def test_下单未接入时明确失败而不是假装成交(monkeypatch, tmp_path):
+    """
+    ⚠️ 把状态写成 filled 却没真的买,是这个功能最坏的一种失效:
+       台账显示"已成交"、`/paper` 给你算着盈亏,而你根本没有这个仓位。
+    """
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    b._handle_callback({"id": "1", "data": f"buy:{key}",
+                        "message": {"message_id": 1, "chat": {"id": "999"}}})
+    with store_.get_conn() as c:
+        assert c.execute("SELECT status FROM copytrade_signals").fetchone()["status"] == "failed"
+    assert "没有成交" in n.answers[0]
+    assert n.edits and "未成交" in n.edits[0]
+
+
+def test_找不到信号时不报错(monkeypatch, tmp_path):
+    n = _Notif()
+    b, _ = _bot(monkeypatch, tmp_path, n)
+    b._handle_callback({"id": "1", "data": "buy:solana:deadbeef",
+                        "message": {"message_id": 1, "chat": {"id": "999"}}})
+    assert "找不到" in n.answers[0]
+
+
+def test_callback_data不超TG的64字节上限():
+    """超了 TG 直接 400,而消息会**没有按钮地发出去** —— 你以为能点,其实不能"""
+    ca = "GCa9TZMK9Q3VUSkhZgX76YAQBjqQd1dPxkBnZojFpump"
+    for prefix in ("buy", "skip"):
+        data = f"{prefix}:solana:{ca[:12]}"
+        assert len(data.encode()) <= 64, data

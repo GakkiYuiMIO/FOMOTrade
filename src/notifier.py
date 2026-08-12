@@ -67,11 +67,17 @@ class TelegramNotifier:
             except Exception:  # noqa: BLE001
                 pass
 
-    def send(self, text: str, parse_mode: str = "HTML", chat_id: str | None = None) -> bool:
+    def send(self, text: str, parse_mode: str = "HTML", chat_id: str | None = None,
+             buttons: list[tuple[str, str]] | None = None) -> bool:
         """
         同步发送消息。支持 HTML 标签: <b> <i> <code> <blockquote>
         返回 True 表示 TG 确认收到 —— 调用方据此把 fomo_events.sent 置 1,
         绝不能"发之前就标已发",否则崩在中间会永久丢消息。
+
+        buttons: [(按钮文字, callback_data), …] —— 一行内联键盘。
+        ⚠️ callback_data 是 TG 的硬限制:**最多 64 字节**。Solana 的 CA 是 44 字符、
+           加上链名和动作前缀就顶满了,所以调用方必须传短标识(见 bot._copy_cb)。
+           超长时 TG 直接 400,而那条消息会**没有按钮地发出去** —— 你以为能点,其实不能。
         """
         target = chat_id or self._chat_id
         if not self.enabled or not target:
@@ -89,6 +95,17 @@ class TelegramNotifier:
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
         }
+        if buttons:
+            # ⚠️ 超过 64 字节的 callback_data 会让 TG 整条 400。宁可丢掉那个按钮
+            #    也不能丢掉整条消息 —— 消息里有 CA,没按钮照样能手动买。
+            keep = [(t, d) for t, d in buttons if len(d.encode()) <= 64]
+            if len(keep) != len(buttons):
+                logger.error("callback_data 超 64 字节,已丢弃 {} 个按钮(消息照常发)",
+                             len(buttons) - len(keep))
+            if keep:
+                payload["reply_markup"] = {
+                    "inline_keyboard": [[{"text": t, "callback_data": d} for t, d in keep]]
+                }
 
         # ⚠️ 不要写成 `with self._client() as c` —— 那会在退出时关掉共享连接池,
         #    等于每条消息又退回到"重新握手"。
@@ -128,6 +145,46 @@ class TelegramNotifier:
                 time.sleep(_SEND_RETRY_SEC * attempt)
         return False
 
+    def answer_callback(self, callback_id: str, text: str = "") -> bool:
+        """
+        回应一次按钮点击 —— 不回的话 TG 客户端会把按钮**转圈到超时**,
+        用户以为卡住了会反复点,而每一次点击都是一条新的 update。
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = self._client().post(
+                f"https://api.telegram.org/bot{self._token}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text[:200]},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("answerCallbackQuery 失败(不影响已执行的动作): {}", e)
+            return False
+
+    def edit_message(self, chat_id, message_id: int, text: str) -> bool:
+        """
+        改写已发出的消息,并**清掉键盘**(reply_markup 传空)。
+
+        ⚠️ 清键盘是必须的:按钮留在那里就能被再点一次,
+           而"再点一次"在真实下单模式下就是再买一单。
+        """
+        if not self.enabled:
+            return False
+        try:
+            resp = self._client().post(
+                f"https://api.telegram.org/bot{self._token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text[:MAX_MESSAGE_LEN],
+                      "parse_mode": "HTML", "disable_web_page_preview": True,
+                      "reply_markup": {"inline_keyboard": []}},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("editMessageText 失败: {}", e)
+            return False
+
     def set_my_commands(self, commands: list[tuple[str, str]]) -> bool:
         """
         注册命令菜单 —— 用户在输入框敲 `/` 时 Telegram 弹出的那个列表。
@@ -164,7 +221,10 @@ class TelegramNotifier:
         if not self.enabled:
             return []
         url = f"https://api.telegram.org/bot{self._token}/getUpdates"
-        params: dict = {"timeout": timeout, "allowed_updates": '["message"]'}
+        # ⚠️ allowed_updates 是白名单:不写 callback_query,按钮点击**永远收不到**,
+        #    而且没有任何报错 —— 表现是"按钮点了没反应",极难联想到是这里。
+        params: dict = {"timeout": timeout,
+                        "allowed_updates": '["message","callback_query"]'}
         if offset is not None:
             params["offset"] = offset
         try:

@@ -276,9 +276,86 @@ class CommandBot:
         logger.info("Telegram 命令层已停止")
 
     # ============================================================
+    # 按钮回调(跟单确认)
+    # ============================================================
+    def _handle_callback(self, cb: dict) -> None:
+        """
+        处理一次按钮点击。
+
+        ⚠️ 权限门必须和命令层**一模一样**:按钮消息是发到管理员 chat 的,
+           但 callback 里的 from/chat 仍要校验 —— 消息可能被转发到别的群,
+           那里的人点了按钮同样会产生 callback。这条路径会**花钱**,门不能比命令层松。
+        ⚠️ 无论如何都要 answerCallbackQuery:不回的话客户端一直转圈,
+           用户会反复点,而每次点击都是一条新 update。
+        """
+        cb_id = cb.get("id") or ""
+        msg = cb.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id") or "")
+        admin = self._settings.admin_chat_id
+
+        if not admin or chat_id != str(admin):
+            logger.warning("忽略非管理员按钮点击 | chat_id={} | data={}", chat_id, cb.get("data"))
+            self._notifier.answer_callback(cb_id, "无权限")
+            return
+
+        data = (cb.get("data") or "").strip()
+        logger.info("收到按钮点击 | {}", data)
+        try:
+            toast, new_text = self._dispatch_callback(data)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("按钮处理异常 | {}", data)
+            toast, new_text = f"出错了: {e}"[:180], None
+
+        self._notifier.answer_callback(cb_id, toast)
+        # 改写原消息并清掉键盘 —— 留着按钮就能被再点一次,而再点一次就是再买一单
+        if new_text and msg.get("message_id"):
+            self._notifier.edit_message(chat_id, msg["message_id"], new_text)
+
+    def _dispatch_callback(self, data: str) -> tuple[str, str | None]:
+        """回调路由。返回 (气泡提示, 改写后的消息正文或 None)"""
+        action, _, payload = data.partition(":")
+        if action in ("buy", "skip"):
+            return self._cb_copy_decision(action, payload)
+        return "未知按钮", None
+
+    def _cb_copy_decision(self, action: str, token_key: str) -> tuple[str, str | None]:
+        """
+        跟单确认 / 忽略。
+
+        ⚠️ 先用 UPDATE 的 rowcount 抢占状态,再执行下单 ——
+           连点两次、或消息被转发后两个人各点一次,都必须只成交一次。
+           先执行后改状态的写法在这两种情况下会**买两次**。
+        """
+        with store.get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM copytrade_signals WHERE network_id || ':' || "
+                "substr(token_address, 1, 12) = ?", (token_key,),
+            ).fetchone()
+            if row is None:
+                return "找不到这条信号(可能已过期)", None
+            if row["status"] != "pending":
+                return f"已经处理过了({row['status']})", None
+
+            sym = (row["token_symbol"] or "?").lstrip("$")
+            if action == "skip":
+                store.set_copy_status(conn, row["network_id"], row["token_address"], "rejected")
+                return f"已忽略 ${sym}", f"🚫 <b>已忽略</b> · ${_esc(sym)}"
+
+            # ⚠️ 真实下单还没接上。这里**明确失败**而不是假装成功 ——
+            #    把状态写成 filled 却没有真的买,是这个功能最坏的一种失效。
+            store.set_copy_status(conn, row["network_id"], row["token_address"],
+                                  "failed", "执行器未接入")
+            return ("真实下单还没接入,这一单没有成交",
+                    f"❌ <b>未成交</b> · ${_esc(sym)}\n真实下单执行器还没接入,"
+                    f"请自己在 APP 里操作。CA:\n<code>{_esc(row['token_address'])}</code>")
+
+    # ============================================================
     # 分发
     # ============================================================
     def _handle_update(self, up: dict) -> None:
+        if up.get("callback_query"):
+            self._handle_callback(up["callback_query"])
+            return
         msg = up.get("message") or {}
         text = (msg.get("text") or "").strip()
         if not text.startswith("/"):

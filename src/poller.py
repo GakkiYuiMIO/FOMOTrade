@@ -1572,9 +1572,21 @@ class Poller:
                 self._send_copy_signal(cand, d, cfg, status)
 
     def _send_copy_signal(self, cand: Candidate, d, cfg, status: str) -> None:
-        """推一条跟单信号。⚠️ 发送失败不能上抛 —— 台账已经记了,推送只是通知"""
+        """
+        推一条跟单信号。pending 状态附确认按钮,纸上模式不附。
+
+        ⚠️ callback_data 上限 64 字节,而 Solana 的 CA 就有 44 个字符 ——
+           这里用 `网络:CA前12位` 当键(bot 侧用同样的表达式反查)。
+           12 位前缀在一个几百币的库里碰撞概率可以忽略,而且反查还带网络限定。
+        ⚠️ 发送失败不能上抛 —— 台账已经记了,推送只是通知。
+        """
+        buttons = None
+        if status == "pending":
+            key = f"{cand.network_id}:{cand.token_address[:12]}"
+            buttons = [(f"✅ 买入 ${cfg.amount_usd:,.0f}", f"buy:{key}"),
+                       ("🚫 忽略", f"skip:{key}")]
         try:
-            self.notifier.send(render_copy_signal(cand, d, cfg, status))
+            self.notifier.send(render_copy_signal(cand, d, cfg, status), buttons=buttons)
         except Exception as e:  # noqa: BLE001
             logger.error("跟单信号推送失败(台账已记录): {}", e)
 
