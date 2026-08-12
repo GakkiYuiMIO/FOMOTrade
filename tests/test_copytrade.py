@@ -217,20 +217,100 @@ def test_连点两次不会重复处理(monkeypatch, tmp_path):
     assert "已经处理过了" in n.answers[1]
 
 
-def test_下单未接入时明确失败而不是假装成交(monkeypatch, tmp_path):
+def _click_buy(b, key):
+    b._handle_callback({"id": "1", "data": f"buy:{key}",
+                        "message": {"message_id": 1, "chat": {"id": "999"}}})
+
+
+def _status(store_):
+    with store_.get_conn() as c:
+        return c.execute("SELECT status FROM copytrade_signals").fetchone()["status"]
+
+
+def _set_dry(store_, dry: bool):
+    from dataclasses import replace as _replace
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, _replace(store_.load_copy_config(c),
+                                            paper_only=False, dry_run_execute=dry))
+
+
+def test_演练模式绝不记成已成交(monkeypatch, tmp_path):
     """
-    ⚠️ 把状态写成 filled 却没真的买,是这个功能最坏的一种失效:
-       台账显示"已成交"、`/paper` 给你算着盈亏,而你根本没有这个仓位。
+    ⚠️ 演练根本没点成交按钮。记成 filled 会让 /paper 给一个
+       **并不存在的仓位**算盈亏 —— 这是这个功能最坏的一种失效。
     """
+    from src import bot as bot_mod
+    from src.executor import BuyResult
+
     n = _Notif()
     b, store_ = _bot(monkeypatch, tmp_path, n)
     key = _pending(store_)
-    b._handle_callback({"id": "1", "data": f"buy:{key}",
-                        "message": {"message_id": 1, "chat": {"id": "999"}}})
-    with store_.get_conn() as c:
-        assert c.execute("SELECT status FROM copytrade_signals").fetchone()["status"] == "failed"
+    _set_dry(store_, True)
+    calls = []
+    monkeypatch.setattr(bot_mod, "execute_buy",
+                        lambda *a, **kw: calls.append(kw) or BuyResult(True, "演练通过"))
+    _click_buy(b, key)
+
+    assert calls and calls[0]["dry_run"] is True, "演练模式必须把 dry_run 传下去"
+    assert _status(store_) != "filled", "演练绝不能记成已成交"
+    assert "未成交" in n.edits[0]
+
+
+def test_真实模式才记filled(monkeypatch, tmp_path):
+    from src import bot as bot_mod
+    from src.executor import BuyResult
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    _set_dry(store_, False)
+    monkeypatch.setattr(bot_mod, "execute_buy", lambda *a, **kw: BuyResult(True, "已提交"))
+    _click_buy(b, key)
+    assert _status(store_) == "filled"
+
+
+def test_执行器抛异常时记failed而不是filled(monkeypatch, tmp_path):
+    """浏览器起不来、页面改版、余额不足 —— 一律当成没有成交"""
+    from src import bot as bot_mod
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    _set_dry(store_, False)
+
+    def boom(*a, **kw):
+        raise RuntimeError("找不到成交按钮")
+
+    monkeypatch.setattr(bot_mod, "execute_buy", boom)
+    _click_buy(b, key)
+    assert _status(store_) == "failed"
     assert "没有成交" in n.answers[0]
-    assert n.edits and "未成交" in n.edits[0]
+    assert "找不到成交按钮" in n.edits[0]
+
+
+def test_执行期间再点一次不会重复下单(monkeypatch, tmp_path):
+    """
+    ⚠️ 抢占状态必须发生在**调用执行器之前**。否则第一次还在跑浏览器时
+       第二次点进来,会看到状态仍是 pending,于是买第二单。
+    """
+    from src import bot as bot_mod
+    from src.executor import BuyResult
+
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    key = _pending(store_)
+    _set_dry(store_, False)
+    seen = []
+
+    def slow(*a, **kw):
+        seen.append(1)
+        assert _status(store_) == "executing", "调用执行器之前必须已经把状态抢占掉"
+        return BuyResult(True, "ok")
+
+    monkeypatch.setattr(bot_mod, "execute_buy", slow)
+    _click_buy(b, key)
+    _click_buy(b, key)
+    assert len(seen) == 1, "只能执行一次"
 
 
 def test_找不到信号时不报错(monkeypatch, tmp_path):

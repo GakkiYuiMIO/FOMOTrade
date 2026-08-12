@@ -43,6 +43,9 @@ class CopyConfig:
     # ⚠️ 默认只做纸上跟单。要接真实下单必须显式关掉它 ——
     #    "升级了一版就开始花钱"是绝对不能发生的事。
     paper_only: bool = True
+    # ⚠️ 就算开了真实下单,默认也只**演练**:走完全部步骤但不点最后那个成交按钮。
+    #    这是验证"自动化点对了没有"的唯一安全方式。确认无误后 /copy live 关掉它。
+    dry_run_execute: bool = True
     min_buyers: int = 2                 # 几个名单成员买过就触发
     window_hours: int = 24              # 在多长的窗口内数这些人
     max_age_hours: int | None = 24      # 币龄上限;None = 不限

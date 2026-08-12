@@ -27,8 +27,9 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from src import store
-from src.config import get_settings
+from src.config import PROBE_DIR, get_settings
 from src.copytrade import pnl
+from src.executor import buy as execute_buy
 from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
@@ -341,13 +342,36 @@ class CommandBot:
                 store.set_copy_status(conn, row["network_id"], row["token_address"], "rejected")
                 return f"已忽略 ${sym}", f"🚫 <b>已忽略</b> · ${_esc(sym)}"
 
-            # ⚠️ 真实下单还没接上。这里**明确失败**而不是假装成功 ——
-            #    把状态写成 filled 却没有真的买,是这个功能最坏的一种失效。
-            store.set_copy_status(conn, row["network_id"], row["token_address"],
-                                  "failed", "执行器未接入")
-            return ("真实下单还没接入,这一单没有成交",
-                    f"❌ <b>未成交</b> · ${_esc(sym)}\n真实下单执行器还没接入,"
-                    f"请自己在 APP 里操作。CA:\n<code>{_esc(row['token_address'])}</code>")
+            cfg = store.load_copy_config(conn)
+            # ⚠️ **先抢占状态再执行**:executing 是个中间态,连点第二次会被上面
+            #    `status != pending` 挡住。先执行后改状态的话,连点两次就是买两次。
+            store.set_copy_status(conn, row["network_id"], row["token_address"], "executing")
+
+        net, ca = row["network_id"], row["token_address"]
+        try:
+            res = execute_buy(net, ca, sym, row["amount_usd"],
+                              dry_run=cfg.dry_run_execute,
+                              screenshot_dir=str(PROBE_DIR))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("买入执行失败 | {} {}", sym, ca[:10])
+            with store.get_conn() as conn:
+                store.set_copy_status(conn, net, ca, "failed", str(e)[:200])
+            return (f"没有成交:{e}"[:180],
+                    f"❌ <b>未成交</b> · ${_esc(sym)}\n{_esc(str(e)[:300])}\n"
+                    f"<code>{_esc(ca)}</code>")
+
+        # ⚠️ 演练模式**绝不能记成 filled**:那会让 /paper 给一个并不存在的仓位算盈亏
+        with store.get_conn() as conn:
+            store.set_copy_status(conn, net, ca,
+                                  "rejected" if cfg.dry_run_execute else "filled",
+                                  res.message[:200])
+        if cfg.dry_run_execute:
+            return ("演练通过(未真实成交)",
+                    f"🧪 <b>演练通过 · 未成交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
+                    f"确认无误后 <code>/copy live</code> 开真实成交")
+        return ("已提交,请到 APP 核对",
+                f"✅ <b>已提交</b> · ${_esc(sym)}\n{_esc(res.message)}\n"
+                f"<code>{_esc(ca)}</code>")
 
     # ============================================================
     # 分发
@@ -815,6 +839,8 @@ class CommandBot:
         "off":     ("enabled", lambda v: False),
         "real":    ("paper_only", lambda v: False),
         "paper":   ("paper_only", lambda v: True),
+        "live":    ("dry_run_execute", lambda v: False),
+        "rehearse": ("dry_run_execute", lambda v: True),
         "buyers":  ("min_buyers", lambda v: max(1, int(v))),
         "window":  ("window_hours", lambda v: max(1, int(v))),
         "age":     ("max_age_hours", lambda v: None if v in ("off", "0") else max(1, int(v))),
@@ -823,7 +849,7 @@ class CommandBot:
         "daily":   ("daily_max", lambda v: max(0, int(v))),
         "starred": ("starred_only", lambda v: v in ("1", "on", "true", "yes")),
     }
-    _COPY_SWITCHES = ("on", "off", "paper", "real")
+    _COPY_SWITCHES = ("on", "off", "paper", "real", "live", "rehearse")
 
     def _cmd_copy(self, arg: str) -> str:
         """/copy 查看 · /copy <项> <值> 改。⚠️ 接真实下单必须显式 /copy real"""
@@ -849,7 +875,9 @@ class CommandBot:
                 store.save_copy_config(conn, cfg)
             taken = store.copy_taken_today(conn)
 
-        mode = "🧪 纸上跟单(不花钱)" if cfg.paper_only else "🛒 <b>真实下单</b>(仍需你点确认)"
+        mode = ("🧪 纸上跟单(不花钱)" if cfg.paper_only
+                else ("🎭 演练下单(走流程但不成交)" if cfg.dry_run_execute
+                      else "🛒 <b>真实成交</b>(仍需你点确认)"))
         age = f"≤ {cfg.max_age_hours} 小时" if cfg.max_age_hours is not None else "不限"
         mcap = _money(cfg.max_entry_mcap) if cfg.max_entry_mcap is not None else "不限"
         return "\n".join([
