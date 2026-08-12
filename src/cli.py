@@ -28,9 +28,10 @@ from loguru import logger
 
 from src import store
 from src.client import request_stop
-from src.config import PROBE_DIR, SESSION_FILE, get_settings, mask
+from src.config import PROBE_DIR, PROFILE_DIR, SESSION_FILE, get_settings, mask
 from src.logger import setup_logger
 from src.models import (
+    NETWORK_SLUG,
     QUOTE_TOKENS,
     known_networks,
     normalize_network,
@@ -808,6 +809,139 @@ def cmd_run() -> int:
 # ============================================================
 # 入口
 # ============================================================
+def cmd_capture_buy(ca: str, network: str, amount: float) -> int:
+    """
+    抓「点了成交之后会出现什么」—— 用户报告点击后有个**滑块**要拖。
+
+    ⚠️ 本命令**从不点成交按钮**。它把页面开好、金额填好,然后停下来等**你**点;
+       你点的那一刻它开始每 0.5s 采一次 DOM,把新出现的滑块/弹窗结构和截图存下来。
+       分工是刻意的:下单是你的动作,抓结构是程序的活。
+    ⚠️ 存下来的结构会用来写滑块处理逻辑,所以采样要采**元素属性**
+       (role / aria-valuenow / type=range / draggable / 位置尺寸),不能只截图 ——
+       光看图写不出定位器。
+    """
+    from src.auth import _DROP_DEFAULT_ARGS, _LOGIN_CHANNELS, _STEALTH_ARGS
+    from src.executor import TOKEN_URL
+
+    slug = NETWORK_SLUG.get((network or "").strip())
+    if not slug:
+        _out(f"❌ 不支持的链: {network}")
+        return 1
+
+    s = get_settings()
+    out_dir = PROBE_DIR / "buyflow"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    url = TOKEN_URL.format(slug=slug, ca=ca)
+
+    # 采样脚本:把"可能是滑块/确认控件"的元素连同属性一起吐出来
+    probe_js = """() => {
+      const out = [];
+      const sel = 'button,[role=slider],input[type=range],[draggable=true],'
+                + '[role=dialog],[aria-valuenow],[class*=slid],[class*=Slid],'
+                + '[class*=drag],[class*=Drag],[class*=confirm],[class*=Confirm]';
+      document.querySelectorAll(sel).forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) return;
+        out.push({
+          tag: el.tagName.toLowerCase(),
+          role: el.getAttribute('role') || '',
+          type: el.getAttribute('type') || '',
+          aria: el.getAttribute('aria-label') || '',
+          valuenow: el.getAttribute('aria-valuenow') || '',
+          valuemax: el.getAttribute('aria-valuemax') || '',
+          draggable: el.getAttribute('draggable') || '',
+          testid: el.getAttribute('data-testid') || '',
+          cls: (el.className || '').toString().slice(0, 90),
+          text: (el.innerText || '').trim().slice(0, 60),
+          box: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+        });
+      });
+      return out;
+    }"""
+
+    from playwright.sync_api import sync_playwright
+
+    base: dict = {
+        "user_data_dir": str(PROFILE_DIR), "headless": False, "locale": "en-US",
+        "args": list(_STEALTH_ARGS), "ignore_default_args": list(_DROP_DEFAULT_ARGS),
+    }
+    if s.fomo_proxy:
+        base["proxy"] = {"server": s.fomo_proxy}
+
+    with sync_playwright() as p:
+        ctx = None
+        for ch in _LOGIN_CHANNELS:
+            try:
+                kw = dict(base)
+                if ch:
+                    kw["channel"] = ch
+                ctx = p.chromium.launch_persistent_context(**kw)
+                break
+            except Exception as e:  # noqa: BLE001
+                logger.debug("{} 启动失败: {}", ch, e)
+        if ctx is None:
+            _out("❌ 浏览器起不来(profile 可能正被另一个窗口占用,关掉再试)")
+            return 1
+
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.set_default_timeout(45_000)
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_timeout(8000)
+
+            amount_input = page.locator('input[placeholder="0"]').first
+            if not amount_input.count():
+                _out("❌ 找不到金额输入框,页面结构可能变了")
+                return 1
+            amount_input.fill(f"{amount:.2f}")
+            page.wait_for_timeout(2000)
+
+            before = {json.dumps(x, sort_keys=True) for x in page.evaluate(probe_js)}
+            page.screenshot(path=str(out_dir / "0_before.png"))
+
+            _out("=" * 64)
+            _out(f"金额已填 ${amount:.2f}。**现在请你自己点那个成交按钮** —— 本程序不会点。")
+            _out("点完之后如果出现滑块,把它拖到底完成成交;我会全程记录结构。")
+            _out(f"我会盯 120 秒,结果存到 {out_dir}")
+            _out("=" * 64)
+
+            seen, shots = set(), 0
+            for i in range(240):                     # 240 × 0.5s = 120s
+                page.wait_for_timeout(500)
+                try:
+                    now = page.evaluate(probe_js)
+                except Exception:  # noqa: BLE001
+                    continue                          # 页面正在跳转,下一轮再采
+                fresh = [x for x in now
+                         if json.dumps(x, sort_keys=True) not in before
+                         and json.dumps(x, sort_keys=True) not in seen]
+                if not fresh:
+                    continue
+                for x in fresh:
+                    seen.add(json.dumps(x, sort_keys=True))
+                shots += 1
+                page.screenshot(path=str(out_dir / f"{shots}_step.png"))
+                _out(f"\n--- 第 {i * 0.5:.1f}s 出现 {len(fresh)} 个新元素 ---")
+                for x in fresh:
+                    bits = [f"<{x['tag']}>"]
+                    for k in ("role", "type", "aria", "valuenow", "valuemax",
+                              "draggable", "testid"):
+                        if x[k]:
+                            bits.append(f"{k}={x[k]!r}")
+                    if x["text"]:
+                        bits.append(f"text={x['text']!r}")
+                    bits.append(f"box={x['box']}")
+                    bits.append(f"cls={x['cls']!r}")
+                    _out("  " + " ".join(bits))
+                (out_dir / f"{shots}_step.json").write_text(
+                    json.dumps(fresh, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            _out(f"\n✅ 记录结束,共 {shots} 次变化。截图与 JSON 在 {out_dir}")
+            return 0
+        finally:
+            ctx.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="fomo",
@@ -831,6 +965,13 @@ def main() -> int:
                         help="正式运行:轮询 + Telegram 命令层")
     parser.add_argument("--init-db", action="store_true",
                         help="只建表,不做别的")
+    parser.add_argument("--capture-buy", metavar="CA", default=None,
+                        help="抓买入流程:开页面填好金额后**停下来等你自己点**,"
+                             "把点击后出现的滑块/弹窗结构抓下来(本程序全程不点成交)")
+    parser.add_argument("--amount", type=float, default=2.0,
+                        help="--capture-buy 填多少金额(默认 2)")
+    parser.add_argument("--network", type=str, default="solana",
+                        help="--capture-buy 的链,默认 solana")
     args = parser.parse_args()
 
     setup_logger()
@@ -844,6 +985,8 @@ def main() -> int:
         return cmd_check()
     if args.init_db:
         return cmd_init_db()
+    if args.capture_buy:
+        return cmd_capture_buy(args.capture_buy, args.network, args.amount)
     if args.dry_run:
         return cmd_dry_run()
     if args.run:
