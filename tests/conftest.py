@@ -18,6 +18,19 @@ from src.models import EVENT_BUY, FomoEvent, dump_raw
 
 
 @pytest.fixture(autouse=True)
+def _clear_stop_flag():
+    """
+    client 的停机 Event 是**模块级全局**。某个用例设了它而不清,
+    后面所有用例的请求都会被当成"停机中"直接放弃 —— 而且失败信息完全指不到根因。
+    """
+    from src import client as _c
+
+    _c.reset_stop()
+    yield
+    _c.reset_stop()
+
+
+@pytest.fixture(autouse=True)
 def _no_send_throttle(monkeypatch):
     """
     单测里不要真的 sleep。

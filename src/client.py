@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import random
 import threading
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -93,6 +92,67 @@ _JITTER = 0.35
 def _backoff(attempt: int) -> float:
     """第 attempt 次失败后要等多久(带抖动)"""
     return _BACKOFF_SEC * attempt * random.uniform(1 - _JITTER, 1 + _JITTER)
+
+
+# ============================================================
+# 停机信号
+# ============================================================
+# ⚠️ 没有这个信号时,Ctrl+C 要等十几秒到几十秒才真的退出:
+#    调度器停了,但线程池里十几个 worker 还卡在重试退避的 sleep 里、
+#    或者卡在一个 12s 的 HTTP 超时上;ThreadPoolExecutor 的 atexit 钩子会 join 它们,
+#    于是进程一直挂着,用户只能连按好几次 Ctrl+C。
+#    这里给一个全局 Event:退避改成可打断的 wait(),排队中的请求直接放弃。
+_STOP = threading.Event()
+
+
+def request_stop() -> None:
+    """通知所有在途请求尽快放弃(cli 收到 Ctrl+C 时调用)"""
+    _STOP.set()
+
+
+def stop_requested() -> bool:
+    return _STOP.is_set()
+
+
+def reset_stop() -> None:
+    """单测用:Event 是模块级全局,不重置会污染后续用例"""
+    _STOP.clear()
+
+
+def sleep_or_stop(seconds: float) -> bool:
+    """
+    可打断的等待。返回 True 表示"别等了,要停机了"。
+
+    ⚠️ 凡是**以秒计**的 sleep 都该走这里,不只是重试退避 ——
+       poller 的推送节流同样会一次等好几十秒,用 time.sleep 就等于按了 Ctrl+C 也走不掉。
+    """
+    return _STOP.wait(seconds)
+
+
+# ============================================================
+# 瞬时故障计数(日志降噪)
+# ============================================================
+# ⚠️ 每次 5xx/429 重试都打一条 WARNING,一轮就是几十行刷屏 —— 而这些**已经被处理掉了**
+#    (重试 + balances 有缓存兜底)。用户真正需要知道的是"这一轮有多少次、哪个端点",
+#    不是每一次。所以逐条降到 DEBUG,由 poller 每轮汇总成一行。
+#    上游抖动是这个 API 的常态(实测 /balances 从 p50 1.2s 劣化到单次 10s 过),
+#    刷屏的后果是真正要紧的 ERROR 被淹掉。
+_ERRS: dict[str, int] = {}
+_ERRS_LOCK = threading.Lock()
+
+
+def _note_transient(kind: str) -> None:
+    with _ERRS_LOCK:
+        _ERRS[kind] = _ERRS.get(kind, 0) + 1
+
+
+def take_transient_errors() -> dict[str, int]:
+    """取走并清空本轮的瞬时故障计数(poller 每轮末尾调一次)"""
+    with _ERRS_LOCK:
+        out = dict(_ERRS)
+        _ERRS.clear()
+        return out
+
 
 # Cloudflare 拦截页的特征词。
 # ⚠️ 绝不能只看 cf-ray 响应头:prod-api 整站都在 Cloudflare 后面,合法的 401 也带这个头。
@@ -322,6 +382,8 @@ class _BaseFomoClient:
            包成 FomoAPIError 会让 poller 以为只是某个接口抖动,继续空转刷日志,
            而设计文档 §3.5 要求的是「告警需要重新登录 + 停止轮询」。
         """
+        if stop_requested():
+            raise FomoAPIError(f"{path} 停机中,未发出")
         attempt = 0
         auth_retried = False
         # ⚠️ 记住"这一路上见过 401/403"。401 若正好落在**最后一次**尝试上,
@@ -337,10 +399,12 @@ class _BaseFomoClient:
             try:
                 status, text, headers = self._request(path, params)
             except _TransportError as e:
-                if attempt < _MAX_ATTEMPTS:
+                _note_transient("传输失败")
+                if attempt < _MAX_ATTEMPTS and not stop_requested():
                     wait = _backoff(attempt)
-                    logger.warning("请求传输失败,{:.1f}s 后重试 | {} | {}", wait, path, e)
-                    time.sleep(wait)
+                    logger.debug("请求传输失败,{:.1f}s 后重试 | {} | {}", wait, path, e)
+                    if sleep_or_stop(wait):
+                        raise FomoAPIError(f"{path} 停机中,放弃重试") from e
                     continue
                 raise FomoAPIError(f"{path} 传输失败: {e}") from e
 
@@ -348,10 +412,12 @@ class _BaseFomoClient:
                 return text
 
             if status == 429:
+                _note_transient("限流 429")
                 wait = _retry_after(headers)
-                if attempt < _MAX_ATTEMPTS:
-                    logger.warning("FOMO 限流 429,{:.1f}s 后重试 | {}", wait, path)
-                    time.sleep(wait)
+                if attempt < _MAX_ATTEMPTS and not stop_requested():
+                    logger.debug("FOMO 限流 429,{:.1f}s 后重试 | {}", wait, path)
+                    if sleep_or_stop(wait):
+                        raise FomoAPIError(f"{path} 停机中,放弃重试")
                     continue
                 raise FomoAPIError(f"{path} 持续 429 限流")
 
@@ -379,10 +445,13 @@ class _BaseFomoClient:
                     f"{(text or '')[:200]} —— 请重新执行 --login"
                 )
 
-            if status >= 500 and attempt < _MAX_ATTEMPTS:
+            if status >= 500:
+                _note_transient(f"服务端 {status}")
+            if status >= 500 and attempt < _MAX_ATTEMPTS and not stop_requested():
                 wait = _backoff(attempt)
-                logger.warning("FOMO 服务端错误 {},{:.1f}s 后重试 | {}", status, wait, path)
-                time.sleep(wait)
+                logger.debug("FOMO 服务端错误 {},{:.1f}s 后重试 | {}", status, wait, path)
+                if sleep_or_stop(wait):
+                    raise FomoAPIError(f"{path} 停机中,放弃重试")
                 continue
 
             raise FomoAPIError(f"{path} HTTP {status}: {(text or '')[:300]}")

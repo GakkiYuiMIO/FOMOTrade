@@ -47,7 +47,7 @@ def test_401落在最后一次尝试上仍然抛AuthError(monkeypatch):
         # 前面服务端错误,最后一次鉴权失败 —— 恰好把重试次数用光
         return (500, "boom", {}) if calls["n"] < C._MAX_ATTEMPTS else (401, "unauthorized", {})
 
-    monkeypatch.setattr(C.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(C, "sleep_or_stop", lambda _s: False)   # 别真的退避
     with pytest.raises(C.AuthError):
         _fake_client(responder)._fetch_ok("/whatever")
     assert calls["n"] == C._MAX_ATTEMPTS
@@ -55,7 +55,7 @@ def test_401落在最后一次尝试上仍然抛AuthError(monkeypatch):
 
 def test_纯服务端错误耗尽重试仍然是FomoAPIError(monkeypatch):
     """反向:没出现过 401 就不该谎报成鉴权失败,否则会误停轮询、让用户白跑一次 --login"""
-    monkeypatch.setattr(C.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(C, "sleep_or_stop", lambda _s: False)   # 别真的退避
     with pytest.raises(C.FomoAPIError) as ei:
         _fake_client(lambda: (503, "unavailable", {}))._fetch_ok("/whatever")
     assert not isinstance(ei.value, C.AuthError)

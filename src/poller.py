@@ -28,7 +28,13 @@ from loguru import logger
 
 from src import store
 from src.auth import AuthError
-from src.client import NotSupportedError, UserSnapshot
+from src.client import (
+    NotSupportedError,
+    UserSnapshot,
+    sleep_or_stop,
+    stop_requested,
+    take_transient_errors,
+)
 from src.config import get_settings
 from src.formatter import render
 from src.models import (
@@ -149,6 +155,15 @@ _THESIS_LOOKBACK_SEC = 3600
 # 有交易的人一律当场刷新、不占这个名额;轮转只是用来纠正两类我们看不见的漂移
 # (链上转账 + 价格跌破 dust 线)。69 人 / 8 个 ≈ 9 轮扫一圈。
 _BALANCE_ROTATE_PER_TICK = 8
+# 冷启动预热:每轮最多补多少个"从没拉到过 balances"的人。
+# ⚠️ 不设这个上限的话,进程一启动就会把全名单的 balances 一次性打出去 ——
+#    /balances 是最重的端点(单个 100~400KB、p50 1.22s),70 个并发直接把源站打到
+#    **504 Gateway Timeout**(不是限流,是 origin 超时)。用户日志里满屏的
+#    "FOMO 服务端错误 504 | …/balances" 就是这么来的,而且重试也是 504,
+#    结果是缓存反而填不满。摊到几轮里填,每轮几个请求,源站扛得住、缓存也真的填上了。
+# ⚠️ 代价:预热完成前 count_holders 返回 None,「N 人仍持有」整段消失
+#    (这是既定的降级语义)。70 人 / 每轮 10 个 ≈ 7 轮,10s 一轮就是一分多钟。
+_BALANCE_WARMUP_PER_TICK = 10
 # 活动流一次取多少条。实测 100 条覆盖约一小时;上限就是 100(传 200 直接 400)。
 _FEED_LIMIT = 100
 # 隔多少轮调一次活动流。
@@ -530,6 +545,7 @@ class Poller:
         # 上一轮有新交易的人 → 下一轮必须重拉 balances(见 _fetch_snapshots 里的说明)
         self._bal_dirty: set[str] = set()
         self._bal_rr = 0                            # balances 轮转刷新的游标
+        self._warm_rr = 0                           # 冷启动预热的轮转游标
         self._feed_seen: set[str] = set()           # 上次活动流里见过的条目 id
         self._feed_thesis: list[dict] = []          # 活动流里捡到的观点,交给 _collect_thesis
         self._tick_no = 0                           # 轮次计数,用来给活动流降频(见 _poll_feed)
@@ -690,16 +706,25 @@ class Poller:
             workers = max(1, self.settings.fomo_fetch_workers)
 
         auth_err: list[AuthError] = []
+        failed: list[str] = []
 
         def call(kind: str, uid: str):
+            # 停机中就别再发了:线程池里可能还排着几十个请求,一个个跑完
+            # 会让 Ctrl+C 等上十几秒(见 client.request_stop 的说明)
+            if stop_requested():
+                return None
             try:
                 return getattr(self.client, f"get_{kind}")(uid)
             except AuthError as e:
                 auth_err.append(e)
                 return None
             except Exception as e:  # noqa: BLE001
-                logger.warning("{} 拉取失败(该项降级) | user={} handle={} | {}",
-                               kind, uid, handles.get(uid), e)
+                # ⚠️ 逐条 WARNING 会在上游抖动时刷屏几十行,把真正要紧的 ERROR 淹掉。
+                #    这些失败**已经被处理**(balances 有缓存兜底、swaps 下一轮重来),
+                #    汇总成一行就够(见本函数末尾)。
+                failed.append(kind)
+                logger.debug("{} 拉取失败(该项降级) | user={} handle={} | {}",
+                             kind, uid, handles.get(uid), e)
                 return None
 
         def run(jobs: list[tuple[str, str]]) -> list:
@@ -733,9 +758,21 @@ class Poller:
         #    表现:名单集体抢同一个新币的那一两分钟里,「N 人仍持有」系统性偏小 ——
         #    而那正是这个数字最该准的时刻。改造前每轮全员重拉,下一轮就自愈了。
         #    count_holders 里给买入方向写的那个 +1 补偿,说明这个索引延迟是本项目已确认的事实。
+        # 冷启动预热要限量,否则一启动就把全名单的 balances 一次打出去,源站直接 504
+        # (见 _BALANCE_WARMUP_PER_TICK 的说明)
+        # ⚠️ 轮转取,不是每轮都取头几个:上游抖动时队头那几个会一直失败,
+        #    固定取头部等于让后面的人永远排不上,缓存永远填不满。
+        pending = [u for u in uids if u not in self._bal_cache]
+        if pending:
+            k = min(_BALANCE_WARMUP_PER_TICK, len(pending))
+            start = self._warm_rr % len(pending)
+            self._warm_rr = start + k
+            warmup = [pending[(start + i) % len(pending)] for i in range(k)]
+        else:
+            warmup = []
         need_bal = sorted(self._bal_dirty
                           | self._rotate_balances(uids, self._bal_dirty)
-                          | {u for u in uids if u not in self._bal_cache})
+                          | set(warmup))
         need_trd: list[str] = []
         res = run([("swaps", u) for u in need_swaps]
                   + [("balances", u) for u in need_bal]
@@ -766,6 +803,7 @@ class Poller:
         logger.debug("采集 | 名单 {} 人 · swaps {} 人 · 有新动作 {} 人 · balances {} 人 · 补漏 {} 人",
                      len(uids), len(need_swaps), len(hot),
                      len(need_bal) + len(extra_bal), len(extra_bal))
+        self._log_transient(failed, len(uids) - len(self._bal_cache))
 
         # ---- 组装。本轮没拉的读缓存,保证 count_holders 拿到全员覆盖 ----
         snapshots: dict = {}
@@ -795,6 +833,27 @@ class Poller:
             #    用户会一直以为监控还活着。
             raise auth_err[0]
         return snapshots
+
+    def _log_transient(self, failed: list[str], not_warm: int) -> None:
+        """
+        把本轮的上游抖动汇总成**一行**。
+
+        ⚠️ 逐条打 WARNING 的话,上游一抖就是几十行刷屏(用户实测启动时满屏
+           "FOMO 服务端错误 504 | …/balances"),真正要紧的 ERROR 会被淹掉。
+           而这些失败本身都已经被处理:balances 有缓存兜底、swaps 下一轮重来。
+           所以逐条降到 DEBUG,这里只报"多少次、什么类型、还差几个人没预热"。
+        """
+        errs = take_transient_errors()
+        if not errs and not failed:
+            return
+        parts = [f"{k}×{v}" for k, v in sorted(errs.items())]
+        if failed:
+            per_kind: dict[str, int] = {}
+            for k in failed:
+                per_kind[k] = per_kind.get(k, 0) + 1
+            parts.append("最终降级 " + "/".join(f"{k}×{v}" for k, v in sorted(per_kind.items())))
+        tail = f" · 还有 {not_warm} 人的持仓未预热" if not_warm > 0 else ""
+        logger.warning("上游抖动 | {}{}(已重试/降级,不影响推送)", " · ".join(parts), tail)
 
     def _hot_users(self, swaps: dict) -> set[str]:
         """
@@ -1087,6 +1146,18 @@ class Poller:
                     seen.add(k)
                     picked.append(k)
         return [(*k, meta[k]["network_raw"]) for k in picked]
+
+    def close(self) -> None:
+        """
+        释放常驻资源。cli 退出时调用。
+
+        ⚠️ 不关的话,ThreadPoolExecutor 的 atexit 钩子会在解释器退出时 join 这条线程,
+           而它可能正卡在一个 HTTP 超时里 —— 表现就是 Ctrl+C 之后进程还挂着不走
+           (用户日志里那段 `_python_exit → t.join() → KeyboardInterrupt` 就是它)。
+        """
+        pool, self._thesis_pool = self._thesis_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _start_thesis(self, batch: list[tuple]):
         """
@@ -1457,7 +1528,10 @@ class Poller:
         if self._send_tokens >= 1.0:
             self._send_tokens -= 1.0
             return
-        time.sleep((1.0 - self._send_tokens) * rate)
+        # ⚠️ 可打断:积压几十条时这里会连着等好几十秒,Ctrl+C 得能立刻停下
+        if sleep_or_stop((1.0 - self._send_tokens) * rate):
+            self._send_tokens = 0.0
+            return
         self._send_tokens = 0.0
         self._send_last = time.monotonic()
 

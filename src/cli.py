@@ -20,12 +20,14 @@ import sys
 import threading
 import time
 import unicodedata
+from contextlib import suppress
 from datetime import UTC, datetime
 from urllib.parse import quote
 
 from loguru import logger
 
 from src import store
+from src.client import request_stop
 from src.config import PROBE_DIR, SESSION_FILE, get_settings, mask
 from src.logger import setup_logger
 from src.models import (
@@ -787,9 +789,18 @@ def cmd_run() -> int:
     except (KeyboardInterrupt, SystemExit):
         logger.info("收到退出信号,正在停止…")
     finally:
+        # ⚠️ 顺序要紧:**先喊停在途请求**,再关调度器。
+        #    只关调度器的话,线程池里还排着几十个请求会一个个跑完(每个还带重试退避),
+        #    Ctrl+C 要等十几秒才真的退出 —— 用户只能连按好几次。
+        request_stop()
         stop_event.set()
         if sched.running:
             sched.shutdown(wait=False)
+        # 观点线程池是常驻的,不关的话 atexit 会 join 它,而它可能卡在 HTTP 超时里
+        with suppress(Exception):
+            poller.close()
+        with suppress(Exception):
+            client.close()
     logger.info("已退出")
     return 0
 

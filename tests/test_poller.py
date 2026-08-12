@@ -989,19 +989,21 @@ def test_冷启动不把全员挂成脏(db):
 
 def test_冷启动不给全员补拉trades(db):
     """
-    ⚠️ 冷启动本来就是单轮请求量的峰值(全员 swaps + 全员 balances)。
-       再按"全员 hot"叠一份 trades 就是 3N 个请求砸在启动瞬间 —— 实测足以打爆限流窗口,
-       接着连活动流自己都 429、退回全员扫描,越滚越大。
+    ⚠️ 冷启动是单轮请求量的峰值。再按"全员 hot"叠一份 trades 就是 3N 个请求
+       砸在启动瞬间 —— 实测足以打爆限流窗口。
        而冷启动的 hot 只是"没有差集基准"的产物,并不代表这些人刚交易过。
     """
+    from src.poller import _BALANCE_WARMUP_PER_TICK
+
     for i in range(20):
         _add_ready(f"u{i:02d}", f"h{i:02d}")
     snaps = {f"u{i:02d}": _snap(f"u{i:02d}", swaps=[_swap(f"s{i}")]) for i in range(20)}
     client = CountingClient(snaps)
     Poller(client, FakeNotifier()).tick()
 
-    assert len(client.calls["swaps"]) == 20, "冷启动的全员 swaps 是必须的"
-    assert len(client.calls["balances"]) == 20, "冷启动要把持仓缓存填满"
+    assert len(client.calls["swaps"]) == 20, "冷启动的全员 swaps 是必须的(它便宜)"
+    # balances 是最重的端点,冷启动分批预热(见 test_冷启动分批预热balances而不是一次全打)
+    assert len(client.calls["balances"]) <= _BALANCE_WARMUP_PER_TICK
     assert len(client.calls["trades"]) <= 1, \
         f"冷启动不该给全员补 trades,实际 {len(client.calls['trades'])} 次"
 
@@ -1130,3 +1132,60 @@ def test_优先名额不会撑大每轮扫描总量(db):
     for i in range(50):
         p._thesis_priority[("solana", f"CA{i:03d}")] = deadline
     assert len(p._pick_thesis_batch()) <= _THESIS_TOKENS_PER_TICK
+
+
+def test_冷启动分批预热balances而不是一次全打(db):
+    """
+    ⚠️ /balances 是最重的端点(单个 100~400KB、p50 1.22s)。一启动就把全名单
+       一次性打出去,源站直接 504 Gateway Timeout(不是限流,是 origin 超时)——
+       而且重试也是 504,结果缓存反而填不满。用户日志里满屏的
+       "FOMO 服务端错误 504 | …/balances" 就是这么来的。
+    """
+    from src.poller import _BALANCE_WARMUP_PER_TICK
+
+    n = _BALANCE_WARMUP_PER_TICK * 3
+    for i in range(n):
+        _add_ready(f"u{i:03d}", f"h{i:03d}")
+    client = CountingClient({f"u{i:03d}": _snap(f"u{i:03d}") for i in range(n)})
+    p = Poller(client, FakeNotifier())
+
+    p.tick()
+    first = len(client.calls["balances"])
+    assert first <= _BALANCE_WARMUP_PER_TICK, \
+        f"冷启动一轮最多预热 {_BALANCE_WARMUP_PER_TICK} 个,实际打了 {first} 个"
+
+    # 但必须真的在往前推进 —— 限量不能变成"永远填不满"
+    for _ in range(6):
+        p.tick()
+    assert len(p._bal_cache) == n, f"几轮之内要把缓存填满,实际 {len(p._bal_cache)}/{n}"
+
+
+def test_停机信号让在途请求立刻放弃(db):
+    """
+    Ctrl+C 之后线程池里还排着几十个请求,一个个跑完(每个还带重试退避)
+    要等十几秒 —— 用户只能连按好几次 Ctrl+C。
+    """
+    from src.client import request_stop, reset_stop
+
+    for i in range(20):
+        _add_ready(f"u{i:02d}", f"h{i:02d}")
+    client = CountingClient({f"u{i:02d}": _snap(f"u{i:02d}") for i in range(20)})
+    p = Poller(client, FakeNotifier())
+    request_stop()
+    try:
+        p.tick()
+    finally:
+        reset_stop()
+    assert client.calls["swaps"] == [], "停机中排队的请求一个都不该发出去"
+
+
+def test_close_关掉常驻线程池(db):
+    """不关的话 atexit 会 join 它,而它可能卡在 HTTP 超时里 —— 进程就走不掉"""
+    _add_ready("uA", "alice")
+    p = Poller(CountingClient({"uA": _snap("uA")}), FakeNotifier())
+    p._token_meta = {("solana", CA_TOAD): {"network_raw": 1399811149}}
+    p.tick()
+    assert p._thesis_pool is not None
+    p.close()
+    assert p._thesis_pool is None
+    p.close()          # 幂等:cli 的 finally 里可能重复调
