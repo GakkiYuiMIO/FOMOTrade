@@ -53,16 +53,22 @@ class FomoSettings(BaseSettings):
     fomo_client_impl: str = Field("http")
 
     # ---------- 轮询 ----------
-    fomo_poll_interval_sec: int = Field(20, ge=5, description="轮询间隔(秒)")
+    fomo_poll_interval_sec: int = Field(12, ge=5, description="轮询间隔(秒)")
     fomo_backfill_max_items: int = Field(
         500, ge=0, description="/add 时回填多少条历史 swaps 建立首次买入判定基线"
     )
+    # 推送**稳态**速率(秒/条)。突发由 poller._throttle_send 的令牌桶吸收:
+    # 连着来 5 条可以立刻发完,再多才按这个速率匀速。
     fomo_send_interval_sec: float = Field(
-        3.5, ge=0, description="推送间隔(秒),规避 TG 同 chat 约 20 msg/min 限流"
+        1.5, ge=0, description="推送稳态间隔(秒/条),突发另由令牌桶吸收"
     )
-    # 拉取并发度。实测单人快照约 1s,串行拉 68 人要 69s 远超轮询间隔 ——
-    # 名单一大就必须并发。调太高会给 FOMO 打出可观的瞬时 QPS,6 是延迟与礼貌的折中。
-    fomo_fetch_workers: int = Field(6, ge=1, le=16, description="快照拉取并发线程数")
+    # 拉取并发度。调度单元是**一个请求**不是一个用户(见 poller._fetch_snapshots)。
+    # ⚠️ 实测有明确的拐点:69 人 × 3 端点在 12 线程 15.1s、24 线程 10.8s,
+    #    但 36 线程反而掉到 66.6s —— 服务端/代理已经打满,再加只会换来 504 和重试风暴。
+    # ⚠️ 真实峰值并发**不止这个数**:观点扫描跑在后台线程,与这里的池子同时在打,
+    #    峰值 = 本值 + poller._THESIS_WORKERS。调这个值时按和算,别只看这一处 ——
+    #    12+8=20 的时候实测已经会撞限流(同一毫秒 15 个请求一起 429)。
+    fomo_fetch_workers: int = Field(12, ge=1, le=32, description="拉取并发线程数")
     # 距上一轮超过这么久(分钟)就认定"中间停过机":本轮事件照常入库,
     # 但不逐条推送,改发一条汇总。
     # 默认 45 分钟 —— 比正常轮询间隔(20-35s)大两个量级,不会被网络抖动误触发;

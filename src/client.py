@@ -17,6 +17,7 @@ FOMO API 客户端 —— 双实现(设计文档 §2.1 端点表 / §2.2 鉴权 
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from collections.abc import Iterator
@@ -54,6 +55,10 @@ _FOLLOWING_PAGE = 100
 #    遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象(见 poller._collect_thesis)。
 EP_TOKEN_THESIS = "/feed/token/thesis"
 
+# 「我关注的人」的活动流。买/卖/观点三类混在一条流里,一次调用就知道名单里谁刚动过。
+# 详见 _BaseFomoClient.get_activity_feed 的说明与实测数据。
+EP_ACTIVITY_FEED = "/feed/tradingActivity"
+
 # TODO(probe #15): 取值格式未实测。前端是 getChains() 的返回值,可能是逗号分隔 slug、
 #                  也可能是 JSON 数组或链 ID。改这个值还可能影响响应里 networkId 的表示(同 probe #10)。
 # ⚠️ 必须是**数字链 ID**,不是链名。实测(2026-08-11 抓 fomo.family 网页版真实请求头):
@@ -67,9 +72,24 @@ SUPPORTED_CHAINS = "1,56,143,4663,8453,1399811149"
 # TODO(probe #5): 分页参数名(limit/offset/cursor/before)与单页上限全是猜的
 _PAGE_SIZE = 50
 _MAX_PAGES = 20          # 设计文档 §8.3 的内部硬上限
-_TIMEOUT_SEC = 25.0
-_MAX_ATTEMPTS = 5        # 单次请求的总尝试次数上限,防止退避循环无限打转
+# ⚠️ 超时不是"越宽容越好":它发生在线程池的一个 worker 里,一个卡死的请求会占住
+#    整整一个并发名额。实测正常响应 p50 0.3-1.2s,25s 的余量只会把单轮拖到分钟级。
+_TIMEOUT_SEC = 12.0
+# 单次请求的总尝试次数上限,防止退避循环无限打转。
+# ⚠️ 5 次线性退避最坏要 sleep 1.5+3+4.5+6 = 15s,而这 15s 全部计入单轮耗时 ——
+#    日志里那些 79s 的 tick 就是这么来的。balances 现在有缓存兜底、失败的代价小得多,
+#    3 次(最坏 sleep 4.5s)是重试价值与单轮耗时的更好平衡。
+_MAX_ATTEMPTS = 3
 _BACKOFF_SEC = 1.5
+# 退避抖动幅度。⚠️ 没有抖动时,同时打出去的十几个请求会在同一毫秒一起重试 ——
+#    真实日志里出现过 5 个 balances 在 22:38:17 同秒 504、又在同秒一起重试,
+#    等于把瞬时压力原样重放一遍。
+_JITTER = 0.35
+
+
+def _backoff(attempt: int) -> float:
+    """第 attempt 次失败后要等多久(带抖动)"""
+    return _BACKOFF_SEC * attempt * random.uniform(1 - _JITTER, 1 + _JITTER)
 
 # Cloudflare 拦截页的特征词。
 # ⚠️ 绝不能只看 cf-ray 响应头:prod-api 整站都在 Cloudflare 后面,合法的 401 也带这个头。
@@ -118,6 +138,7 @@ class FomoClient(Protocol):
                          limit: int = 100) -> list[dict]: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
+    def get_activity_feed(self, limit: int = 100) -> list[dict]: ...
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
     def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
@@ -227,14 +248,23 @@ def _is_cloudflare_block(text: str) -> bool:
 
 
 def _retry_after(headers: dict, default: float = 3.0) -> float:
-    """429 的退避秒数。上限 60s —— 一个畸形的头不该把整个 tick 卡死。"""
+    """
+    429 的退避秒数。上限 60s —— 一个畸形的头不该把整个 tick 卡死。
+
+    ⚠️ 必须带抖动。实测过一次真实的雷群:同一毫秒里 15 个请求
+       (balances × 10、thesis × 5、trades × 1)一起 429,服务端给的 retry-after 又完全相同,
+       于是它们又在同一毫秒一起重试 —— 等于把刚才那波压力原样重放一遍,
+       而且每一轮都会再撞一次。抖动是打散雷群的唯一手段。
+    """
+    wait = default
     for k, v in (headers or {}).items():
         if str(k).lower() == "retry-after":
             try:
-                return max(1.0, min(float(v), 60.0))
+                wait = max(1.0, min(float(v), 60.0))
             except (TypeError, ValueError):
-                return default
-    return default
+                wait = default
+            break
+    return wait * random.uniform(1 - _JITTER, 1 + _JITTER)
 
 
 def _item_identity(item: dict) -> str:
@@ -290,14 +320,23 @@ class _BaseFomoClient:
         """
         attempt = 0
         auth_retried = False
+        # ⚠️ 记住"这一路上见过 401/403"。401 若正好落在**最后一次**尝试上,
+        #    下面那个 `continue` 会直接把循环耗尽,走到函数末尾抛 FomoAPIError ——
+        #    而 FomoAPIError 会被 _fetch_snapshots 的 `except Exception` 吞成"该项降级为 None",
+        #    tick 照常返回、last_tick_at 照常前进、/status 显示一切正常。
+        #    结果正是本 docstring 要避免的那种失效:一个看起来完全健康的、死掉的监控。
+        #    _MAX_ATTEMPTS 从 5 降到 3 之后,凑齐"前面两次失败 + 最后一次 401"的门槛低了不少,
+        #    而这个 API 一次抖动就能甩出一串 504/429。
+        auth_status: int | None = None
         while attempt < _MAX_ATTEMPTS:
             attempt += 1
             try:
                 status, text, headers = self._request(path, params)
             except _TransportError as e:
                 if attempt < _MAX_ATTEMPTS:
-                    logger.warning("请求传输失败,{:.1f}s 后重试 | {} | {}", _BACKOFF_SEC * attempt, path, e)
-                    time.sleep(_BACKOFF_SEC * attempt)
+                    wait = _backoff(attempt)
+                    logger.warning("请求传输失败,{:.1f}s 后重试 | {} | {}", wait, path, e)
+                    time.sleep(wait)
                     continue
                 raise FomoAPIError(f"{path} 传输失败: {e}") from e
 
@@ -313,6 +352,7 @@ class _BaseFomoClient:
                 raise FomoAPIError(f"{path} 持续 429 限流")
 
             if status in (401, 403):
+                auth_status = status
                 # ⚠️ 这两支都必须抛 AuthError,**不能抛 FomoAPIError**。
                 #    fetch_snapshot 只对 AuthError 显式上抛,FomoAPIError 会落进
                 #    `except Exception` 把三个分项置 None → tick 正常返回 0 →
@@ -336,12 +376,19 @@ class _BaseFomoClient:
                 )
 
             if status >= 500 and attempt < _MAX_ATTEMPTS:
-                logger.warning("FOMO 服务端错误 {},{:.1f}s 后重试 | {}", status, _BACKOFF_SEC * attempt, path)
-                time.sleep(_BACKOFF_SEC * attempt)
+                wait = _backoff(attempt)
+                logger.warning("FOMO 服务端错误 {},{:.1f}s 后重试 | {}", status, wait, path)
+                time.sleep(wait)
                 continue
 
             raise FomoAPIError(f"{path} HTTP {status}: {(text or '')[:300]}")
 
+        if auth_status is not None:
+            # 重试次数耗尽,但这一路上出现过鉴权失败 —— 必须以 AuthError 收场(见循环前的说明)
+            raise AuthError(
+                f"{path} 鉴权失败(HTTP {auth_status},重试 {_MAX_ATTEMPTS} 次耗尽)"
+                f" —— 请重新执行 --login"
+            )
         raise FomoAPIError(f"{path} 重试 {_MAX_ATTEMPTS} 次仍失败")
 
     def _get(self, path: str, params: dict | None = None):
@@ -418,6 +465,39 @@ class _BaseFomoClient:
                 break
             last_id = str(fresh[-1]["id"])
         return out[:max_items]
+
+    def get_activity_feed(self, limit: int = 100) -> list[dict]:
+        """
+        「我关注的人」的活动流 —— 一次调用就知道名单里谁刚有动作。
+
+        实测(2026-08-11):单次 0.25~0.43s,100 条覆盖约一小时,
+        且 100/100 条都属于监控名单、名单外用户 0 个 —— 这是**关注流不是全站流**。
+        拿它当变更检测器,可以把「全员 69 次 swaps(3~5s)」压成「1 次 0.35s」。
+
+        返回 responseObject.items,每条形如:
+          swap_buy / swap_sell:
+            {"type":"swap_buy", "id":…, "createdAt":…, "userId":…, "userHandle":…,
+             "usdAmount":…, "marketCap":…, "price":…, "ticker":…,
+             "tokenAddress":…, "networkId": 8453, "equity":…}
+          thesis:
+            {"type":"thesis", …, "comment":{…正文与代币…}, "authorTrade":{…持仓盈亏…}}
+
+        ⚠️ swap 条目的形态与 /v2/users/{uid}/swaps **完全不同**(没有 in/out 两条腿),
+           绝不能喂给 normalize_swaps。本项目只拿它当"谁动了"的信号,事件本身仍以
+           swaps 端点为准 —— 少一处字段假设就少一处静默失效。
+           thesis 条目则与 /feed/token/thesis 形态一致,可以直接复用 normalize_thesis。
+        ⚠️ 它只覆盖**当前登录账号关注的人**。名单里若有没关注的人,他的动作不会出现在这里
+           —— 所以 poller 必须保留一条全员轮转扫描兜底(见 _fetch_snapshots)。
+        ⚠️ limit 上限 100(传 200 直接 400)。
+        ⚠️ 这个端点限流很紧:实测 2.5s 内连打 10 次全部 429。
+           每 tick 只调一次远在安全线内,但绝不能放进循环里调。
+        """
+        payload = self._get(EP_ACTIVITY_FEED, {"limit": max(1, min(int(limit), 100))})
+        ro = _unwrap(payload)
+        if isinstance(ro, dict):
+            items = ro.get("items")
+            return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
+        return [x for x in _as_list(ro) if isinstance(x, dict)]
 
     def get_trades(self, user_id: str) -> list[dict]:
         """

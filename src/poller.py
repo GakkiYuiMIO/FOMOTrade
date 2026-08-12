@@ -28,7 +28,7 @@ from loguru import logger
 
 from src import store
 from src.auth import AuthError
-from src.client import NotSupportedError
+from src.client import NotSupportedError, UserSnapshot
 from src.config import get_settings
 from src.formatter import render
 from src.models import (
@@ -136,11 +136,39 @@ _TS_GUARD_DROP_RATIO = 0.5
 
 # ---- 观点采集(见 Poller._collect_thesis) ----
 # 每 tick 扫多少个代币。调用量恒定不随名单规模增长:币多时只是轮转一圈更慢。
-# 20s 一轮 × 25 个 = 一分钟覆盖 75 个币,对几十人的名单足够。
-_THESIS_TOKENS_PER_TICK = 25
+# ⚠️ 有了活动流之后这条路**降级成兜底**了:已关注的人发观点,活动流下一轮就直接推,
+#    根本不用等轮转扫到。这里只负责捞"名单里没关注的人"。
+#    所以从 25 降到 12 —— 少 13 个请求/轮,正好把峰值并发压回安全线内(见 _THESIS_WORKERS)。
+_THESIS_TOKENS_PER_TICK = 12
 # afterTime 回看窗口(秒)。够覆盖轮转一圈的时间即可 —— 拉太久白费流量,
 # 拉太短会在轮转间隙漏掉观点。精确去重由 event_id + 游标负责,这里只是压 payload。
 _THESIS_LOOKBACK_SEC = 3600
+
+# ---- 增量采集(见 _fetch_snapshots)----
+# 每 tick 额外刷新多少个「本轮没有交易」的用户的 balances。
+# 有交易的人一律当场刷新、不占这个名额;轮转只是用来纠正两类我们看不见的漂移
+# (链上转账 + 价格跌破 dust 线)。69 人 / 8 个 ≈ 9 轮扫一圈。
+_BALANCE_ROTATE_PER_TICK = 8
+# 活动流一次取多少条。实测 100 条覆盖约一小时,足够跨过任何一次正常轮询间隔;
+# 上限就是 100(传 200 直接 400)。
+_FEED_LIMIT = 100
+# 兜底扫描:每 tick 无条件拉多少个人的 swaps。
+# ⚠️ 这不是优化项而是**正确性要求** —— 活动流只覆盖「当前登录账号关注的人」,
+#    名单里若有没关注的人,他的交易永远不会出现在流里。12 个/轮 → 69 人 6 轮扫一圈,
+#    最坏延迟约 1.5 分钟,仍好于改造前的全员 45~85s。
+SWEEP_PER_TICK = 12
+# 观点扫描的并发上限。这一段是纯 IO,串行 25 个币实测 4.1s,并发 8 降到 2.2s。
+# ⚠️ 但它与 fomo_fetch_workers **同时在跑**(观点在后台线程,快照在主线程池),
+#    真实峰值并发是两者相加。实测 12+8=20 会真的撞上限流:
+#    同一毫秒 15 个请求一起 429(balances×10 + thesis×5 + trades×1)。
+#    降到 4 之后峰值 16,配合 _THESIS_TOKENS_PER_TICK 从 25 减到 12,这一段仍在 1s 上下。
+_THESIS_WORKERS = 4
+
+# ---- 推送节流(见 _throttle_send)----
+# Telegram 对单个 chat 的软限是 ~1 条/秒并允许小幅突发。
+# 固定 sleep 太保守:一轮 6 条按 3.5s 要多等 17.5s,而这 17.5s 全部算在 tick 耗时里。
+# 改成令牌桶 —— 桶里的令牌可以立刻发完,之后才退化成匀速,稳态速率仍受 send_interval 约束。
+_SEND_BURST = 5
 
 # runtime_state 里记录上一轮时间的键。用来识别"关机了一晚上"这类长间断
 _LAST_TICK_KEY = "last_tick_at"
@@ -468,6 +496,23 @@ class Poller:
         self._thesis_rr = 0                         # 观点轮转扫描的游标(见 _collect_thesis)
         # 本轮是不是"停机后的第一轮"。见 tick() 里的说明
         self._catchup_since: str | None = None
+        # ---- 增量采集状态(见 _fetch_snapshots)----
+        self._swap_seen: dict[str, set[str]] = {}   # uid → 上一轮见过的 swap id 集合
+        self._bal_cache: dict[str, list[dict]] = {}  # uid → 最近一次成功拉到的 balances
+        # 上一轮有新交易的人 → 下一轮必须重拉 balances(见 _fetch_snapshots 里的说明)
+        self._bal_dirty: set[str] = set()
+        self._bal_rr = 0                            # balances 轮转刷新的游标
+        self._sweep_rr = 0                          # 全员 swaps 兜底扫描的游标
+        self._feed_seen: set[str] = set()           # 上一轮活动流里见过的条目 id
+        self._feed_thesis: list[dict] = []          # 活动流里捡到的观点,交给 _collect_thesis
+        # 本轮真的去拉过 swaps 的人。⚠️ 用来区分"拉取失败"和"本轮压根没排到他",
+        #    否则 _collect_events 会对没排到的五十几个人每轮刷一条 WARNING
+        self._swaps_attempted: set[str] = set()
+        # 观点网络采集的后台线程。跨 tick 复用,懒建(见 _start_thesis)
+        self._thesis_pool: ThreadPoolExecutor | None = None
+        # ---- 推送令牌桶(见 _throttle_send)。跨 tick 保持,不是每轮重置 ----
+        self._send_tokens = float(_SEND_BURST)
+        self._send_last = time.monotonic()
 
     # --------------------------------------------------------
     # 主循环
@@ -493,6 +538,14 @@ class Poller:
             self._catchup_since = self._detect_gap(conn)
 
             # --- 2) 采集 ---
+            # ⚠️ 观点的轮转扫描与用户快照采集**互不依赖**,串行跑等于白等一个屏障:
+            #    实测两段各自的尾延迟都有 2~4s,叠起来就是一轮里最贵的两截。
+            #    这里让观点先在后台跑起来,与快照采集重叠。
+            #    代价:批次是拿**上一轮**的 _token_meta 选的 —— 它只决定"这轮扫哪些币",
+            #    不参与任何事件的判定,晚一轮完全无害(首轮 meta 为空则本轮不扫,
+            #    活动流那条路照常工作)。
+            batch = self._pick_thesis_batch()
+            take_thesis = self._start_thesis(batch)
             snapshots = self._fetch_snapshots(users)
             # 先建代币/持仓索引:归一化时要用它补 symbol、市值、持仓、均价
             self._build_token_index(snapshots)
@@ -501,9 +554,9 @@ class Poller:
 
             # --- 3) 归一化 + 游标过滤 ---
             events = self._collect_events(conn, users, snapshots)
-            # 观点单独走一条路:它按代币查,不按用户查(见 _collect_thesis)
+            # 观点单独走一条路:活动流直取 + 按代币轮转兜底(见 _collect_thesis)
             try:
-                events.extend(self._collect_thesis(conn, users))
+                events.extend(self._collect_thesis(conn, users, batch, take_thesis()))
             except AuthError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -564,48 +617,244 @@ class Poller:
 
     def _fetch_snapshots(self, users) -> dict:
         """
-        逐个用户拉快照。单个用户失败置 None ——
-        一个人的网络抖动不能让整个名单的推送停摆(count_holders 会据此整段降级)。
+        两段式增量采集 —— 把单轮从 ~35s 压到个位数秒的关键。
+
+        实测单端点延迟(69 人名单,2026-08-11,含代理):
+            swaps p50 0.27s · balances p50 1.22s · trades p50 0.72s
+        全员三个端点都拉 = 69 × 2.2 ≈ 152 请求秒,6 线程要 31s,已经超过轮询间隔。
+        但后两个端点**没必要全员每轮拉**:
+
+          - trades 只用于渲染「已实现盈亏 / 剩余持仓 / 均价」,而这几行只出现在
+            **本轮有新事件的那个人**的那条消息里。没有新事件的人拉回来完全用不上。
+          - balances 有两个用途:count_holders 要全员覆盖、_token_meta 要市值。
+            而持仓只在这人**交易**时才变(转账 FOMO 没有可用端点,本来就看不见),
+            所以「有新 swap 的人当场刷 + 其余人轮转慢刷 + 剩下的读缓存」
+            既保住全员覆盖,又把请求量从 69 降到十几个。
+
+        ⚠️ 返回值形态与改造前**完全一致**:每个人的 balances 都有值(本轮没拉的读缓存),
+           所以 count_holders / _build_token_index 一行都不用改。缓存只在本函数内部生效,
+           刻意不外泄成新的跨模块契约。
+        ⚠️ 单个用户失败仍置 None —— 一个人的网络抖动不能让整个名单的推送停摆。
         """
-        snapshots: dict = {}
-        auth_err: AuthError | None = None
+        uids = [u["user_id"] for u in users]
+        handles = {u["user_id"]: _row_get(u, "handle") for u in users}
         # ⚠️ playwright 实现必须串行:它按线程私有创建整套浏览器,而线程池每 tick 建新线程,
         #    线程退出时浏览器不回收 —— 实测每 tick 泄漏 6 套 chromium,进程数单调递增到卡死。
         if not getattr(self.client, "supports_concurrency", True):
             workers = 1
         else:
-            workers = max(1, min(self.settings.fomo_fetch_workers, len(users)))
+            workers = max(1, self.settings.fomo_fetch_workers)
 
-        def one(u):
-            uid = u["user_id"]
+        auth_err: list[AuthError] = []
+
+        def call(kind: str, uid: str):
             try:
-                return uid, self.client.fetch_snapshot(uid), None
+                return getattr(self.client, f"get_{kind}")(uid)
             except AuthError as e:
-                return uid, None, e
+                auth_err.append(e)
+                return None
             except Exception as e:  # noqa: BLE001
-                logger.error("拉取快照失败 user={} handle={} err={}", uid, _row_get(u, "handle"), e)
-                return uid, None, None
+                logger.warning("{} 拉取失败(该项降级) | user={} handle={} | {}",
+                               kind, uid, handles.get(uid), e)
+                return None
 
-        if workers == 1:
-            results = [one(u) for u in users]
+        def run(jobs: list[tuple[str, str]]) -> list:
+            """
+            ⚠️ 调度单元是**一个请求**而不是"一个用户"。按用户调度时同一个人的
+               swaps/balances/trades 只能串行,慢的那个端点会把整条线程占住 ——
+               实测 69 人 × 3 端点:按用户 12 线程 17.8s,按请求 12 线程 15.1s、24 线程 10.8s。
+            """
+            if not jobs:
+                return []
+            if workers == 1 or len(jobs) == 1:
+                return [call(*j) for j in jobs]
+            with ThreadPoolExecutor(max_workers=min(workers, len(jobs)),
+                                    thread_name_prefix="fomo-fetch") as ex:
+                return list(ex.map(lambda j: call(*j), jobs))
+
+        # ---- 第一段:一次活动流问出「谁刚动过」 ----
+        feed_hot, feed_ok = self._poll_feed(uids)
+        # ⚠️ cold 必须在 _hot_users 之前取:那一步会把 _swap_seen 填满。
+        #    冷启动没有差集基准,_hot_users 会把**所有人**判成 hot —— 那不是"所有人刚交易过"。
+        cold = not self._swap_seen
+        if not feed_ok or cold:
+            # 活动流挂了、或冷启动还没有基准 → 退回全员扫描,宁可慢一轮也不能漏
+            need_swaps = uids
         else:
-            # ⚠️ 并发是名单规模的硬需求,不是优化:实测单人快照 1.01s,
-            #    串行拉 68 人要 69s,而轮询间隔才 20s —— tick 会无限堆积。
-            #    HttpFomoClient 已改成每线程一个 curl 会话,并发是安全的。
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="fomo-fetch") as ex:
-                results = list(ex.map(one, users))
+            need_swaps = sorted(feed_hot | self._rotate(uids, SWEEP_PER_TICK, "_sweep_rr"))
+        self._swaps_attempted = set(need_swaps)
 
-        for uid, snap, err in results:
+        # ---- 第二段:一个池子里同时打三类请求 ----
+        # ⚠️ 关键在于**不要为了等 swaps 的判定结果而多设一道屏障**:每道屏障都要付一次
+        #    尾延迟(实测单个请求最慢能到 3~5s),两道串起来就是一轮里最贵的部分。
+        #    活动流已经点过名了,这些人的 balances/trades 直接跟 swaps 一起发出去。
+        # ⚠️ _bal_dirty 不能省:有新交易的人,他的 balances 与 swaps 是**同一个池子里并发发出**的,
+        #    拿回来的必然是服务端还没索引到这笔交易的旧持仓。这份最不准的快照一旦进缓存,
+        #    下一轮他既不 hot 也多半轮不到轮转,错误状态就被冻结整整一个轮转周期(约 9 轮)。
+        #    表现:名单集体抢同一个新币的那一两分钟里,「N 人仍持有」系统性偏小 ——
+        #    而那正是这个数字最该准的时刻。改造前每轮全员重拉,下一轮就自愈了。
+        #    count_holders 里给买入方向写的那个 +1 补偿,说明这个索引延迟是本项目已确认的事实。
+        need_bal = sorted(feed_hot | self._bal_dirty
+                          | self._rotate_balances(uids, feed_hot | self._bal_dirty)
+                          | {u for u in uids if u not in self._bal_cache})
+        need_trd = sorted(feed_hot)
+        res = run([("swaps", u) for u in need_swaps]
+                  + [("balances", u) for u in need_bal]
+                  + [("trades", u) for u in need_trd])
+        i, j = len(need_swaps), len(need_swaps) + len(need_bal)
+        swaps = dict(zip(need_swaps, res[:i], strict=True))
+        bal_now = dict(zip(need_bal, res[i:j], strict=True))
+        trades = dict(zip(need_trd, res[j:], strict=True))
+        if auth_err:
+            # 登录态挂了后面全是白打,直接上抛
+            raise auth_err[0]
+
+        # ---- 第三段:补漏。兜底扫描发现的"活动流没提过、但确实有新 swap"的人 ----
+        # ⚠️ 这一段必须有:活动流只覆盖当前登录账号关注的人,名单里没关注的那些人
+        #    只会在这里现身。稳态下 extra 基本是空集,不花钱。
+        hot = self._hot_users(swaps)
+        # ⚠️ 要按**第一池实际拉过谁**来扣,不能按 feed_hot 扣:冷启动时 feed_hot 是空集,
+        #    而第一池已经把全员 balances 拉过一遍了 —— 按 feed_hot 扣会整整重拉 69 次。
+        extra_bal = sorted(hot - set(need_bal))
+        extra_trd = sorted(hot - set(need_trd))
+        if extra_bal or extra_trd:
+            res2 = run([("balances", u) for u in extra_bal] + [("trades", u) for u in extra_trd])
+            bal_now.update(zip(extra_bal, res2[:len(extra_bal)], strict=True))
+            trades.update(zip(extra_trd, res2[len(extra_bal):], strict=True))
+        # 本轮有新交易的人,他们的 balances 必然还没反映这笔交易(见上面 need_bal 处的说明),
+        # 挂上脏标记让下一轮无条件重拉一次 —— 稳态下每轮也就多几个请求。
+        # ⚠️ 两个信号都要收:hot 来自 swaps 差集,feed_hot 来自活动流。
+        #    活动流通常**更早**知道这笔交易(它就是干这个的),这种时候 swaps 端点
+        #    往往还没索引到 → hot 是空的。只认 hot 就正好漏掉最需要补的那一类。
+        # ⚠️ 但冷启动那一轮的 hot 是"全员"(没有差集基准),不代表全员刚交易过 ——
+        #    照单全收会让重启后的第二轮白白重拉 69 次 balances(实测 2.4s → 5.9s)。
+        self._bal_dirty = feed_hot if cold else (set(hot) | feed_hot)
+        logger.debug("采集 | 名单 {} 人 · 活动流{} · swaps {} 人 · 有新动作 {} 人"
+                     " · balances {} 人 · 补漏 {} 人",
+                     len(uids), "命中" if feed_ok else "失败(退回全员扫描)",
+                     len(need_swaps), len(hot), len(need_bal) + len(extra_bal), len(extra_bal))
+
+        # ---- 组装。本轮没拉的读缓存,保证 count_holders 拿到全员覆盖 ----
+        snapshots: dict = {}
+        for uid in uids:
+            b = bal_now.get(uid)
+            if b is not None:
+                self._bal_cache[uid] = b
+            else:
+                # ⚠️ 只有 None 才回落缓存。[] 是"拉到了、确实没有持仓",是有效值,
+                #    用 `or` 写会把它当假值吞掉,那人就永远停在旧持仓上。
+                b = self._bal_cache.get(uid)
+            snap = UserSnapshot(user_id=uid)
+            snap.swaps = swaps.get(uid)
+            snap.balances = b
+            snap.trades = trades.get(uid)
             snapshots[uid] = snap
-            if err is not None and auth_err is None:
-                auth_err = err
-        if auth_err is not None:
+
+        # 已经移出名单的人不再占内存(69 人的 balances 原始体积约 8MB)
+        for gone in set(self._bal_cache) - set(uids):
+            self._bal_cache.pop(gone, None)
+            self._swap_seen.pop(gone, None)
+
+        if auth_err:
             # ⚠️ 必须上抛,绝不能吞掉。登录态失效是"整个管道都废了",
-            #    不是"某个用户拉取失败" —— 吞掉的后果是程序每 20 秒空转一次只刷 ERROR 日志,
+            #    不是"某个用户拉取失败" —— 吞掉的后果是程序每轮空转一次只刷 ERROR 日志,
             #    而 §3.5 要求的那条「🔐 登录态失效」TG 告警永远发不出去,
             #    用户会一直以为监控还活着。
-            raise auth_err
+            raise auth_err[0]
         return snapshots
+
+    def _hot_users(self, swaps: dict) -> set[str]:
+        """
+        本轮出现了「上一轮没见过的 swap id」的用户 —— 只有这些人需要 trades 和新 balances。
+
+        ⚠️ 比的是**整页 id 集合**,不是"最新一条变没变"。服务端偶尔会把一笔更早的 swap
+           补进列表(跨链单两条腿到达时间不同),只看头一条会漏掉它,那条消息的
+           「剩余持仓 / 已实现盈亏」就会整行消失。
+        ⚠️ 拉取失败(None)的人**不算 hot,也不更新记忆** —— 没数据就产不出事件,
+           拉 trades 没有意义;而记忆保持不动,下一轮拉成功时照样能正确 diff 出新条目。
+        ⚠️ 冷启动(_swap_seen 为空)时所有人都算 hot:那一轮要把持仓缓存填满,
+           count_holders 才有全员覆盖。代价是启动后第一轮慢一次,之后每轮都快。
+        """
+        hot: set[str] = set()
+        for uid, items in swaps.items():
+            if items is None:
+                continue
+            ids = {i for i in (_pick_str(x, *_K_NATIVE_ID) for x in items if isinstance(x, dict)) if i}
+            prev = self._swap_seen.get(uid)
+            if prev is None or (ids - prev):
+                hot.add(uid)
+            self._swap_seen[uid] = ids
+        return hot
+
+    def _poll_feed(self, uids: list[str]) -> tuple[set[str], bool]:
+        """
+        一次调用问出「名单里谁刚有动作」。返回 (活跃用户集合, 本次是否成功)。
+
+        这是整轮里性价比最高的一步:实测 1 次 0.35s,替掉了原来 69 次 swaps 的 3~5s。
+        顺带把流里的观点条目捡出来交给 _collect_thesis —— 观点从"轮转扫币、最坏 4 分钟
+        才轮到"变成"下一轮就推"。
+
+        ⚠️ 活动流只当**变更检测器**,事件本身仍以 swaps 端点为准。
+           流里的 swap 条目形态与 swaps 端点完全不同(没有 in/out 两条腿),
+           拿它直接造事件等于凭空多一套字段假设,而这类假设失效时是**静默**的。
+           观点条目是例外:它与 /feed/token/thesis 同形,normalize_thesis 直接吃得下,
+           且 event_id 用的是同一个原生 id,两条路撞上也会被 INSERT OR IGNORE 去重。
+        ⚠️ 失败返回 False 而不是空集合 —— 调用方要据此退回全员扫描。
+           把"流挂了"和"没人有动作"混成同一个返回值,表现就是监控静悄悄地停止工作。
+        """
+        self._feed_thesis = []
+        watched = set(uids)
+        try:
+            items = self.client.get_activity_feed(limit=_FEED_LIMIT)
+        except AuthError:
+            raise                       # 登录态是全局问题,必须上抛
+        except NotSupportedError:
+            return set(), False         # playwright 实现没有这个能力,静默退回全员扫描
+        except Exception as e:          # noqa: BLE001
+            logger.warning("活动流拉取失败,本轮退回全员扫描 | {}", e)
+            return set(), False
+
+        hot: set[str] = set()
+        current: set[str] = set()
+        for it in items:
+            fid = _pick_str(it, *_K_NATIVE_ID)
+            uid = _pick_str(it, "userId")
+            if not fid or uid not in watched:
+                continue
+            current.add(fid)
+            if fid in self._feed_seen:
+                continue
+            hot.add(uid)
+            if it.get("type") == "thesis":
+                self._feed_thesis.append(it)
+        # ⚠️ 记忆只留**本轮流里还在的** id:流是滚动窗口,滚出去的条目再也不会回来,
+        #    一直累积就是无界增长。滚出去又意外重现的代价只是多拉一次,不会漏。
+        self._feed_seen = current
+        return hot, True
+
+    def _rotate(self, uids: list[str], n: int, cursor_attr: str) -> set[str]:
+        """
+        在名单上取一段轮转切片,并前进对应的游标。
+
+        ⚠️ 游标走在**完整名单**上,不是"去掉 hot 之后的池子"上:池子成员每轮都在变,
+           在变长度的列表上取模不构成扫描,会有人长期轮不到。
+        """
+        if not uids or n <= 0:
+            return set()
+        n = min(n, len(uids))
+        start = getattr(self, cursor_attr) % len(uids)
+        setattr(self, cursor_attr, (start + n) % len(uids))
+        return {uids[(start + i) % len(uids)] for i in range(n)}
+
+    def _rotate_balances(self, uids: list[str], hot: set[str]) -> set[str]:
+        """
+        轮转刷新一小批「本轮没交易」的人的 balances。
+
+        为什么在"有交易就当场刷"之外还需要轮转:还有两条我们看不见的路会改变
+        「是否仍持有」—— 链上转账(FOMO 没有可用端点)和价格跌破 $1 dust 线。
+        轮转让这类漂移最迟在一圈之内被纠正,代价只有每轮几个请求。
+        """
+        return self._rotate(uids, _BALANCE_ROTATE_PER_TICK, "_bal_rr") - hot
 
     def _build_token_index(self, snapshots: dict) -> None:
         """
@@ -747,45 +996,133 @@ class Poller:
             # 行情快照只影响 /hot 的展示,绝不能因为它失败而中断本轮推送
             logger.warning("行情快照落库失败(不影响推送): {}", e)
 
-    def _collect_thesis(self, conn, users) -> list[FomoEvent]:
+    def _pick_thesis_batch(self) -> list[tuple]:
         """
-        观点采集:遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象。
+        选出本轮要扫的代币并前进轮转游标,返回 [(net, ca, network_raw), …]。
 
-        ⚠️ FOMO **没有**"按用户查观点"的端点(/feed/user/thesis 是 404),只能这么绕。
-           直接代价是调用量 = 持仓币数,所以做了三件事压住它:
-             1) 跨用户去重 —— 多人持有同一个币只拉一次(_token_meta 天然按币聚合)
-             2) 每 tick 最多拉 _THESIS_TOKENS_PER_TICK 个,**轮转覆盖**,
-                币多时延迟变长但调用量恒定,不会随名单规模爆炸
-             3) 带 afterTime 增量拉(单位**毫秒**,传秒会被服务端忽略)
-        ⚠️ 只能看到"监控用户当前持仓的币"下的观点。他对已清仓的币发的观点看不到 ——
-           这是本方案的已知盲区,写在这里免得日后当成 bug 查。
+        ⚠️ 读的是**上一轮**的 _token_meta —— 本函数在 _build_token_index 之前调用,
+           为的是让网络请求能和快照采集并行。它只决定"这轮扫哪些币",
+           不参与任何事件判定,晚一轮完全无害;首轮 meta 为空则本轮不扫。
+        ⚠️ network_raw 必须在这里就**取出来带走**,不能让后台线程回头再查
+           self._token_meta —— 那个字段会被 _build_token_index 整体换掉(第 941 行是重新赋值),
+           后台线程正好在中间读到新字典时,老字典里才有的币会取到 None,
+           带着 networkId=None 发出去就是一个 400,那个币的观点这轮静默丢掉。
+        """
+        tokens = sorted(  # 固定顺序,轮转才有意义
+            (k for k, v in self._token_meta.items() if v.get("network_raw") is not None)
+        )
+        if not tokens:
+            return []
+        meta = self._token_meta          # 定住这一版,循环里不再重新解引用
+        n = len(tokens)
+        take = min(_THESIS_TOKENS_PER_TICK, n)
+        start = self._thesis_rr % n
+        self._thesis_rr = (start + take) % n
+        return [(*tokens[(start + i) % n], meta[tokens[(start + i) % n]]["network_raw"])
+                for i in range(take)]
+
+    def _start_thesis(self, batch: list[tuple]):
+        """
+        启动观点的网络采集,返回一个"去取结果"的可调用对象(阻塞到拿到为止)。
+
+        ⚠️ 不可并发的实现(playwright)必须**留在主线程**同步跑完,绝不能丢进后台线程。
+           它按 threading.local 私有创建整套 playwright + chromium,而线程退出时不回收 ——
+           每 tick 一条新线程就是每 tick 泄漏一套浏览器(约 300MB),12s 一轮的话
+           几分钟就能把内存吃光。这与 _fetch_snapshots 里那道守卫是同一个理由、同一个故障,
+           只是换了个入口进来。
+        ⚠️ 线程池**跨 tick 复用**,不是每轮新建:每轮建一条新线程等于每轮重做
+           TLS 握手(curl 会话是 threading.local 的),而且对 playwright 就是上面那个泄漏。
+           batch 为空时连池子都不建 —— 冷启动第一轮和空名单都属于这种情况。
+        """
+        if not batch:
+            return list                       # 调用它返回 [],等价于"没扫任何币"
+        if not getattr(self.client, "supports_concurrency", True):
+            raw = self._fetch_thesis_raw(batch)
+            return lambda: raw
+        if self._thesis_pool is None:
+            self._thesis_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fomo-thesis-bg")
+        return self._thesis_pool.submit(self._fetch_thesis_raw, batch).result
+
+    def _fetch_thesis_raw(self, batch: list[tuple]) -> list | BaseException:
+        """
+        纯网络:把一批代币的观点拉回来。**不碰 DB、不碰 conn** ——
+        它跑在后台线程里,而 sqlite 连接不跨线程。
+
+        返回与 batch 等长的列表(单个失败置 None);登录态失效时返回那个异常本身,
+        由主线程 raise —— 后台线程里抛出去没人接得住。
+        """
+        if not batch:
+            return []
+        after_ms = int((time.time() - _THESIS_LOOKBACK_SEC) * 1000)
+        auth_err: list[AuthError] = []
+
+        def fetch_one(key):
+            # ⚠️ network_raw 由 _pick_thesis_batch 一并带过来,这里**不碰 self._token_meta** ——
+            #    主线程正在重建它,后台线程回头去查就是一个数据竞争(见 _pick_thesis_batch)。
+            _net, ca_, raw_net = key
+            try:
+                return self.client.get_token_thesis(ca_, raw_net, after_ms=after_ms)
+            except AuthError as e:
+                auth_err.append(e)          # 登录态问题是全局的,收集后交给主线程上抛
+                return None
+            except Exception as e:          # noqa: BLE001
+                logger.debug("thesis 拉取失败 token={} err={}", ca_[:16], e)
+                return None
+
+        # ⚠️ 这批请求彼此无依赖,串行纯属浪费:实测串行 25 个 4.1s、并发 8 只要 2.2s。
+        #    playwright 实现按线程建整套浏览器,必须退回串行(同 _fetch_snapshots)。
+        if not getattr(self.client, "supports_concurrency", True) or len(batch) == 1:
+            results = [fetch_one(k) for k in batch]
+        else:
+            with ThreadPoolExecutor(max_workers=min(_THESIS_WORKERS, len(batch)),
+                                    thread_name_prefix="fomo-thesis") as ex:
+                results = list(ex.map(fetch_one, batch))
+        return auth_err[0] if auth_err else results
+
+    def _collect_thesis(self, conn, users, batch: list[tuple],
+                        results: list | BaseException) -> list[FomoEvent]:
+        """
+        观点采集。两条路合流:
+
+          A) 活动流(_poll_feed 顺手捡的)—— **零额外调用、下一轮就能推**。
+             流里的观点条目与 /feed/token/thesis 同形,直接喂 normalize_thesis。
+          B) 按代币轮转扫描 —— 兜底。活动流只覆盖"当前登录账号关注的人",
+             名单里没关注的人只能靠这条路捞回来。
+
+        为什么 B 这么绕:FOMO **没有**"按用户查观点"的端点(/feed/user/thesis 是 404),
+        只能遍历监控用户持仓里的币 → 按币拉 → 按 userId 过滤。代价是调用量 = 持仓币数,
+        所以压了三道:
+          1) 跨用户去重 —— 多人持有同一个币只拉一次(_token_meta 天然按币聚合)
+          2) 每 tick 最多拉 _THESIS_TOKENS_PER_TICK 个,**轮转覆盖**,
+             币多时延迟变长但调用量恒定,不会随名单规模爆炸
+          3) 带 afterTime 增量拉(单位**毫秒**,传秒会被服务端忽略)
+
+        ⚠️ 两条路都用原生 id 生成 event_id,同一条观点两边都抓到也会被
+           INSERT OR IGNORE 去重,不会推两遍。
+        ⚠️ B 只能看到"监控用户当前持仓的币"下的观点。他对已清仓的币发的观点看不到 ——
+           这是已知盲区(A 不受此限),写在这里免得日后当成 bug 查。
         """
         # ⚠️ 名单直接从入参 users 取,不读 self._watched_ids ——
         #    后者由 tick() 里的 _refresh_watched_index 设置,本函数收了 users 却依赖
         #    另一处设的实例字段,是隐藏耦合:换个调用顺序就静默返回空,不报错。
         watched = {u["user_id"] for u in users}
-        tokens = [k for k, v in self._token_meta.items() if v.get("network_raw") is not None]
-        if not tokens or not watched:
+        if not watched:
             return []
-        tokens.sort()                      # 固定顺序,轮转才有意义
-        n = len(tokens)
-        take = min(_THESIS_TOKENS_PER_TICK, n)
-        start = self._thesis_rr % n
-        batch = [tokens[(start + i) % n] for i in range(take)]
-        self._thesis_rr = (start + take) % n
 
-        after_ms = int((time.time() - _THESIS_LOOKBACK_SEC) * 1000)
         by_user: dict[str, list[dict]] = {}
-        failed = 0
-        for net, ca in batch:
-            raw_net = (self._token_meta.get((net, ca)) or {}).get("network_raw")
-            try:
-                items = self.client.get_token_thesis(ca, raw_net, after_ms=after_ms)
-            except AuthError:
-                raise                       # 登录态问题是全局的,必须上抛
-            except Exception as e:          # noqa: BLE001
-                failed += 1
-                logger.debug("thesis 拉取失败 token={} err={}", ca[:16], e)
+        # ---- A) 活动流顺手捡到的观点。零额外调用,先收进来 ----
+        for it in self._feed_thesis:
+            if it.get("userId") in watched:
+                by_user.setdefault(it["userId"], []).append(it)
+
+        # ---- B) 按代币轮转扫描的结果(网络部分已在后台线程跑完,见 _fetch_thesis_raw)----
+        if isinstance(results, BaseException):
+            raise results
+
+        failed = sum(1 for r in results if r is None)
+        for items in results:
+            if items is None:
                 continue
             for it in items:
                 # 按币查会把该币下**所有人**的观点都拉回来(热门币一次 100 条),
@@ -797,6 +1134,9 @@ class Poller:
             logger.warning("thesis 本轮 {}/{} 个代币拉取失败", failed, len(batch))
         if not by_user:
             return []
+        if self._feed_thesis:
+            logger.debug("thesis | 活动流直取 {} 条 · 轮转扫描 {} 个代币",
+                         len(self._feed_thesis), len(batch))
 
         out: list[FomoEvent] = []
         rows = {u["user_id"]: u for u in users}
@@ -829,7 +1169,12 @@ class Poller:
                 ("swaps", getattr(snap, "swaps", None), self.normalize_swaps),
             ):
                 if items is None:
-                    # None = 该项拉取失败(区别于空列表)。swaps 挂了不影响其余三类继续推
+                    # None 有两种来源,必须分开看:
+                    #   本轮排到他了却拿回 None = 真的拉取失败,要 WARN;
+                    #   本轮压根没排到他(活动流说他没动、也没轮到兜底扫描)= 正常,静默跳过。
+                    #   不分开的话,稳态下每轮会对五十几个人各刷一条 WARNING。
+                    if uid not in self._swaps_attempted:
+                        continue
                     logger.warning("{} 的 {} 本 tick 拉取失败,本类跳过", uid, kind)
                     continue
                 try:
@@ -974,8 +1319,6 @@ class Poller:
             return
 
         ready = store.ready_user_ids(conn)
-        interval = self.settings.fomo_send_interval_sec
-        first = True
         for ev in pending:
             buyers = watchlist = holders = None
             baseline_pending = False
@@ -1008,10 +1351,8 @@ class Poller:
                 logger.info("[dry-run] {}", text.replace("\n", " ⏎ "))
                 continue
 
-            # 串行 + 固定间隔,规避 TG 同 chat 约 20 msg/min 的限流。第一条不等
-            if not first:
-                time.sleep(interval)
-            first = False
+            # 串行发送 + 令牌桶限速,规避 TG 同 chat 的限流
+            self._throttle_send()
 
             try:
                 ok = self.notifier.send(text)
@@ -1021,6 +1362,30 @@ class Poller:
             if ok:
                 # ⚠️ 只能在 TG 确认收到之后才置 sent=1。"发之前就标已发"会在崩溃时永久丢消息
                 store.mark_sent(conn, ev.event_id, buyers, watchlist)
+
+    def _throttle_send(self) -> None:
+        """
+        推送限速:令牌桶。桶里有令牌就立刻发,没有就等攒出一个。
+
+        ⚠️ 桶**跨 tick 保持**,不是每轮重置 —— 否则每轮都能突发 _SEND_BURST 条,
+           连续几轮爆量时实际速率会超过 TG 的软限,反而挨 429。
+        ⚠️ 这段 sleep 发生在 tick 内部,直接计入单轮耗时。原来固定 sleep(3.5s)
+           的写法下,一轮 6 条要凭空多花 17.5s —— 那正是日志里
+           「新事件 6 条 · 耗时 67s」比「新事件 1 条 · 耗时 35s」多出来的那一截。
+        """
+        rate = self.settings.fomo_send_interval_sec
+        if rate <= 0:
+            return
+        now = time.monotonic()
+        self._send_tokens = min(float(_SEND_BURST),
+                                self._send_tokens + (now - self._send_last) / rate)
+        self._send_last = now
+        if self._send_tokens >= 1.0:
+            self._send_tokens -= 1.0
+            return
+        time.sleep((1.0 - self._send_tokens) * rate)
+        self._send_tokens = 0.0
+        self._send_last = time.monotonic()
 
     # --------------------------------------------------------
     # 历史基线(seeding)
