@@ -164,6 +164,17 @@ class FomoAPIError(Exception):
     """FOMO API 调用失败。message 里必须说清是 Cloudflare 拦截还是鉴权失败。"""
 
 
+class UserGoneError(FomoAPIError):
+    """
+    上游明确说这个用户不存在了(HTTP 404)。
+
+    ⚠️ 与 FomoAPIError 分开是**必须的**:后者的语义是"这次没成功,下次再试",
+       而这个的语义是"再试一万次也是这个结果"。混在一起的后果实测过 ——
+       两个被删掉的账号被每 15 秒重试一次,连续 10 天约 11.5 万次注定失败的请求,
+       日志里每轮刷一行"上游抖动",而真正的原因(账号没了)一次都没说出口。
+    """
+
+
 class NotSupportedError(Exception):
     """当前 client 实现不支持该能力(PlaywrightFomoClient 不支持 swaps 分页)"""
 
@@ -454,6 +465,10 @@ class _BaseFomoClient:
                     raise FomoAPIError(f"{path} 停机中,放弃重试")
                 continue
 
+            if status == 404:
+                # ⚠️ 不记 _note_transient:404 不是抖动,把它混进"上游抖动"的汇总里
+                #    会让一个永久故障看起来像网络问题,从而永远没人去处理它。
+                raise UserGoneError(f"{path} HTTP 404: {(text or '')[:200]}")
             raise FomoAPIError(f"{path} HTTP {status}: {(text or '')[:300]}")
 
         if auth_status is not None:

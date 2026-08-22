@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from src import store
-from src.client import NotSupportedError, UserSnapshot
+from src.client import NotSupportedError, UserGoneError, UserSnapshot
 from src.models import EVENT_BUY, now_iso
 from src.poller import _SEND_BURST, Poller
 from tests.conftest import CA_TOAD
@@ -1420,3 +1420,108 @@ def test_close_关掉常驻线程池(db):
     p.close()
     assert p._thesis_pool is None
     p.close()          # 幂等:cli 的 finally 里可能重复调
+
+
+# ============================================================
+# 上游 404:账号已不存在
+# ⚠️ 实测过不做这件事的代价:2 个被删的账号被每 15 秒重试一次、连续 10 天,
+#    约 11.5 万次注定失败的请求,而日志里只说"上游抖动"
+# ============================================================
+class GoneClient(FakeClient):
+    """指定的人一律 404,其余正常"""
+
+    def __init__(self, snaps, gone: set[str]):
+        super().__init__(snaps)
+        self.gone = gone
+        self.calls: list[tuple[str, str]] = []
+
+    def get_swaps(self, uid, **kw):
+        self.calls.append(("swaps", uid))
+        if uid in self.gone:
+            raise UserGoneError("/v2/users/x/swaps HTTP 404: User not found")
+        return super().get_swaps(uid, **kw)
+
+    def get_balances(self, uid, **kw):
+        self.calls.append(("balances", uid))
+        if uid in self.gone:
+            raise UserGoneError("/v2/users/x/balances HTTP 404: User not found")
+        return super().get_balances(uid, **kw)
+
+
+def _gone_setup(db):
+    _add_ready("uA", "alice")
+    _add_ready("uB", "bob")
+    snaps = {u: UserSnapshot(u, swaps=[], transfers=[], thesis=[], balances=[])
+             for u in ("uA", "uB")}
+    return GoneClient(snaps, {"uB"})
+
+
+def test_上游404的人下一轮就不再拉了(db):
+    """核心诉求:永久失败不能每轮重试。这是 11.5 万次废请求的来源"""
+    client = _gone_setup(db)
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    assert any(u == "uB" for _, u in client.calls), "第一轮总要试一次才知道他没了"
+
+    client.calls.clear()
+    p.tick()
+    assert not any(u == "uB" for _, u in client.calls), "第二轮起绝不能再拉他"
+    assert any(u == "uA" for _, u in client.calls), "别把正常的人一起停了"
+
+
+def test_404只告警一次(db):
+    """⚠️ 这个状态会持续存在(实测 10 天)。每轮发一条 = TG 被刷爆 = 等于没有告警"""
+    client = _gone_setup(db)
+    n = FakeNotifier()
+    p = Poller(client, n)
+    for _ in range(3):
+        p.tick()
+    hits = [s for s in n.sent if "已不存在" in s]
+    assert len(hits) == 1, f"只该告警一次,实际 {len(hits)} 次"
+    assert "bob" in hits[0], "必须点名是谁,否则用户无从下手"
+
+
+def test_404不自动移出名单(db):
+    """
+    ⚠️ 账号可能只是改名或临时不可见,而 /del 会连基线一起删掉 —— 不可逆。
+       停止拉取是程序的事,删不删是用户的决定。
+    """
+    client = _gone_setup(db)
+    Poller(client, FakeNotifier()).tick()
+    with store.get_conn() as c:
+        row = store.get_watch_user(c, "uB")
+        assert row["active"] == 1, "绝不能自动踢出名单"
+        assert row["missing_since"], "但要标记出来"
+        assert len(store.list_active_users(c)) == 2, "共识分母仍是完整名单"
+        assert [r["user_id"] for r in store.fetchable_users(c)] == ["uA"]
+
+
+def test_404的人历史记录仍然算数(db):
+    """他历史上的买入是真实发生过的事,不能因为账号后来没了就抹掉"""
+    _add_ready("uA", "alice")
+    _add_ready("uB", "bob")
+    with store.get_conn() as c:
+        store.mark_user_missing(c, "uB")
+        assert len(store.list_active_users(c)) == 2
+        assert len(store.ready_user_ids(c)) == 2
+
+
+def test_账号恢复后会重新开始采集(db):
+    """改名/临时不可见会自己恢复 —— 一次误判不能变成永久失明"""
+    from src import poller as pmod
+
+    client = _gone_setup(db)
+    p = Poller(client, FakeNotifier())
+    p.tick()
+    with store.get_conn() as c:
+        assert store.get_watch_user(c, "uB")["missing_since"]
+
+    client.gone.clear()                       # 上游恢复了
+    monkey = pmod._MISSING_RECHECK_TICKS
+    try:
+        pmod._MISSING_RECHECK_TICKS = 1       # 别在测试里等一小时
+        p.tick()
+    finally:
+        pmod._MISSING_RECHECK_TICKS = monkey
+    with store.get_conn() as c:
+        assert not store.get_watch_user(c, "uB")["missing_since"], "恢复后要撤掉标记"

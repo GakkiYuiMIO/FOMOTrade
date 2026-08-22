@@ -247,6 +247,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE watch_users ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
         logger.info("迁移:watch_users 补列 starred(特别关注)")
 
+    if wcols and "missing_since" not in wcols:
+        conn.execute("ALTER TABLE watch_users ADD COLUMN missing_since TEXT")
+        logger.info("迁移:watch_users 补列 missing_since(上游 404,账号已不存在)")
+
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(token_snapshot)").fetchall()}
     if tcols and "max_market_cap" not in tcols:
         conn.execute("ALTER TABLE token_snapshot ADD COLUMN max_market_cap REAL")
@@ -323,6 +327,49 @@ def find_user_by_handle(conn, handle: str):
 def list_active_users(conn) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM watch_users WHERE active = 1 ORDER BY added_at"
+    ).fetchall()
+
+
+def fetchable_users(conn) -> list[sqlite3.Row]:
+    """
+    本轮真正要去拉数据的人 —— 排除掉上游已经 404 的账号。
+
+    ⚠️ 与 list_active_users 分开是有意的:/list、共识计数用的仍是完整名单
+       (那些人历史上的买入是**真实发生过的事**,不能因为账号后来没了就抹掉),
+       只有"去拉他今天的数据"这件事没有意义。
+    """
+    return conn.execute(
+        "SELECT * FROM watch_users WHERE active = 1 AND missing_since IS NULL "
+        "ORDER BY added_at"
+    ).fetchall()
+
+
+def mark_user_missing(conn, user_id: str) -> bool:
+    """标记为「上游说不存在」。返回 True 表示这次是**新**标上的(用来只告警一次)"""
+    with tx(conn):
+        cur = conn.execute(
+            "UPDATE watch_users SET missing_since = ? "
+            "WHERE user_id = ? AND missing_since IS NULL",
+            (now_iso(), user_id),
+        )
+    return cur.rowcount == 1
+
+
+def clear_user_missing(conn, user_id: str) -> bool:
+    """账号又能拉到了 —— 撤掉标记。返回 True 表示确实撤掉了一个"""
+    with tx(conn):
+        cur = conn.execute(
+            "UPDATE watch_users SET missing_since = NULL "
+            "WHERE user_id = ? AND missing_since IS NOT NULL",
+            (user_id,),
+        )
+    return cur.rowcount == 1
+
+
+def missing_users(conn) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM watch_users WHERE active = 1 AND missing_since IS NOT NULL "
+        "ORDER BY missing_since"
     ).fetchall()
 
 

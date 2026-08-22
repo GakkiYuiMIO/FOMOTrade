@@ -22,6 +22,7 @@ import json
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import UTC, datetime
 
 from loguru import logger
@@ -30,6 +31,7 @@ from src import copyworker, store
 from src.auth import AuthError
 from src.client import (
     NotSupportedError,
+    UserGoneError,
     UserSnapshot,
     sleep_or_stop,
     stop_requested,
@@ -203,6 +205,10 @@ _TOKEN_AGE_MIN_TS = 1420070400
 _LAST_TICK_KEY = "last_tick_at"
 # 跟单日报最后报到哪一天(UTC 日期串)。跨日的第一轮据此补报前一天
 _COPY_SUMMARY_KEY = "copy_summary_day"
+
+# 隔多少轮重试一次"上游 404"的账号。15s 一轮 → 240 轮约等于 1 小时。
+# ⚠️ 别调小:这条的意义是"别让误判变成永久失明",不是"尽快恢复"。
+_MISSING_RECHECK_TICKS = 240
 
 
 def _num_fmt(v) -> str:
@@ -586,8 +592,17 @@ class Poller:
                 logger.debug("监控名单为空,本 tick 跳过")
                 return 0
             self._refresh_watched_index(users)
+            # ⚠️ 采集名单要排除掉上游已经 404 的账号,但**共识计数与展示仍用完整名单**:
+            #    他们历史上的买入是真实发生过的事,不能因为账号后来没了就抹掉。
+            #    没有这道过滤时实测:2 个被删的账号被每 15 秒重试一次、连续 10 天。
+            users = store.fetchable_users(conn)
+            if not users:
+                logger.warning("名单里的人上游全部 404,本 tick 无可采集")
+                return 0
             # 识别"中间停过机"。必须在采集之前判,采集之后 last_tick_at 就被刷新了
             self._catchup_since = self._detect_gap(conn)
+            with suppress(Exception):
+                self._recheck_missing(conn)
 
             # --- 2) 采集 ---
             # ⚠️ 观点的轮转扫描与用户快照采集**互不依赖**,串行跑等于白等一个屏障:
@@ -724,6 +739,7 @@ class Poller:
 
         auth_err: list[AuthError] = []
         failed: list[str] = []
+        gone: list[str] = []
 
         def call(kind: str, uid: str):
             # 停机中就别再发了:线程池里可能还排着几十个请求,一个个跑完
@@ -734,6 +750,13 @@ class Poller:
                 return getattr(self.client, f"get_{kind}")(uid)
             except AuthError as e:
                 auth_err.append(e)
+                return None
+            except UserGoneError as e:
+                # ⚠️ 这不是抖动,是"这个人没了"。不进 failed(那会汇总成"上游抖动"),
+                #    单独收集起来,由 tick 末尾标记 + 只告警一次。
+                gone.append(uid)
+                logger.debug("{} 上游 404 | user={} handle={} | {}",
+                             kind, uid, handles.get(uid), e)
                 return None
             except Exception as e:  # noqa: BLE001
                 # ⚠️ 逐条 WARNING 会在上游抖动时刷屏几十行,把真正要紧的 ERROR 淹掉。
@@ -820,6 +843,8 @@ class Poller:
         logger.debug("采集 | 名单 {} 人 · swaps {} 人 · 有新动作 {} 人 · balances {} 人 · 补漏 {} 人",
                      len(uids), len(need_swaps), len(hot),
                      len(need_bal) + len(extra_bal), len(extra_bal))
+        if gone:
+            self._handle_gone_users(sorted(set(gone)), handles)
         self._log_transient(failed, len(uids) - len(self._bal_cache))
 
         # ---- 组装。本轮没拉的读缓存,保证 count_holders 拿到全员覆盖 ----
@@ -839,9 +864,9 @@ class Poller:
             snapshots[uid] = snap
 
         # 已经移出名单的人不再占内存(69 人的 balances 原始体积约 8MB)
-        for gone in set(self._bal_cache) - set(uids):
-            self._bal_cache.pop(gone, None)
-            self._swap_seen.pop(gone, None)
+        for dropped in set(self._bal_cache) - set(uids):
+            self._bal_cache.pop(dropped, None)
+            self._swap_seen.pop(dropped, None)
 
         if auth_err:
             # ⚠️ 必须上抛,绝不能吞掉。登录态失效是"整个管道都废了",
@@ -850,6 +875,53 @@ class Poller:
             #    用户会一直以为监控还活着。
             raise auth_err[0]
         return snapshots
+
+    def _handle_gone_users(self, uids: list[str], handles: dict) -> None:
+        """
+        上游 404 的账号:落标记、只告警一次、从此不再拉他。
+
+        ⚠️ **不自动移出名单**。账号可能只是改了名或临时不可见,而 /del 会把
+           基线一起删掉 —— 那是不可逆的。这里只停止拉取并告诉用户,删不删由他决定。
+        ⚠️ 告警必须只发一次:这个状态会持续存在(实测持续了 10 天),
+           每轮发一条的话,TG 会被刷爆,而刷爆等同于没有告警。
+        """
+        fresh = []
+        with store.get_conn() as conn:
+            for uid in uids:
+                if store.mark_user_missing(conn, uid):
+                    fresh.append(uid)
+        if not fresh:
+            return
+        names = ", ".join(f"@{handles.get(u) or u[:8]}" for u in fresh)
+        logger.warning("上游 404,已停止拉取(不再重试) | {}", names)
+        with suppress(Exception):
+            self.notifier.send(
+                f"\U0001F47B <b>{len(fresh)} 个账号在 FOMO 上已不存在</b>\n"
+                f"{html.escape(names)}\n"
+                "已停止拉取他们的数据(之前每 15 秒重试一次,一直失败)。\n"
+                "他们的历史记录仍计入共识;确认不要了就 <code>/del &lt;handle&gt;</code>。"
+            )
+
+    def _recheck_missing(self, conn) -> None:
+        """
+        隔一阵子重试一次被标记的账号 —— 改名/临时不可见的情况会自己恢复。
+
+        ⚠️ 频率要低。这一条的全部意义是"别让一次误判变成永久失明",
+           不是"尽快恢复" —— 恢复晚一小时没有任何代价。
+        """
+        if self._tick_no % _MISSING_RECHECK_TICKS:
+            return
+        for row in store.missing_users(conn):
+            uid = row["user_id"]
+            try:
+                self.client.get_balances(uid)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if store.clear_user_missing(conn, uid):
+                logger.info("账号又能拉到了,恢复采集 | @{}", row["handle"])
+                with suppress(Exception):
+                    self.notifier.send(
+                        f"✅ <b>@{html.escape(row['handle'] or uid[:8])} 又能拉到了</b>,已恢复采集")
 
     def _log_transient(self, failed: list[str], not_warm: int) -> None:
         """
