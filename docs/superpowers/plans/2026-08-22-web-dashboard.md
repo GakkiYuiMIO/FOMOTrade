@@ -1470,5 +1470,8 @@ git commit -m "名单盈亏采集 + 网页展示
   「先按推荐的做,做出来后有需要的再调」。
 - **命名一致性**:`readonly_conn` / `follow_value` / `copy_summary` / `copy_ledger_full` /
   `save_user_pnl` / `load_user_pnl` 在各 Task 间已核对一致。
-- **占位符**:无 TBD / TODO。两处标了「以实际实现为准」(`hot_tokens` 列名、
-  `get_leaderboard` 签名),均已给出确认方法与容错写法。
+- **占位符**:无。初稿里有两处「以实际实现为准」,已全部实测查实并写死:
+  - `hot_tokens` 的列叫 **`symbol`** 不是 `token_symbol` —— 初稿写错了,会直接渲染空白
+  - `get_leaderboard(period, limit)` **limit 必传**(不带直接 400),
+    且必须用 `period="following"` —— 实测只有它返回全部四个盈亏字段,
+    `"7d"` 返回的是全站前 100 榜,大半不是名单里的人。初稿的调用方式是错的。
