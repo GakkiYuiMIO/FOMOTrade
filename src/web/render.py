@@ -65,20 +65,39 @@ def token_label(symbol: str | None, ca: str) -> str:
     return (ca[:6] + "…") if ca else ""
 
 
+def age_minutes(iso: str | None) -> float | None:
+    """
+    ISO 时间戳距现在过了多少分钟 —— stale_mark() 和 pages._is_frozen() 共用的
+    解析逻辑(抽出来之前两处各自写了一遍完全一样的六行:解析 ISO、'Z'→'+00:00'、
+    naive→UTC 补时区、算分钟差)。
+
+    ⚠️ 本函数只负责"能不能解析、解析出来多久";缺失(None/空串)或解析失败一律
+       返回 None,**不**在这里替调用方决定"缺失该怎么办"——stale_mark 和
+       _is_frozen 对缺失/损坏的处理结果虽然都是"当作不新鲜",但具体动作不同
+       (前者要挑不同的提示文案,后者只需要一个 bool),阈值比较也各自独立
+       (STALE_MIN vs LEDGER_FREEZE_MIN),抽取范围到此为止,不要把阈值判断也搬进来。
+    """
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - dt).total_seconds() / 60
+
+
 def stale_mark(updated_at: str | None) -> str:
     """行情太旧的标记。⚠️ 够新返回空串 —— 正常情况不该占屏"""
     if not updated_at:
         return "⚠️ 无行情"
-    try:
-        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-    except ValueError:
+    mins = age_minutes(updated_at)
+    if mins is None:
         # ⚠️ carry-over fix(Task 4 review):损坏的时间戳不能"失败即当新鲜"——
         #    那等于让一条脏数据看起来和真正的实时行情一样,而 stale 标记
         #    在跟单台账页恰恰是用户判断"这个倍数能不能信"的依据。
         return "⚠️ 时间戳异常"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    mins = (datetime.now(UTC) - dt).total_seconds() / 60
     if mins <= STALE_MIN:
         return ""
     if mins < 60 * 24:

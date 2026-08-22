@@ -8,19 +8,28 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
 
 from src import store
 from src.web import queries as q
-from src.web.render import esc, mcap, money, mult, page, pct, stale_mark, token_label
+from src.web.render import age_minutes, esc, mcap, money, mult, page, pct, stale_mark, token_label
 
 _SNAPSHOT_NOTE = ('<p class=note>所有数字按<b>当前行情快照</b>计算。'
                   '实测相邻两轮之间整体倍数会有百分之几的波动。</p>')
 
 # 台账页「新鲜/冻结」拆分用的阈值(分钟)。
-# ⚠️ 故意不复用 render.STALE_MIN —— 那个常量同时是 bot._STALE_MCAP_MIN,
-#    是买入安全线的实时判据。两者共用一个数字的话,以后谁为了调买入安全线
-#    改了那个常量,这里的统计口径会被无声地一起带偏。
+# ⚠️ 故意不复用 render.STALE_MIN —— 之前这里写过"那个常量同时是
+#    bot._STALE_MCAP_MIN,是买入安全线的实时判据",经核实这个说法是错的:
+#    bot._STALE_MCAP_MIN 只喂给 bot._stale_mark(),而后者只在 /paper 这条
+#    Telegram 命令里给台账现价加"⚠️ 行情停在 Xh 前"的展示标注(bot.py:986),
+#    不参与任何买入判断。真正的买入闸门是 copytrade.CopyConfig.max_entry_mcap,
+#    拿当次实时抓到的 entry_mcap 比较(copytrade.py:174-179);买入时机的安全阀
+#    是 copyworker.MAX_STALE_SEC(排队等执行的时效上限,copyworker.py:43)——
+#    这两个都和 _STALE_MCAP_MIN 无关。
+#    不复用的决定本身没错,只是理由要换一个:render.STALE_MIN 回答的是
+#    "这条现价展示该不该标 stale",LEDGER_FREEZE_MIN 回答的是"这条该不该被
+#    计入冻结子集统计口径",是两个独立动机的阈值,只是当前恰好都取 60 分钟。
+#    共用同一个数字的话,以后谁为了调其中一个用途改了这个值,
+#    另一处的口径会被无声地一起带偏。
 #    阈值本身对结果的影响是实质性的,不是装饰:实测 60min → 29/28 条、
 #    0.71x/0.65x;24h → 34/23 条、0.78x/0.59x。
 LEDGER_FREEZE_MIN = 60
@@ -132,21 +141,14 @@ def _is_frozen(updated_at: str | None) -> bool:
     """
     行情快照是否已经停更超过 LEDGER_FREEZE_MIN 分钟。
 
-    ⚠️ 独立于 render.stale_mark() 实现 —— 后者的阈值是 render.STALE_MIN,
+    ⚠️ 阈值判断独立于 render.stale_mark() —— 后者比较的是 render.STALE_MIN,
        与本页的分类阈值 LEDGER_FREEZE_MIN 概念上是两件事(见上面常量的注释),
-       即便当前取值恰好相同也不该共用同一段判断逻辑。
+       即便当前取值恰好相同也不该共用同一个阈值。两者共用的只是
+       render.age_minutes() 这段解析逻辑本身,不是阈值比较。
        缺失 / 解析不了的时间戳都算冻结,不能当新鲜处理。
     """
-    if not updated_at:
-        return True
-    try:
-        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    mins = (datetime.now(UTC) - dt).total_seconds() / 60
-    return mins > LEDGER_FREEZE_MIN
+    mins = age_minutes(updated_at)
+    return mins is None or mins > LEDGER_FREEZE_MIN
 
 
 def copy_ledger(conn: sqlite3.Connection) -> str:
