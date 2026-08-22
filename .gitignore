@@ -53,3 +53,4 @@ Thumbs.db
 # Poetry
 # ==================================================
 poetry.lock
+.superpowers/
