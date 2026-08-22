@@ -21,6 +21,7 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 from src import store
+from src.config import SESSION_FILE
 from src.web import server
 
 
@@ -88,10 +89,13 @@ def test_未知路径返回404(running_server):
 #    三条 payload 分别对应:裸 '..'、URL 编码后的 '..'(server 会 unquote 再路由)、
 #    以及绝对路径注入(pathlib 在 windows 上遇到带盘符的绝对路径会整体替换掉左操作数,
 #    必须靠 STATIC_DIR.resolve() not in f.parents 这道containment 检查挡住)。
+#    ⚠️ 绝对路径那条从 SESSION_FILE 推导,不写死盘符 —— 写死的话仓库换个位置
+#       (别的机器、CI)它就变成打一个根本不存在的路径:测试照样绿,
+#       但已经不再验证任何东西了。
 _TRAVERSAL_PAYLOADS = [
     "/static/../../../data/fomo_session.json",
     "/static/..%2f..%2f..%2fdata%2ffomo_session.json",
-    "/static/E:/cryptoCode/FOMO/data/fomo_session.json",
+    "/static/" + str(SESSION_FILE).replace("\\", "/"),
 ]
 
 
