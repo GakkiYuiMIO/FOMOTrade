@@ -118,7 +118,12 @@ def follow_value(conn: sqlite3.Connection,
     try:
         pnl = {r["user_id"]: r for r in conn.execute(
             "SELECT user_id, total_pnl, pnl_7d FROM user_pnl_snapshot")}
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        # ⚠️ 只吞「表还不存在」这一种 —— 新表要等 --run 建库才出现,
+        #    而 --web 是只读进程不建库。其它 OperationalError(锁、磁盘、列名写错)
+        #    必须原样抛出,否则真 bug 会被永久藏起来。
+        if "no such table" not in str(e):
+            raise
         pnl = {}
     for d in out:
         p = pnl.get(d["user_id"])

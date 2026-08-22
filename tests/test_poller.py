@@ -1606,23 +1606,70 @@ def test_名单盈亏采集每20轮才调一次(db):
     assert client.leaderboard_calls == 1, "第 20 轮该打一次"
 
 
+def test_名单盈亏与活动流永不同轮触发(db):
+    """
+    ⚠️ _PNL_EVERY_N_TICKS=20 与 _FEED_EVERY_N_TICKS=6 并不互质(gcd=2)——
+       两者错开完全靠调用顺序:_poll_feed 的降频判断在 _tick_no 自增**之前**,
+       _maybe_poll_pnl 的判断排在 tick() 里更晚的位置,在自增**之后**。
+       这条测试把这个隐性依赖钉死:谁把其中一次判断挪到自增的另一侧,
+       活动流与名单盈亏采集就可能撞进同一轮(两个各自有独立限流的网络请求
+       叠在一起打),这里会变红,而不是在生产环境里悄悄退化。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA")}, leaderboard=[_pnl_row("uA")])
+    p = Poller(client, FakeNotifier())
+    both_fired_together = False
+    for _ in range(120):  # LCM(6, 20) = 60,跑两圈以上留足余量
+        before_feed, before_lb = client.feed_calls, client.leaderboard_calls
+        p.tick()
+        fired_feed = client.feed_calls > before_feed
+        fired_lb = client.leaderboard_calls > before_lb
+        if fired_feed and fired_lb:
+            both_fired_together = True
+    assert not both_fired_together, "活动流与名单盈亏采集在同一轮同时触发了"
+    # 两条低频任务各自确实按周期触发过 —— 不是因为都没触发才"没撞上"
+    assert client.feed_calls > 0
+    assert client.leaderboard_calls > 0
+
+
 def test_名单盈亏采集失败不影响买卖推送(db):
-    """挂了只是这轮没更新盈亏展示列,买卖判定和推送必须照常"""
+    """
+    挂了只是这轮没更新盈亏展示列,买卖判定和推送必须照常。
+
+    ⚠️ review 抓到的坑:新建的 Poller._tick_no 从 0 起步,tick() 里
+       _fetch_snapshots 先把它自增到 1 才轮到 _maybe_poll_pnl 检查,
+       1 % 20 != 0,第一轮根本不会调 get_leaderboard —— leaderboard_boom
+       从未被触发,这条测试原来是假的(删掉 tick() 里包 _maybe_poll_pnl 的
+       try/except,424 个测试照样全绿)。
+       把 _tick_no 手动拨到 19,tick() 里自增到 20 后 20 % 20 == 0,
+       这一轮才会真的调用 get_leaderboard、真的抛出 leaderboard_boom。
+    """
     _add_ready("uA", "alice")
     client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")])},
                         leaderboard_boom=RuntimeError("leaderboard 500"))
     notifier = FakeNotifier()
-    n = Poller(client, notifier).tick()
+    p = Poller(client, notifier)
+    p._tick_no = 19        # 本轮 _fetch_snapshots 自增后正好落在 20
+    n = p.tick()
+    assert client.leaderboard_calls == 1, "没真的调到采集,这条测试就是假的"
     assert n == 1 and len(notifier.sent) == 1, "盈亏采集失败绝不能挡住买卖推送"
 
 
 def test_名单盈亏采集不支持时静默跳过(db):
-    """playwright 等实现若不支持该端点,NotSupportedError 必须被吞掉,不是告警也不是崩溃"""
+    """
+    playwright 等实现若不支持该端点,NotSupportedError 必须被吞掉,不是告警也不是崩溃。
+
+    ⚠️ 同上一条的坑:必须把 _tick_no 拨到 19,否则第一轮直接被降频门槛挡住,
+       get_leaderboard 根本没被调过,NotSupportedError 也就无从触发。
+    """
     _add_ready("uA", "alice")
     client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")])},
                         leaderboard_boom=NotSupportedError("测试用:不支持榜单"))
     notifier = FakeNotifier()
-    n = Poller(client, notifier).tick()
+    p = Poller(client, notifier)
+    p._tick_no = 19        # 本轮 _fetch_snapshots 自增后正好落在 20
+    n = p.tick()
+    assert client.leaderboard_calls == 1, "没真的调到采集,这条测试就是假的"
     assert n == 1 and len(notifier.sent) == 1
     with store.get_conn() as c:
         assert store.load_user_pnl(c) == [], "没能力拉就该是没有数据,不是报错"

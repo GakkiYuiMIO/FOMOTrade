@@ -5,6 +5,8 @@
 # ruff: noqa: N802
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from src import store
@@ -188,6 +190,38 @@ def test_名单盈亏表不存在时跟单价值仍能返回(conn):
     assert len(rows) == 1
     assert rows[0]["total_pnl"] is None
     assert rows[0]["pnl_7d"] is None
+
+
+class _LockedPnlConn:
+    """
+    包一层真实连接,只让涉及 user_pnl_snapshot 的查询抛出「数据库被锁」,其余原样代理。
+
+    ⚠️ sqlite3.Connection 是 C 扩展类型,实例不允许直接 monkeypatch .execute
+       (会报 "attribute 'execute' is read-only"),所以用一层代理对象而不是
+       monkeypatch.setattr(conn, ...)。
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, *a, **kw):
+        if "user_pnl_snapshot" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *a, **kw)
+
+
+def test_跟单价值_盈亏表其它OperationalError原样上抛(conn):
+    """
+    ⚠️ follow_value 只应该吞「表还不存在」这一种 OperationalError ——
+       数据库被锁、磁盘错误、列名拼错这些真 bug 不能被这段兜底悄悄吃掉,
+       否则会被永久藏起来,变成一个"看起来正常但数据一直是 None"的隐形故障。
+    """
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 200_000)])
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        queries.follow_value(_LockedPnlConn(conn), min_tokens=1)
 
 
 def test_跟单台账不截断且带整体倍数(conn):
