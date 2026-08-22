@@ -56,8 +56,14 @@ def dashboard(conn: sqlite3.Connection) -> str:
 
 def people(conn: sqlite3.Connection) -> str:
     rows = q.follow_value(conn)
+    # ⚠️「他自己 7d / 生涯」两列与前面「跟单价值」三列是两个完全不同的问题:
+    #    前者是「他自己赚了多少」,后者是「跟着他买我能拿到什么」——
+    #    本期数据里两者相关性很弱、时常反向,不能让读者以为前者能推出后者。
+    #    用一条竖线把两组视觉上分开,不新增 CSS 框架。
+    sep = ' style="border-left:2px solid var(--line)"'
     head = ("<tr><th>名单成员</th><th>币数</th><th>峰值中位</th>"
-            "<th>现价中位</th><th>胜率</th></tr>")
+            "<th>现价中位</th><th>胜率</th>"
+            f"<th{sep}>他自己 7d</th><th>他自己生涯</th></tr>")
     trs = []
     for r in rows:
         name = r["display_name"] or r["handle"] or r["user_id"][:8]
@@ -68,7 +74,9 @@ def people(conn: sqlite3.Connection) -> str:
             f'<td class=n>{r["tokens"]}</td>'
             f'<td class=n>{mult(r["median_peak"])}</td>'
             f'<td class="n {cls}">{mult(r["median_now"])}</td>'
-            f'<td class=n>{pct(r["win_rate"])}</td></tr>'
+            f'<td class=n>{pct(r["win_rate"])}</td>'
+            f'<td class=n{sep}>{money(r.get("pnl_7d"))}</td>'
+            f'<td class=n>{money(r.get("total_pnl"))}</td></tr>'
         )
     empty = "<p class=note>还没有足够的数据。</p>" if not trs else ""
     body = (
@@ -79,6 +87,9 @@ def people(conn: sqlite3.Connection) -> str:
         + "<p class=note><b>峰值中位</b>是「最好的时候能到多少」,"
           "<b>现价中位</b>是「拿到现在还剩多少」。两列一起看才有意义 —— "
           "差别往往不在选币,在卖点。</p>"
+        + "<p class=note>竖线右侧的<b>「他自己 7d / 生涯」</b>是这个人自己的盈亏,"
+          "和左边「跟单价值」三列回答的是两个问题,不能互相推导 —— "
+          "有人自己很赚但进场早、跑得快,跟着他反而接盘。数据缺失时这两格留空。</p>"
         + _SNAPSHOT_NOTE
     )
     return page("跟单价值", body, active="/people")

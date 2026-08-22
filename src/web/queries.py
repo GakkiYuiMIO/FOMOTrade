@@ -111,6 +111,21 @@ def follow_value(conn: sqlite3.Connection,
             "median_peak": st.median(p["_peak"]),
             "win_rate": sum(1 for x in p["_now"] if x > 1.0) / n,
         })
+
+    # ⚠️ user_pnl_snapshot 由 store.init_db() 建表,只在 --run 才会真正建出来
+    #    (--web 故意不建表)。表还不存在时整块跳过,让这两列保持 None,
+    #    而不是让 people 页直接崩掉。
+    try:
+        pnl = {r["user_id"]: r for r in conn.execute(
+            "SELECT user_id, total_pnl, pnl_7d FROM user_pnl_snapshot")}
+    except sqlite3.OperationalError:
+        pnl = {}
+    for d in out:
+        p = pnl.get(d["user_id"])
+        # ⚠️ 拿不到就是 None,不要填 0 —— 0 是「不赚不亏」,会让人排到中间去
+        d["total_pnl"] = p["total_pnl"] if p else None
+        d["pnl_7d"] = p["pnl_7d"] if p else None
+
     out.sort(key=lambda d: -d["median_peak"])
     return out
 

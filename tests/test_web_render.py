@@ -137,6 +137,51 @@ def test_人员榜缺显示名时不显示空白(conn):
     assert "alice" in out
 
 
+def test_人员榜显示名单盈亏且与跟单价值分隔(conn):
+    """
+    Task 8:「他自己 7d / 生涯」两列答的是「他自己赚了多少」,
+    与前面「跟单价值」三列(跟着他买我能拿到什么)是两个问题,
+    页面上必须有视觉分隔,不能让读者以为一个能推出另一个。
+    """
+    store.add_watch_user(conn, "u1", "alice", None)
+    store.mark_stats_ready(conn, "u1")
+    for i in range(q.MIN_TOKENS_FOR_RANK):
+        ca = f"ca{i}"
+        _buy(conn, "u1", "alice", ca, f"2026-08-12T{i:02d}:00:00+00:00", 100_000.0)
+        store.upsert_token_snapshots(conn, [("solana", ca, ca.upper(), 1.0, 200_000.0)])
+    store.save_user_pnl(conn, [
+        {"user_id": "u1", "total_pnl": 491_083.0, "pnl_24h": 100.0,
+         "pnl_7d": -144_223.0, "pnl_30d": 200.0},
+    ])
+
+    out = pages.people(conn)
+    assert "他自己 7d" in out
+    assert "他自己生涯" in out
+    assert "-$144,223.00" in out, "pnl_7d 要用 money() 渲染,负号在 $ 前面"
+    assert "$491,083.00" in out
+    assert "border-left" in out, "两列必须与跟单价值列有视觉分隔(竖线/换色之一)"
+
+
+def test_人员榜在盈亏表不存在时仍能渲染(conn):
+    """
+    ⚠️ user_pnl_snapshot 由 store.init_db() 建表,只在 --run 才会真正建出来
+       (--web 故意不建表)。机器还没重启过监控进程时这张表就是不存在的,
+       /people 绝不能因此崩掉 —— 这两格留空即可。
+    """
+    store.add_watch_user(conn, "u1", "alice", None)
+    store.mark_stats_ready(conn, "u1")
+    for i in range(q.MIN_TOKENS_FOR_RANK):
+        ca = f"ca{i}"
+        _buy(conn, "u1", "alice", ca, f"2026-08-12T{i:02d}:00:00+00:00", 100_000.0)
+        store.upsert_token_snapshots(conn, [("solana", ca, ca.upper(), 1.0, 200_000.0)])
+    with store.tx(conn):
+        conn.execute("DROP TABLE user_pnl_snapshot")
+
+    out = pages.people(conn)
+    assert out.startswith("<!doctype html>")
+    assert "alice" in out
+
+
 def test_跟单页显示整体倍数(conn):
     store.record_copy_signal(
         conn, network_id="solana", token_address="ca1", token_symbol="TOAD",

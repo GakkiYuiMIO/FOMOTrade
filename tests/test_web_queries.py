@@ -147,6 +147,49 @@ def test_峰值为0时不当成缺失(conn):
     assert r["median_peak"] == pytest.approx(0.0), "0 是真实值,不能回落成现价 2.0x"
 
 
+def test_跟单价值合并名单盈亏(conn):
+    """
+    Task 8:follow_value 的返回里要带上 total_pnl / pnl_7d,
+    但这两列答的是「他自己赚了多少」,与其余列(跟单价值)是两码事。
+    ⚠️ 拿不到数据的人必须是 None,不能填 0 —— 0 是「不赚不亏」的真实值,
+       填 0 会让拿不到数据的人在排行里排到中间去。
+    """
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
+    _buy(conn, "u2", "bob", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 200_000)])
+    store.save_user_pnl(conn, [
+        {"user_id": "u1", "total_pnl": 491_083.0, "pnl_24h": 100.0,
+         "pnl_7d": -144_223.0, "pnl_30d": 200.0},
+        # u2 故意不写盈亏,模拟「这轮没采集到」
+    ])
+
+    rows = {r["user_id"]: r for r in queries.follow_value(conn, min_tokens=1)}
+    assert rows["u1"]["total_pnl"] == pytest.approx(491_083.0)
+    assert rows["u1"]["pnl_7d"] == pytest.approx(-144_223.0)
+    assert rows["u2"]["total_pnl"] is None, "没采集到就该是 None,不能是 0"
+    assert rows["u2"]["pnl_7d"] is None
+
+
+def test_名单盈亏表不存在时跟单价值仍能返回(conn):
+    """
+    ⚠️ user_pnl_snapshot 由 store.init_db() 建表,只在 --run 时跑过一次才会存在
+       (--web 故意不建表)。机器还没重启过监控进程时这张表就是不存在的,
+       follow_value 绝不能因此抛异常炸掉整个 /people 页。
+    """
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 200_000)])
+    with store.tx(conn):
+        conn.execute("DROP TABLE user_pnl_snapshot")
+
+    rows = queries.follow_value(conn, min_tokens=1)
+    assert len(rows) == 1
+    assert rows[0]["total_pnl"] is None
+    assert rows[0]["pnl_7d"] is None
+
+
 def test_跟单台账不截断且带整体倍数(conn):
     """
     ⚠️ TG 的 /paper 只显 15 条,55 条里 40 条永远看不到,

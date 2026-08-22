@@ -516,8 +516,11 @@ class _BaseFomoClient:
         榜单。period ∈ {24h, 7d, 30d, following};following 是"我关注的人里的排名"。
 
         ⚠️ limit **必传**:不带直接 400。服务端上限 100,传更大也只给 100。
-        字段:id / displayName / userHandle / pnl24h / totalVolume / numTrades /
-             followers / totalHoldings / topHoldings[] / clan。
+        字段:id / displayName / userHandle / totalPnL / pnl24h / pnl7d / pnl30d /
+             totalVolume / numTrades / followers / totalHoldings / topHoldings[] / clan。
+        ⚠️ 实测(2026-08-22):period="following" 一个请求返回 79 行,
+           同时带全部四个盈亏字段;period="7d" 之类返回的是**全站前 100 榜**,
+           只有 pnl7d 一项,且大半不是我们名单里的人 —— 采集名单盈亏只能用 following。
         """
         p = (period or "24h").strip().lower()
         path = EP_LEADERBOARD.format(period=quote(p, safe=""))

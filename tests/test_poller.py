@@ -71,7 +71,9 @@ class FakeClient:
     def __init__(self, snaps: dict | None = None, *, seed_supported: bool = False,
                  feed: list | None = None, feed_boom: Exception | None = None,
                  me: str = "ME", following: list | None = None,
-                 following_boom: Exception | None = None):
+                 following_boom: Exception | None = None,
+                 leaderboard: list | None = None,
+                 leaderboard_boom: Exception | None = None):
         self.snaps = snaps or {}
         self.seed_supported = seed_supported
         self.feed = feed if feed is not None else []
@@ -84,12 +86,22 @@ class FakeClient:
         self.following = following if following is not None else list(self.snaps)
         self.following_boom = following_boom
         self.following_calls = 0
+        # 名单盈亏采集(Task 8)用
+        self.leaderboard = leaderboard if leaderboard is not None else []
+        self.leaderboard_boom = leaderboard_boom
+        self.leaderboard_calls = 0
 
     def get_activity_feed(self, limit: int = 100) -> list:
         self.feed_calls += 1
         if self.feed_boom:
             raise self.feed_boom
         return list(self.feed)
+
+    def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list:
+        self.leaderboard_calls += 1
+        if self.leaderboard_boom:
+            raise self.leaderboard_boom
+        return list(self.leaderboard)
 
     def get_current_user(self) -> dict:
         return {"id": self.me, "userHandle": "me"}
@@ -1525,3 +1537,92 @@ def test_账号恢复后会重新开始采集(db):
         pmod._MISSING_RECHECK_TICKS = monkey
     with store.get_conn() as c:
         assert not store.get_watch_user(c, "uB")["missing_since"], "恢复后要撤掉标记"
+
+
+# ============================================================
+# 名单盈亏采集(Task 8)
+# ⚠️ 这只是网页上的一列展示,买卖判定完全不依赖它 —— 失败必须静默降级,
+#    绝不能让盈亏采集的异常影响推送或买卖判定。
+# ============================================================
+def _pnl_row(uid: str) -> dict:
+    """
+    一行形态完整的 leaderboard(period=following)返回,字段名取实测真实值:
+    id / userHandle / displayName / totalPnL / pnl24h / pnl7d / pnl30d /
+    totalHoldings / numTrades / totalVolume / swapCount。
+    """
+    return {
+        "id": uid, "userHandle": f"h_{uid}", "displayName": uid,
+        "totalPnL": 491_083.0, "pnl24h": 1234.5, "pnl7d": -144_223.0,
+        "pnl30d": 20_316.0, "totalHoldings": 55_000.0, "numTrades": 17,
+        "totalVolume": 999_999.0, "swapCount": 17,
+    }
+
+
+def test_名单盈亏采集提取字段与来源严格对应(db):
+    """
+    用与实测完全一致的字段名构造一行,确认 _maybe_poll_pnl 落库的字段
+    不是错位、漏读,也没有把 None 悄悄填成 0。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA")}, leaderboard=[_pnl_row("uA")])
+    p = Poller(client, FakeNotifier())
+    with store.get_conn() as c:
+        p._maybe_poll_pnl(c)          # 新建的 Poller._tick_no == 0,0 % 20 == 0,该轮必打
+        row = store.load_user_pnl(c)[0]
+    assert row["user_id"] == "uA"
+    assert row["total_pnl"] == pytest.approx(491_083.0)
+    assert row["pnl_24h"] == pytest.approx(1234.5)
+    assert row["pnl_7d"] == pytest.approx(-144_223.0)
+    assert row["pnl_30d"] == pytest.approx(20_316.0)
+    assert row["total_holdings"] == pytest.approx(55_000.0)
+    assert row["num_trades"] == 17
+
+
+def test_名单盈亏缺字段时存None不存0(db):
+    """⚠️ 0 是「不赚不亏」,None 是「拿不到」—— 上游没给的字段必须原样存 None"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA")}, leaderboard=[
+        {"id": "uA", "userHandle": "alice"}  # 除了 id 什么都没给
+    ])
+    p = Poller(client, FakeNotifier())
+    with store.get_conn() as c:
+        p._maybe_poll_pnl(c)
+        row = store.load_user_pnl(c)[0]
+    assert row["total_pnl"] is None
+    assert row["pnl_24h"] is None
+    assert row["pnl_7d"] is None
+    assert row["pnl_30d"] is None
+
+
+def test_名单盈亏采集每20轮才调一次(db):
+    """15s × 20 = 5 分钟一次,不能每轮都打这个接口"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA")}, leaderboard=[_pnl_row("uA")])
+    p = Poller(client, FakeNotifier())
+    for _ in range(19):
+        p.tick()
+    assert client.leaderboard_calls == 0, "前 19 轮不该调 leaderboard"
+    p.tick()
+    assert client.leaderboard_calls == 1, "第 20 轮该打一次"
+
+
+def test_名单盈亏采集失败不影响买卖推送(db):
+    """挂了只是这轮没更新盈亏展示列,买卖判定和推送必须照常"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")])},
+                        leaderboard_boom=RuntimeError("leaderboard 500"))
+    notifier = FakeNotifier()
+    n = Poller(client, notifier).tick()
+    assert n == 1 and len(notifier.sent) == 1, "盈亏采集失败绝不能挡住买卖推送"
+
+
+def test_名单盈亏采集不支持时静默跳过(db):
+    """playwright 等实现若不支持该端点,NotSupportedError 必须被吞掉,不是告警也不是崩溃"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")])},
+                        leaderboard_boom=NotSupportedError("测试用:不支持榜单"))
+    notifier = FakeNotifier()
+    n = Poller(client, notifier).tick()
+    assert n == 1 and len(notifier.sent) == 1
+    with store.get_conn() as c:
+        assert store.load_user_pnl(c) == [], "没能力拉就该是没有数据,不是报错"
