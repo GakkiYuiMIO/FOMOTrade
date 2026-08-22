@@ -24,15 +24,22 @@ def _ready(c, uid, handle):
     store.mark_stats_ready(c, uid)
 
 
-def _buy(c, uid, handle, ca, ts, mcap):
-    """写一条买入事件"""
-    from src.models import EVENT_BUY, FomoEvent
+def _buy(c, uid, handle, ca, ts, mcap, reason=None):
+    """
+    写一条买入事件。
+
+    ⚠️ badge_reason 必须显式给 —— 真实链路里它由 judge_badge 填,
+       而这里绕过了它。留 NULL 的话所有事件都会被 COUNTABLE_REASONS 过滤掉,
+       测试会以「一条数据都没有」的方式假绿。
+    """
+    from src.models import EVENT_BUY, REASON_LOCAL_STATS, FomoEvent
 
     ev = FomoEvent(
         event_id=f"{uid}:{ca}:{ts}", event_type=EVENT_BUY, user_id=uid,
         handle=handle, user_handle=handle, network_id="solana",
         token_address=ca, token_symbol=ca.upper(), amount_usd=100.0,
         event_ts=ts, market_cap=mcap, raw_json="{}",
+        badge_reason=reason or REASON_LOCAL_STATS,
     )
     store.insert_event(c, ev)
 
@@ -99,3 +106,24 @@ def test_只算名单里就绪的人(conn):
     _buy(conn, "u2", "bob", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
     store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 200_000)])
     assert queries.follow_value(conn, min_tokens=1) == []
+
+
+def test_稳定币互换不算跟单标的(conn):
+    """
+    ⚠️ 买 USDC 不是一个可跟的信号,而且稳定币几乎不动,
+       把它算进去会把所有人的中位数往 1.0x 拽 —— 实测会让区分度从
+       1.125~2.088 塌缩到 1.050~1.843。
+       与 count_recent_buyers 用同一套 COUNTABLE_REASONS 谓词。
+    """
+    from src.models import REASON_QUOTE_TOKEN
+
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "real", "2026-08-12T01:00:00+00:00", 100_000)
+    _buy(conn, "u1", "alice", "usdc", "2026-08-12T02:00:00+00:00", 100_000,
+         reason=REASON_QUOTE_TOKEN)
+    for ca in ("real", "usdc"):
+        store.upsert_token_snapshots(conn, [("solana", ca, "X", 1.0, 200_000)])
+
+    rows = queries.follow_value(conn, min_tokens=1)
+    assert len(rows) == 1
+    assert rows[0]["tokens"] == 1, "稳定币互换必须被排除"

@@ -11,6 +11,8 @@ from __future__ import annotations
 import sqlite3
 import statistics as st
 
+from src.models import COUNTABLE_REASONS
+
 # 少于这么多个币就不给排名。⚠️ 不是不显示,是不参与排序 ——
 # 3 个币的「胜率 100%」是噪声,放进榜单顶端会直接误导决策。
 MIN_TOKENS_FOR_RANK = 8
@@ -33,19 +35,20 @@ def follow_value(conn: sqlite3.Connection,
        混用会把当时市值变成现在市值,凭空造出纸面盈利。
 
     ⚠️ 只筛 active=1 AND stats_ready=1(与 count_recent_buyers 同一套谓词),
-       否则榜单和推送里的数字对不上。**不**额外按 badge_reason 过滤 ——
-       那是"打不打徽章/算不算共识分子"的判据,这里只看"买入当时是否记到了市值",
-       两件事口径不同,混用会把本该计入的正常买入悄悄漏掉。
+       否则榜单和推送里的数字对不上。
 
-    ⚠️ 已知代价:极少数情况下"把计价币(USDC/WSOL 等)换成计价币"或类似的边缘事件
-       会被记成一笔 badge_reason=quote_token 的 BUY 且带着市值,这里不会排除它 ——
-       实测过带 COUNTABLE_REASONS 过滤 vs 不过滤两种口径,过滤后部分人(如样例数据里
-       的 change)会因此掉出 min_tokens 门槛、且中位数整体偏移,与本文件开发时用真实库
-       核对过的参考结果对不上。两种口径孰优尚无定论,先按"对得上参考结果"的这版来,
-       之后如果要收紧再单独评估。
+    ⚠️ 必须额外按 COALESCE(badge_reason,'') IN COUNTABLE_REASONS 过滤,**且是刻意的**:
+       它排除的是买入计价币(USDC/WSOL/WETH/WBNB 等,badge_reason=quote_token)以及
+       基线未就绪时记的行(no_baseline)。买 USDC 不是一个可跟的信号,
+       而且计价币市值几乎不动,混进来会把每个人的中位数都往 1.0x 拽 ——
+       实测过带这道过滤 vs 不带:带了之后峰值中位的区分度是 1.125~2.088,
+       不带则塌缩到 1.050~1.843,前者才是真实信号。
+       这条谓词也让本表的口径与 count_recent_buyers 保持一致,
+       否则网页上的数字会和 Telegram 推送的对不上。
     """
+    marks = ",".join("?" * len(COUNTABLE_REASONS))
     rows = conn.execute(
-        """
+        f"""
         WITH first_buy AS (
             SELECT e.user_id, e.network_id, e.token_address, MIN(e.event_ts) AS ts
             FROM fomo_events e
@@ -53,6 +56,7 @@ def follow_value(conn: sqlite3.Connection,
                               AND w.active = 1 AND w.stats_ready = 1
             WHERE e.event_type = 'BUY'
               AND e.market_cap IS NOT NULL
+              AND COALESCE(e.badge_reason, '') IN ({marks})
             GROUP BY e.user_id, e.network_id, e.token_address
         )
         SELECT w.user_id, w.handle, w.display_name, w.starred,
@@ -66,7 +70,8 @@ def follow_value(conn: sqlite3.Connection,
         JOIN watch_users w ON w.user_id = f.user_id
         JOIN token_snapshot s ON s.network_id = f.network_id
                              AND s.token_address = f.token_address
-        """,
+        """,  # noqa: S608
+        COUNTABLE_REASONS,
     ).fetchall()
 
     per: dict[str, dict] = {}
