@@ -17,11 +17,16 @@ from contextlib import contextmanager
 
 from loguru import logger
 
-from src.store import DB_PATH
+from src import store
 
 
-class WebDbError(RuntimeError):
-    """数据库打不开。⚠️ 报错要能让人照着做,不要只丢 sqlite 的原文"""
+class WebDbError(Exception):
+    """
+    数据库打不开。⚠️ 报错要能让人照着做,不要只丢 sqlite 的原文
+
+    ⚠️ 只覆盖「库文件不存在」这一种情况 —— 权限不足、文件损坏等其它打不开的原因
+       会原样冒出 sqlite3.OperationalError,不会被包装成这个更友好的提示。
+    """
 
 
 @contextmanager
@@ -32,20 +37,31 @@ def readonly_conn():
     ⚠️ 不做连接池:泄漏的读事务会把 WAL 钉住、无上限增长、全程静默无报错 ——
        这是本设计最隐蔽的风险,而连接池正是最容易泄漏的地方。
     """
-    if not DB_PATH.exists():
-        raise WebDbError(f"找不到数据库 {DB_PATH} —— 先跑 .\\bot.ps1 --run 让它建库")
+    # ⚠️ 用 store.DB_PATH 而非在 import 时解包成局部名字:
+    #    后者会在模块加载那一刻把值定死,后续测试只 monkeypatch store.DB_PATH
+    #    就再也打不到这里,报错会变成一头雾水的"文件不存在"。
+    if not store.DB_PATH.exists():
+        raise WebDbError(f"找不到数据库 {store.DB_PATH} —— 先跑 .\\bot.ps1 --run 让它建库")
 
+    fallback = False
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10.0)
+        conn = sqlite3.connect(f"file:{store.DB_PATH}?mode=ro", uri=True, timeout=10.0)
     except sqlite3.OperationalError as e:
         logger.warning("只读方式打不开库,退回 query_only: {}", e)
-        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
-        conn.execute("PRAGMA query_only = ON")
+        conn = sqlite3.connect(str(store.DB_PATH), timeout=10.0)
+        fallback = True
 
-    conn.row_factory = sqlite3.Row
-    # ⚠️ busy_timeout 必须设:Windows 上锁竞争很常见,不设会直接抛 database is locked
-    conn.execute("PRAGMA busy_timeout = 5000")
+    # ⚠️ 连接一旦建立,后面每一条语句都必须在 finally 的保护范围内 ——
+    #    否则 PRAGMA 抛异常时连接就泄漏了,而泄漏的读事务会把 WAL 钉住、
+    #    无上限增长、全程静默无报错。
     try:
+        conn.row_factory = sqlite3.Row
+        # ⚠️ busy_timeout 必须设:Windows 上锁竞争很常见,不设会直接抛 database is locked
+        conn.execute("PRAGMA busy_timeout = 5000")
+        if fallback:
+            # mode=ro 那条路是操作系统文件句柄级只读,不需要也不受这个 PRAGMA 影响;
+            # 只有退回普通连接时才需要它来拒绝写入
+            conn.execute("PRAGMA query_only = ON")
         yield conn
     finally:
         conn.close()
