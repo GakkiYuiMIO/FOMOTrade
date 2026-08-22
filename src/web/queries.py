@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import sqlite3
 import statistics as st
+from datetime import UTC, datetime
 
+from src import store as _store
 from src.models import COUNTABLE_REASONS
 
 # 少于这么多个币就不给排名。⚠️ 不是不显示,是不参与排序 ——
@@ -80,7 +82,10 @@ def follow_value(conn: sqlite3.Connection,
         # ⚠️ entry 为 0 或 None 都要跳过 —— 按 0 算会造出无穷大倍数
         if not entry or now is None:
             continue
-        peak = r["peak_mc"] or now
+        # ⚠️ 判空必须用 is None,不能用真值判断 —— peak_mc 为 0 是脏数据但仍是
+        #    「有取到值」的真实值,`or` 会把它和 NULL(没取到值)混为一谈,
+        #    悄悄回落成 now 从而抹掉这条脏数据本该暴露出来的异常
+        peak = r["peak_mc"] if r["peak_mc"] is not None else now
         p = per.setdefault(r["user_id"], {
             "user_id": r["user_id"],
             "handle": r["handle"],
@@ -108,3 +113,83 @@ def follow_value(conn: sqlite3.Connection,
         })
     out.sort(key=lambda d: -d["median_peak"])
     return out
+
+
+def copy_ledger_full(conn: sqlite3.Connection) -> list[dict]:
+    """
+    跟单台账**全量**,不截断。
+
+    ⚠️ TG 的 /paper 截到 15 条是聊天流的限制;网页没有这个限制,
+       而「整体多少倍」这个结论只有看到全部才得得出来。
+    """
+    rows = conn.execute(
+        """
+        SELECT g.*, s.market_cap AS now_mc, s.max_market_cap AS peak_mc,
+               s.updated_at AS mcap_at
+        FROM copytrade_signals g
+        LEFT JOIN token_snapshot s
+               ON s.network_id = g.network_id AND s.token_address = g.token_address
+        ORDER BY g.triggered_at DESC
+        """
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        entry, now = r["entry_mcap"], r["now_mc"]
+        # ⚠️ 缺任何一个都置 None,不要填 0 —— 0 会被读成「归零了」
+        d["multiple"] = (now / entry) if (entry and now is not None) else None
+        d["value"] = (r["amount_usd"] * d["multiple"]) if d["multiple"] is not None else None
+        out.append(d)
+    return out
+
+
+def copy_summary(conn: sqlite3.Connection) -> dict:
+    """跟单整体成绩。⚠️ 合计只统计**算得出价**的单子"""
+    rows = copy_ledger_full(conn)
+    priced = [r for r in rows if r["multiple"] is not None]
+    invested = sum(r["amount_usd"] for r in priced)
+    value = sum(r["value"] for r in priced)
+    return {
+        "rows": rows,
+        "count": len(rows),
+        "priced": len(priced),
+        "invested": invested,
+        "value": value,
+        "multiple": (value / invested) if invested else None,
+        "winners": sum(1 for r in priced if r["multiple"] > 1.0),
+    }
+
+
+def dashboard(conn: sqlite3.Connection) -> dict:
+    """首页几个大数字"""
+    last = _store.get_state(conn, "last_tick_at")
+    age = None
+    if last:
+        try:
+            dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - dt).total_seconds()
+        except ValueError:
+            age = None
+
+    today = _store.now_iso()[:10] + "T00:00:00+00:00"
+    n_events = conn.execute(
+        "SELECT COUNT(*) n FROM fomo_events WHERE event_ts >= ?", (today,)
+    ).fetchone()["n"]
+    n_tokens = conn.execute(
+        "SELECT COUNT(DISTINCT token_address) n FROM fomo_events "
+        "WHERE event_type = 'BUY' AND event_ts >= ?", (today,)
+    ).fetchone()["n"]
+    n_users = conn.execute(
+        "SELECT COUNT(*) n FROM watch_users WHERE active = 1"
+    ).fetchone()["n"]
+
+    return {
+        # ⚠️ None 表示「从来没跑过」,与 0(刚跑过)是完全不同的两件事
+        "last_tick_age_sec": age,
+        "events_today": n_events,
+        "tokens_today": n_tokens,
+        "watch_count": n_users,
+        "copy": copy_summary(conn),
+    }

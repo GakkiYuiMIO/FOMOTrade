@@ -127,3 +127,73 @@ def test_稳定币互换不算跟单标的(conn):
     rows = queries.follow_value(conn, min_tokens=1)
     assert len(rows) == 1
     assert rows[0]["tokens"] == 1, "稳定币互换必须被排除"
+
+
+def test_峰值为0时不当成缺失(conn):
+    """
+    ⚠️ 项目铁律:判空用 is None。0 在这个库里经常是有意义的真实值,
+       真值判断会把它和缺失一起吞掉 —— formatter.py 为这条吃过亏。
+       这里 0 虽然是脏数据,但口径要一致,否则 queries.py 作为模板会把
+       真值判断扩散到后面几个函数里。
+    """
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", "2026-08-12T01:00:00+00:00", 100_000)
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 200_000)])
+    # 把峰值强行改成 0(真实数据里不会出现,但口径必须确定)
+    with store.tx(conn):
+        conn.execute("UPDATE token_snapshot SET max_market_cap = 0")
+
+    r = queries.follow_value(conn, min_tokens=1)[0]
+    assert r["median_peak"] == pytest.approx(0.0), "0 是真实值,不能回落成现价 2.0x"
+
+
+def test_跟单台账不截断且带整体倍数(conn):
+    """
+    ⚠️ TG 的 /paper 只显 15 条,55 条里 40 条永远看不到,
+       「整体 0.64x」这个结论在 TG 上根本得不出来。这正是网页存在的理由。
+    """
+    for i in range(20):
+        store.record_copy_signal(
+            conn, network_id="solana", token_address=f"ca{i}", token_symbol="X",
+            buyers=2, entry_mcap=100_000.0, age_sec=60,
+            amount_usd=40.0, status="paper")
+        store.upsert_token_snapshots(
+            conn, [("solana", f"ca{i}", "X", 1.0, 50_000.0)])   # 全部腰斩
+
+    r = queries.copy_summary(conn)
+    assert r["count"] == 20, "不能截断"
+    assert r["invested"] == pytest.approx(800.0)
+    assert r["value"] == pytest.approx(400.0)
+    assert r["multiple"] == pytest.approx(0.5)
+    assert r["winners"] == 0
+
+
+def test_跟单台账缺行情时不计入合计(conn):
+    """⚠️ 拿不到现价的单子按 0 算会把整体倍数拉垮,那是假的亏损"""
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="known", token_symbol="X",
+        buyers=2, entry_mcap=100_000.0, age_sec=60, amount_usd=40.0, status="paper")
+    store.upsert_token_snapshots(conn, [("solana", "known", "X", 1.0, 200_000.0)])
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="nomcap", token_symbol="X",
+        buyers=2, entry_mcap=100_000.0, age_sec=60, amount_usd=40.0, status="paper")
+
+    r = queries.copy_summary(conn)
+    assert r["count"] == 2, "两条都要列出来"
+    assert r["priced"] == 1, "但只有一条能算价"
+    assert r["multiple"] == pytest.approx(2.0), "合计只按能算价的那条"
+
+
+def test_看板健康度报出最后一轮距今多久(conn):
+    from src.models import now_iso
+
+    with store.tx(conn):
+        store.set_state(conn, "last_tick_at", now_iso())
+    r = queries.dashboard(conn)
+    assert r["last_tick_age_sec"] is not None
+    assert r["last_tick_age_sec"] < 60
+
+
+def test_从没跑过时健康度是None而不是0(conn):
+    """⚠️ 0 会被读成「刚刚跑过」,而真相是「从来没跑过」"""
+    assert queries.dashboard(conn)["last_tick_age_sec"] is None
