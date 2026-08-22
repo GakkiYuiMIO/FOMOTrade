@@ -23,9 +23,14 @@ def esc(v) -> str:
 
 
 def money(v: float | None) -> str:
+    # ⚠️ carry-over fix(Task 4 review):与 formatter.py 的 _fmt_usd 对齐 ——
+    #    负号写在美元符号前面("-$12.30"),不是 "$-12.30"。
+    #    Task 8 的跟单人均 PnL 列会出现大额负数(实测 -87,897 / -144,223),
+    #    两种写法混用在同一页会非常显眼。
     if v is None:
         return ""
-    return f"${v:,.2f}"
+    sign = "-" if v < 0 else ""
+    return f"{sign}${abs(v):,.2f}"
 
 
 def mult(v: float | None) -> str:
@@ -67,7 +72,10 @@ def stale_mark(updated_at: str | None) -> str:
     try:
         dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
     except ValueError:
-        return ""
+        # ⚠️ carry-over fix(Task 4 review):损坏的时间戳不能"失败即当新鲜"——
+        #    那等于让一条脏数据看起来和真正的实时行情一样,而 stale 标记
+        #    在跟单台账页恰恰是用户判断"这个倍数能不能信"的依据。
+        return "⚠️ 时间戳异常"
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     mins = (datetime.now(UTC) - dt).total_seconds() / 60

@@ -5,7 +5,11 @@
 # ruff: noqa: N802
 from __future__ import annotations
 
-from src.web import render
+import pytest
+
+from src import store
+from src.web import pages, render
+from src.web import queries as q
 
 
 def test_缺失显示为空而不是零或NA():
@@ -59,3 +63,85 @@ def test_导航栏仅当前页高亮():
     for href in ("/", "/hot", "/copy"):
         assert f'<a href="{href}" class="on">' not in html_out
         assert f'<a href="{href}" class="">' in html_out
+
+
+def test_负数金额符号在美元符号前面():
+    """
+    carry-over fix(Task 4 review):与 formatter.py 的 _fmt_usd 对齐。
+    ⚠️ "-$5.00" 而不是 "$-5.00" —— Task 8 的跟单人均 PnL 列会有大额负数
+       (实测数据里有 -87,897 / -144,223),两种写法混用在同一页会很扎眼。
+    """
+    assert render.money(-5) == "-$5.00"
+    assert render.money(-87897) == "-$87,897.00"
+    assert render.money(0.0) == "$0.00", "0 不是负数,不能被误判"
+
+
+def test_时间戳损坏时不当作新鲜行情处理():
+    """
+    carry-over fix(Task 4 review):stale_mark 对无法解析的时间戳原来是
+    `except ValueError: return ""`,等价于"看起来很新鲜"。
+    ⚠️ 一条脏数据不该看起来和实时行情一样 —— stale 标记正是用户判断
+       "这个倍数能不能信"的依据。
+    """
+    assert render.stale_mark("not-a-timestamp") != ""
+    assert render.stale_mark("") != ""
+
+
+@pytest.fixture
+def conn(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "t.db")
+    store.init_db()
+    with store.get_conn() as c:
+        yield c
+
+
+def test_空库也能渲染每个页面(conn):
+    """⚠️ 刚建库、一条数据都没有时页面不能崩 —— 那是第一次跑的人看到的画面"""
+    for fn in (pages.dashboard, pages.people, pages.hot, pages.copy_ledger):
+        out = fn(conn)
+        assert out.startswith("<!doctype html>")
+        assert "<main>" in out
+
+
+def _buy(c, uid, handle, ca, ts, mcap):
+    """
+    写一条买入事件,badge_reason 显式给 REASON_LOCAL_STATS ——
+    留空会被 COUNTABLE_REASONS 过滤掉,测试会以"一条数据都没有"的方式假绿。
+    """
+    from src.models import EVENT_BUY, REASON_LOCAL_STATS, FomoEvent
+
+    ev = FomoEvent(
+        event_id=f"{uid}:{ca}:{ts}", event_type=EVENT_BUY, user_id=uid,
+        handle=handle, user_handle=handle, network_id="solana",
+        token_address=ca, token_symbol=ca.upper(), amount_usd=100.0,
+        event_ts=ts, market_cap=mcap, raw_json="{}",
+        badge_reason=REASON_LOCAL_STATS,
+    )
+    store.insert_event(c, ev)
+
+
+def test_人员榜缺显示名时不显示空白(conn):
+    """
+    ⚠️ /people 只展示样本 >= MIN_TOKENS_FOR_RANK 个币的人(queries.follow_value 的
+       排名门槛),plan 原文的测试只 add_watch_user 不造买入事件,凑不够门槛,
+       "alice" 根本不会出现在任何一行 —— 实测跑过,断言会假败。
+       这里补足到门槛线,真正测的是 display_name 缺失时回退到 handle 显示。
+    """
+    store.add_watch_user(conn, "u1", "alice", None)
+    store.mark_stats_ready(conn, "u1")
+    for i in range(q.MIN_TOKENS_FOR_RANK):
+        ca = f"ca{i}"
+        _buy(conn, "u1", "alice", ca, f"2026-08-12T{i:02d}:00:00+00:00", 100_000.0)
+        store.upsert_token_snapshots(conn, [("solana", ca, ca.upper(), 1.0, 200_000.0)])
+    out = pages.people(conn)
+    assert "alice" in out
+
+
+def test_跟单页显示整体倍数(conn):
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="ca1", token_symbol="TOAD",
+        buyers=2, entry_mcap=100_000.0, age_sec=60, amount_usd=40.0, status="paper")
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "TOAD", 1.0, 200_000.0)])
+    out = pages.copy_ledger(conn)
+    assert "2.00x" in out
+    assert "$TOAD" in out
