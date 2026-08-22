@@ -1,11 +1,14 @@
 """
 四个页面的渲染。每个函数进只读连接,出完整 HTML。
 
-⚠️ 页面只调 queries.* 取数、只调 render.* 出字符串,自己不写 SQL 也不拼 <html>。
+⚠️ 页面只调 queries.*/render.* 取数出串,自己不写 SQL 也不拼 <html>——
+   唯一例外是 hot() 直接调 store.hot_tokens:那本来就是聚合好的只读函数,
+   不是绕过 queries.py 现拼的 SQL,queries.py 里没有它是因为不需要再包一层。
 """
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 from src import store
 from src.web import queries as q
@@ -13,6 +16,14 @@ from src.web.render import esc, mcap, money, mult, page, pct, stale_mark, token_
 
 _SNAPSHOT_NOTE = ('<p class=note>所有数字按<b>当前行情快照</b>计算。'
                   '实测相邻两轮之间整体倍数会有百分之几的波动。</p>')
+
+# 台账页「新鲜/冻结」拆分用的阈值(分钟)。
+# ⚠️ 故意不复用 render.STALE_MIN —— 那个常量同时是 bot._STALE_MCAP_MIN,
+#    是买入安全线的实时判据。两者共用一个数字的话,以后谁为了调买入安全线
+#    改了那个常量,这里的统计口径会被无声地一起带偏。
+#    阈值本身对结果的影响是实质性的,不是装饰:实测 60min → 29/28 条、
+#    0.71x/0.65x;24h → 34/23 条、0.78x/0.59x。
+LEDGER_FREEZE_MIN = 60
 
 
 def _card(k: str, v: str) -> str:
@@ -106,15 +117,36 @@ def _sub_multiple(rows: list[dict]) -> float | None:
     return (value / invested) if invested else None
 
 
+def _is_frozen(updated_at: str | None) -> bool:
+    """
+    行情快照是否已经停更超过 LEDGER_FREEZE_MIN 分钟。
+
+    ⚠️ 独立于 render.stale_mark() 实现 —— 后者的阈值是 render.STALE_MIN,
+       与本页的分类阈值 LEDGER_FREEZE_MIN 概念上是两件事(见上面常量的注释),
+       即便当前取值恰好相同也不该共用同一段判断逻辑。
+       缺失 / 解析不了的时间戳都算冻结,不能当新鲜处理。
+    """
+    if not updated_at:
+        return True
+    try:
+        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    mins = (datetime.now(UTC) - dt).total_seconds() / 60
+    return mins > LEDGER_FREEZE_MIN
+
+
 def copy_ledger(conn: sqlite3.Connection) -> str:
     c = q.copy_summary(conn)
     priced = [r for r in c["rows"] if r["multiple"] is not None]
     # ⚠️ 实测(Task 3):token_snapshot 只覆盖「名单里还有人持有」的币,清仓后就停更 ——
     #    56 条能算出价的里有 23 条(41%)是三天前冻住的现价,却照样参与整体倍数。
     #    新鲜 0.681x、冻结 0.595x,合起来的 0.70x 把差别抹平了。
-    #    这里按 stale_mark(同一套「多旧算冻住」的判据)把两类分开报,不能只给一个合计数。
-    fresh_rows = [r for r in priced if not stale_mark(r["mcap_at"])]
-    frozen_rows = [r for r in priced if stale_mark(r["mcap_at"])]
+    #    这里用 LEDGER_FREEZE_MIN 把两类分开报,不能只给一个合计数。
+    fresh_rows = [r for r in priced if not _is_frozen(r["mcap_at"])]
+    frozen_rows = [r for r in priced if _is_frozen(r["mcap_at"])]
     fresh_mult = _sub_multiple(fresh_rows)
     frozen_mult = _sub_multiple(frozen_rows)
 
@@ -132,8 +164,10 @@ def copy_ledger(conn: sqlite3.Connection) -> str:
             f'<td class=n>{money(r["amount_usd"])}</td>'
             f'<td class=n>{money(r["value"])}</td>'
             f'<td class="n {cls}">{mult(m)}</td>'
-            # ⚠️ 每行标 stale:这里的告警文案与整体拆分用的是同一个 stale_mark 判据,
-            #    行内看到"⚠️ 行情停在 3d 前"时,应该能对应到上面冻结子集里
+            # ⚠️ 每行标 stale(展示用 render.stale_mark,阈值 render.STALE_MIN)。
+            #    与上面冻结子集的判据(LEDGER_FREEZE_MIN)是两个独立的常量,
+            #    当前取值恰好都是 60 分钟,所以行内的"⚠️ 行情停在 Xh 前"
+            #    目前能对上冻结子集,但这只是巧合,不是绑定关系。
             f'<td class=dim>{esc(stale_mark(r["mcap_at"]))}</td></tr>'
         )
     empty = "<p class=note>还没有跟单信号。</p>" if not trs else ""
@@ -148,8 +182,10 @@ def copy_ledger(conn: sqlite3.Connection) -> str:
         + _card("赚钱单数", f'{c["winners"]}/{c["priced"]}')
         + "</div>"
         + (f'<div class=scroll><table>{head}{"".join(trs)}</table></div>' if trs else empty)
-        + '<p class=note>⚠️ 「冻结」= 现价快照已停更(通常是清仓后不再刷新)。'
-          '它拉低还是拉高整体倍数,不看拆分看不出来 —— 合并成一个数会把这个信息抹掉。</p>'
+        + (f'<p class=note>⚠️ 超过 {LEDGER_FREEZE_MIN} 分钟没更新行情的算「冻结」:'
+           '轮询默认每 15 秒刷新一次持有中的币的现价,所以停更基本等于'
+           '「名单里已经没人持有这个币了」。它拉低还是拉高整体倍数,'
+           '不看拆分看不出来 —— 合并成一个数会把这个信息抹掉。</p>')
         + '<p class=note>⚠️ 纸上盈亏按市值比折算,<b>没算手续费、滑点、gas</b>,真实结果只会更差。</p>'
         + _SNAPSHOT_NOTE
     )

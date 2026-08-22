@@ -145,3 +145,37 @@ def test_跟单页显示整体倍数(conn):
     out = pages.copy_ledger(conn)
     assert "2.00x" in out
     assert "$TOAD" in out
+
+
+def test_跟单页把新鲜和冻结的倍数分开算(conn):
+    """
+    ⚠️ 实测真实数据里 40% 的「现价」是停更的 —— token_snapshot 只更新
+       「名单里还有人持有」的币,大家清仓后那个价就冻在那儿了。
+       只给一个合计倍数会把这件事抹平,而冻结子集系统性更差
+       (实测 0.65x vs 新鲜 0.71x)。
+    ⚠️ 这条测试存在的理由:审查时把分类逻辑改成「全部算新鲜」,
+       原有 12 条测试**全绿** —— 这个功能当时是裸奔的。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    # 新鲜的一条:翻倍
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="fresh1", token_symbol="FRESH",
+        buyers=2, entry_mcap=100_000.0, age_sec=60, amount_usd=40.0, status="paper")
+    store.upsert_token_snapshots(conn, [("solana", "fresh1", "FRESH", 1.0, 200_000.0)])
+    # 冻结的一条:腰斩,且行情停在 3 天前
+    store.record_copy_signal(
+        conn, network_id="solana", token_address="frozen1", token_symbol="FROZEN",
+        buyers=2, entry_mcap=100_000.0, age_sec=60, amount_usd=40.0, status="paper")
+    store.upsert_token_snapshots(conn, [("solana", "frozen1", "FROZEN", 1.0, 50_000.0)])
+    old = (datetime.now(UTC) - timedelta(days=3)).isoformat(timespec="seconds")
+    with store.tx(conn):
+        conn.execute("UPDATE token_snapshot SET updated_at = ? WHERE token_address = ?",
+                     (old, "frozen1"))
+
+    out = pages.copy_ledger(conn)
+    assert "新鲜倍数(1条)" in out, "新鲜子集应当只有 1 条"
+    assert "冻结倍数(1条)" in out, "冻结子集应当只有 1 条"
+    assert "2.00x" in out, "新鲜子集应当是 2.00x"
+    assert "0.50x" in out, "冻结子集应当是 0.50x"
+    assert "行情停在" in out, "冻结那行必须带 stale 标记"
