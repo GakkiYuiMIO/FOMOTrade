@@ -184,6 +184,24 @@ CREATE TABLE IF NOT EXISTS token_snapshot (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (network_id, token_address)
 );
+
+-- 名单成员的盈亏快照。来自 /v2/leaderboard/following。
+-- ⚠️ 实测:period="following" **一个请求**就返回 79 行 × 全部四个盈亏字段
+--    (totalPnL / pnl24h / pnl7d / pnl30d),而 period="7d" 只返回 pnl7d
+--    (那是全站前 100 榜,不是我们的名单)。所以只能用 following。
+--    client.get_leaderboard 的文档字符串漏写了后三个字段,顺手补上。
+-- ⚠️ 按人覆盖写,只保留最新 —— 每轮追加一天就是几百行垃圾,
+--    而这个值是慢变量,历史序列本期用不上。
+CREATE TABLE IF NOT EXISTS user_pnl_snapshot (
+    user_id        TEXT PRIMARY KEY,
+    total_pnl      REAL,     -- 生涯总盈亏
+    pnl_24h        REAL,
+    pnl_7d         REAL,
+    pnl_30d        REAL,
+    total_holdings REAL,     -- 当前总持仓价值
+    num_trades     INTEGER,
+    updated_at     TEXT NOT NULL
+);
 """
 
 
@@ -987,6 +1005,37 @@ def token_buyers(conn, network_id: str, token_address: str, since_iso: str,
         """,  # noqa: S608
         (network_id, token_address, since_iso, *COUNTABLE_REASONS, int(limit)),
     ).fetchall()
+
+
+def save_user_pnl(conn, rows: list[dict]) -> None:
+    """
+    覆盖写名单成员盈亏。
+
+    ⚠️ None 必须原样写 None,不能填 0 —— 0 是「不赚不亏」,None 是「拿不到」,
+       写成 0 会让拿不到数据的人在排行里排到中间去。
+    """
+    ts = now_iso()
+    cols = ("total_pnl", "pnl_24h", "pnl_7d", "pnl_30d", "total_holdings", "num_trades")
+    with tx(conn):
+        conn.executemany(
+            """
+            INSERT INTO user_pnl_snapshot(user_id, total_pnl, pnl_24h, pnl_7d,
+                                          pnl_30d, total_holdings, num_trades, updated_at)
+            VALUES (:user_id, :total_pnl, :pnl_24h, :pnl_7d,
+                    :pnl_30d, :total_holdings, :num_trades, :ts)
+            ON CONFLICT(user_id) DO UPDATE SET
+                total_pnl = excluded.total_pnl, pnl_24h = excluded.pnl_24h,
+                pnl_7d = excluded.pnl_7d, pnl_30d = excluded.pnl_30d,
+                total_holdings = excluded.total_holdings,
+                num_trades = excluded.num_trades, updated_at = excluded.updated_at
+            """,
+            [{"user_id": r["user_id"], "ts": ts,
+              **{c: r.get(c) for c in cols}} for r in rows],
+        )
+
+
+def load_user_pnl(conn) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM user_pnl_snapshot").fetchall()
 
 
 # ============================================================

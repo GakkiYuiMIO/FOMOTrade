@@ -1163,3 +1163,23 @@ def test_金额上限只数真的会出账的状态(conn):
 
     assert store.copy_spent_today(conn) == 65.0, "只该数 filled(40) + pending(25)"
     assert store.copy_taken_today(conn) == 5, "笔数口径含全部,与金额口径故意不同"
+
+
+def test_名单盈亏快照按人覆盖写(conn):
+    """同一个人只保留最新一条,不是每次都追加 —— 否则一天就是几百行垃圾"""
+    store.save_user_pnl(conn, [
+        {"user_id": "u1", "pnl_24h": 100.0, "pnl_7d": 200.0, "pnl_30d": 300.0},
+        {"user_id": "u2", "pnl_24h": -50.0, "pnl_7d": None, "pnl_30d": None},
+    ])
+    store.save_user_pnl(conn, [
+        {"user_id": "u1", "pnl_24h": 999.0, "pnl_7d": 200.0, "pnl_30d": 300.0},
+    ])
+    got = {r["user_id"]: r["pnl_24h"] for r in store.load_user_pnl(conn)}
+    assert got == {"u1": 999.0, "u2": -50.0}
+
+
+def test_盈亏为None时不写成0(conn):
+    """⚠️ 0 是「不赚不亏」,None 是「拿不到」。写成 0 会污染排行"""
+    store.save_user_pnl(conn, [
+        {"user_id": "u1", "pnl_24h": None, "pnl_7d": None, "pnl_30d": None}])
+    assert store.load_user_pnl(conn)[0]["pnl_24h"] is None

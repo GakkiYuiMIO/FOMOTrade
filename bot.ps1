@@ -11,6 +11,7 @@
 #   .\bot.ps1 --init-db               只建表
 #   .\bot.ps1 --dry-run               跑一次 tick,只打印不推送
 #   .\bot.ps1 --run                   正式运行(轮询 + Telegram 命令层)
+#   .\bot.ps1 --web                   启动只读网页看板(仅本机 127.0.0.1:8420)
 #
 # 退出码:0 成功 / 1 失败 / 2 未登录(--probe)
 

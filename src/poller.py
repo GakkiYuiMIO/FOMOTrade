@@ -178,6 +178,17 @@ _FEED_LIMIT = 100
 #    _thesis_priority 覆盖)。挂了也无所谓 —— 买卖判定完全不依赖它。
 #    6 轮 × 10s = 每分钟一次,实测安全。
 _FEED_EVERY_N_TICKS = 6
+# 名单盈亏采集的降频。15s × 20 = 5 分钟。
+# ⚠️ 不是靠 20 与 _FEED_EVERY_N_TICKS(6)互质来错开的 —— gcd(20, 6) = 2,
+#    两者并不互质。真正错开的原因是调用时机差一拍:_poll_feed 的降频判断在
+#    _fetch_snapshots 把 _tick_no 自增**之前**执行,而 _maybe_poll_pnl 排在
+#    tick() 里 _fetch_snapshots **之后**,判断时 _tick_no 已经自增过。
+#    这 1 个 tick 的偏移量,加上两个降频常量都是偶数,使得"活动流本轮该打"
+#    与"盈亏采集本轮该打"恰好落在 _tick_no 的两种奇偶性上,永远碰不到一起——
+#    这是调用顺序带来的副作用,不是这两个常量本身保证的。见
+#    tests/test_poller.py::test_名单盈亏与活动流永不同轮触发:谁把其中一次
+#    判断挪到自增的另一侧,这条回归测试会变红。
+_PNL_EVERY_N_TICKS = 20
 # 观点优先扫描的保留名额:**刚动过**的币优先扫。
 # ⚠️ 观点几乎总是发在刚买的币上 —— 实测用户 10:05 买入、10:05 发观点。
 #    不留这个名额的话,只能等轮转扫到(约 400 个币 / 每轮 12 个 ≈ 6 分钟),
@@ -653,6 +664,11 @@ class Poller:
                 self._maybe_copy_summary(conn, dry_run=dry_run)
             except Exception as e:  # noqa: BLE001
                 logger.warning("跟单日报失败(不影响推送): {}", e)
+
+            try:
+                self._maybe_poll_pnl(conn)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("名单盈亏采集失败(不影响推送): {}", e)
 
             # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
             # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
@@ -1769,6 +1785,39 @@ class Poller:
                 self.notifier.send(self._render_copy_summary(s))
         with store.tx(conn):
             store.set_state(conn, _COPY_SUMMARY_KEY, today)
+
+    def _maybe_poll_pnl(self, conn) -> None:
+        """
+        每 20 轮拉一次名单成员盈亏,一个请求拿全 80 人。
+
+        ⚠️ 失败静默降级:这只是网页上的一列展示,买卖判定完全不依赖它。
+        """
+        if self._tick_no % _PNL_EVERY_N_TICKS:
+            return
+        try:
+            # ⚠️ limit 必传,不带直接 400;服务端上限 100。
+            # ⚠️ 必须用 "following":实测只有它同时返回 totalPnL/pnl24h/pnl7d/pnl30d,
+            #    而 "7d" 之类返回的是**全站前 100 榜**,里面大半不是我们名单的人。
+            board = self.client.get_leaderboard("following", limit=100)
+        except NotSupportedError:
+            return
+        rows = []
+        for it in board or []:
+            uid = _pick_str(it, "id", "userId")
+            if not uid:
+                continue
+            rows.append({
+                "user_id": uid,
+                "total_pnl": _f(it.get("totalPnL")),
+                "pnl_24h": _f(it.get("pnl24h")),
+                "pnl_7d": _f(it.get("pnl7d")),
+                "pnl_30d": _f(it.get("pnl30d")),
+                "total_holdings": _f(it.get("totalHoldings")),
+                "num_trades": _i(it.get("numTrades")),
+            })
+        if rows:
+            store.save_user_pnl(conn, rows)
+            logger.debug("名单盈亏已更新 {} 人", len(rows))
 
     @staticmethod
     def _render_copy_summary(s: dict) -> str:

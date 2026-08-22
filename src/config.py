@@ -54,6 +54,7 @@ class FomoSettings(BaseSettings):
 
     # ---------- 轮询 ----------
     fomo_poll_interval_sec: int = Field(15, ge=5, description="轮询间隔(秒)")
+    fomo_web_port: int = Field(8420, ge=1024, le=65535, description="网页版端口(仅本机)")
     fomo_backfill_max_items: int = Field(
         500, ge=0, description="/add 时回填多少条历史 swaps 建立首次买入判定基线"
     )

@@ -731,6 +731,20 @@ def _reconcile_copytrade(notifier) -> None:
         notifier.send("\n".join(lines))
 
 
+def cmd_web() -> int:
+    """
+    启动只读网页看板。
+
+    ⚠️ 这个进程**不写库、不调用 FOMO 接口**。
+       令牌续期会写回 data/fomo_session.json,两个进程同时续期会把登录态搞坏。
+    """
+    from src.web.server import serve
+
+    s = get_settings()
+    serve(port=s.fomo_web_port)
+    return 0
+
+
 def cmd_run() -> int:
     """
     正式运行:poller 跑在主线程的 BlockingScheduler 上,bot 命令层跑 daemon 线程。
@@ -1016,6 +1030,8 @@ def main() -> int:
                         help="跑一次 tick,只打印不推送")
     parser.add_argument("--run", action="store_true",
                         help="正式运行:轮询 + Telegram 命令层")
+    parser.add_argument("--web", action="store_true",
+                        help="启动只读网页看板(仅本机 127.0.0.1)")
     parser.add_argument("--init-db", action="store_true",
                         help="只建表,不做别的")
     parser.add_argument("--capture-buy", metavar="CA", default=None,
@@ -1028,7 +1044,9 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logger()
-    store.init_db()
+    # ⚠️ --web 是只读进程,不能让它建库(init_db 开的是读写连接)
+    if not args.web:
+        store.init_db()
 
     if args.login:
         return cmd_login(args.cdp)
@@ -1042,6 +1060,8 @@ def main() -> int:
         return cmd_capture_buy(args.capture_buy, args.network, args.amount)
     if args.dry_run:
         return cmd_dry_run()
+    if args.web:
+        return cmd_web()
     if args.run:
         return cmd_run()
 

@@ -1,0 +1,21 @@
+:root{--bg:#14161a;--fg:#e7e8e4;--dim:#969ba3;--line:#2b2f35;--up:#5fa57a;--down:#c87264;--acc:#d9a24e}
+@media(prefers-color-scheme:light){:root{--bg:#f7f7f4;--fg:#1b1e24;--dim:#6a6f78;--line:#dedeDA;--up:#3d7a55;--down:#a34a3c;--acc:#a87227}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC",sans-serif}
+nav{display:flex;gap:1.2rem;padding:1rem 1.5rem;border-bottom:1px solid var(--line)}
+nav a{color:var(--dim);text-decoration:none}
+nav a.on,nav a:hover{color:var(--fg)}
+main{max-width:70rem;margin:0 auto;padding:1.5rem}
+h1{font-size:1.4rem;margin:0 0 1rem}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{text-align:right;padding:.45rem .6rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--dim);font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+td.n{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace}
+.up{color:var(--up)}.down{color:var(--down)}.dim{color:var(--dim);font-size:.85em}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.7rem;margin-bottom:1.5rem}
+.card{border:1px solid var(--line);border-radius:4px;padding:.8rem}
+.card .v{font-size:1.6rem;font-variant-numeric:tabular-nums}
+.card .k{color:var(--dim);font-size:.8rem}
+.scroll{overflow-x:auto}
+.note{color:var(--dim);font-size:.85rem;margin-top:1rem}
