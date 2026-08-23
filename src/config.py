@@ -54,6 +54,19 @@ class FomoSettings(BaseSettings):
 
     # ---------- 轮询 ----------
     fomo_poll_interval_sec: int = Field(15, ge=5, description="轮询间隔(秒)")
+    # ---------- 价格历史采集(供仪表盘画 sparkline) ----------
+    # 采样降频(轮数)。15s × 20 = 5 分钟一次:细到能看出 memecoin 的日内脉冲,
+    # 又不会让 token_price_history 涨得太快。做成配置项而不是硬编码常量,
+    # 是为了日后调宽/调窄采样密度时不用改代码 —— 参见 poller._maybe_sample_price_history。
+    fomo_price_history_sample_ticks: int = Field(
+        20, ge=1, description="价格历史采样间隔(轮数),默认 20 轮≈5 分钟"
+    )
+    # 保留天数。这些是 memecoin:买卖判定本身只看 24 小时窗口,copytrade 的
+    # max_age_hours 同样以 24 小时为界,3 天足够覆盖一个币"冒头→暴涨→归零"的
+    # 整个可交易生命周期,再长只是白占磁盘。同样做成配置项,方便日后放宽。
+    fomo_price_history_retain_days: int = Field(
+        3, ge=1, description="价格历史保留天数,超过自动清理"
+    )
     fomo_web_port: int = Field(8420, ge=1024, le=65535, description="网页版端口(仅本机)")
     fomo_backfill_max_items: int = Field(
         500, ge=0, description="/add 时回填多少条历史 swaps 建立首次买入判定基线"

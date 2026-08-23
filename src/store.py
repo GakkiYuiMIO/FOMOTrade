@@ -185,6 +185,31 @@ CREATE TABLE IF NOT EXISTS token_snapshot (
     PRIMARY KEY (network_id, token_address)
 );
 
+-- ============ 【价格历史】名单持仓代币的采样序列 ============
+-- 每 fomo_price_history_sample_ticks 轮(默认 20×15s=5 分钟)把当轮
+-- self._token_meta 里每个币的现价/市值采一行,供仪表盘画迷你走势图(sparkline)。
+-- 这是全项目唯一的价格时间序列 —— token_snapshot 每 tick 覆盖写,历史看不见。
+-- ⚠️ 只采名单里**还有人持有**的币,这本来就是 _token_meta 的范围,零额外 API 调用;
+--    没人持有了就不再出现在这里,是正确行为(这个币的价格已经不再是名单关心的事)。
+-- ⚠️ price_usd / market_cap 都必须允许 NULL,且拿不到时要存 NULL 而不是 0 ——
+--    见 formatter.py 头部的规矩:0 是真实值(真的归零了),不能被"没采到"占用。
+CREATE TABLE IF NOT EXISTS token_price_history (
+    network_id    TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    sampled_at    TEXT NOT NULL,   -- 采样时刻(UTC ISO)。同一 tick 落的所有行共用同一个值
+    price_usd     REAL,
+    market_cap    REAL,
+    -- 主键顺序与唯一的读路径完全对齐:WHERE network_id=? AND token_address=?
+    -- AND sampled_at>=? ORDER BY sampled_at —— PK 自带的 autoindex 本身就是
+    -- 这条路径需要的全部索引,不必再重复建一张。
+    -- 顺带把"同一个币同一时刻重复采样"变成主键冲突,INSERT OR IGNORE 天然幂等。
+    PRIMARY KEY (network_id, token_address, sampled_at)
+);
+-- 专给清理任务用:prune 按 sampled_at 单列判过期,用不上以 network_id 打头的
+-- 上面那条 PK 索引(sampled_at 是第三列,不能做范围扫描)——没有它,清理会
+-- 退化成全表扫描,而这张表稳态下是百万行量级。
+CREATE INDEX IF NOT EXISTS idx_price_history_sampled_at ON token_price_history(sampled_at);
+
 -- 名单成员的盈亏快照。来自 /v2/leaderboard/following。
 -- ⚠️ 实测:period="following" **一个请求**就返回 79 行 × 全部四个盈亏字段
 --    (totalPnL / pnl24h / pnl7d / pnl30d),而 period="7d" 只返回 pnl7d
@@ -1036,6 +1061,85 @@ def save_user_pnl(conn, rows: list[dict]) -> None:
 
 def load_user_pnl(conn) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM user_pnl_snapshot").fetchall()
+
+
+# ============================================================
+# 【价格历史】采样 / 读取 / 清理
+# ============================================================
+def save_price_samples(conn, rows: list[tuple]) -> None:
+    """
+    批量写入价格历史采样。
+
+    rows = [(network_id, token_address, sampled_at, price_usd, market_cap), ...]
+    调用方(poller._maybe_sample_price_history)每轮为整批代币生成**同一个**
+    sampled_at,代表"这一刻的截面"——这里不再自己生成时间戳,是为了让
+    "同一个币同一时刻重复采样"这件事完全由调用方的输入决定,而不是被
+    now_iso() 秒级精度的巧合悄悄影响,测试也因此能稳定复现幂等性。
+
+    ⚠️ INSERT OR IGNORE:命中主键(network_id, token_address, sampled_at)冲突时
+       直接跳过,不报错也不产生第二行 —— 这就是"再次采样同一时刻"的幂等实现。
+    ⚠️ price_usd / market_cap 必须原样传 None,绝不能在调用方把 None 改写成 0 ——
+       0 是真实价格/市值(见 formatter.py 头部的规矩),executemany 会把 None
+       正确绑定成 SQL NULL,这里唯一要守住的是不能提前把它填掉。
+    """
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO token_price_history
+            (network_id, token_address, sampled_at, price_usd, market_cap)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def load_price_history(conn, network_id: str, token_address: str,
+                       since_iso: str) -> list[sqlite3.Row]:
+    """
+    某个币的价格采样序列,升序(旧→新)—— sparkline 从左到右画的顺序,
+    也是图表唯一会用到的读法(见主键顺序的说明)。
+    """
+    return conn.execute(
+        """
+        SELECT * FROM token_price_history
+        WHERE network_id = ? AND token_address = ? AND sampled_at >= ?
+        ORDER BY sampled_at ASC
+        """,
+        (network_id, token_address, since_iso),
+    ).fetchall()
+
+
+# 分批删除的批大小与单次调用的批数上限。
+# ⚠️ 稳态下这张表是百万行量级,一条不加限制的 DELETE 会长时间占住写锁,
+#    堵住同一时刻的采样 / 事件落库(WAL 下写者互斥)。分批 + 每批独立事务,
+#    把最坏情况下单批的阻塞时间摊薄到毫秒级;命中批数上限时剩余的留到
+#    下一次 prune(远低于采样频率,见 poller._maybe_prune_price_history)继续删 ——
+#    保留期本身就是"3 天左右"的模糊承诺,没必要为了删干净而让某一次 tick 卡顿。
+_PRUNE_BATCH_SIZE = 5000
+_PRUNE_MAX_BATCHES = 20
+
+
+def prune_price_history(conn, keep_days: int) -> int:
+    """清理超过 keep_days 天的价格历史,返回本次实际删除的行数。"""
+    cutoff = iso_minutes_ago(keep_days * 24 * 60)
+    deleted = 0
+    for _ in range(_PRUNE_MAX_BATCHES):
+        with tx(conn):
+            cur = conn.execute(
+                """
+                DELETE FROM token_price_history
+                WHERE rowid IN (
+                    SELECT rowid FROM token_price_history
+                    WHERE sampled_at < ? LIMIT ?
+                )
+                """,
+                (cutoff, _PRUNE_BATCH_SIZE),
+            )
+        deleted += cur.rowcount
+        if cur.rowcount < _PRUNE_BATCH_SIZE:
+            break
+    return deleted
 
 
 # ============================================================
