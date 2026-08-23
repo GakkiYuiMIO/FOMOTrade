@@ -1903,3 +1903,41 @@ def test_价格历史清理按远低于采样的频率触发(db, monkeypatch):
         assert calls["n"] == 1, "第 3 轮该触发一次清理"
     finally:
         pmod._PRICE_HISTORY_PRUNE_EVERY_N_TICKS = monkey
+
+
+def test_清理按配置的保留天数生效不写死(db, monkeypatch):
+    """
+    ⚠️ 与采样那侧的 _n_and_offset(p) 呼应,守住对称的一个漏洞:
+       _maybe_prune_price_history 把 self.settings.fomo_price_history_retain_days
+       传给 store.prune_price_history,但此前没有任何测试验证过这个"传"字 ——
+       如果谁把那一行悄悄改成 store.prune_price_history(conn, 999)(或者随便
+       写死哪个数字),之前的清理测试全部照样绿(它们只关心"清理被调用过"
+       和"清理本身按 keep_days 删对了行",从不关心 keep_days 是不是配置值)。
+       这里把保留天数改成非默认的 1 天,插入横跨这条边界的样本,
+       断言清理效果确实跟着配置值走,而不是跟着代码里某个写死的数字走。
+    """
+    from src.config import get_settings
+    from src.models import iso_minutes_ago
+
+    monkeypatch.setenv("FOMO_PRICE_HISTORY_RETAIN_DAYS", "1")
+    get_settings.cache_clear()
+    try:
+        _add_ready("uA", "alice")
+        client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+        p = Poller(client, FakeNotifier())
+        assert p.settings.fomo_price_history_retain_days == 1, "配置没吃到,测试前提不成立"
+
+        with store.get_conn() as c:
+            store.save_price_samples(c, [
+                ("solana", "old", iso_minutes_ago(60 * 36), 1.0, None),    # 36 小时前:超过 1 天保留期
+                ("solana", "fresh", iso_minutes_ago(60 * 12), 1.0, None),  # 12 小时前:在保留期内
+            ])
+            p._maybe_prune_price_history(c)   # 新建 Poller._tick_no == 0,0 % N == 0,必触发
+            left = {r["token_address"] for r in
+                    c.execute("SELECT token_address FROM token_price_history")}
+        assert left == {"fresh"}, (
+            "保留天数=1 时,36 小时前的样本该被清掉、12 小时前的该留住;"
+            "如果这里失败,大概率是 keep_days 没有真的从配置传下去"
+        )
+    finally:
+        get_settings.cache_clear()
