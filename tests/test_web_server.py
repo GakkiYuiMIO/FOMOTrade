@@ -66,11 +66,37 @@ def _get(port: int, path: str) -> tuple[int, dict, bytes]:
         conn.close()
 
 
-@pytest.mark.parametrize("path", ["/", "/people", "/hot", "/copy"])
-def test_四个页面路由返回200(running_server, path):
+@pytest.mark.parametrize("path", ["/", "/board", "/people", "/hot", "/copy"])
+def test_五个页面路由返回200(running_server, path):
     status, _, body = _get(running_server, path)
     assert status == 200
     assert body.startswith(b"<!doctype html>")
+
+
+def test_首页是信号卡片流旧看板挪到board(running_server):
+    """
+    ⚠️ 硬规则:信号卡片流是新首页,旧看板必须还能通过 /board 访问到,
+       不能因为换了首页就把旧页面丢了。
+    """
+    status, _, body = _get(running_server, "/")
+    assert status == 200
+    assert "信号卡片流".encode() in body
+
+    status, _, body = _get(running_server, "/board")
+    assert status == 200
+    assert "<h1>看板</h1>".encode() in body
+
+
+def test_首页查询串参数被夹住不会500(running_server):
+    """⚠️ 硬规则:查询串不可信,荒谬输入必须被夹住,不能让服务端 500"""
+    for qs in (
+        "?min_buyers=abc&hours=xyz",
+        "?min_buyers=-999999&hours=-999999",
+        "?min_buyers=999999999999&hours=999999999999",
+    ):
+        status, _, body = _get(running_server, "/" + qs)
+        assert status == 200, f"{qs} 不该让服务端出错"
+        assert body.startswith(b"<!doctype html>")
 
 
 def test_静态文件返回200且是css类型(running_server):

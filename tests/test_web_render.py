@@ -60,9 +60,69 @@ def test_导航栏仅当前页高亮():
     """plan 的测试块没覆盖这条,但 nav 高亮逻辑容易在重构时悄悄错位。"""
     html_out = render.page("标题", "<p>body</p>", active="/people")
     assert '<a href="/people" class="on">' in html_out
-    for href in ("/", "/hot", "/copy"):
+    for href in ("/", "/board", "/hot", "/copy"):
         assert f'<a href="{href}" class="on">' not in html_out
         assert f'<a href="{href}" class="">' in html_out
+
+
+def test_导航栏首页是信号流旧看板挪到board():
+    """
+    ⚠️ 信号卡片流是新首页,旧看板必须还能从导航栏点到 —— 硬规则「四个老页面都要
+       保持可达」,不能因为换了首页就把 /board 从导航里漏掉。
+    """
+    html_out = render.page("标题", "<p>body</p>", active="/")
+    assert '<a href="/" class="on">信号</a>' in html_out
+    assert '<a href="/board" class="">看板</a>' in html_out
+
+
+def test_走势图点数不足时显示提示而不是图表():
+    """
+    ⚠️ token_price_history 刚上线,重启 + 跑够采样间隔前几乎全是空的 ——
+       少于 2 个有效点必须降级成安静的提示文案,绝不能是空 <svg>(看着像坏了)
+       或者拿假数据填(硬规则:不许伪造数据)。
+    """
+    for pts in ([], [1.0], [None, None], [1.0, None]):
+        out = render.sparkline(pts)
+        assert "还没有足够的行情历史" in out
+        assert "<svg" not in out
+
+
+def test_走势图有两个以上有效点时画svg():
+    out = render.sparkline([100.0, 300.0, 200.0])
+    assert "<svg" in out
+    assert "还没有足够的行情历史" not in out
+    # None 混在有效点之间只应该被跳过,不该让整条线报废
+    out2 = render.sparkline([100.0, None, 200.0])
+    assert "<svg" in out2
+
+
+def test_ATH进度条按现价占峰值的比例算():
+    out = render.ath_bar(50_000, 100_000)
+    assert "50%" in out
+    assert "width:50.0%" in out
+
+
+def test_ATH进度条缺任一数据时为空():
+    """⚠️ 判空用 is None —— 但缺了没法除,退化成空条不崩不算错"""
+    assert render.ath_bar(None, 100_000) == ""
+    assert render.ath_bar(50_000, None) == ""
+
+
+def test_ATH进度条峰值为0时不崩溃():
+    """峰值 0 是脏数据但仍是「取到值」的真实值(is None 判空铁律),
+    只是除零算不出比例,这里只要求不崩、退化成空条,不是把 0 当缺失处理"""
+    assert render.ath_bar(50_000, 0) == ""
+
+
+def test_币龄复用formatter同一套算法():
+    """⚠️ 不能自己另写一份换算,否则迟早和 Telegram 消息里的币龄对不上"""
+    import time
+
+    from src.formatter import fmt_token_age
+
+    created = time.time() - 3600 * 5
+    assert render.token_age(created) == fmt_token_age(created)
+    assert render.token_age(None) == ""
 
 
 def test_负数金额符号在美元符号前面():
@@ -97,7 +157,7 @@ def conn(tmp_path, monkeypatch):
 
 def test_空库也能渲染每个页面(conn):
     """⚠️ 刚建库、一条数据都没有时页面不能崩 —— 那是第一次跑的人看到的画面"""
-    for fn in (pages.dashboard, pages.people, pages.hot, pages.copy_ledger):
+    for fn in (pages.feed, pages.dashboard, pages.people, pages.hot, pages.copy_ledger):
         out = fn(conn)
         assert out.startswith("<!doctype html>")
         assert "<main>" in out
@@ -118,6 +178,96 @@ def _buy(c, uid, handle, ca, ts, mcap):
         badge_reason=REASON_LOCAL_STATS,
     )
     store.insert_event(c, ev)
+
+
+def _ready(c, uid, handle):
+    store.add_watch_user(c, uid, handle, handle)
+    store.mark_stats_ready(c, uid)
+
+
+def test_信号流按币聚合同一人加仓两次只算一张卡(conn):
+    """⚠️ 与 queries.py 那条聚合口径测试对应的页面级验证:同一个人分批加仓
+    不该被拆成两张长得一样的卡,「N 人买入」也不该被加仓笔数撑大"""
+    from src.models import iso_minutes_ago
+
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", iso_minutes_ago(120), 100_000)
+    _buy(conn, "u1", "alice", "ca1", iso_minutes_ago(60), 500_000)  # 加仓
+
+    out = pages.feed(conn, {"min_buyers": ["1"], "hours": ["24"]})
+    assert out.count('class=scard-token') == 1, "两笔买入只能出一张卡"
+    assert '<b>1</b> 人买入' in out
+
+
+def test_信号流买家数阈值真的会过滤(conn):
+    """默认门槛 ≥2 人:只有 1 个买家的币不该出现在默认信息流里"""
+    from src.models import iso_minutes_ago
+
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "solo", iso_minutes_ago(60), 100_000)
+    _buy(conn, "u1", "alice", "duo", iso_minutes_ago(60), 100_000)
+    _buy(conn, "u2", "bob", "duo", iso_minutes_ago(55), 120_000)
+
+    out = pages.feed(conn)  # 不传 query,走默认 min_buyers=2
+    assert "$DUO" in out
+    assert "$SOLO" not in out
+
+    out_relaxed = pages.feed(conn, {"min_buyers": ["1"]})
+    assert "$SOLO" in out_relaxed, "放宽到 1 人门槛后应该能看到"
+
+
+def test_信号流买家昵称转义不会转两次(conn):
+    """
+    ⚠️ 回归测试:昵称先在 pages._signal_card 里拼成「、」分隔的字符串,
+       又要同时塞进 title 属性和可见文字两处 —— 之前的实现在拼接阶段就转义了
+       一次,渲染阶段又对整串转义了一次,'&' 会变成 '&amp;amp;'(双重转义)。
+       正确结果是原文只转义一次。
+    """
+    from src.models import iso_minutes_ago
+
+    _ready(conn, "u1", "AT&T")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "AT&T", "ca1", iso_minutes_ago(60), 100_000)
+    _buy(conn, "u2", "bob", "ca1", iso_minutes_ago(55), 100_000)
+
+    out = pages.feed(conn, {"min_buyers": ["2"]})
+    assert "AT&amp;T" in out, "必须转义一次"
+    assert "AT&amp;amp;T" not in out, "不能转义两次"
+
+
+def test_信号流没有快照的币仍能渲染不崩(conn):
+    """硬规则:token_snapshot 没有对应行时,卡片照样渲染,那几格空着不报错"""
+    from src.models import iso_minutes_ago
+
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "nosnap", iso_minutes_ago(60), 100_000)
+    _buy(conn, "u2", "bob", "nosnap", iso_minutes_ago(55), 100_000)
+
+    out = pages.feed(conn, {"min_buyers": ["2"]})
+    assert "$NOSNAP" in out
+    assert "还没有足够的行情历史" in out  # 没有 token_price_history,sparkline 该降级
+
+
+def test_信号流查询串参数被夹住不会产生荒谬查询(conn):
+    """
+    ⚠️ 硬规则:查询串来的值必须校验+夹值。这里用垃圾输入(非数字、超大数、
+    负数)砸 pages.feed,只要求不崩、不抛异常 —— 校验/夹值本身在
+    test_web_queries.py 那条 signal_feed 测试里已经钉死了具体边界。
+    """
+    from src.models import iso_minutes_ago
+
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", iso_minutes_ago(60), 100_000)
+
+    for query in (
+        {"min_buyers": ["abc"], "hours": ["xyz"]},
+        {"min_buyers": ["-999999"], "hours": ["-999999"]},
+        {"min_buyers": ["999999999999999999"], "hours": ["999999999999999999"]},
+    ):
+        out = pages.feed(conn, query)
+        assert out.startswith("<!doctype html>")
 
 
 def test_人员榜缺显示名时不显示空白(conn):

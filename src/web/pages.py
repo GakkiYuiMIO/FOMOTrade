@@ -1,17 +1,34 @@
 """
-四个页面的渲染。每个函数进只读连接,出完整 HTML。
+五个页面的渲染。每个函数进只读连接(+ 查询串参数),出完整 HTML。
 
 ⚠️ 页面只调 queries.*/render.* 取数出串,自己不写 SQL 也不拼 <html>——
    唯一例外是 hot() 直接调 store.hot_tokens:那本来就是聚合好的只读函数,
    不是绕过 queries.py 现拼的 SQL,queries.py 里没有它是因为不需要再包一层。
+⚠️ 每个路由函数统一签名 (conn, query),query 是 urllib.parse.parse_qs 的原样输出
+   (dict[str, list[str]])。只有 feed() 真的读它 —— 其余四个页面没有可调参数,
+   加这个形参只是为了让 server.ROUTES 能一视同仁地调用,不必为首页单独分支。
 """
 from __future__ import annotations
 
 import sqlite3
 
 from src import store
+from src.models import NETWORK_DISPLAY
 from src.web import queries as q
-from src.web.render import age_minutes, esc, mcap, money, mult, page, pct, stale_mark, token_label
+from src.web.render import (
+    age_minutes,
+    ath_bar,
+    esc,
+    mcap,
+    money,
+    mult,
+    page,
+    pct,
+    sparkline,
+    stale_mark,
+    token_age,
+    token_label,
+)
 
 _SNAPSHOT_NOTE = ('<p class=note>所有数字按<b>当前行情快照</b>计算。'
                   '实测相邻两轮之间整体倍数会有百分之几的波动。</p>')
@@ -39,7 +56,7 @@ def _card(k: str, v: str) -> str:
     return f'<div class=card><div class=v>{v}</div><div class=k>{esc(k)}</div></div>'
 
 
-def dashboard(conn: sqlite3.Connection) -> str:
+def dashboard(conn: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
     d = q.dashboard(conn)
     c = d["copy"]
     age = d["last_tick_age_sec"]
@@ -60,10 +77,10 @@ def dashboard(conn: sqlite3.Connection) -> str:
           f'<a href="/copy">看全部</a></p>'
         + _SNAPSHOT_NOTE
     )
-    return page("看板", body, active="/")
+    return page("看板", body, active="/board")
 
 
-def people(conn: sqlite3.Connection) -> str:
+def people(conn: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
     rows = q.follow_value(conn)
     # ⚠️「他自己 7d / 生涯」两列与前面「跟单价值」三列是两个完全不同的问题:
     #    前者是「他自己赚了多少」,后者是「跟着他买我能拿到什么」——
@@ -104,7 +121,7 @@ def people(conn: sqlite3.Connection) -> str:
     return page("跟单价值", body, active="/people")
 
 
-def hot(conn: sqlite3.Connection) -> str:
+def hot(conn: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
     from src.models import iso_minutes_ago
 
     rows = store.hot_tokens(conn, iso_minutes_ago(60 * 24))
@@ -151,7 +168,7 @@ def _is_frozen(updated_at: str | None) -> bool:
     return mins is None or mins > LEDGER_FREEZE_MIN
 
 
-def copy_ledger(conn: sqlite3.Connection) -> str:
+def copy_ledger(conn: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
     c = q.copy_summary(conn)
     priced = [r for r in c["rows"] if r["multiple"] is not None]
     # ⚠️ 实测(Task 3):token_snapshot 只覆盖「名单里还有人持有」的币,清仓后就停更 ——
@@ -203,3 +220,125 @@ def copy_ledger(conn: sqlite3.Connection) -> str:
         + _SNAPSHOT_NOTE
     )
     return page("我的跟单", body, active="/copy")
+
+
+# ============================================================
+# 信号卡片流(新首页)
+# ============================================================
+# 筛选条的可选项。⚠️ 只是链接文案,不限制用户能不能在地址栏手打别的数字 ——
+# 真正的边界是 queries.FEED_MIN_BUYERS_RANGE / FEED_WINDOW_MIN_RANGE。
+_BUYER_OPTIONS = (1, 2, 3, 5, 10)
+_HOUR_OPTIONS = (1, 6, 24, 72, 168)
+# 小时是给人看的查询串单位,换算成分钟后仍落在 queries.py 的同一个区间里 ——
+# 除出来的上下界当作事实源,不在这里另写一遍数字。
+_HOUR_RANGE = (max(1, q.FEED_WINDOW_MIN_RANGE[0] // 60), q.FEED_WINDOW_MIN_RANGE[1] // 60)
+
+
+def _clamp_int(raw: list[str] | None, default: int, lo: int, hi: int) -> int:
+    """
+    从查询串里夹一个整数。⚠️ 这是本页唯一接收不可信输入的地方 ——
+    读者能直接在地址栏改数字,不夹的话一个荒谬的 min_buyers 或 hours
+    会变成荒谬的 SQL 时间窗口(硬规则:查询串必须校验+夹值,不能信任)。
+    parse_qs 给的是 list[str] 或缺失;解析不出数字就退回默认值,不报错。
+    """
+    try:
+        v = int(raw[0]) if raw else default
+    except (ValueError, TypeError):
+        v = default
+    return max(lo, min(hi, v))
+
+
+def _feed_filters(min_buyers: int, hours: int) -> str:
+    """筛选条:买家数阈值 + 时间窗,纯 <a> 链接,不上 JS。"""
+    def _link(label: str, href: str, active: bool) -> str:
+        cls = " class=on" if active else ""
+        return f'<a href="{esc(href)}"{cls}>{esc(label)}</a>'
+
+    buyers = "".join(
+        _link(f"≥{n}人", f"/?min_buyers={n}&hours={hours}", n == min_buyers)
+        for n in _BUYER_OPTIONS
+    )
+    hrs = "".join(
+        _link(f"{h}h" if h < 24 else f"{h // 24}d", f"/?min_buyers={min_buyers}&hours={h}", h == hours)
+        for h in _HOUR_OPTIONS
+    )
+    return f'<div class=filters>{buyers}<span class=dim>丨</span>{hrs}</div>'
+
+
+def _mcap_range(entry: float | None, now: float | None) -> str:
+    """
+    「入场 → 现在」市值。⚠️ 两边独立判空 —— 只缺一边就显示拿到的那一半,
+    不能因为缺了一个数就把另一个已知数也藏起来。
+    """
+    if entry is None and now is None:
+        return ""
+    if entry is None:
+        return f"现在 {mcap(now)}"
+    if now is None:
+        return f"入场 {mcap(entry)}"
+    return f"{mcap(entry)} → {mcap(now)}"
+
+
+def _signal_card(d: dict) -> str:
+    """一张信号卡:字段来源见 queries.signal_feed 的注释。"""
+    shown = d["buyer_handles"]
+    more = d["buyers"] - len(shown)
+    # ⚠️ 保持原文不转义,esc() 只在拼进 HTML 的那一刻调用一次 ——
+    #    title 属性和下面的可见文字各用一次 esc(who),都是同一份未转义原文,
+    #    不能像之前那样对已经转义过的字符串再转义一次(& 会变成 &amp;amp;)。
+    who = "、".join(shown) + (f" 等{more}人" if more > 0 else "")
+    age = token_age(d.get("token_created_at"))
+    net = esc(NETWORK_DISPLAY.get(d["network_id"], d["network_id"]))
+    mc_range = _mcap_range(d.get("entry_mcap"), d.get("now_mcap"))
+    stale = stale_mark(d.get("mcap_at"))
+    avg_line = money(d.get("avg_usd"))
+    total_line = money(d.get("total_usd"))
+
+    return (
+        '<div class=scard>'
+        '<div class=scard-head>'
+        f'<span class=scard-token>{esc(token_label(d.get("symbol"), d["token_address"]))}</span>'
+        f'<span class=dim>{net}</span>'
+        + (f'<span class=dim>· {esc(age)}</span>' if age else "")
+        + '</div>'
+        # ⚠️ 「N 人买入」不做成链接:现有四个页面里没有一个能按单币筛选,
+        #    硬链过去只会把人带到一个无关的列表。改用 title 悬浮 + 下面这行
+        #    直接把人名列出来 —— 这正是我们相对 Debot 的优势:知道具体是谁。
+        + f'<div class=scard-buyers title="{esc(who)}"><b>{d["buyers"]}</b> 人买入</div>'
+        + (f'<div class="dim scard-who">{esc(who)}</div>' if who else "")
+        + '<div class=scard-row>'
+        + (f'<span class=dim>均笔 {avg_line}</span>' if avg_line else "")
+        + (f'<span class=dim>合计 {total_line}</span>' if total_line else "")
+        + '</div>'
+        + (f'<div class=scard-row><span class=dim>{esc(mc_range)}</span></div>' if mc_range else "")
+        + (f'<div class=scard-mult>{mult(d.get("multiple"))}</div>' if d.get("multiple") is not None else "")
+        + ath_bar(d.get("now_mcap"), d.get("peak_mcap"))
+        + sparkline(d["price_points"])
+        + (f'<div class="dim scard-stale">{esc(stale)}</div>' if stale else "")
+        + '</div>'
+    )
+
+
+def feed(conn: sqlite3.Connection, query: dict[str, list[str]] | None = None) -> str:
+    """
+    信号卡片流:新首页。一个币一张卡,回答「名单刚买了什么、几个人买的」。
+
+    ⚠️ 默认 ≥2 人 / 24 小时 —— 实测近 24h 189 个在买的币里,126 个只有
+       1 个人买过,那是噪声不是信号;默认门槛把它们先滤掉。
+    """
+    query = query or {}
+    min_buyers = _clamp_int(query.get("min_buyers"), q.FEED_MIN_BUYERS_DEFAULT, *q.FEED_MIN_BUYERS_RANGE)
+    hours = _clamp_int(query.get("hours"), q.FEED_WINDOW_MIN_DEFAULT // 60, *_HOUR_RANGE)
+
+    rows = q.signal_feed(conn, min_buyers=min_buyers, window_min=hours * 60)
+    cards = "".join(_signal_card(d) for d in rows)
+    empty = (f'<p class=note>近 {hours} 小时内没有 ≥{min_buyers} 人买入的币。'
+             '试试放宽筛选条件。</p>')
+    body = (
+        "<h1>信号卡片流</h1>"
+        + _feed_filters(min_buyers, hours)
+        + (f'<div class=feed>{cards}</div>' if rows else empty)
+        + '<p class=note>市值、峰值按<b>当前行情快照</b>计算,入场市值取窗口内该币'
+          '<b>最早一笔有市值的买入</b> —— 两者时点不同,差值不代表已实现盈亏。</p>'
+    )
+    return page("信号", body, active="/")

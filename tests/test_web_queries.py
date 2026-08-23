@@ -274,3 +274,164 @@ def test_看板健康度报出最后一轮距今多久(conn):
 def test_从没跑过时健康度是None而不是0(conn):
     """⚠️ 0 会被读成「刚刚跑过」,而真相是「从来没跑过」"""
     assert queries.dashboard(conn)["last_tick_age_sec"] is None
+
+
+# ============================================================
+# 信号卡片流(queries.signal_feed)
+# ============================================================
+# ⚠️ 必须用「现在往前推 N 分钟」而不是写死日期字符串 —— signal_feed 带
+#    时间窗过滤(与本文件其它口径测试不同,那些函数不筛时间),写死的日期
+#    一旦落到默认 24h 窗口之外,测试会以「查询串就是夹不住」的方式假败。
+from src.models import iso_minutes_ago as _ago  # noqa: E402
+
+
+def test_信号流按币聚合不是按笔(conn):
+    """
+    ⚠️ 核心口径:同一个人对同一个币加仓两次,必须聚合成一张卡、买家数算 1 ——
+       按笔算的话,796 笔买入会变成 796 张卡,而且同一个人加仓三次会长出
+       三张长得一样的卡。
+    """
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", _ago(120), 100_000)
+    _buy(conn, "u1", "alice", "ca1", _ago(60), 500_000)  # 加仓
+
+    rows = queries.signal_feed(conn, min_buyers=1)
+    assert len(rows) == 1, "两笔买入只能聚合出一张卡"
+    assert rows[0]["buyers"] == 1, "加仓不能把买家数撑大"
+    assert rows[0]["buys"] == 2, "笔数本身照实记,只是不能拆成两张卡"
+
+
+def test_信号流买家数阈值真的会过滤(conn):
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "solo", _ago(60), 100_000)
+    _buy(conn, "u1", "alice", "duo", _ago(60), 100_000)
+    _buy(conn, "u2", "bob", "duo", _ago(55), 120_000)
+
+    only_two_plus = {r["token_address"] for r in queries.signal_feed(conn, min_buyers=2)}
+    assert only_two_plus == {"duo"}, "只有 ≥2 人买过的币能进 ≥2 门槛的结果"
+
+    everyone = {r["token_address"] for r in queries.signal_feed(conn, min_buyers=1)}
+    assert everyone == {"solo", "duo"}, "门槛放到 1 之后两个都该在"
+
+
+def test_信号流稳定币互换不计入买家数(conn):
+    """
+    ⚠️ 与 count_recent_buyers / hot_tokens / follow_value 同一套谓词:
+       COALESCE(badge_reason,'') IN COUNTABLE_REASONS 必须守住 —— 否则稳定币
+       互换(USDC/WSOL 等,badge_reason=quote_token)会被算成「有人买了这个币」,
+       把「N 人买入」这个卡片的立身之本做虚高。
+
+       这条过滤器在本项目已经出过一次事:网页版 Task 2 时实现者因为测试全挂
+       就把它删掉,后来实测发现删掉会让 254 条稳定币互换污染共识数、把所有人
+       的中位数往 1.0x 拽。它在 signal_feed 里是新写的一份(WHERE 子句本身),
+       不能指望 follow_value / hot_tokens 那两条同名测试替它兜底 —— 补一条
+       专门守住 signal_feed 自己的这一行。
+    """
+    from src.models import REASON_QUOTE_TOKEN
+
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", _ago(60), 100_000)                          # 正常买入
+    _buy(conn, "u2", "bob", "ca1", _ago(55), 100_000, reason=REASON_QUOTE_TOKEN)  # 稳定币互换
+
+    rows = queries.signal_feed(conn, min_buyers=1)
+    assert len(rows) == 1
+    assert rows[0]["buyers"] == 1, "稳定币互换的那个人不能被算进买家数"
+
+    # 更有价值的断言:直接对应用户会看到的行为 —— 过不了 ≥2 人的默认门槛
+    assert queries.signal_feed(conn, min_buyers=2) == []
+
+
+def test_信号流入场市值取窗口内最早一笔而不是快照(conn):
+    """
+    ⚠️ 铁律:entry 绝不能用 token_snapshot 回填 —— 那是「现在」的市值,
+       回填会凭空造出纸面盈利。这里让快照市值远高于最早那笔买入的市值,
+       entry 必须仍然等于最早那笔的值。
+    """
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", _ago(120), 100_000)   # 最早
+    _buy(conn, "u2", "bob", "ca1", _ago(60), 150_000)      # 更晚
+    store.upsert_token_snapshots(conn, [("solana", "ca1", "X", 1.0, 999_000)])  # 现在的市值,离谱地高
+
+    rows = queries.signal_feed(conn, min_buyers=2)
+    assert len(rows) == 1
+    assert rows[0]["entry_mcap"] == pytest.approx(100_000), "入场必须是最早那笔,不是快照"
+    assert rows[0]["now_mcap"] == pytest.approx(999_000), "现在的市值才该来自快照"
+
+
+def test_信号流没有快照的币仍能返回(conn):
+    """⚠️ token_snapshot 没有对应行时不能崩,那几列该是 None 不是 0"""
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", _ago(60), 100_000)
+    _buy(conn, "u2", "bob", "ca1", _ago(55), 100_000)
+
+    rows = queries.signal_feed(conn, min_buyers=2)
+    assert len(rows) == 1
+    assert rows[0]["now_mcap"] is None
+    assert rows[0]["peak_mcap"] is None
+    assert rows[0]["mcap_at"] is None
+    assert rows[0]["multiple"] is None, "算不出倍数时必须是 None,不能按 0 算"
+
+
+def test_信号流缺金额的买入不会伪造出0合计(conn):
+    """
+    ⚠️ 判空铁律:一笔买入都拿不到金额时,合计/均笔必须是 None(格子空着),
+       不能显示成一个假的「$0.00 合计」——0 是真实值,不是「不知道」。
+    """
+    from src.models import EVENT_BUY, REASON_LOCAL_STATS, FomoEvent
+
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    for uid, handle, ts in (("u1", "alice", _ago(60)), ("u2", "bob", _ago(55))):
+        ev = FomoEvent(
+            event_id=f"{uid}:noamt:{ts}", event_type=EVENT_BUY, user_id=uid,
+            handle=handle, user_handle=handle, network_id="solana",
+            token_address="noamt", token_symbol="NOAMT", amount_usd=None,
+            event_ts=ts, market_cap=100_000, raw_json="{}",
+            badge_reason=REASON_LOCAL_STATS,
+        )
+        store.insert_event(conn, ev)
+
+    rows = queries.signal_feed(conn, min_buyers=2)
+    assert len(rows) == 1
+    assert rows[0]["total_usd"] is None
+    assert rows[0]["avg_usd"] is None
+
+
+def test_信号流价格历史表不存在时仍能返回(conn):
+    """
+    ⚠️ 实测踩过的坑(对着真实 data/fomo.db 的拷贝验证时发现):
+       token_price_history 只在 store.init_db() 里建,而 --web 是只读进程
+       故意不建表。正在跑的监控进程只要还没重启过,这张表在真实库里就是
+       「压根不存在」,不是「存在但是空的」—— 直接查会是 sqlite3.OperationalError:
+       no such table,不是空列表。signal_feed 绝不能因此崩掉。
+    """
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", _ago(60), 100_000)
+    _buy(conn, "u2", "bob", "ca1", _ago(55), 100_000)
+    with store.tx(conn):
+        conn.execute("DROP TABLE token_price_history")
+
+    rows = queries.signal_feed(conn, min_buyers=2)
+    assert len(rows) == 1
+    assert rows[0]["price_points"] == [], "表不存在时退化成空列表,不能抛异常"
+
+
+def test_信号流的min_buyers和window会被夹在合理范围内(conn):
+    """
+    ⚠️ 硬规则:查询串来的值必须校验+夹值,不能直接拼进 SQL —— 这里钉的是
+       queries.signal_feed 自己的防御性夹值(pages.py 那道校验单独测)。
+    """
+    from src.models import now_iso
+
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", now_iso(), 100_000)
+
+    # 荒谬的负数下限应该被夹到 1,买家数=1 的币能出现
+    assert len(queries.signal_feed(conn, min_buyers=-999, window_min=60 * 24)) == 1
+    # 荒谬的超大上限应该被夹到 50,买家数=1 的币达不到门槛
+    assert queries.signal_feed(conn, min_buyers=99999999, window_min=60 * 24) == []

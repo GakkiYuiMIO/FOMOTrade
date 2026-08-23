@@ -12,7 +12,7 @@ import traceback
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from loguru import logger
 
@@ -21,9 +21,11 @@ from src.web.db import WebDbError, readonly_conn
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-# 路由表:路径 → 渲染函数(conn) -> str
+# 路由表:路径 → 渲染函数(conn, query) -> str。
+# ⚠️ 信号卡片流是新首页,旧看板挪到 /board —— 四个老页面都还在,只是首页换了人。
 ROUTES = {
-    "/": pages.dashboard,
+    "/": pages.feed,
+    "/board": pages.dashboard,
     "/people": pages.people,
     "/hot": pages.hot,
     "/copy": pages.copy_ledger,
@@ -37,7 +39,8 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug("web {} {}", self.address_string(), fmt % args)
 
     def do_GET(self):                          # noqa: N802
-        path = unquote(urlparse(self.path).path)
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
         try:
             if path.startswith("/static/"):
                 return self._static(path)
@@ -45,10 +48,13 @@ class Handler(BaseHTTPRequestHandler):
             if fn is None:
                 return self._send(404, "text/html; charset=utf-8",
                                   b"<h1>404</h1>")
+            # ⚠️ 查询串是唯一的不可信输入面(?min_buyers=/?hours=)。这里只解析、
+            #    不校验 —— 校验+夹值的责任在 pages.feed(),别处不重复这道逻辑。
+            query = parse_qs(parsed.query)
             # ⚠️ 每个请求开一次连接、用完立刻关。不做连接池 ——
             #    泄漏的读事务会把 WAL 钉住、无上限增长、全程静默无报错。
             with readonly_conn() as conn:
-                body = fn(conn)
+                body = fn(conn, query)
             return self._send(200, "text/html; charset=utf-8", body.encode())
         except WebDbError as e:
             return self._send(503, "text/plain; charset=utf-8", str(e).encode())
