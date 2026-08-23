@@ -13,7 +13,7 @@ import statistics as st
 from datetime import UTC, datetime
 
 from src import store as _store
-from src.models import COUNTABLE_REASONS
+from src.models import COUNTABLE_REASONS, iso_minutes_ago
 
 # 少于这么多个币就不给排名。⚠️ 不是不显示,是不参与排序 ——
 # 3 个币的「胜率 100%」是噪声,放进榜单顶端会直接误导决策。
@@ -213,3 +213,134 @@ def dashboard(conn: sqlite3.Connection) -> dict:
         "watch_count": n_users,
         "copy": copy_summary(conn),
     }
+
+
+# ============================================================
+# 信号卡片流(首页)
+# ============================================================
+# ⚠️ 这两组范围是查询串校验的唯一事实源 —— pages.py 解析 ?min_buyers=/?hours=
+#    时夹的也是这两个区间,不在两处各写一份数字。
+FEED_MIN_BUYERS_DEFAULT = 2
+FEED_MIN_BUYERS_RANGE = (1, 50)
+# 单位:分钟。1 小时 ~ 14 天 —— 再短没有聚合意义,再长会把 fomo_events 全表扫一遍。
+FEED_WINDOW_MIN_DEFAULT = 60 * 24
+FEED_WINDOW_MIN_RANGE = (60, 60 * 24 * 14)
+
+# 卡片流硬上限,**不接受查询串输入** —— 只作为「有人手改 min_buyers=1 导致
+# 189 个币全进来」时的保底,不是用户可调参数。
+_FEED_ROW_LIMIT = 300
+# 每张卡「谁买的」最多展示几个人,超出的在 pages.py 那边折成「等 N 人」
+_FEED_BUYER_SAMPLE = 8
+
+
+def signal_feed(conn: sqlite3.Connection, *,
+                min_buyers: int = FEED_MIN_BUYERS_DEFAULT,
+                window_min: int = FEED_WINDOW_MIN_DEFAULT) -> list[dict]:
+    """
+    信号卡片流:按**币**聚合的「名单集体买入」信号,首页的数据源。
+
+    ⚠️ 必须按币聚合,绝不能一笔买入出一张卡 —— 同一个人分批加仓会被拆成
+       好几张长得一样的卡,而且信息流会被刷屏(实测近 24h:796 笔买入,
+       去重到币只有 189 个)。「N 人买入」的 N 是 COUNT(DISTINCT user_id),
+       不是笔数。
+
+    ⚠️ 入场市值取窗口内**最早一笔有市值**的买入(与 hot_tokens / follow_value
+       同一惯例:ROW_NUMBER 按「有没有市值」再按时间排序取第一名),
+       绝不能拿 token_snapshot 回填 —— 那是「现在」的市值,
+       回填等于凭空造出纸面盈利(见模块顶部铁律)。
+
+    ⚠️ 谓词必须与 count_recent_buyers 完全一致(active=1 AND stats_ready=1 +
+       COALESCE(badge_reason,'') IN COUNTABLE_REASONS),否则卡片上的
+       「N 人买入」会和 Telegram 推送、/hot 页的共识数对不上。
+
+    ⚠️ min_buyers / window_min 来自查询串,pages.py 已经夹过一次范围;
+       这里再夹一遍是防御性的第二道线 —— 防止以后哪个新调用方漏掉那道校验,
+       让一个荒谬的值变成荒谬的 SQL 时间窗口。
+    """
+    min_buyers = max(FEED_MIN_BUYERS_RANGE[0], min(FEED_MIN_BUYERS_RANGE[1], int(min_buyers)))
+    window_min = max(FEED_WINDOW_MIN_RANGE[0], min(FEED_WINDOW_MIN_RANGE[1], int(window_min)))
+    since_iso = iso_minutes_ago(window_min)
+
+    marks = ",".join("?" * len(COUNTABLE_REASONS))
+    rows = conn.execute(
+        f"""
+        WITH scoped AS (
+            SELECT e.network_id, e.token_address, e.token_symbol, e.user_id,
+                   e.amount_usd, e.market_cap, e.event_ts, e.token_created_at,
+                   -- 该币最早**且有市值**的那一行:没市值的排到分区末尾。
+                   -- 与 hot_tokens 完全同一套写法,道理也一样:market_cap 只来自
+                   -- balances,可能晚于最早那笔 swap 出现。
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.network_id, e.token_address
+                       ORDER BY CASE WHEN e.market_cap IS NULL THEN 1 ELSE 0 END, e.event_ts
+                   ) AS rn_mcap
+            FROM fomo_events e
+            JOIN watch_users w ON w.user_id = e.user_id
+                              AND w.active = 1 AND w.stats_ready = 1
+            WHERE e.event_type = 'BUY'
+              AND e.event_ts >= ?
+              AND e.token_address IS NOT NULL
+              AND COALESCE(e.badge_reason, '') IN ({marks})
+        ),
+        agg AS (
+            SELECT network_id, token_address,
+                   MAX(token_symbol)       AS symbol,
+                   MAX(token_created_at)   AS token_created_at,
+                   COUNT(DISTINCT user_id) AS buyers,
+                   COUNT(*)                AS buys,
+                   -- ⚠️ 不用 COALESCE(amount_usd,0):SUM/COUNT 对 NULL 的标准语义
+                   --    (自动跳过 NULL,不吞真实的 0)刚好就是判空铁律要的效果 ——
+                   --    一笔都拿不到金额时 total_usd 是 NULL(卡片上那格空着),
+                   --    不会显示成一个假的「$0.00 合计」。
+                   SUM(amount_usd)         AS total_usd,
+                   COUNT(amount_usd)       AS priced_buys
+            FROM scoped
+            GROUP BY network_id, token_address
+        )
+        SELECT a.*,
+               m.market_cap AS entry_mcap,
+               s.market_cap AS now_mcap,
+               -- 峰值缺失时退回现价(老库 max_market_cap 可能还没回填),与
+               -- hot_tokens 的 COALESCE(s.max_market_cap, s.market_cap) 同一惯例
+               COALESCE(s.max_market_cap, s.market_cap) AS peak_mcap,
+               s.updated_at AS mcap_at
+        FROM agg a
+        LEFT JOIN scoped m ON m.network_id = a.network_id
+                          AND m.token_address = a.token_address AND m.rn_mcap = 1
+        LEFT JOIN token_snapshot s ON s.network_id = a.network_id
+                                  AND s.token_address = a.token_address
+        WHERE a.buyers >= ?
+        ORDER BY a.buyers DESC, a.total_usd DESC, a.token_address
+        LIMIT ?
+        """,  # noqa: S608
+        (since_iso, *COUNTABLE_REASONS, min_buyers, _FEED_ROW_LIMIT),
+    ).fetchall()
+
+    # ⚠️ 实测踩过的坑:token_price_history 是本分支新加的表,只在 store.init_db()
+    #    的建表/迁移里创建 —— 而 --web 是只读进程故意不建表(与 user_pnl_snapshot
+    #    同理)。正在跑的监控进程只要还没重启过一次,这张表在真实库里就是
+    #    「压根不存在」而不是「存在但是空的」,直接查会是 OperationalError,
+    #    不是空列表。这里只探测一次,不在循环里对每个币都 try/except 一遍。
+    has_price_history = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_price_history'"
+    ).fetchone() is not None
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        entry, now = d["entry_mcap"], d["now_mcap"]
+        # ⚠️ entry 为 0 或 None 都要跳过(按 0 算会造出无穷大倍数),
+        #    now 判空必须用 is None —— 0 是「归零了」的真实值,不是缺失
+        d["multiple"] = (now / entry) if (entry and now is not None) else None
+        d["avg_usd"] = (d["total_usd"] / d["priced_buys"]) if d["priced_buys"] else None
+        # ⚠️ 谁买的:复用 store.token_buyers(与本函数同一套谓词、已单测覆盖),
+        #    不在这里重新拼一遍「按人去重 + 取 handle」的逻辑
+        d["buyer_handles"] = [b["who"] for b in _store.token_buyers(
+            conn, d["network_id"], d["token_address"], since_iso, limit=_FEED_BUYER_SAMPLE)]
+        # sparkline 用的价格历史。⚠️ 刚上线的表,重启 + 跑够采样间隔前基本是空的 ——
+        #    render.sparkline 负责把 <2 个点降级成提示文案,这里不做任何特殊处理;
+        #    表还不存在时直接给空列表,走的是同一条降级路径。
+        d["price_points"] = [p["market_cap"] for p in _store.load_price_history(
+            conn, d["network_id"], d["token_address"], since_iso)] if has_price_history else []
+        out.append(d)
+    return out

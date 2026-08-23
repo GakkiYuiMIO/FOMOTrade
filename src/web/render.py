@@ -13,6 +13,8 @@ import html
 import math
 from datetime import UTC, datetime
 
+from src.formatter import fmt_token_age
+
 # 行情多旧算冻住。与 bot._STALE_MCAP_MIN / store.SNAPSHOT_FRESH_MIN 是同一道线
 STALE_MIN = 60
 
@@ -105,9 +107,56 @@ def stale_mark(updated_at: str | None) -> str:
     return f"⚠️ 行情停在 {int(mins / 1440)}d 前"
 
 
+def token_age(created_at: int | float | None) -> str:
+    """
+    币龄展示。⚠️ 直接复用 formatter.fmt_token_age —— 那是 Telegram 消息同一套
+    算法(纯函数、不碰 DB),两处各写一份换算迟早会算出两个不一样的「币龄」。
+    拿不到就是空串(铁律 2),透传 fmt_token_age 的 None,不在这里另判一次。
+    """
+    return fmt_token_age(created_at) or ""
+
+
+def ath_bar(now_v: float | None, peak_v: float | None) -> str:
+    """
+    ATH 进度条:现价是峰值的百分之几。
+
+    ⚠️ 判空用 is None —— peak_v=0 是脏数据但仍是「取到值」的真实值(见
+       queries.follow_value 同类注释)。但 0 做分母算不出比例,这不是把 0
+       当成缺失处理,是数学上除不了,退化成空条不崩不算错。
+    """
+    if now_v is None or peak_v is None or peak_v <= 0:
+        return ""
+    frac = max(0.0, min(1.0, now_v / peak_v))
+    return (
+        f'<div class=athbar><div class=athbar-fill style="width:{frac * 100:.1f}%"></div></div>'
+        f'<div class=dim>现价是峰值的 {frac * 100:.0f}%</div>'
+    )
+
+
+def sparkline(values: list[float | None]) -> str:
+    """
+    迷你走势图(市值序列)。⚠️ token_price_history 刚上线,重启 + 跑够采样
+    间隔前几乎全是空的 —— 少于 2 个有效点画不出趋势线,这里给一句安静的
+    提示,绝不能拿假数据填,也不能留一个空 <svg> 看着像坏掉了。
+    """
+    pts = [v for v in values if v is not None]
+    if len(pts) < 2:
+        return '<p class="note spark-empty">还没有足够的行情历史</p>'
+    lo, hi = min(pts), max(pts)
+    span = (hi - lo) or 1.0  # 全部相同时避免除零,画一条水平线而不是报错
+    w, h, pad = 120, 28, 2
+    step = (w - 2 * pad) / (len(pts) - 1)
+    coords = " ".join(
+        f"{pad + i * step:.1f},{pad + (h - 2 * pad) * (1 - (v - lo) / span):.1f}"
+        for i, v in enumerate(pts)
+    )
+    return f'<svg class=spark viewBox="0 0 {w} {h}" preserveAspectRatio="none"><polyline points="{coords}"/></svg>'
+
+
 def page(title: str, body: str, active: str = "") -> str:
     """整页骨架。⚠️ 不用 CDN —— 本机自用,断网也要能开"""
-    nav = [("/", "看板"), ("/people", "人员"), ("/hot", "热门币"), ("/copy", "我的跟单")]
+    nav = [("/", "信号"), ("/board", "看板"), ("/people", "人员"),
+           ("/hot", "热门币"), ("/copy", "我的跟单")]
     links = "".join(
         f'<a href="{href}" class="{"on" if href == active else ""}">{esc(label)}</a>'
         for href, label in nav
