@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # 测试函数名用中文(项目规范),与其余 tests/ 保持一致
 # ruff: noqa: N802
+import math
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ import pytest
 from src import store
 from src.client import NotSupportedError, UserGoneError, UserSnapshot
 from src.models import EVENT_BUY, now_iso
-from src.poller import _SEND_BURST, Poller
+from src.poller import _FEED_EVERY_N_TICKS, _PNL_EVERY_N_TICKS, _SEND_BURST, Poller
 from tests.conftest import CA_TOAD
 
 # ---- 时间锚点 ------------------------------------------------------------
@@ -1694,17 +1695,27 @@ def _bal(ca: str, *, price: float | None = 1.0, mcap: float | None = 1_000_000.0
 _ANCIENT = "2020-01-01T00:00:00+00:00"
 
 
+def _n_and_offset(p: Poller) -> tuple[int, int]:
+    """真实配置里的采样周期与错峰偏移 —— 全部测试都从这里取,不写死具体数字。"""
+    n = p.settings.fomo_price_history_sample_ticks
+    return n, n // 2
+
+
 def test_价格采样只在降频轮触发(db):
-    """默认每 20 轮采一次(15s×20=5 分钟),不能每轮都写"""
+    """
+    不写死"20 轮"这个曾经的默认值 —— 直接从 p.settings 读真实配置算出该在第几次
+    tick() 调用触发,配置的默认值以后再改,这条测试也不需要跟着改数字。
+    """
     _add_ready("uA", "alice")
     client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
     p = Poller(client, FakeNotifier())
-    for _ in range(9):
+    n, offset = _n_and_offset(p)
+    for _ in range(offset - 1):
         p.tick()
     with store.get_conn() as c:
         assert store.load_price_history(c, "solana", CA_TOAD, _ANCIENT) == [], \
-            "前 9 轮(tick_no 1~9)都不该落库"
-    p.tick()   # 第 10 次调用,_tick_no 自增到 10,10 % 20 == 10,该轮必采
+            f"前 {offset - 1} 轮都不该落库"
+    p.tick()   # 第 offset 次调用,_tick_no 自增到 offset,offset % n == offset,该轮必采
     with store.get_conn() as c:
         rows = store.load_price_history(c, "solana", CA_TOAD, _ANCIENT)
     assert len(rows) == 1
@@ -1726,7 +1737,8 @@ def test_只采token_meta里出现的代币(db):
         "uB": _snap("uB", balances=[_bal(ca2, price=2.0, mcap=2_000_000.0)]),
     })
     p = Poller(client, FakeNotifier())
-    p._tick_no = 9
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1
     p.tick()
     assert set(p._token_meta) == {("solana", CA_TOAD), ("solana", ca2)}
     with store.get_conn() as c:
@@ -1743,7 +1755,8 @@ def test_采样时市值缺失存NULL不存0(db):
     _add_ready("uA", "alice")
     client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD, price=1.0, mcap=None)])})
     p = Poller(client, FakeNotifier())
-    p._tick_no = 9
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1
     p.tick()
     with store.get_conn() as c:
         row = store.load_price_history(c, "solana", CA_TOAD, _ANCIENT)[0]
@@ -1754,9 +1767,9 @@ def test_采样时市值缺失存NULL不存0(db):
 def test_价格采样失败不影响买卖推送(db, monkeypatch):
     """
     复刻名单盈亏那条测试踩过的坑:新建的 Poller._tick_no 从 0 起步,tick() 里
-    _fetch_snapshots 先自增到 1 才轮到采样门槛检查,而默认门槛是
-    `_tick_no % 20 == 10`,第一轮根本不满足 —— 必须手动把 _tick_no 拨到 9,
-    让本轮自增后变成 10 才会真的调用 store.save_price_samples。
+    _fetch_snapshots 先自增到 1 才轮到采样门槛检查,而门槛是
+    `_tick_no % n == n // 2`,第一轮根本不满足 —— 必须手动把 _tick_no 拨到
+    `offset - 1`(offset 从真实配置算出,不写死),让本轮自增后正好命中。
     只 mock 掉 client 端没用(采样不打网络请求),这里改成 mock store 层函数,
     并用调用计数器断言它真的被触发过,不然这条测试就是在测一个从未发生的失败。
     """
@@ -1764,7 +1777,8 @@ def test_价格采样失败不影响买卖推送(db, monkeypatch):
     client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")], balances=[_bal(CA_TOAD)])})
     notifier = FakeNotifier()
     p = Poller(client, notifier)
-    p._tick_no = 9   # 本轮 _fetch_snapshots 自增后变 10,10 % 20 == 10,该轮必采
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1   # 本轮 _fetch_snapshots 自增后命中 offset,该轮必采
 
     calls = {"n": 0}
 
@@ -1780,17 +1794,24 @@ def test_价格采样失败不影响买卖推送(db, monkeypatch):
 
 def test_价格采样与名单盈亏永不同轮触发(db, monkeypatch):
     """
-    ⚠️ 两者默认周期相同(都是 20 轮),且都排在 tick() 里 _tick_no 自增**之后**
-       检查——不像 _poll_feed 与 _maybe_poll_pnl 那样能靠调用时机差一拍天然错开,
-       这里比较的是同一个 _tick_no 值。_maybe_sample_price_history 故意用
-       `== n // 2` 而不是 `== 0`,让采样固定落在盈亏采集之后第 10 轮:
-       谁把这个比较符号改回 `== 0`,两个任务会在**每一次**该采样的轮次上都
-       撞在一起,这里会变红。
+    ⚠️ 采样周期(fomo_price_history_sample_ticks,默认 60)与 _maybe_poll_pnl 的
+       _PNL_EVERY_N_TICKS(=20)在改这条测试之前**曾经**恰好相等(都是 20),
+       现在不再相等,但这条回归测试依然有意义:只要两个周期存在公约数,
+       "同一 tick 触发"就不能只凭直觉排除,必须真的跑够 lcm(n, 20) 轮验证。
+       _maybe_sample_price_history 用 `== n // 2` 而不是 `== 0` 来错峰:
+       谁把这个比较符号改回 `== 0`,只要 n 恰好等于 20(比如以后又调回旧默认值),
+       两个任务会在**每一次**该采样的轮次上都撞在一起,这里会变红。
+       ⚠️ 周期数 n 从 p.settings 读真实配置,循环圈数按 lcm(n, 20) 动态算 ——
+          默认值以后再改,这条测试也依然覆盖得到完整的联合周期,不会因为
+          写死的圈数不够而"意外通过"。
     """
     _add_ready("uA", "alice")
     client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])},
                         leaderboard=[_pnl_row("uA")])
     p = Poller(client, FakeNotifier())
+    n, _ = _n_and_offset(p)
+    period = math.lcm(n, _PNL_EVERY_N_TICKS)
+    rounds = period * 3   # 跑足 3 个完整联合周期,不是拍脑袋定的轮数
 
     calls = {"n": 0}
     real_save = store.save_price_samples
@@ -1802,7 +1823,7 @@ def test_价格采样与名单盈亏永不同轮触发(db, monkeypatch):
     monkeypatch.setattr(store, "save_price_samples", counting)
 
     both_fired_together = False
-    for _ in range(80):   # 周期都是 20,跑 4 圈留足余量
+    for _ in range(rounds):
         before_price, before_lb = calls["n"], client.leaderboard_calls
         p.tick()
         fired_price = calls["n"] > before_price
@@ -1813,6 +1834,47 @@ def test_价格采样与名单盈亏永不同轮触发(db, monkeypatch):
     # 两条任务各自确实按周期触发过 —— 不是因为都没触发才"没撞上"
     assert calls["n"] > 0
     assert client.leaderboard_calls > 0
+
+
+def test_价格采样与活动流永不同轮触发(db, monkeypatch):
+    """
+    ⚠️ _poll_feed 的降频判断在 _tick_no 自增**之前**执行,价格采样排在自增
+       **之后**(与 _maybe_poll_pnl 同侧)—— 不像 feed/pnl 那样靠调用位置
+       天然错开一拍,这条关系必须单独验证,不能从"跟 PNL 没撞"就推断
+       "跟 feed 也没撞"(两边的判断时机不一样,不能类推)。
+       活动流是网络请求,价格采样是纯内存读 + 一次本地 executemany:
+       即使某个配置组合下两者真的同轮触发,代价也不是"两个网络请求排队
+       等待"那种量级,严格说不算不可接受;但当前默认配置下经过这条测试
+       验证,两者其实完全不会撞见 —— 好过放着一个本可以避免的风险不管。
+       周期数与循环圈数都从真实配置动态算,理由同上一条测试。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+    p = Poller(client, FakeNotifier())
+    n, _ = _n_and_offset(p)
+    period = math.lcm(n, _FEED_EVERY_N_TICKS)
+    rounds = period * 3
+
+    calls = {"n": 0}
+    real_save = store.save_price_samples
+
+    def counting(conn, rows):
+        calls["n"] += 1
+        return real_save(conn, rows)
+
+    monkeypatch.setattr(store, "save_price_samples", counting)
+
+    both_fired_together = False
+    for _ in range(rounds):
+        before_price, before_feed = calls["n"], client.feed_calls
+        p.tick()
+        fired_price = calls["n"] > before_price
+        fired_feed = client.feed_calls > before_feed
+        if fired_price and fired_feed:
+            both_fired_together = True
+    assert not both_fired_together, "价格采样与活动流在同一轮同时触发了"
+    assert calls["n"] > 0
+    assert client.feed_calls > 0
 
 
 def test_价格历史清理按远低于采样的频率触发(db, monkeypatch):

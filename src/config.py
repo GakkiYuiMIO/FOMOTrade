@@ -55,11 +55,18 @@ class FomoSettings(BaseSettings):
     # ---------- 轮询 ----------
     fomo_poll_interval_sec: int = Field(15, ge=5, description="轮询间隔(秒)")
     # ---------- 价格历史采集(供仪表盘画 sparkline) ----------
-    # 采样降频(轮数)。15s × 20 = 5 分钟一次:细到能看出 memecoin 的日内脉冲,
-    # 又不会让 token_price_history 涨得太快。做成配置项而不是硬编码常量,
-    # 是为了日后调宽/调窄采样密度时不用改代码 —— 参见 poller._maybe_sample_price_history。
+    # 采样降频(轮数)。15s × 60 = 15 分钟一次。
+    # ⚠️ 这个数字最初错定成了 5 分钟(20 轮),依据是"要看清日内插针"——
+    #    但那是拿全尺寸图表的精度在想问题。这份数据的第一用途是卡片上的
+    #    sparkline:一条约 120px 宽的迷你走势线,渲染时本来就要把点位降采样到
+    #    几十个,3 天窗口给 864 个点(5 分钟粒度)纯属浪费,画不出来的细节
+    #    只会白白吃磁盘。15 分钟粒度下 3 天是 288 个点,对 sparkline 绰绰有余;
+    #    日后如果真要支持"点开看全尺寸日内图"这种更细的场景,再单独加一档
+    #    更高频的采样,而不是把这个默认值继续往小调。
+    #    做成配置项而不是硬编码常量,是为了日后调整采样密度时不用改代码 ——
+    #    参见 poller._maybe_sample_price_history。
     fomo_price_history_sample_ticks: int = Field(
-        20, ge=1, description="价格历史采样间隔(轮数),默认 20 轮≈5 分钟"
+        60, ge=1, description="价格历史采样间隔(轮数),默认 60 轮≈15 分钟(按 sparkline 渲染精度定的)"
     )
     # 保留天数。这些是 memecoin:买卖判定本身只看 24 小时窗口,copytrade 的
     # max_age_hours 同样以 24 小时为界,3 天足够覆盖一个币"冒头→暴涨→归零"的
