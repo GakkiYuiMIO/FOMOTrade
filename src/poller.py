@@ -189,6 +189,14 @@ _FEED_EVERY_N_TICKS = 6
 #    tests/test_poller.py::test_名单盈亏与活动流永不同轮触发:谁把其中一次
 #    判断挪到自增的另一侧,这条回归测试会变红。
 _PNL_EVERY_N_TICKS = 20
+# 价格历史清理的降频。这是纯本地维护动作(无网络请求),但一次性删太多行会
+# 长时间占住写锁,所以也不能太频繁跑。约 4 小时一次:15s × 961 ≈ 4.0 小时。
+# ⚠️ 961 = 31² 特意选的,与 _FEED_EVERY_N_TICKS(6)、_PNL_EVERY_N_TICKS(20)
+#    都互质 —— 不会像下面的采样任务那样"每次都必然撞上",只会隔几天偶发重叠
+#    一次。没有像采样那样严防死守到"永不相撞",是因为这里权衡过成本:
+#    清理本身是分批小事务(见 store.prune_price_history),真正该严防的是
+#    "同一 tick 挤进两个网络请求"这种延迟叠加,清理不属于这一类。
+_PRICE_HISTORY_PRUNE_EVERY_N_TICKS = 961
 # 观点优先扫描的保留名额:**刚动过**的币优先扫。
 # ⚠️ 观点几乎总是发在刚买的币上 —— 实测用户 10:05 买入、10:05 发观点。
 #    不留这个名额的话,只能等轮转扫到(约 400 个币 / 每轮 12 个 ≈ 6 分钟),
@@ -669,6 +677,15 @@ class Poller:
                 self._maybe_poll_pnl(conn)
             except Exception as e:  # noqa: BLE001
                 logger.warning("名单盈亏采集失败(不影响推送): {}", e)
+
+            try:
+                self._maybe_sample_price_history(conn)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("价格历史采样失败(不影响推送): {}", e)
+            try:
+                self._maybe_prune_price_history(conn)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("价格历史清理失败(不影响推送): {}", e)
 
             # 记录本轮时间,供下次识别间断。放在最后:中途异常时不刷新,
             # 下一轮仍会认出这段间断,不会把积压当成正常增量逐条推出去
@@ -1818,6 +1835,74 @@ class Poller:
         if rows:
             store.save_user_pnl(conn, rows)
             logger.debug("名单盈亏已更新 {} 人", len(rows))
+
+    def _maybe_sample_price_history(self, conn) -> None:
+        """
+        按配置的降频把当轮 self._token_meta(名单当前持有的全部代币)采一行价格/市值,
+        供仪表盘画 sparkline。零额外 API 调用 —— 数据已经在 _build_token_index 里建好。
+
+        ⚠️ 判断刻意写成 `== n // 2` 而不是常见的 `== 0`,n 取自配置
+           (fomo_price_history_sample_ticks,默认 60 轮≈15 分钟)——
+           不是写死的数字,改配置不需要跟着改这里的比较逻辑:
+           1) vs _maybe_poll_pnl(固定周期 20):两者在 tick() 里都排在
+              _fetch_snapshots 把 _tick_no 自增**之后**检查,比的是同一个
+              _tick_no 值 —— 不像 _poll_feed 与 _maybe_poll_pnl 那样天然靠
+              调用时机差一拍错开。若也写成 `% n == 0`,只要 n 恰好等于
+              _PNL_EVERY_N_TICKS(比如这次改之前的默认值 20),会在**每一次**
+              该采样的轮次上都跟盈亏采集必然同时触发,不是偶尔撞上。
+           2) vs _poll_feed(固定周期 6,判断在自增**之前**执行):这次错开
+              半个周期是否也躲开了 feed,不能靠 gcd 直觉("n//2 能被 6 整除
+              就一定撞"是错的)——真正决定撞不撞的是"自增前 vs 自增后"这一拍
+              时差,必须代入两边的判断时机分别验证,详见下面两条回归测试的
+              docstring。
+           错开半个周期后,采样固定落在盈亏采集之后第 n//2 轮;只要 n>1,
+           当前默认值(60)下经过验证不会跟 PNL 或 feed 撞见,见
+           tests/test_poller.py::test_价格采样与名单盈亏永不同轮触发 和
+           test_价格采样与活动流永不同轮触发 —— 这两条测试都从
+           self.settings 读真实配置值,默认值再变也能验出新配置下撞不撞。
+           这个保证只覆盖"当前配置下经测试验证过",没有再往上做一层
+           "对任意 n 都数学上证明不会撞"的通用加固(比如启动时校验 n 与
+           6、20 的公约数关系并拒绝危险取值)——不做的原因见下一条:
+           真撞上的代价太小,不值得为了防一个便宜的意外去加运行时校验
+           或更复杂的相位算法。
+        ⚠️ 采样本身不打网络请求,与盈亏采集/活动流撞车的真实代价只是
+           "同一 tick 多做一次 executemany",量级上远小于网络请求的排队等待,
+           这里仍然选择错开纯粹是因为免费(改一个比较符号),不是因为
+           不错开会有明显的性能问题。换句话说:即使以后有人把
+           fomo_price_history_sample_ticks 调成某个恰好会撞车的值,
+           后果也只是在一个本来就受网络请求约束的 tick 上,额外多跑一次
+           纯本地的 executemany —— 跟"两个网络请求在同一个 tick 里排队等待"
+           完全不是一个量级,没必要为了这种低代价的偶发情况引入更强的保证。
+        """
+        n = self.settings.fomo_price_history_sample_ticks
+        if self._tick_no % n != n // 2:
+            return
+        ts = now_iso()
+        rows = [
+            (net, ca, ts, m.get("price_usd"), m.get("market_cap"))
+            for (net, ca), m in self._token_meta.items()
+        ]
+        if not rows:
+            return
+        with store.tx(conn):
+            store.save_price_samples(conn, rows)
+        logger.debug("价格历史已采样 {} 个代币", len(rows))
+
+    def _maybe_prune_price_history(self, conn) -> None:
+        """
+        价格历史清理,降频远低于采样(见 _PRICE_HISTORY_PRUNE_EVERY_N_TICKS)。
+
+        ⚠️ 独立降频、独立 try/except,不搭在采样那次调用里一起做:
+           清理可能要删几万行(分批执行,见 store.prune_price_history),
+           把它跟"每 5 分钟都要做"的采样绑在一起,会让采样这个高频动作偶尔
+           变慢且变得不可预测。清理出问题最多是保留窗口多留了几个小时的旧数据,
+           不影响采样,更不影响买卖推送。
+        """
+        if self._tick_no % _PRICE_HISTORY_PRUNE_EVERY_N_TICKS:
+            return
+        deleted = store.prune_price_history(conn, self.settings.fomo_price_history_retain_days)
+        if deleted:
+            logger.debug("价格历史清理完成,删除 {} 行", deleted)
 
     @staticmethod
     def _render_copy_summary(s: dict) -> str:

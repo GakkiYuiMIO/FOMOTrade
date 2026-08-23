@@ -1183,3 +1183,110 @@ def test_盈亏为None时不写成0(conn):
     store.save_user_pnl(conn, [
         {"user_id": "u1", "pnl_24h": None, "pnl_7d": None, "pnl_30d": None}])
     assert store.load_user_pnl(conn)[0]["pnl_24h"] is None
+
+
+# ============================================================
+# 【价格历史】(feat/price-history)
+# ============================================================
+def test_价格采样落库后能读到(conn):
+    store.save_price_samples(conn, [
+        ("solana", "ca1", "2026-08-23T00:00:00+00:00", 1.5, 1_000_000.0),
+    ])
+    rows = store.load_price_history(conn, "solana", "ca1", "2020-01-01T00:00:00+00:00")
+    assert len(rows) == 1
+    assert rows[0]["price_usd"] == pytest.approx(1.5)
+    assert rows[0]["market_cap"] == pytest.approx(1_000_000.0)
+
+
+def test_同一代币同一时刻重复采样不重复(conn):
+    """⚠️ 主键 (network_id, token_address, sampled_at) 保证幂等,不是靠调用方去重"""
+    ts = "2026-08-23T00:05:00+00:00"
+    store.save_price_samples(conn, [("solana", "ca1", ts, 1.0, 100.0)])
+    store.save_price_samples(conn, [("solana", "ca1", ts, 999.0, 999.0)])  # 同一时刻,数值不同也照样忽略
+    rows = store.load_price_history(conn, "solana", "ca1", "2020-01-01T00:00:00+00:00")
+    assert len(rows) == 1, "同一时刻重复采样必须被主键挡住,不能变成两行"
+    assert rows[0]["price_usd"] == pytest.approx(1.0), "先到者为准(INSERT OR IGNORE)"
+
+
+def test_价格与市值为None时存NULL不存0(conn):
+    """⚠️ 0 是真实价格/市值,None 是「这一刻没采到」—— formatter.py 头部同一条规矩"""
+    store.save_price_samples(conn, [
+        ("solana", "ca1", "2026-08-23T00:00:00+00:00", None, None),
+    ])
+    row = store.load_price_history(conn, "solana", "ca1", "2020-01-01T00:00:00+00:00")[0]
+    assert row["price_usd"] is None
+    assert row["market_cap"] is None
+
+
+def test_价格历史按时间升序且遵守since(conn):
+    store.save_price_samples(conn, [
+        ("solana", "ca1", "2026-08-23T00:10:00+00:00", 3.0, None),
+        ("solana", "ca1", "2026-08-23T00:00:00+00:00", 1.0, None),
+        ("solana", "ca1", "2026-08-23T00:05:00+00:00", 2.0, None),
+    ])
+    rows = store.load_price_history(conn, "solana", "ca1", "2026-08-23T00:01:00+00:00")
+    assert [r["price_usd"] for r in rows] == [2.0, 3.0], "升序且必须排除 since 之前的点"
+
+
+def test_价格历史只返回指定代币(conn):
+    store.save_price_samples(conn, [
+        ("solana", "ca1", "2026-08-23T00:00:00+00:00", 1.0, None),
+        ("solana", "ca2", "2026-08-23T00:00:00+00:00", 2.0, None),
+        ("base", "ca1", "2026-08-23T00:00:00+00:00", 3.0, None),
+    ])
+    rows = store.load_price_history(conn, "solana", "ca1", "2020-01-01T00:00:00+00:00")
+    assert len(rows) == 1 and rows[0]["price_usd"] == pytest.approx(1.0)
+
+
+def test_清理只删超过保留期的行并返回删除数(conn):
+    from src.models import iso_minutes_ago
+
+    store.save_price_samples(conn, [("solana", "old", "2020-01-01T00:00:00+00:00", 1.0, None)])
+    with store.tx(conn):
+        conn.execute(
+            "UPDATE token_price_history SET sampled_at = ? WHERE token_address = 'old'",
+            (iso_minutes_ago(60 * 24 * 10),),  # 10 天前,超出 3 天保留期
+        )
+    store.save_price_samples(conn, [("solana", "fresh", "2026-08-23T00:00:00+00:00", 1.0, None)])
+    with store.tx(conn):
+        conn.execute(
+            "UPDATE token_price_history SET sampled_at = ? WHERE token_address = 'fresh'",
+            (iso_minutes_ago(60),),  # 1 小时前,在保留期内
+        )
+
+    deleted = store.prune_price_history(conn, keep_days=3)
+    assert deleted == 1
+    left = {r["token_address"] for r in conn.execute("SELECT token_address FROM token_price_history")}
+    assert left == {"fresh"}
+
+
+def test_清理分批执行不会一次性超过批数上限(conn):
+    """
+    ⚠️ 稳态下这张表是百万行量级,单次 prune 调用必须有界 ——
+       用一个小批大小把上限逻辑压到能在单测里验证:命中批数上限时
+       应该只删掉 批大小×批数上限 行,剩下的留到下一次调用。
+    """
+    from src.models import iso_minutes_ago
+
+    monkey_batch, monkey_max = store._PRUNE_BATCH_SIZE, store._PRUNE_MAX_BATCHES
+    old_ts = iso_minutes_ago(60 * 24 * 10)
+    try:
+        store._PRUNE_BATCH_SIZE = 3
+        store._PRUNE_MAX_BATCHES = 2
+        rows = [("solana", f"ca{i}", f"2020-01-01T00:00:{i:02d}+00:00", 1.0, None)
+                for i in range(10)]
+        store.save_price_samples(conn, rows)
+        with store.tx(conn):
+            conn.execute("UPDATE token_price_history SET sampled_at = ?", (old_ts,))
+            # 让 sampled_at 各不相同,避免主键冲突;10 行全部过期
+            for i in range(10):
+                conn.execute(
+                    "UPDATE token_price_history SET sampled_at = ? WHERE token_address = ?",
+                    (iso_minutes_ago(60 * 24 * 10 + i), f"ca{i}"),
+                )
+        deleted = store.prune_price_history(conn, keep_days=3)
+        assert deleted == 6, "批大小 3 × 批数上限 2 = 6,不该一次删完 10 行"
+        remaining = conn.execute("SELECT COUNT(*) n FROM token_price_history").fetchone()["n"]
+        assert remaining == 4
+    finally:
+        store._PRUNE_BATCH_SIZE, store._PRUNE_MAX_BATCHES = monkey_batch, monkey_max

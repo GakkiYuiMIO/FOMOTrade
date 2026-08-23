@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # 测试函数名用中文(项目规范),与其余 tests/ 保持一致
 # ruff: noqa: N802
+import math
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ import pytest
 from src import store
 from src.client import NotSupportedError, UserGoneError, UserSnapshot
 from src.models import EVENT_BUY, now_iso
-from src.poller import _SEND_BURST, Poller
+from src.poller import _FEED_EVERY_N_TICKS, _PNL_EVERY_N_TICKS, _SEND_BURST, Poller
 from tests.conftest import CA_TOAD
 
 # ---- 时间锚点 ------------------------------------------------------------
@@ -1673,3 +1674,270 @@ def test_名单盈亏采集不支持时静默跳过(db):
     assert n == 1 and len(notifier.sent) == 1
     with store.get_conn() as c:
         assert store.load_user_pnl(c) == [], "没能力拉就该是没有数据,不是报错"
+
+
+# ============================================================
+# 价格历史采样(feat/price-history)
+# ⚠️ 只采 self._token_meta 里当前有的币(名单还持有的),零额外 API 调用;
+#    失败必须静默降级,绝不能让采样/清理的异常影响推送或买卖判定。
+# ============================================================
+def _bal(ca: str, *, price: float | None = 1.0, mcap: float | None = 1_000_000.0,
+        network: str = "solana") -> dict:
+    """一条形态完整的 balances 记录,含 marketCap —— _build_token_index 的市值只从这里来"""
+    return {
+        "balance": {"tokenAddress": ca, "tokenId": f"{ca}:1399811149"},
+        "tokenFilterResult": {"priceUSD": price, "marketCap": mcap,
+                              "token": {"networkId": network}},
+        "userToken": {"humanAmountRemaining": 100.0},
+    }
+
+
+_ANCIENT = "2020-01-01T00:00:00+00:00"
+
+
+def _n_and_offset(p: Poller) -> tuple[int, int]:
+    """真实配置里的采样周期与错峰偏移 —— 全部测试都从这里取,不写死具体数字。"""
+    n = p.settings.fomo_price_history_sample_ticks
+    return n, n // 2
+
+
+def test_价格采样只在降频轮触发(db):
+    """
+    不写死"20 轮"这个曾经的默认值 —— 直接从 p.settings 读真实配置算出该在第几次
+    tick() 调用触发,配置的默认值以后再改,这条测试也不需要跟着改数字。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+    p = Poller(client, FakeNotifier())
+    n, offset = _n_and_offset(p)
+    for _ in range(offset - 1):
+        p.tick()
+    with store.get_conn() as c:
+        assert store.load_price_history(c, "solana", CA_TOAD, _ANCIENT) == [], \
+            f"前 {offset - 1} 轮都不该落库"
+    p.tick()   # 第 offset 次调用,_tick_no 自增到 offset,offset % n == offset,该轮必采
+    with store.get_conn() as c:
+        rows = store.load_price_history(c, "solana", CA_TOAD, _ANCIENT)
+    assert len(rows) == 1
+    assert rows[0]["price_usd"] == pytest.approx(1.0)
+    assert rows[0]["market_cap"] == pytest.approx(1_000_000.0)
+
+
+def test_只采token_meta里出现的代币(db):
+    """
+    ⚠️ 采样源头就是 self._token_meta.items(),不是另起一套"名单持仓"的判定 ——
+       这条测试把"落库的键集合 == _token_meta 的键集合"钉死,而不只是验证
+       某一个币被采到(那样即使多采了别的币也测不出来)。
+    """
+    _add_ready("uA", "alice")
+    _add_ready("uB", "bob")
+    ca2 = "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvbugz"
+    client = FakeClient({
+        "uA": _snap("uA", balances=[_bal(CA_TOAD, price=1.0, mcap=1_000_000.0)]),
+        "uB": _snap("uB", balances=[_bal(ca2, price=2.0, mcap=2_000_000.0)]),
+    })
+    p = Poller(client, FakeNotifier())
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1
+    p.tick()
+    assert set(p._token_meta) == {("solana", CA_TOAD), ("solana", ca2)}
+    with store.get_conn() as c:
+        toad = store.load_price_history(c, "solana", CA_TOAD, _ANCIENT)
+        other = store.load_price_history(c, "solana", ca2, _ANCIENT)
+        untouched = store.load_price_history(c, "solana", "从未出现过的代币", _ANCIENT)
+    assert len(toad) == 1 and toad[0]["price_usd"] == pytest.approx(1.0)
+    assert len(other) == 1 and other[0]["price_usd"] == pytest.approx(2.0)
+    assert untouched == []
+
+
+def test_采样时市值缺失存NULL不存0(db):
+    """⚠️ 0 是真实市值,None 是「这一刻没拿到」—— formatter.py 头部同一条规矩"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD, price=1.0, mcap=None)])})
+    p = Poller(client, FakeNotifier())
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1
+    p.tick()
+    with store.get_conn() as c:
+        row = store.load_price_history(c, "solana", CA_TOAD, _ANCIENT)[0]
+    assert row["market_cap"] is None
+    assert row["price_usd"] == pytest.approx(1.0)
+
+
+def test_价格采样失败不影响买卖推送(db, monkeypatch):
+    """
+    复刻名单盈亏那条测试踩过的坑:新建的 Poller._tick_no 从 0 起步,tick() 里
+    _fetch_snapshots 先自增到 1 才轮到采样门槛检查,而门槛是
+    `_tick_no % n == n // 2`,第一轮根本不满足 —— 必须手动把 _tick_no 拨到
+    `offset - 1`(offset 从真实配置算出,不写死),让本轮自增后正好命中。
+    只 mock 掉 client 端没用(采样不打网络请求),这里改成 mock store 层函数,
+    并用调用计数器断言它真的被触发过,不然这条测试就是在测一个从未发生的失败。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", swaps=[_swap("s1")], balances=[_bal(CA_TOAD)])})
+    notifier = FakeNotifier()
+    p = Poller(client, notifier)
+    _, offset = _n_and_offset(p)
+    p._tick_no = offset - 1   # 本轮 _fetch_snapshots 自增后命中 offset,该轮必采
+
+    calls = {"n": 0}
+
+    def boom(conn, rows):
+        calls["n"] += 1
+        raise RuntimeError("price history boom")
+
+    monkeypatch.setattr(store, "save_price_samples", boom)
+    n = p.tick()
+    assert calls["n"] == 1, "没真的调到采样,这条测试就是假的"
+    assert n == 1 and len(notifier.sent) == 1, "价格采样失败绝不能挡住买卖推送"
+
+
+def test_价格采样与名单盈亏永不同轮触发(db, monkeypatch):
+    """
+    ⚠️ 采样周期(fomo_price_history_sample_ticks,默认 60)与 _maybe_poll_pnl 的
+       _PNL_EVERY_N_TICKS(=20)在改这条测试之前**曾经**恰好相等(都是 20),
+       现在不再相等,但这条回归测试依然有意义:只要两个周期存在公约数,
+       "同一 tick 触发"就不能只凭直觉排除,必须真的跑够 lcm(n, 20) 轮验证。
+       _maybe_sample_price_history 用 `== n // 2` 而不是 `== 0` 来错峰:
+       谁把这个比较符号改回 `== 0`,只要 n 恰好等于 20(比如以后又调回旧默认值),
+       两个任务会在**每一次**该采样的轮次上都撞在一起,这里会变红。
+       ⚠️ 周期数 n 从 p.settings 读真实配置,循环圈数按 lcm(n, 20) 动态算 ——
+          默认值以后再改,这条测试也依然覆盖得到完整的联合周期,不会因为
+          写死的圈数不够而"意外通过"。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])},
+                        leaderboard=[_pnl_row("uA")])
+    p = Poller(client, FakeNotifier())
+    n, _ = _n_and_offset(p)
+    period = math.lcm(n, _PNL_EVERY_N_TICKS)
+    rounds = period * 3   # 跑足 3 个完整联合周期,不是拍脑袋定的轮数
+
+    calls = {"n": 0}
+    real_save = store.save_price_samples
+
+    def counting(conn, rows):
+        calls["n"] += 1
+        return real_save(conn, rows)
+
+    monkeypatch.setattr(store, "save_price_samples", counting)
+
+    both_fired_together = False
+    for _ in range(rounds):
+        before_price, before_lb = calls["n"], client.leaderboard_calls
+        p.tick()
+        fired_price = calls["n"] > before_price
+        fired_lb = client.leaderboard_calls > before_lb
+        if fired_price and fired_lb:
+            both_fired_together = True
+    assert not both_fired_together, "价格采样与名单盈亏采集在同一轮同时触发了"
+    # 两条任务各自确实按周期触发过 —— 不是因为都没触发才"没撞上"
+    assert calls["n"] > 0
+    assert client.leaderboard_calls > 0
+
+
+def test_价格采样与活动流永不同轮触发(db, monkeypatch):
+    """
+    ⚠️ _poll_feed 的降频判断在 _tick_no 自增**之前**执行,价格采样排在自增
+       **之后**(与 _maybe_poll_pnl 同侧)—— 不像 feed/pnl 那样靠调用位置
+       天然错开一拍,这条关系必须单独验证,不能从"跟 PNL 没撞"就推断
+       "跟 feed 也没撞"(两边的判断时机不一样,不能类推)。
+       活动流是网络请求,价格采样是纯内存读 + 一次本地 executemany:
+       即使某个配置组合下两者真的同轮触发,代价也不是"两个网络请求排队
+       等待"那种量级,严格说不算不可接受;但当前默认配置下经过这条测试
+       验证,两者其实完全不会撞见 —— 好过放着一个本可以避免的风险不管。
+       周期数与循环圈数都从真实配置动态算,理由同上一条测试。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+    p = Poller(client, FakeNotifier())
+    n, _ = _n_and_offset(p)
+    period = math.lcm(n, _FEED_EVERY_N_TICKS)
+    rounds = period * 3
+
+    calls = {"n": 0}
+    real_save = store.save_price_samples
+
+    def counting(conn, rows):
+        calls["n"] += 1
+        return real_save(conn, rows)
+
+    monkeypatch.setattr(store, "save_price_samples", counting)
+
+    both_fired_together = False
+    for _ in range(rounds):
+        before_price, before_feed = calls["n"], client.feed_calls
+        p.tick()
+        fired_price = calls["n"] > before_price
+        fired_feed = client.feed_calls > before_feed
+        if fired_price and fired_feed:
+            both_fired_together = True
+    assert not both_fired_together, "价格采样与活动流在同一轮同时触发了"
+    assert calls["n"] > 0
+    assert client.feed_calls > 0
+
+
+def test_价格历史清理按远低于采样的频率触发(db, monkeypatch):
+    """清理不该每次采样都顺带做一遍 —— 独立降频、独立 try/except"""
+    from src import poller as pmod
+
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+    p = Poller(client, FakeNotifier())
+
+    calls = {"n": 0}
+    real_prune = store.prune_price_history
+
+    def counting(conn, keep_days):
+        calls["n"] += 1
+        return real_prune(conn, keep_days)
+
+    monkeypatch.setattr(store, "prune_price_history", counting)
+    monkey = pmod._PRICE_HISTORY_PRUNE_EVERY_N_TICKS
+    try:
+        pmod._PRICE_HISTORY_PRUNE_EVERY_N_TICKS = 3
+        for _ in range(2):
+            p.tick()
+        assert calls["n"] == 0, "还没到第 3 轮,不该触发清理"
+        p.tick()
+        assert calls["n"] == 1, "第 3 轮该触发一次清理"
+    finally:
+        pmod._PRICE_HISTORY_PRUNE_EVERY_N_TICKS = monkey
+
+
+def test_清理按配置的保留天数生效不写死(db, monkeypatch):
+    """
+    ⚠️ 与采样那侧的 _n_and_offset(p) 呼应,守住对称的一个漏洞:
+       _maybe_prune_price_history 把 self.settings.fomo_price_history_retain_days
+       传给 store.prune_price_history,但此前没有任何测试验证过这个"传"字 ——
+       如果谁把那一行悄悄改成 store.prune_price_history(conn, 999)(或者随便
+       写死哪个数字),之前的清理测试全部照样绿(它们只关心"清理被调用过"
+       和"清理本身按 keep_days 删对了行",从不关心 keep_days 是不是配置值)。
+       这里把保留天数改成非默认的 1 天,插入横跨这条边界的样本,
+       断言清理效果确实跟着配置值走,而不是跟着代码里某个写死的数字走。
+    """
+    from src.config import get_settings
+    from src.models import iso_minutes_ago
+
+    monkeypatch.setenv("FOMO_PRICE_HISTORY_RETAIN_DAYS", "1")
+    get_settings.cache_clear()
+    try:
+        _add_ready("uA", "alice")
+        client = FakeClient({"uA": _snap("uA", balances=[_bal(CA_TOAD)])})
+        p = Poller(client, FakeNotifier())
+        assert p.settings.fomo_price_history_retain_days == 1, "配置没吃到,测试前提不成立"
+
+        with store.get_conn() as c:
+            store.save_price_samples(c, [
+                ("solana", "old", iso_minutes_ago(60 * 36), 1.0, None),    # 36 小时前:超过 1 天保留期
+                ("solana", "fresh", iso_minutes_ago(60 * 12), 1.0, None),  # 12 小时前:在保留期内
+            ])
+            p._maybe_prune_price_history(c)   # 新建 Poller._tick_no == 0,0 % N == 0,必触发
+            left = {r["token_address"] for r in
+                    c.execute("SELECT token_address FROM token_price_history")}
+        assert left == {"fresh"}, (
+            "保留天数=1 时,36 小时前的样本该被清掉、12 小时前的该留住;"
+            "如果这里失败,大概率是 keep_days 没有真的从配置传下去"
+        )
+    finally:
+        get_settings.cache_clear()
