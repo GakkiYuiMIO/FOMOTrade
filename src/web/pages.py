@@ -313,7 +313,7 @@ def _signal_card(d: dict) -> str:
         + (f'<div class=scard-row><span class=dim>{esc(mc_range)}</span></div>' if mc_range else "")
         + (f'<div class=scard-mult>{mult(d.get("multiple"))}</div>' if d.get("multiple") is not None else "")
         + ath_bar(d.get("now_mcap"), d.get("peak_mcap"))
-        + sparkline(d.get("price_points") or [])
+        + sparkline(d["price_points"])
         + (f'<div class="dim scard-stale">{esc(stale)}</div>' if stale else "")
         + '</div>'
     )

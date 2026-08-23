@@ -315,6 +315,34 @@ def test_信号流买家数阈值真的会过滤(conn):
     assert everyone == {"solo", "duo"}, "门槛放到 1 之后两个都该在"
 
 
+def test_信号流稳定币互换不计入买家数(conn):
+    """
+    ⚠️ 与 count_recent_buyers / hot_tokens / follow_value 同一套谓词:
+       COALESCE(badge_reason,'') IN COUNTABLE_REASONS 必须守住 —— 否则稳定币
+       互换(USDC/WSOL 等,badge_reason=quote_token)会被算成「有人买了这个币」,
+       把「N 人买入」这个卡片的立身之本做虚高。
+
+       这条过滤器在本项目已经出过一次事:网页版 Task 2 时实现者因为测试全挂
+       就把它删掉,后来实测发现删掉会让 254 条稳定币互换污染共识数、把所有人
+       的中位数往 1.0x 拽。它在 signal_feed 里是新写的一份(WHERE 子句本身),
+       不能指望 follow_value / hot_tokens 那两条同名测试替它兜底 —— 补一条
+       专门守住 signal_feed 自己的这一行。
+    """
+    from src.models import REASON_QUOTE_TOKEN
+
+    _ready(conn, "u1", "alice")
+    _ready(conn, "u2", "bob")
+    _buy(conn, "u1", "alice", "ca1", _ago(60), 100_000)                          # 正常买入
+    _buy(conn, "u2", "bob", "ca1", _ago(55), 100_000, reason=REASON_QUOTE_TOKEN)  # 稳定币互换
+
+    rows = queries.signal_feed(conn, min_buyers=1)
+    assert len(rows) == 1
+    assert rows[0]["buyers"] == 1, "稳定币互换的那个人不能被算进买家数"
+
+    # 更有价值的断言:直接对应用户会看到的行为 —— 过不了 ≥2 人的默认门槛
+    assert queries.signal_feed(conn, min_buyers=2) == []
+
+
 def test_信号流入场市值取窗口内最早一笔而不是快照(conn):
     """
     ⚠️ 铁律:entry 绝不能用 token_snapshot 回填 —— 那是「现在」的市值,
