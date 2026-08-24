@@ -19,6 +19,7 @@ Telegram 命令层 —— getUpdates 长轮询 + 命令分发(设计文档 §3.4
 from __future__ import annotations
 
 import html
+import re
 import threading
 import time
 from dataclasses import replace
@@ -31,6 +32,10 @@ from src.config import PROBE_DIR, get_settings
 from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
 from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
+
+# _f/_pick_str 是 poller 已经踩过坑写好的"字段可能缺、可能嵌套、可能是脏字符串"
+# 兜底解析器。/ca 解析的是同一个 API(client.get_token_thesis),没道理另起一套。
+from src.poller import _f, _pick_str
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
 POLL_TIMEOUT_SEC = 30
@@ -73,6 +78,7 @@ _COMMAND_MENU = [
     ("list", "查看监控名单与基线状态"),
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
+    ("ca", "查合约地址:/ca <地址> [链] — FOMO 用户怎么看这个币"),
     ("copy", "跟单参数:/copy 查看 · /copy <项> <值> 修改"),
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
@@ -113,6 +119,7 @@ _HELP = (
     "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
     "/status — 运行状态\n"
     "/who &lt;CA&gt; [链] — 名单里谁买过这个币\n"
+    "/ca &lt;地址&gt; [链] — 查这个合约地址:观点 + 名单买没买过\n"
     "/rebuild — 重建全部历史基线(回填逻辑改动后用)\n"
     "/help — 本说明"
 )
@@ -236,6 +243,38 @@ def _num(v) -> float:
 def _day_str(iso: str | None) -> str:
     """ISO 时间取日期部分;缺失显示"时间未知"(绝不显示 None / N/A)"""
     return (iso or "")[:10] or "时间未知"
+
+
+# ============================================================
+# /ca <合约地址> —— 查这个币:观点(全站,任何地址都能查)+ 名单本地记录
+# ============================================================
+# 从 API 拉多少条观点。拉够了才能在本地按持仓额可靠地重新排序(接口本身不按这个排)
+CA_THESIS_FETCH_LIMIT = 30
+# 消息里最多展示这么多条(TG 4096 字符硬上限,一条观点还可能带一段长文)
+MAX_CA_THESIS_ROWS = 8
+# 单条观点摘要最多这么多字符 —— 不截断的话一条长文/刷屏换行就能撑爆整条消息的排版
+CA_THESIS_SNIPPET_CHARS = 140
+# 名单区最多展开几个买家
+MAX_CA_LOCAL_BUYERS = 10
+# 本地"名单买没买过"要看全部历史,不设时间窗(3650 天 ≈ 本库不可能积累到的年限)
+CA_LOCAL_LOOKBACK_DAYS = 3650
+# 地址是 0x 开头、本地又没见过时,按这个顺序试链,首个有观点的即停手。
+# ⚠️ 实测证实(同一地址分别喂 nid=56/8453/1/999):猜错链只会拿到空列表 [],
+#    绝不会拿到别的币的数据(服务端按 tokenAddress+networkId 精确过滤,不做模糊匹配)——
+#    所以"按顺序试、命中就停"这个策略是安全的,不存在"静默显示错链数据"的风险。
+#    本地已经认识这个地址时完全不走这条路(见 _cmd_ca),这里只覆盖真正陌生的地址。
+CA_EVM_GUESS_ORDER = ("bsc", "base", "ethereum", "monad", "hyperliquid", "robinhood")
+# ⚠️ 实测(2026-08-24,真实 API):/feed/token/thesis 的 networkId 参数要的是 FOMO 原生的
+#    **数字链 ID**(56 = BSC),不是我们本地聚合用的归一化别名 —— 直接传 "bsc" 会 400:
+#    `{"message":"Invalid input: query.networkId - Expected number, received nan"}`。
+#    这张表是 models._NETWORK_ALIASES 里已经反查出来的原生值,这里只是反过来:
+#    归一化值 → 调 get_token_thesis 时真正要传的那个数字 ID。未收录的值原样透传
+#    (与 normalize_network 对未知链的兜底策略一致,不吞掉、让服务端的报错说话)。
+_NETWORK_RAW_ID = {
+    "solana": "1399811149", "base": "8453", "bsc": "56", "ethereum": "1",
+    "monad": "143", "robinhood": "4663", "hyperliquid": "1337",
+}
+_CA_WS_RUN = re.compile(r"\s+")
 
 
 class CommandBot:
@@ -477,6 +516,8 @@ class CommandBot:
             return self._cmd_status()
         if cmd == "/who":
             return self._cmd_who(arg)
+        if cmd == "/ca":
+            return self._cmd_ca(arg)
         return f"❓ 未知命令 {_esc(cmd)},发 /help 看用法"
 
     # ============================================================
@@ -1104,3 +1145,273 @@ class CommandBot:
             return f"🔎 名单里没人买过这个币(或该币不在任何人的基线内)\n<code>{_esc(ca)}</code>"
         # CA 独占最后一行且整行是 <code>:点击即复制,不依赖网络(设计文档 §10.3)
         return "\n".join(blocks) + f"\n<code>{_esc(ca)}</code>"
+
+    # ============================================================
+    # /ca <合约地址>
+    # ============================================================
+    def _cmd_ca(self, arg: str) -> str:
+        """
+        /ca <合约地址> [链] —— 粘一个合约地址上来,看全站 FOMO 用户怎么看 + 名单有没有人碰过。
+
+        两段互相独立、互不依赖:
+          观点区 —— 实时查 client.get_token_thesis,**任何地址都能查**,不要求本地认识
+                    这个币(这是本命令存在的意义:场景是刚在 Twitter 上看到一个陌生 CA)。
+          本地名单区 —— 查本地库,只覆盖名单里的人买过/持有过的币。多数地址查不到,
+                    这是正常情况不是 bug,必须显式说"无人持有"而不是留空当没这回事。
+
+        ⚠️ 链解析(按优先级,命中一条就不再往下猜):
+           1) 用户给了第二个参数 —— 完全按他说的,不再猜。
+           2) 没给,但本地库已经见过这个地址(user_token_stats / token_snapshot 有它)
+              —— 链直接从本地拿,**不发一个探测请求**,这是最常见的省请求路径
+              (实测:名单碰过的币占比不到 1/3,但只要碰过就不用猜)。
+           3) 都没有 —— 0x 开头按 CA_EVM_GUESS_ORDER 依次试(实测证实猜错链只会拿到
+              空列表、不会拿到别的币的数据,见该常量的注释),命中就停手;
+              非 0x(base58)只有 Solana 一条链,直接查、不用猜。
+           最坏情况(全新地址、猜到最后一条才中,或者哪条都不中)是
+           len(CA_EVM_GUESS_ORDER) = 6 次请求,单条命令用不了更多。
+        """
+        parts = (arg or "").split()
+        if not parts:
+            return "用法: /ca &lt;合约地址&gt; [链]  例: /ca 0xfc6e...5777 bsc"
+        ca = normalize_token_address(parts[0])
+        if not ca:
+            return "⚠️ 请给出代币合约地址"
+        forced_net = normalize_network(parts[1]) if len(parts) > 1 else None
+
+        local_nets, local_symbol, local_lines = self._ca_local(ca)
+
+        if forced_net:
+            candidates = [forced_net]
+        elif local_nets:
+            candidates = local_nets                 # 本地已经见过,链是确定的,不猜
+        elif ca.startswith("0x"):
+            candidates = list(CA_EVM_GUESS_ORDER)
+        else:
+            candidates = ["solana"]
+
+        items: list[dict] = []
+        used_net: str | None = None
+        tried: list[str] = []
+        for net in candidates:
+            tried.append(net)
+            try:
+                # get_token_thesis 的 networkId 要原生数字 ID,不是本地归一化别名,见
+                # _NETWORK_RAW_ID 的注释(实测踩过:传 "bsc" 直接 400)
+                raw_net = _NETWORK_RAW_ID.get(net, net)
+                got = self._client.get_token_thesis(ca, raw_net, limit=CA_THESIS_FETCH_LIMIT)
+            except Exception as e:  # noqa: BLE001
+                return self._ca_error(ca, e)
+            items = [it for it in (got or []) if isinstance(it, dict)]
+            if items:
+                used_net = net
+                break
+
+        # 全都没查到 + 本地也不认识:说不清是"没这个币"还是"猜错了链",
+        # 措辞必须把这份不确定性带出来,不能断言任何一边(见常量注释里的实测)
+        if not items and not local_nets:
+            if forced_net:
+                return (f"🔎 <code>{_esc(ca)}</code> · {_esc(_chain_name(forced_net))}\n"
+                        f"这条链上没查到观点,本地也没有记录 —— 可能是新币,也可能还没人发观点")
+            return (f"🔎 <code>{_esc(ca)}</code>\n"
+                    f"{_esc('/'.join(tried))} 都没查到观点,本地也没有记录\n"
+                    f"可能是全新的币、还没人发观点,也可能是猜错了链 —— "
+                    f"可指定:/ca &lt;地址&gt; &lt;链&gt;")
+
+        if items:
+            # 头部用观点接口**回读到的真实值**,不用自己请求时传的猜测 ——
+            # 猜对了两者一致,万一哪天服务端不再是"错链必空"这套行为,头部也不会跟着猜错
+            first = items[0]
+            sym = (_pick_str(first, "ticker") or "?").lstrip("$")
+            chain_id = normalize_network(_pick_str(first, "networkId")) or used_net
+        else:
+            sym = (local_symbol or "?").lstrip("$")
+            chain_id = forced_net or (local_nets[0] if local_nets else None)
+        lines = [f"<b>${_esc(sym)}</b> · {_esc(_chain_name(chain_id))}"]
+
+        if items:
+            rows = sorted(items, key=lambda it: _num(_ca_pos_usd(it)), reverse=True)
+            author_ids = {_pick_str(it, "userId") or _pick_str(it, "userHandle") for it in rows}
+            author_ids.discard(None)
+            lines.append(f"📋 {len(rows)} 条观点 · {len(author_ids)} 位作者")
+            shown = rows[:MAX_CA_THESIS_ROWS]
+            for it in shown:
+                lines.extend(_ca_thesis_row(it))
+            omitted = len(rows) - len(shown)
+            if omitted:
+                lines.append(f"…按持仓额排序,还有 {omitted} 条未显示")
+        else:
+            lines.append(f"💭 没查到观点(已试 {_esc('/'.join(tried))})")
+
+        lines.append("")
+        lines.extend(local_lines)
+        lines.append(f"<code>{_esc(ca)}</code>")
+        return "\n".join(lines)
+
+    def _ca_local(self, ca: str) -> tuple[list[str], str | None, list[str]]:
+        """
+        本地名单区。返回 (地址在本地出现过的链, 顺手捞到的一个 symbol, 渲染好的展示行)。
+
+        前两项同时供 _cmd_ca 做链解析用 —— 本地已经认识的地址不用再去猜链、
+        也不用再多发一个探测请求(见 _cmd_ca 的链解析说明)。
+
+        ⚠️ store.py 是冻结契约,没有"按地址反查链"的函数,与 _cmd_who 同样的处理:
+           这是条只读 SELECT、不含任何判定逻辑,就地写比动冻结文件代价小。
+        """
+        since = _iso_days_ago(CA_LOCAL_LOOKBACK_DAYS)
+        with store.get_conn() as conn:
+            # ⚠️ 用 fomo_events 而不是 user_token_stats:后者只是前者按"算数的买入"
+            #    聚合出来的派生表,任何一行 user_token_stats 必然对应一行 fomo_events,
+            #    反过来不成立(SELL、非计数原因的 BUY 只落 fomo_events)。
+            #    这里要的是"本地是否见过这个地址"这个更宽的信号,token_snapshot
+            #    再补上"持有但没见过买入事件"(比如转入)的那一小撮。
+            local_nets = [
+                r["network_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT network_id FROM fomo_events WHERE token_address = ? "
+                    "UNION SELECT DISTINCT network_id FROM token_snapshot WHERE token_address = ?",
+                    (ca, ca),
+                ).fetchall()
+                if r["network_id"]
+            ]
+
+            symbol = None
+            srow = conn.execute(
+                "SELECT token_symbol FROM fomo_events "
+                "WHERE token_address = ? AND token_symbol IS NOT NULL LIMIT 1",
+                (ca,),
+            ).fetchone()
+            if srow:
+                symbol = srow["token_symbol"]
+
+            blocks: list[str] = []
+            for net in local_nets:
+                buyers = store.token_buyers(conn, net, ca, since, limit=MAX_CA_LOCAL_BUYERS)
+                snap = conn.execute(
+                    "SELECT market_cap, max_market_cap FROM token_snapshot "
+                    "WHERE network_id = ? AND token_address = ?",
+                    (net, ca),
+                ).fetchone()
+                if not buyers and snap is None:
+                    continue
+
+                head = f"👥 你的名单 · {_esc(_chain_name(net))}"
+                if buyers:
+                    head += f":{len(buyers)} 人买过"
+                blocks.append(head)
+
+                now_mc = _f(snap["market_cap"]) if snap else None
+                peak_mc = _f(snap["max_market_cap"]) if snap else None
+                if now_mc is not None:
+                    seg = [f"💎 现在市值 {_money(now_mc)}"]
+                    # 明显回落过才提峰值,与 /hot 同一个取舍(见 _PEAK_MIN_RATIO 的注释)
+                    if peak_mc is not None and peak_mc > now_mc * _PEAK_MIN_RATIO:
+                        seg.append(f"峰值 {_money(peak_mc)}")
+                    blocks.append("   " + " · ".join(seg))
+
+                # 谁先买的排前面(token_buyers 本身就按首买时间正序返回)
+                for b in buyers:
+                    row = [f"@{_esc(b['who'] or '?')}"]
+                    entry_mc = _f(b["mcap"])
+                    if entry_mc is not None:
+                        row.append(f"💎{_money(entry_mc)} 进场")
+                        # 每个买家自己的进场市值不同,倍数必须逐人算,不能借用 peak/now 一概而论
+                        if now_mc is not None and entry_mc > 0:
+                            row.append(f"现 {now_mc / entry_mc:.1f}x")
+                    usd = _f(b["usd"])
+                    if usd is not None:              # 0 = 这几笔没解析出金额,不是没买
+                        row.append(_money(usd) + (f"({b['buys']} 笔)" if b["buys"] > 1 else ""))
+                    blocks.append("   " + " · ".join(row))
+
+        if not blocks:
+            blocks = ["👥 你的名单:无人持有"]
+        return local_nets, symbol, blocks
+
+    def _ca_error(self, ca: str, e: Exception) -> str:
+        """
+        把 client 层异常翻成人话。与 _resolve_error 同构,但这里查的是合约地址不是用户
+        handle ——"找不到用户 @xxx" 这种措辞对地址没有意义,所以单独写一份而不是改
+        影响 /add /following /top 的那个公用函数。
+        """
+        from src.auth import AuthError
+        from src.client import FomoAPIError
+
+        if isinstance(e, AuthError):
+            logger.warning("get_token_thesis 鉴权失败 | {}", e)
+            return "❌ 登录态失效,请到服务器执行 <code>.\\bot.ps1 --login</code> 重新登录"
+
+        status = getattr(e, "status", None) or getattr(e, "status_code", None)
+        text = str(e)
+        if status in (401, 403) or "401" in text or "403" in text:
+            return (
+                "❌ FOMO 接口拒绝访问(登录态失效,或 Cloudflare 拦截)\n"
+                "先试 <code>.\\bot.ps1 --login</code>;仍不行则把 FOMO_CLIENT_IMPL 改成 playwright"
+            )
+        if isinstance(e, FomoAPIError):
+            logger.warning("get_token_thesis 失败 | {} | {}", ca[:16], e)
+            return f"❌ FOMO 接口异常: {_esc(text[:150])}"
+        logger.exception("get_token_thesis 未知异常 | {}", ca[:16])
+        return f"❌ 查询失败: {_esc(text[:150])}"
+
+
+# ============================================================
+# /ca 辅助渲染(纯函数,不碰网络 / DB)
+# ============================================================
+def _ca_pos_usd(it: dict) -> float | None:
+    """这条观点作者的持仓额(authorTrade.usdValue)。排序键用,取不到就是 None"""
+    trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
+    return _f(trade.get("usdValue"))
+
+
+def _ca_thesis_text(raw: dict) -> str:
+    """
+    观点正文 → 单行摘要,已转义。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义":反过来的话会在截断点切断一个 `&amp;`
+       之类的实体,残缺实体照样让整条消息 400(formatter._thesis_line 早踩过这个坑)。
+    ⚠️ 实测顶层 comment 就是正文字符串本身;poller.py 另一路(活动流)记录过
+       {"comment": {"comment": "正文", ...}} 这种嵌套形状,两种都认,不猜死一种。
+    """
+    text = _pick_str(raw, "comment")
+    if not text:
+        c = raw.get("comment") if isinstance(raw, dict) else None
+        if isinstance(c, dict):
+            text = _pick_str(c, "comment", "text", "content", "body")
+    if not text:
+        return ""
+    flat = _CA_WS_RUN.sub(" ", text).strip()
+    if not flat:
+        return ""
+    if len(flat) > CA_THESIS_SNIPPET_CHARS:
+        flat = flat[:CA_THESIS_SNIPPET_CHARS].rstrip() + "…"
+    return _esc(flat)
+
+
+def _signed_money(v: float) -> str:
+    """带正负号的金额,用于盈亏 —— 正值也要显式带 '+' 才看得出是在赚钱(_money 只标负号)"""
+    s = _money(v)
+    return s if s.startswith("-") else f"+{s}"
+
+
+def _ca_thesis_row(it: dict) -> list[str]:
+    """一条观点渲染成 1~2 行:@作者 · 持仓 · 未实现盈亏(百分比);下面跟正文摘要"""
+    trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
+    handle = _pick_str(it, "userHandle") or _pick_str(it, "displayName") or "?"
+    seg = [f"@{_esc(handle)}"]
+
+    pos = _f(trade.get("usdValue"))
+    if pos is not None:                      # 0 是「已清仓」的真实值,必须照常显示,不能省
+        seg.append(_money(pos))
+
+    pnl = _f(trade.get("unrealizedPnlUsd"))
+    if pnl is not None:
+        piece = _signed_money(pnl)
+        pct = _f(trade.get("percentageUnrealizedPnl"))
+        if pct is not None:
+            piece += f" ({pct:+.1f}%)"
+        seg.append(piece)
+
+    lines = [" · ".join(seg)]
+    text = _ca_thesis_text(it)
+    if text:
+        lines.append(f"  {text}")
+    return lines
