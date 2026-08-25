@@ -259,11 +259,12 @@ def test_盈亏恰好为0仍显示0点00(monkeypatch, tmp_path):
 # ============================================================
 # 排序与展示上限
 # ============================================================
-def test_按持仓额从大到小排序(monkeypatch, tmp_path):
+def test_按投入本金从大到小排序(monkeypatch, tmp_path):
+    """浮盈为 0 时本金 == 持仓额,这条只钉"大的在前"这个方向"""
     items = [
-        _item(handle="low", usd=10.0),
-        _item(handle="high", usd=500.0),
-        _item(handle="mid", usd=100.0),
+        _item(handle="low", usd=10.0, pnl=0.0, pct=0.0),
+        _item(handle="high", usd=500.0, pnl=0.0, pct=0.0),
+        _item(handle="mid", usd=100.0, pnl=0.0, pct=0.0),
     ]
     client = _FakeClient({"56": items})
     b, _ = _bot(monkeypatch, tmp_path, client)
@@ -271,7 +272,83 @@ def test_按持仓额从大到小排序(monkeypatch, tmp_path):
     out = b._cmd_ca(f"{CA_BSC} bsc")
 
     assert out.index("@high") < out.index("@mid") < out.index("@low"), \
-        f"持仓额应从大到小排(500 > 100 > 10):\n{out}"
+        f"本金应从大到小排(500 > 100 > 10):\n{out}"
+
+
+def test_清仓者按本金排序而不是按卖完之后剩下的0(monkeypatch, tmp_path):
+    """
+    usdValue 对已清仓的人**恒等于 0** —— 那是他卖完之后的剩余,不是他的仓位规模。
+    拿剩余当规模排序等于把所有清仓者钉死在队尾:真实抓包 100 条按 usdValue 排,
+    6 个清仓者整整齐齐落在 #95–#100,而展示上限只有 8 行 ——
+    于是"已清仓者显示已实现盈亏"那条修复在真实数据上一行都渲染不出来。
+
+    ⚠️ 验收标准**不是**"清仓者必须排前面"。巨鲸拿着几万、清仓者本金才一千,
+       巨鲸排前面是**对的**,硬把清仓者塞进来反而是错的。标准是两类人可比:
+       本金 $5,000 的清仓者必须能压过一个只拿着 $50 的人,同时压不过真正的巨鲸。
+    """
+    items = [
+        # 本金 $5,000 翻倍后全部卖出 → realized 5000 / +100%,反推本金 5000
+        _closed("sold5000", 5000.0, 100.0),
+        # 还拿着 $50、浮盈 0 → 本金 $50。旧键下他 50 > 0,能把清仓者压在下面
+        _item(handle="holds50", usd=50.0, pnl=0.0, pct=0.0),
+        # 真巨鲸:在持成本 34,615(= 51,474.66 - 16,859.28),比谁都大
+        _item(handle="whale", usd=51474.66, pnl=16859.28, pct=48.7),
+    ]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert out.index("@sold5000") < out.index("@holds50"), \
+        f"本金 $5,000 的清仓者必须排在只拿着 $50 的人前面:\n{out}"
+    assert out.index("@whale") < out.index("@sold5000"), \
+        f"本金最大的巨鲸仍然排第一 —— 不能为了照顾清仓者把他挤下去:\n{out}"
+
+
+def test_本金算不出来的人垫底而不是被当成没投过钱(monkeypatch, tmp_path):
+    """
+    percentageRealizedPnl 缺失/为 0 时那个除法根本没有定义,本金是**不知道**。
+    把未知折成 0 丢进排序,等于断言"这个人没投过钱"—— 那是把未知当成事实。
+    未知统一垫底:排前面是抬举,垫底至少不制造假事实。
+    ⚠️ unknown 故意放在输入的**第一位**:折成 0 的写法会让它和 zerocost 打平,
+       稳定排序会原样保留输入顺序,于是 unknown 反而跑到前面去 —— 那正是要守住的错。
+    """
+    unknown = _item(handle="unknown", usd=0.0, pnl=0.0, pct=0.0)
+    for k in ("usdValue", "unrealizedPnlUsd", "realizedPnlUsd", "percentageRealizedPnl"):
+        unknown["authorTrade"].pop(k)
+    # 本金**确实**是 0(在持 0、浮盈 0):这是事实,该排在"不知道"前面
+    zerocost = _item(handle="zerocost", usd=0.0, pnl=0.0, pct=0.0)
+    client = _FakeClient({"56": [unknown, zerocost]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert "@unknown" in out, "本金未知不等于该被吞掉,人还是要出现"
+    assert out.index("@zerocost") < out.index("@unknown"), \
+        f"本金已知(哪怕是 0)排在本金未知的前面:\n{out}"
+
+
+@pytest.mark.parametrize("trade, want, why", [
+    ({"usdValue": 1000.0, "unrealizedPnlUsd": 200.0,
+      "realizedPnlUsd": 500.0, "percentageRealizedPnl": 0.0}, 800.0,
+     "pct 恰好 0 时除法没定义,已卖那一半算不出来,只用在持那一半(下界),不补 0"),
+    ({"usdValue": 1000.0, "unrealizedPnlUsd": 200.0,
+      "realizedPnlUsd": 500.0, "percentageRealizedPnl": 5e-324}, None,
+     "次正规数百分比:pct/100 会下溢成 0.0 直接 ZeroDivisionError;算出 inf 也不能当本金"),
+    ({"usdValue": 0.0, "unrealizedPnlUsd": 1000.0}, 0.0,
+     "浮盈大于市值 → 本金算出负数,没有物理含义,压回 0(我们知道他投得极少,不是未知)"),
+    ({}, None, "两半都取不到 → 未知,不是 0"),
+])
+def test_本金反推对各种脏字段都有确定行为(trade, want, why):
+    """⚠️ 这些组合全都来自"陌生人可控 + 服务端可变"的字段,崩一次整条命令就没了回执"""
+    from src.bot import _ca_cost_usd
+
+    got = _ca_cost_usd({"authorTrade": trade})
+
+    if want is None:
+        assert got is None, f"{why};实际 {got!r}"
+    else:
+        assert got == pytest.approx(want), f"{why};实际 {got!r}"
 
 
 def test_展示条数有上限且说明省略了多少条(monkeypatch, tmp_path):
@@ -288,7 +365,7 @@ def test_展示条数有上限且说明省略了多少条(monkeypatch, tmp_path)
     assert shown == MAX_CA_THESIS_ROWS, f"应只展示 {MAX_CA_THESIS_ROWS} 条,实际 {shown}"
     # ⚠️ 条数必须钉死:原来写的是 `"4" in out`,而 @h4 这个 handle 自己就带一个 "4",
     #    条数算错也照样绿 —— 那半个断言在空转
-    assert f"…按持仓额排序,还有 {n - MAX_CA_THESIS_ROWS} 位未显示" in out
+    assert f"…按投入本金排序,还有 {n - MAX_CA_THESIS_ROWS} 位未显示" in out
 
 
 # ============================================================
@@ -404,6 +481,66 @@ def test_已清仓与仍持仓的几个人渲染各不相同(monkeypatch, tmp_pa
     bodies = [r.split(" · ", 1)[1] for r in rows]
     assert len(set(bodies)) == 4, f"四个人的盈亏各不相同,渲染也必须各不相同:\n{rows}"
     assert _thesis_line_of(out, "rxyz") == "@rxyz · $157.11 · 未实现 -$6.26 (-2.5%)"
+
+
+def test_仍在持仓又已经落袋一部分时两段都要显示(monkeypatch, tmp_path):
+    """
+    真实抓包 100 条里 **74 条**是"还拿着 + 已经卖掉一部分",不是只有完全清仓那 6 条。
+    数字照抄首行 @change 的原值:手上 $51,474.66、已经落袋 $35,901.03。
+    只报未实现那一段的话,这 3.59 万一分不显示。
+
+    ⚠️ 金额用的是 _money 的紧凑记法($51.47K),那是全项目共用的排名展示格式
+       (见 _money 的 docstring),这里不为 /ca 单独改。要看的是**两个量都在**。
+    """
+    client = _FakeClient({"56": [
+        _item(handle="change", usd=51474.65676630271, pnl=16859.27797467851,
+              pct=48.7045890098938,
+              realized=35901.02696208642, realized_pct=46.32469188226596),
+    ]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "change") == (
+        "@change · $51.47K · 未实现 +$16.86K (+48.7%) · 已实现 +$35.90K (+46.3%)")
+
+
+def test_浮亏但已落袋赚更多时方向不会被读反(monkeypatch, tmp_path):
+    """
+    只显示未实现那一段时,这个人看上去在亏 $500;真实情况是他已经落袋 $2,000。
+    盈亏方向整个反过来 —— 而"看别人到底赚没赚"正是这条命令唯一的价值。
+    """
+    client = _FakeClient({"56": [
+        _item(handle="flip", usd=1000.0, pnl=-500.0, pct=-33.3,
+              realized=2000.0, realized_pct=80.0),
+    ]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "flip") == (
+        "@flip · $1.00K · 未实现 -$500.00 (-33.3%) · 已实现 +$2.00K (+80.0%)")
+
+
+def test_一次都没卖过时不显示已实现那一段(monkeypatch, tmp_path):
+    """
+    realizedPnlUsd 恰好 0.0 是"一次都没卖过"的**真实值**,不是缺失。这里定的规矩是不显示,
+    理由:这一段回答的是"已经落袋了多少",而"仍在持仓"这条路径的基线本来就是一分没落袋,
+    不写这一段就是这个意思;写成 `已实现 +$0.00 (+0.0%)` 反而多断言了一次
+    "卖过、只是刚好打平" —— 与"一次都没卖过"是两件事,数据分不出来,不该替读者选一个。
+
+    ⚠️ 这不是拿真值判断去代替 is None:缺失判据仍然只有 is None(见 _ca_append_pnl),
+       而且**持仓额那一列**的 0 照常显示(见 test_持仓恰好为0仍显示0点00)——
+       那里的 0 是"清仓了"这个独一无二的事实,这里省掉的段信息量恒为 0。
+    """
+    client = _FakeClient({"56": [
+        _item(handle="hodl", usd=200.0, pnl=25.0, pct=14.0, realized=0.0, realized_pct=0.0),
+    ]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "hodl") == "@hodl · $200.00 · 未实现 +$25.00 (+14.0%)"
 
 
 def test_未实现盈亏必须带未实现标签(monkeypatch, tmp_path):
@@ -565,6 +702,108 @@ def test_四条恶意四条正常也不撑破预算(monkeypatch, tmp_path):
     assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
     assert len(out) <= MAX_MESSAGE_LEN
     _assert_tg_safe(out)
+
+
+def test_一条塞不下的长观点不连带丢掉后面塞得下的短观点(monkeypatch, tmp_path):
+    """
+    预算用完时**跳过这一行继续试下一行**,不是就此收摊。
+
+    ⚠️ 这不是对抗场景:一个正常人写了条长评论,排在他后面的所有人就都消失了。
+       前几条把 room 吃掉之后,后面那些几十字符的短行本来完全塞得下。
+    ⚠️ 顺带钉死"还有 N 位未显示"的计数 —— 数字从输出自己反推,少报多报都会红。
+    """
+    talky = [_evil(f"talky{i}") for i in range(5)]          # 每条转义后 ~850 字符
+    shorts = [_item(handle=f"short{i}", usd=float(500 - i), text="不错") for i in range(3)]
+    handles = [f"talky{i}" for i in range(5)] + [f"short{i}" for i in range(3)]
+    client = _FakeClient({"56": talky + shorts})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    shown = [h for h in handles if f"@{h}" in out]
+    assert any(h.startswith("short") for h in shown), \
+        f"长行塞不下就该跳过它继续往下试,不能把后面的人一起丢掉:\n{out}"
+    m = re.search(r"还有 (\d+) 位未显示", out)
+    missing = len(handles) - len(shown)
+    if missing == 0:
+        assert m is None, f"一个没少却报了「{m.group(0) if m else ''}」"
+    else:
+        assert m is not None, f"少了 {missing} 位却没说:\n{out}"
+        assert int(m.group(1)) == missing, \
+            f"少了 {missing} 位,却报「{m.group(0)}」—— 少报多报都是错的"
+    _assert_tg_safe(out)
+
+
+# ============================================================
+# 短字段限长 —— ticker / handle / 链名都由陌生人或服务端决定,长度不受任何天然约束
+# ============================================================
+def test_超长ticker不把观点区整段掏空(monkeypatch, tmp_path):
+    """
+    head 段是 _ca_assemble 最后才会砍到的一段。ticker 不限长的话,一个字段就能把
+    room 顶成负数,观点一条都渲染不出来,最后只剩一个 CA 锚点。
+    """
+    from src.bot import CA_MSG_BUDGET, CA_TICKER_CHARS
+
+    items = [_item(handle=f"u{i}", usd=float(900 - i), ticker="A" * 5000) for i in range(3)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
+    assert "A" * (CA_TICKER_CHARS + 1) not in out, "ticker 必须被裁到上限以内"
+    for i in range(3):
+        assert f"@u{i}" in out, f"一个超长 ticker 不该把 @u{i} 挤掉:\n{out[:300]}"
+    _assert_tg_safe(out)
+
+
+def test_超长链名不把观点区整段掏空(monkeypatch, tmp_path):
+    """networkId 是服务端回读的,normalize_network 对未收录的值**原样透传**"""
+    from src.bot import CA_CHAIN_CHARS, CA_MSG_BUDGET
+
+    items = [_item(handle=f"c{i}", usd=float(900 - i), network="Z" * 5000) for i in range(3)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
+    assert "Z" * (CA_CHAIN_CHARS + 1) not in out, "链名必须被裁到上限以内"
+    for i in range(3):
+        assert f"@c{i}" in out, f"一个超长链名不该把 @c{i} 挤掉:\n{out[:300]}"
+    _assert_tg_safe(out)
+
+
+def test_超长handle被裁剪且不挤掉别人(monkeypatch, tmp_path):
+    """handle 是陌生人自己起的名字 —— 一行 3000 字符就能吃掉大半个预算"""
+    from src.bot import CA_HANDLE_CHARS, CA_MSG_BUDGET
+
+    items = [_item(handle="H" * 3000, usd=900.0)]
+    items += [_item(handle=f"n{i}", usd=float(100 - i), text="短") for i in range(3)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
+    assert "H" * (CA_HANDLE_CHARS + 1) not in out, "handle 必须被裁到上限以内"
+    for i in range(3):
+        assert f"@n{i}" in out, f"一个超长 handle 不该把 @n{i} 挤掉:\n{out[:300]}"
+    _assert_tg_safe(out)
+
+
+def test_短字段里的换行被叠平不另起新行(monkeypatch, tmp_path):
+    """
+    只限长不叠平等于没限:handle 里塞 16 个换行,一行就变成十几行 ——
+    预算是按**行**算的,行数被别人控制就等于预算被别人控制。
+    """
+    client = _FakeClient({"56": [_item(handle="a\nb\nc", usd=100.0, ticker="X\nY")]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert "$X Y" in out, f"ticker 里的换行必须叠平:\n{out}"
+    assert "@a b c" in out, f"handle 里的换行必须叠平:\n{out}"
 
 
 def test_正常内容不会被预算误伤(monkeypatch, tmp_path):

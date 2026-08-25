@@ -19,6 +19,7 @@ Telegram 命令层 —— getUpdates 长轮询 + 命令分发(设计文档 §3.4
 from __future__ import annotations
 
 import html
+import math
 import re
 import threading
 import time
@@ -257,12 +258,20 @@ def _day_str(iso: str | None) -> str:
 # ============================================================
 # /ca <合约地址> —— 查这个币:观点(全站,任何地址都能查)+ 名单本地记录
 # ============================================================
-# 从 API 拉多少条观点。拉够了才能在本地按持仓额可靠地重新排序(接口本身不按这个排)
+# 从 API 拉多少条观点。拉够了才能在本地按投入本金可靠地重新排序(接口本身不按这个排)
 CA_THESIS_FETCH_LIMIT = 30
 # 消息里最多展示这么多**位作者**(不是多少条观点,见 _ca_one_row_per_author)
 MAX_CA_THESIS_ROWS = 8
 # 单条观点摘要最多这么多字符 —— 不截断的话一条长文/刷屏换行就能撑爆整条消息的排版
 CA_THESIS_SNIPPET_CHARS = 140
+# 接口来的**短**字段各自的字符上限。
+# ⚠️ ticker / handle / 链名全都由陌生人或服务端决定,长度不受任何天然约束:
+#    一个 3000 字符的 ticker 就能把 head 段撑到顶破预算,_ca_assemble 只会一行行
+#    往下砍,最后整条消息只剩一个 CA 锚点 —— 观点区被一个字段整段掏空。
+#    正文早就有 CA_THESIS_SNIPPET_CHARS 管着,这三个短字段之前一个都没管。
+CA_TICKER_CHARS = 16
+CA_HANDLE_CHARS = 24
+CA_CHAIN_CHARS = 20
 # 整条 /ca 回执自己给自己定的**转义后**字符预算。
 # ⚠️ notifier.send 超限时做的是 text[:MAX_MESSAGE_LEN-10] **盲切**,而 _esc 会把 `&` 撑成
 #    5 个字符、`'` 撑成 6 个(html.escape 默认 quote=True)。观点正文的作者是任意 FOMO
@@ -1252,13 +1261,15 @@ class CommandBot:
         else:
             sym = (local_symbol or "?").lstrip("$")
             chain_id = forced_net or (local_nets[0] if local_nets else None)
-        head = [f"<b>${_esc(sym)}</b> · {_esc(_chain_name(chain_id))}"]
+        # ⚠️ ticker 与链名都可能来自服务端的任意字符串,必须限长(见 CA_TICKER_CHARS):
+        #    head 段是 _ca_assemble 里最后才会被砍的一段,不限长就等于给它一把掏空观点区的刀
+        head = [f"<b>${_ca_clip(sym, CA_TICKER_CHARS)}</b> · "
+                f"{_ca_clip(_chain_name(chain_id), CA_CHAIN_CHARS)}"]
 
         rows: list[dict] = []
         if items:
             # 一位作者一行:8 个位置要给 8 个人,不是给一个人的 8 条刷屏
-            rows = sorted(_ca_one_row_per_author(items),
-                          key=lambda it: _num(_ca_pos_usd(it)), reverse=True)
+            rows = sorted(_ca_one_row_per_author(items), key=_ca_rank_key, reverse=True)
             # ⚠️ 措辞只陈述"我们取到了多少",不陈述全站总数:这个数来自 limit 抓取窗口,
             #    观点超过窗口时它和下面的省略条数都会少报 —— 说成事实就是误导。
             got_line = f"📋 取到 {len(items)} 条观点 · {len(rows)} 位作者"
@@ -1452,10 +1463,75 @@ class CommandBot:
 # ============================================================
 # /ca 辅助渲染(纯函数,不碰网络 / DB)
 # ============================================================
-def _ca_pos_usd(it: dict) -> float | None:
-    """这条观点作者的持仓额(authorTrade.usdValue)。排序键用,取不到就是 None"""
+def _ca_cost_usd(it: dict) -> float | None:
+    """
+    这位作者在这个币上**投入过多少本金**。排序键用;两半都算不出来时返回 None。
+
+    ⚠️ 排序键绝不能用 usdValue。那是"卖完之后还剩多少",对已清仓的人**恒等于 0** ——
+       不是他的仓位规模。真实抓包 100 条按 usdValue 排,6 个清仓者被整整齐齐钉在
+       #95–#100,而展示上限只有 8 行,于是"已清仓的人显示已实现盈亏"那条修复
+       在真实数据上一行都渲染不出来。本金对两类人都可比:巨鲸投十几万排前面是**对的**,
+       而一个投了 $5000 的清仓者能压过一个还拿着 $50 的人 —— 这才是这条命令的价值。
+
+    两半各自反推(实测两个百分比各是对**自己那一半成本**算的):
+      还拿着的一半: usdValue - unrealizedPnlUsd
+        验算 @change:51474.66 - 16859.28 = 34615.38,16859.28 / 34615.38 = +48.70% ✓
+      已卖掉的一半: realizedPnlUsd / (percentageRealizedPnl / 100)
+        验算 @Pastrami_A:611.94 / 0.613265 = 997.85,与"赚 611.94 是 +61.3%"自洽 ✓
+
+    ⚠️ 算不出来的一半**绝不补 0**:0 的含义是"没投过钱",而我们只是"不知道"
+       (percentageRealizedPnl 为 0 或缺失时,除法根本没有定义)。
+       只算得出一半就用那一半 —— 它是本金的**下界**,方向不会错;
+       两半都算不出就返回 None,由 _ca_rank_key 把未知统一垫底,
+       不让一个"不知道"冒充具体数字去跟真实值比大小。
+    """
     trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
-    return _f(trade.get("usdValue"))
+    total: float | None = None
+
+    held = _f(trade.get("usdValue"))
+    unreal = _f(trade.get("unrealizedPnlUsd"))
+    if held is not None and unreal is not None:
+        total = held - unreal
+
+    realized = _f(trade.get("realizedPnlUsd"))
+    realized_pct = _f(trade.get("percentageRealizedPnl"))
+    if realized is not None and realized_pct is not None and realized_pct != 0:
+        # 写成 realized * 100 / pct 而不是 realized / (pct / 100):后者在 pct 是次正规数
+        # (如 5e-324)时,pct / 100 会下溢成 0.0,一个 ZeroDivisionError 直接崩掉整条命令
+        sold = realized * 100.0 / realized_pct
+        total = sold if total is None else total + sold
+
+    if total is None or not math.isfinite(total):
+        return None
+    # 负本金没有物理含义,只可能来自浮点尘埃(清仓后 usdValue = -3.2e-13)或脏数据。
+    # 压回 0 而不是返回 None:我们**知道**这个人投得极少,这是事实不是未知
+    return max(total, 0.0)
+
+
+def _ca_rank_key(it: dict) -> tuple[int, float]:
+    """
+    排序键:本金已知的按本金从大到小,本金**未知**的一律垫底。
+
+    ⚠️ 元组第一位就是"知不知道"这一位。reverse=True 下 1 排在 0 前面,未知全部并列垫底;
+       并列部分靠 sorted 的稳定性保持接口原本的顺序。
+       不把未知折成 0 塞进数字里比大小 —— 那等于把"不知道"当成"没投过钱"来陈述。
+    """
+    cost = _ca_cost_usd(it)
+    return (0, 0.0) if cost is None else (1, cost)
+
+
+def _ca_clip(s: str, limit: int) -> str:
+    """
+    接口来的短字段 → 单行、限长、已转义。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义",与 _ca_thesis_text 同一条理由:
+       反过来会在截断点切断一个 `&amp;`,残缺实体照样让整条消息 400。
+       叠平空白也是必需的:ticker 里塞几个换行就能把一行变成十行,绕开按行算的预算。
+    """
+    flat = _CA_WS_RUN.sub(" ", s).strip()
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return _esc(flat)
 
 
 def _ca_thesis_text(raw: dict) -> str:
@@ -1504,6 +1580,22 @@ def _ca_pos_str(v: float) -> str:
     return _money(v)
 
 
+def _ca_append_pnl(seg: list[str], label: str, pnl: float | None, pct: float | None) -> None:
+    """
+    往行里追加一段 `已实现 +$88.00 (+12.0%)`。
+
+    ⚠️ 缺失的判据只用 is None:pnl 恰好 0.0 是"不赚不亏"这个真实值,照常成段;
+       只有真的取不到(None)才整段消失,绝不打 "N/A" / "--" / 0。百分比同理,
+       它缺失时只掉括号那一小段,金额那半段不受牵连。
+    """
+    if pnl is None:
+        return
+    piece = f"{label} {_signed_money(pnl)}"
+    if pct is not None:
+        piece += f" ({pct:+.1f}%)"
+    seg.append(piece)
+
+
 def _ca_thesis_row(it: dict) -> list[str]:
     """
     一条观点渲染成 1~2 行:@作者 · 持仓/已清仓 · 已实现|未实现盈亏(百分比);下跟正文摘要。
@@ -1515,31 +1607,40 @@ def _ca_thesis_row(it: dict) -> list[str]:
        一个假事实:读者只会把 +$0.00 (+0.0%) 读成"这人打平了",而且还带着正号。
     ⚠️ 两种盈亏混在同一列而不加标签同样误导,所以 _CA_LABEL_* 是必需的不是可选的。
        取舍与 formatter._pnl_line 完全一致(那边卖出看已实现、其余看未实现)。
+    ⚠️ "仍在持仓"**不等于**"一分钱还没落袋"。真实抓包 100 条里 74 条是
+       "还拿着 + 已经卖掉一部分":首行 @change 手上 $51,474.66,已经落袋 $35,901.03。
+       只报未实现那一段的话,这 3.59 万一分不显示,而且盈亏方向可能整个反过来
+       (账面在浮亏、但落袋赚得更多)。所以仍在持仓时也要把已实现那段带出来。
     """
     trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
     handle = _pick_str(it, "userHandle") or _pick_str(it, "displayName") or "?"
-    seg = [f"@{_esc(handle)}"]
+    # handle 是陌生人自己起的名字,长度不受任何约束,见 CA_HANDLE_CHARS
+    seg = [f"@{_ca_clip(handle, CA_HANDLE_CHARS)}"]
 
     closed_at = _pick_str(trade, "closedAt")
     if closed_at is not None:
         # 已清仓:再报 $0.00 持仓只会被读成"他现在空仓且不赚不亏",前半句对、后半句是假的
         seg.append(_CA_CLOSED_MARK)
-        pnl = _f(trade.get("realizedPnlUsd"))
-        pct = _f(trade.get("percentageRealizedPnl"))
-        label = _CA_LABEL_REALIZED
+        _ca_append_pnl(seg, _CA_LABEL_REALIZED,
+                       _f(trade.get("realizedPnlUsd")), _f(trade.get("percentageRealizedPnl")))
     else:
         pos = _f(trade.get("usdValue"))
         if pos is not None:                  # 0 是"刚好清完"的真实值,必须照常显示,不能省
             seg.append(_ca_pos_str(pos))
-        pnl = _f(trade.get("unrealizedPnlUsd"))
-        pct = _f(trade.get("percentageUnrealizedPnl"))
-        label = _CA_LABEL_UNREALIZED
-
-    if pnl is not None:
-        piece = f"{label} {_signed_money(pnl)}"
-        if pct is not None:
-            piece += f" ({pct:+.1f}%)"
-        seg.append(piece)
+        _ca_append_pnl(seg, _CA_LABEL_UNREALIZED,
+                       _f(trade.get("unrealizedPnlUsd")), _f(trade.get("percentageUnrealizedPnl")))
+        realized = _f(trade.get("realizedPnlUsd"))
+        # ⚠️ 恰好 0.0 是"一次都没卖过"的真实值、不是缺失,这里**故意不显示**它:
+        #    这一段回答的问题是"已经落袋了多少",而"仍在持仓"这条路径的基线本来就是
+        #    一分没落袋 —— 不写这一段就是这个意思。写成 `已实现 +$0.00 (+0.0%)` 反而
+        #    多断言了一次"卖过、只是刚好打平",这跟"一次都没卖过"是两件事,数据分不出来,
+        #    不该替读者选一个(与上面已清仓那条注释是同一个错误的两面)。
+        #    对照:持仓额那一列的 0 必须照常显示,那里的 0 是"清仓了"这个独一无二的事实,
+        #    省掉读者就不知道他还剩多少;这里省掉的这一段信息量恒为 0。
+        #    缺失的判据仍然只用 is None(见下面的 _ca_append_pnl),铁律没有被绕开。
+        if realized is not None and realized != 0:
+            _ca_append_pnl(seg, _CA_LABEL_REALIZED, realized,
+                           _f(trade.get("percentageRealizedPnl")))
 
     lines = [" · ".join(seg)]
     text = _ca_thesis_text(it)
@@ -1580,6 +1681,8 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
        整条消息 400(见 CA_MSG_BUDGET 的注释)。
     ⚠️ anchor(整行 <code>CA</code>)是设计文档 §10.3 定义的必备锚点,点击即复制、
        不依赖网络 —— 无论砍到什么程度它都必须活到最后一行。盲切的老路径里它 100% 被吃掉。
+    ⚠️ head 段自身的长度靠 _ca_clip 在上游封顶(ticker / 链名)。这里只把它整段计入
+       room —— 它是最后才会被砍掉的一段,不限长就等于让一个字段吃掉整个观点区。
     """
     room = CA_MSG_BUDGET - _ca_size(head) - _ca_size(tail) - len(anchor) - _CA_OMIT_RESERVE
     body: list[str] = []
@@ -1589,15 +1692,21 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
         block = _ca_thesis_row(it)
         cost = _ca_size(block)
         if used + cost > room:
-            break                            # 整行边界上停,不切半行更不切半个实体
+            # ⚠️ 必须 continue 不能 break:break 会让一条长评论(正常人就写得出来)
+            #    把排在它**后面**、本来完全塞得下的短行全部连带丢掉 —— 一个人话多,
+            #    后面所有人就都消失了。跳过这一条,继续试下一条。
+            #    整行边界上停手这一点不变:不切半行,更不切半个 HTML 实体。
+            continue
         body.extend(block)
         used += cost
         shown += 1
 
     lines = [*head, *body]
+    # 未显示 = 总作者数 - **真正渲染出来的**条数。跳过的和超出 MAX_CA_THESIS_ROWS 的
+    # 都算在里面,shown 只在真正 extend 之后才自增,所以 continue 不会让它少报/多报
     omitted = len(rows) - shown
     if omitted:
-        lines.append(f"…按持仓额排序,还有 {omitted} 位未显示")
+        lines.append(f"…按投入本金排序,还有 {omitted} 位未显示")
     lines.extend(tail)
     # 兜底:本地名单区自己就撑破预算时(理论上不会,买家数有上限),照样只按整行砍,
     # 而且砍到只剩 anchor 也不能让 notifier 去盲切
