@@ -19,6 +19,8 @@ Telegram 命令层 —— getUpdates 长轮询 + 命令分发(设计文档 §3.4
 from __future__ import annotations
 
 import html
+import math
+import re
 import threading
 import time
 from dataclasses import replace
@@ -30,7 +32,20 @@ from src import store
 from src.config import PROBE_DIR, get_settings
 from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
-from src.models import NETWORK_DISPLAY, normalize_network, normalize_token_address
+from src.models import (
+    COUNTABLE_REASONS,
+    NETWORK_DISPLAY,
+    normalize_network,
+    normalize_token_address,
+)
+
+# ⚠️ 只借 MAX_MESSAGE_LEN 这个常量:/ca 要自己算长度预算,而"上限是多少"必须与真正
+#    动手截断的那一方同源 —— 抄一个 4000 过来,哪天 notifier 改了这边就悄悄失效。
+from src.notifier import MAX_MESSAGE_LEN
+
+# _f/_pick_str 是 poller 已经踩过坑写好的"字段可能缺、可能嵌套、可能是脏字符串"
+# 兜底解析器。/ca 解析的是同一个 API(client.get_token_thesis),没道理另起一套。
+from src.poller import _f, _pick_str
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
 POLL_TIMEOUT_SEC = 30
@@ -73,6 +88,7 @@ _COMMAND_MENU = [
     ("list", "查看监控名单与基线状态"),
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
+    ("ca", "查合约地址:/ca <地址> [链] — FOMO 用户怎么看这个币"),
     ("copy", "跟单参数:/copy 查看 · /copy <项> <值> 修改"),
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
@@ -113,6 +129,7 @@ _HELP = (
     "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
     "/status — 运行状态\n"
     "/who &lt;CA&gt; [链] — 名单里谁买过这个币\n"
+    "/ca &lt;地址&gt; [链] — 查这个合约地址:观点 + 名单买没买过\n"
     "/rebuild — 重建全部历史基线(回填逻辑改动后用)\n"
     "/help — 本说明"
 )
@@ -236,6 +253,100 @@ def _num(v) -> float:
 def _day_str(iso: str | None) -> str:
     """ISO 时间取日期部分;缺失显示"时间未知"(绝不显示 None / N/A)"""
     return (iso or "")[:10] or "时间未知"
+
+
+# ============================================================
+# /ca <合约地址> —— 查这个币:观点(全站,任何地址都能查)+ 名单本地记录
+# ============================================================
+# 从 API 拉多少条观点。拉够了才能在本地按投入本金可靠地重新排序(接口本身不按这个排)
+CA_THESIS_FETCH_LIMIT = 30
+# 消息里最多展示这么多**位作者**(不是多少条观点,见 _ca_one_row_per_author)
+MAX_CA_THESIS_ROWS = 8
+# 单条观点摘要最多这么多字符 —— 不截断的话一条长文/刷屏换行就能撑爆整条消息的排版
+CA_THESIS_SNIPPET_CHARS = 140
+# 接口来的**短**字段各自的字符上限。
+# ⚠️ ticker / handle / 链名全都由陌生人或服务端决定,长度不受任何天然约束:
+#    一个 3000 字符的 ticker 就能把 head 段撑到顶破预算,_ca_assemble 只会一行行
+#    往下砍,最后整条消息只剩一个 CA 锚点 —— 观点区被一个字段整段掏空。
+#    正文早就有 CA_THESIS_SNIPPET_CHARS 管着,这三个短字段之前一个都没管。
+CA_TICKER_CHARS = 16
+CA_HANDLE_CHARS = 24
+CA_CHAIN_CHARS = 20
+# 整条 /ca 回执自己给自己定的**转义后**字符预算。
+# ⚠️ notifier.send 超限时做的是 text[:MAX_MESSAGE_LEN-10] **盲切**,而 _esc 会把 `&` 撑成
+#    5 个字符、`'` 撑成 6 个(html.escape 默认 quote=True)。观点正文的作者是任意 FOMO
+#    用户 = 互联网上的陌生人:140 个 `'` 一条就是 840 字符,8 条能到 7000+。盲切点落在
+#    `&amp;` 中间就是残缺实体 → 整条消息 400 → 管理员发了 /ca 什么都收不到,只在日志里
+#    留一行。而且攻击者能自由控制正文长度,也就能自由挑切点,可稳定命中。
+#    (formatter._thesis_line 和 _ca_thesis_text 的注释都记过这个事故。)
+#    所以长度必须由本命令**按转义后的真实长度**自己算,并且只在整行边界上停手。
+CA_MSG_BUDGET = MAX_MESSAGE_LEN - 400
+# 给"还有 N 位未显示"那行预留的位置 —— 免得为了塞进这行提示反而把预算顶破
+_CA_OMIT_RESERVE = 48
+# 装配出口的**单行**上限(转义后字符数)。
+# ⚠️ 这不是"再给某个字段加一道封顶",它是出口不变式(见 _ca_assemble)的支点:
+#    整条消息只能按**整行边界**砍(切进行内就会切碎实体 → 400),于是只要存在
+#    **一行**能单独超过整条预算,按行砍就救不回来 —— CA 锚点行正是那个洞:
+#    它必须活到最后,砍无可砍时照样被贴上去,消息照样超长。
+#    给每一行一个上限,"按行砍"才是完备的:任意行都塞得下,砍到只剩锚点也在预算内。
+#    这一条同时把所有"接口/用户可控的无界短字段"一次性收口 —— ticker、handle、链名、
+#    接口错误文案、已试链名、本地名单里的买家名……不必再逐个去追(那是打地鼠)。
+#    取整条预算的 1/4:既远大于本命令自己渲染得出的最长一行(观点摘要 140 个 `'`
+#    转义后 846 字符),正常内容一个字都不会被误伤;又保证任何一行最多吃掉四分之一条消息。
+CA_LINE_CHARS = CA_MSG_BUDGET // 4
+# 猜链的**总时长**预算。
+# ⚠️ 命令层是严格串行的:一条命令阻塞越久,排在它后面的命令越可能超过 STALE_COMMAND_SEC
+#    被当成过期 update **静默丢弃**(不回复、只留日志)。6 条链 × 每条最坏 3 次重试
+#    ≈ 18 个请求,足够把后面几条命令一起吃掉。这里只压单条命令的最坏阻塞时长,
+#    **不做冷却/限流** —— 实测串行下 10 条连发 21.1s、2.8 req/s,速率本身不构成威胁。
+CA_GUESS_BUDGET_SEC = 45.0
+# 名单区最多展开几个买家
+MAX_CA_LOCAL_BUYERS = 10
+# 本地"名单买没买过"要看全部历史,不设时间窗(3650 天 ≈ 本库不可能积累到的年限)
+CA_LOCAL_LOOKBACK_DAYS = 3650
+# 地址是 0x 开头、本地又没见过时,按这个顺序试链,首个有观点的即停手。
+# ⚠️ 实测证实(同一地址分别喂 nid=56/8453/1/999):猜错链只会拿到空列表 [],
+#    绝不会拿到别的币的数据(服务端按 tokenAddress+networkId 精确过滤,不做模糊匹配)——
+#    所以"按顺序试、命中就停"这个策略是安全的,不存在"静默显示错链数据"的风险。
+#    本地已经认识这个地址时完全不走这条路(见 _cmd_ca),这里只覆盖真正陌生的地址。
+CA_EVM_GUESS_ORDER = ("bsc", "base", "ethereum", "monad", "hyperliquid", "robinhood")
+# ⚠️ 实测(2026-08-24,真实 API):/feed/token/thesis 的 networkId 参数要的是 FOMO 原生的
+#    **数字链 ID**(56 = BSC),不是我们本地聚合用的归一化别名 —— 直接传 "bsc" 会 400:
+#    `{"message":"Invalid input: query.networkId - Expected number, received nan"}`。
+#    这张表是 models._NETWORK_ALIASES 里已经反查出来的原生值,这里只是反过来:
+#    归一化值 → 调 get_token_thesis 时真正要传的那个数字 ID。未收录的值原样透传
+#    (与 normalize_network 对未知链的兜底策略一致,不吞掉、让服务端的报错说话)。
+_NETWORK_RAW_ID = {
+    "solana": "1399811149", "base": "8453", "bsc": "56", "ethereum": "1",
+    "monad": "143", "robinhood": "4663", "hyperliquid": "1337",
+}
+_CA_WS_RUN = re.compile(r"\s+")
+# "除普通空格之外的一切空白" —— 换行、制表、NEL、U+2028 行分隔符……
+# ⚠️ 预算是按**行**算的,一行里混进一个换行就等于行数被上游控制,出口不变式里
+#    那句"每行 ≤ CA_LINE_CHARS"也就不再等于"屏幕上只占一行"。
+#    普通空格必须留着:本地名单区那几行靠行首三个空格做缩进,一起抹掉排版就散了。
+_CA_LINE_BREAK = re.compile(r"[^\S ]+")
+# 一个"原子" = 一个完整标签 / 一个完整实体 / 一个字符。切行只在原子边界上切,
+# 切碎实体或标签都让 TG 整条消息 400(见 CA_MSG_BUDGET)。
+_CA_ATOM = re.compile(r"</?[a-zA-Z][^<>]*>|&(?:amp|lt|gt|quot|#x27|#39);|.", re.S)
+# 本命令**自己**会写进消息里的标签,只有这两个。不在表里的一律当普通文本转义掉 ——
+# 一行里冒出别的标签只可能是上游漏了 _esc(观点正文的作者是互联网上的陌生人),
+# 照抄出去要么 400,要么让陌生人往我们的消息里塞一个 <a href> 链接。
+# ⚠️ 故意只列自己写得出的两个,而不是 TG 支持的一整套:白名单越窄,漏一次 _esc 的后果越小。
+_CA_OK_TAGS = frozenset({"b", "code"})
+# 需要走原子扫描的标记字符。这三个字符一个都没有的行必然是纯文本,可以原样放行。
+_CA_MARKUP = re.compile(r"[<>&]")
+_CA_ELLIPSIS = "…"
+# 盈亏标签。⚠️ 已实现与未实现混在同一列而不加标签同样是误导:读者没法知道手里这个数
+#    是账面浮盈还是已经落袋。与 formatter._pnl_line 同一套语义,只是这边一行要短。
+_CA_LABEL_REALIZED = "已实现"
+_CA_LABEL_UNREALIZED = "未实现"
+_CA_CLOSED_MARK = "已清仓"
+# _money 只精确到分:|v| 落在半分以下,四舍五入出来就是 $0.00。见 _ca_pos_str
+_CA_DUST_USD = 0.005
+# 金额大到这个量级就改用科学计数法。见 _ca_money ——
+# 千万亿美元比全球 M2 还大几个量级,真到了这儿它已经不是"钱"而是脏数据/攻击载荷了
+_CA_MONEY_SCI = 1e15
 
 
 class CommandBot:
@@ -477,6 +588,8 @@ class CommandBot:
             return self._cmd_status()
         if cmd == "/who":
             return self._cmd_who(arg)
+        if cmd == "/ca":
+            return self._cmd_ca(arg)
         return f"❓ 未知命令 {_esc(cmd)},发 /help 看用法"
 
     # ============================================================
@@ -1104,3 +1217,687 @@ class CommandBot:
             return f"🔎 名单里没人买过这个币(或该币不在任何人的基线内)\n<code>{_esc(ca)}</code>"
         # CA 独占最后一行且整行是 <code>:点击即复制,不依赖网络(设计文档 §10.3)
         return "\n".join(blocks) + f"\n<code>{_esc(ca)}</code>"
+
+    # ============================================================
+    # /ca <合约地址>
+    # ============================================================
+    def _cmd_ca(self, arg: str) -> str:
+        """
+        /ca <合约地址> [链] —— 粘一个合约地址上来,看全站 FOMO 用户怎么看 + 名单有没有人碰过。
+
+        两段互相独立、互不依赖:
+          观点区 —— 实时查 client.get_token_thesis,**任何地址都能查**,不要求本地认识
+                    这个币(这是本命令存在的意义:场景是刚在 Twitter 上看到一个陌生 CA)。
+          本地名单区 —— 查本地库,只覆盖名单里的人买过/持有过的币。多数地址查不到,
+                    这是正常情况不是 bug,必须显式说"无人持有"而不是留空当没这回事。
+
+        ⚠️ 链解析(按优先级,命中一条就不再往下猜):
+           1) 用户给了第二个参数 —— 完全按他说的,不再猜。
+           2) 没给,但本地库已经见过这个地址(user_token_stats / token_snapshot 有它)
+              —— 链直接从本地拿,**不发一个探测请求**,这是最常见的省请求路径
+              (实测:名单碰过的币占比不到 1/3,但只要碰过就不用猜)。
+           3) 都没有 —— 0x 开头按 CA_EVM_GUESS_ORDER 依次试(实测证实猜错链只会拿到
+              空列表、不会拿到别的币的数据,见该常量的注释),命中就停手;
+              非 0x(base58)只有 Solana 一条链,直接查、不用猜。
+           最坏情况(全新地址、猜到最后一条才中,或者哪条都不中)是
+           len(CA_EVM_GUESS_ORDER) = 6 次请求;再加上 CA_GUESS_BUDGET_SEC 这道
+           总时长闸门,单条命令不会把后面排队的命令拖过 STALE_COMMAND_SEC。
+        """
+        parts = (arg or "").split()
+        if not parts:
+            return "用法: /ca &lt;合约地址&gt; [链]  例: /ca 0xfc6e...5777 bsc"
+        ca = normalize_token_address(parts[0])
+        if not ca:
+            return "⚠️ 请给出代币合约地址"
+        forced_net = normalize_network(parts[1]) if len(parts) > 1 else None
+        # 锚点在这里一次性收口,下面每条早退路径共用它 —— 地址是用户可控的无界字符串
+        # (normalize_token_address 对非 0x/42 位的输入原样透传),不收口的话
+        # 这几条**不走 _ca_assemble** 的早退路径就是出口不变式之外的洞。
+        anchor = _ca_anchor(ca)
+
+        local_nets, local_symbol, local_lines = self._ca_local(ca)
+
+        if forced_net:
+            candidates = [forced_net]
+        elif local_nets:
+            candidates = local_nets                 # 本地已经见过,链是确定的,不猜
+        elif ca.startswith("0x"):
+            candidates = list(CA_EVM_GUESS_ORDER)
+        else:
+            candidates = ["solana"]
+
+        items, used_net, tried, err, unfinished = self._ca_fetch(ca, candidates)
+
+        # 接口挂了、本地又没有任何记录:确实没东西可说,把错误原样交给用户。
+        # ⚠️ 本地**有**记录时不能走这条路 —— 那半段数据早就算好了,不能被接口异常一起扔掉
+        #   (与本命令 docstring 承诺的"两段互相独立、互不依赖"直接冲突)。
+        if err is not None and not local_nets:
+            return err
+
+        # 全都没查到 + 本地也不认识:说不清是"没这个币"还是"猜错了链",
+        # 措辞必须把这份不确定性带出来,不能断言任何一边(见常量注释里的实测)
+        # ⚠️ 这两条回执逐行过 _ca_fit_line:链名(用户给的第二个参数,normalize_network
+        #    对未收录的值原样透传)和已试链名同样无界,而这里不经过 _ca_assemble,
+        #    出口不变式得自己在这一行上成立(行数是源码里写死的 2~4,总长必然在预算内)。
+        if not items and not local_nets:
+            if forced_net:
+                return "\n".join([
+                    _ca_fit_line(f"🔎 {anchor} · {_esc(_chain_name(forced_net))}"),
+                    "这条链上没查到观点,本地也没有记录 —— 可能是新币,也可能还没人发观点",
+                ])
+            miss = [
+                _ca_fit_line(f"🔎 {anchor}"),
+                _ca_fit_line(f"{_esc('/'.join(tried))} 都没查到观点,本地也没有记录"),
+                "可能是全新的币、还没人发观点,也可能是猜错了链 —— 可指定:/ca &lt;地址&gt; &lt;链&gt;",
+            ]
+            if unfinished:
+                miss.append(_ca_fit_line(f"(猜链耗时太久,{_esc('/'.join(unfinished))} 没试完)"))
+            return "\n".join(miss)
+
+        if items:
+            # 头部用观点接口**回读到的真实值**,不用自己请求时传的猜测 ——
+            # 猜对了两者一致,万一哪天服务端不再是"错链必空"这套行为,头部也不会跟着猜错
+            first = items[0]
+            sym = (_pick_str(first, "ticker") or "?").lstrip("$")
+            chain_id = normalize_network(_pick_str(first, "networkId")) or used_net
+        else:
+            sym = (local_symbol or "?").lstrip("$")
+            chain_id = forced_net or (local_nets[0] if local_nets else None)
+        # ⚠️ ticker 与链名都可能来自服务端的任意字符串。这里的 _ca_clip 管的是**可读性**
+        #    (head 段是 _ca_assemble 最后才砍的一段,不压一压就白吃掉别人的展示位);
+        #    "撑不破消息"那一半由 _ca_assemble 的出口不变式负责,不靠这里。
+        head = [f"<b>${_ca_clip(sym, CA_TICKER_CHARS)}</b> · "
+                f"{_ca_clip(_chain_name(chain_id), CA_CHAIN_CHARS)}"]
+
+        rows: list[dict] = []
+        if items:
+            # 一位作者一行:8 个位置要给 8 个人,不是给一个人的 8 条刷屏
+            rows = sorted(_ca_one_row_per_author(items), key=_ca_rank_key, reverse=True)
+            # ⚠️ 措辞只陈述"我们取到了多少",不陈述全站总数:这个数来自 limit 抓取窗口,
+            #    观点超过窗口时它和下面的省略条数都会少报 —— 说成事实就是误导。
+            got_line = f"📋 取到 {len(items)} 条观点 · {len(rows)} 位作者"
+            if len(items) >= CA_THESIS_FETCH_LIMIT:
+                got_line += f"(只取最近 {CA_THESIS_FETCH_LIMIT} 条,实际可能更多)"
+            head.append(got_line)
+        elif err is not None:
+            head.append(f"💭 观点没拉到:{err}")     # 本地那段照常出,不跟着一起丢
+        else:
+            miss = f"💭 没查到观点(已试 {_esc('/'.join(tried))})"
+            if unfinished:
+                miss += f",{_esc('/'.join(unfinished))} 没试完"
+            head.append(miss)
+
+        return _ca_assemble(head, rows, ["", *local_lines], anchor)
+
+    def _ca_fetch(self, ca: str, candidates: list[str]):
+        """
+        依次试链拉观点。返回 (items, 命中的链, 试过的链, 出错文案, 因超预算没试的链)。
+
+        ⚠️ 出错时**返回**错误文案而不是直接把整条回执替换掉 —— 本地名单区已经算好了,
+           要不要连它一起丢是调用方的判断,不是这里的。
+        ⚠️ 总时长闸门:见 CA_GUESS_BUDGET_SEC。第一条链无论如何都要试,预算是防"猜到
+           天荒地老",不是让命令一个请求都不发。
+        """
+        items: list[dict] = []
+        used_net: str | None = None
+        tried: list[str] = []
+        err: str | None = None
+        deadline = time.monotonic() + CA_GUESS_BUDGET_SEC
+        for i, net in enumerate(candidates):
+            if i and time.monotonic() > deadline:
+                logger.warning("/ca 猜链超时,剩下 {} 不再试 | {}", candidates[i:], ca[:16])
+                return items, used_net, tried, err, list(candidates[i:])
+            tried.append(net)
+            try:
+                # get_token_thesis 的 networkId 要原生数字 ID,不是本地归一化别名,见
+                # _NETWORK_RAW_ID 的注释(实测踩过:传 "bsc" 直接 400)
+                raw_net = _NETWORK_RAW_ID.get(net, net)
+                got = self._client.get_token_thesis(ca, raw_net, limit=CA_THESIS_FETCH_LIMIT)
+            except Exception as e:  # noqa: BLE001
+                err = self._ca_error(ca, e)
+                break
+            items = [it for it in (got or []) if isinstance(it, dict)]
+            if items:
+                used_net = net
+                break
+        return items, used_net, tried, err, []
+
+    def _ca_local(self, ca: str) -> tuple[list[str], str | None, list[str]]:
+        """
+        本地名单区。返回 (地址在本地出现过的链, 顺手捞到的一个 symbol, 渲染好的展示行)。
+
+        前两项同时供 _cmd_ca 做链解析用 —— 本地已经认识的地址不用再去猜链、
+        也不用再多发一个探测请求(见 _cmd_ca 的链解析说明)。
+
+        ⚠️ store.py 是冻结契约,没有"按地址反查链"的函数,与 _cmd_who 同样的处理:
+           这是条只读 SELECT、不含任何判定逻辑,就地写比动冻结文件代价小。
+        """
+        since = _iso_days_ago(CA_LOCAL_LOOKBACK_DAYS)
+        with store.get_conn() as conn:
+            # ⚠️ 用 fomo_events 而不是 user_token_stats:后者只是前者按"算数的买入"
+            #    聚合出来的派生表,任何一行 user_token_stats 必然对应一行 fomo_events,
+            #    反过来不成立(SELL、非计数原因的 BUY 只落 fomo_events)。
+            #    这里要的是"本地是否见过这个地址"这个更宽的信号,token_snapshot
+            #    再补上"持有但没见过买入事件"(比如转入)的那一小撮。
+            local_nets = [
+                r["network_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT network_id FROM fomo_events WHERE token_address = ? "
+                    "UNION SELECT DISTINCT network_id FROM token_snapshot WHERE token_address = ?",
+                    (ca, ca),
+                ).fetchall()
+                if r["network_id"]
+            ]
+
+            symbol = None
+            srow = conn.execute(
+                "SELECT token_symbol FROM fomo_events "
+                "WHERE token_address = ? AND token_symbol IS NOT NULL LIMIT 1",
+                (ca,),
+            ).fetchone()
+            if srow:
+                symbol = srow["token_symbol"]
+
+            blocks: list[str] = []
+            for net in local_nets:
+                buyers = store.token_buyers(conn, net, ca, since, limit=MAX_CA_LOCAL_BUYERS)
+                snap = conn.execute(
+                    "SELECT market_cap, max_market_cap FROM token_snapshot "
+                    "WHERE network_id = ? AND token_address = ?",
+                    (net, ca),
+                ).fetchone()
+                if not buyers and snap is None:
+                    continue
+
+                head = f"👥 你的名单 · {_esc(_chain_name(net))}"
+                if buyers:
+                    head += f":{len(buyers)} 人买过"
+                blocks.append(head)
+
+                now_mc = _f(snap["market_cap"]) if snap else None
+                peak_mc = _f(snap["max_market_cap"]) if snap else None
+                if now_mc is not None:
+                    seg = [f"💎 现在市值 {_money(now_mc)}"]
+                    # 明显回落过才提峰值,与 /hot 同一个取舍(见 _PEAK_MIN_RATIO 的注释)
+                    if peak_mc is not None and peak_mc > now_mc * _PEAK_MIN_RATIO:
+                        seg.append(f"峰值 {_money(peak_mc)}")
+                    blocks.append("   " + " · ".join(seg))
+
+                known_usd = self._ca_buyers_with_usd(conn, net, ca, since)
+                # 谁先买的排前面(token_buyers 本身就按首买时间正序返回)
+                for b in buyers:
+                    row = [f"@{_esc(b['who'] or '?')}"]
+                    entry_mc = _f(b["mcap"])
+                    if entry_mc is not None:
+                        row.append(f"💎{_money(entry_mc)} 进场")
+                        # 每个买家自己的进场市值不同,倍数必须逐人算,不能借用 peak/now 一概而论
+                        if now_mc is not None and entry_mc > 0:
+                            row.append(f"现 {now_mc / entry_mc:.1f}x")
+                    usd = _f(b["usd"])
+                    if usd is not None and b["who"] in known_usd:
+                        row.append(_money(usd) + (f"({b['buys']} 笔)" if b["buys"] > 1 else ""))
+                    else:
+                        # 金额一笔都没解析出来 —— 只报"买了几笔"这个确实知道的事。
+                        # 打 $0.00 会被读成"他只买了 0 块钱",那是凭空造出来的假事实
+                        row.append(f"{b['buys']} 笔")
+                    blocks.append("   " + " · ".join(row))
+
+        if not blocks:
+            blocks = ["👥 你的名单:无人持有"]
+        return local_nets, symbol, blocks
+
+    @staticmethod
+    def _ca_buyers_with_usd(conn, net: str, ca: str, since: str) -> set[str]:
+        """
+        这批买家里,**至少有一笔真的解析出了买入金额**的是谁(返回 who 集合)。
+
+        ⚠️ 为什么需要它:store.token_buyers 的 `SUM(COALESCE(amount_usd, 0))` 会把
+           "一笔都没解析出金额"(amount_usd 全 NULL)压成 0.0,Python 侧的
+           `usd is None` 因此**永远为假** —— is None 这道铁律被 SQL 里的 COALESCE
+           架空了,于是"金额未知"和"真的只买了 0 元"在渲染上再也分不开。
+        ⚠️ store.py 是冻结契约,只能在这里补一条**同谓词**的只读 SELECT
+           (与 _cmd_who / _ca_local 里那两条同样的处理)。谓词必须与 token_buyers
+           完全一致,否则这边判"已知"、那边算出来的却是另一批行的和。
+        """
+        countable = ",".join("?" * len(COUNTABLE_REASONS))
+        rows = conn.execute(
+            f"""
+            SELECT COALESCE(MAX(e.user_handle), MAX(e.handle)) AS who
+            FROM fomo_events e
+            JOIN watch_users w
+              ON w.user_id = e.user_id AND w.active = 1 AND w.stats_ready = 1
+            WHERE e.event_type = 'BUY' AND e.network_id = ? AND e.token_address = ?
+              AND e.event_ts >= ?
+              AND COALESCE(e.badge_reason, '') IN ({countable})
+            GROUP BY e.user_id
+            HAVING COUNT(e.amount_usd) > 0
+            """,
+            (net, ca, since, *COUNTABLE_REASONS),
+        ).fetchall()
+        return {r["who"] for r in rows}
+
+    def _ca_error(self, ca: str, e: Exception) -> str:
+        """
+        把 client 层异常翻成人话。与 _resolve_error 同构,但这里查的是合约地址不是用户
+        handle ——"找不到用户 @xxx" 这种措辞对地址没有意义,所以单独写一份而不是改
+        影响 /add /following /top 的那个公用函数。
+        """
+        from src.auth import AuthError
+        from src.client import FomoAPIError
+
+        if isinstance(e, AuthError):
+            logger.warning("get_token_thesis 鉴权失败 | {}", e)
+            return "❌ 登录态失效,请到服务器执行 <code>.\\bot.ps1 --login</code> 重新登录"
+
+        status = getattr(e, "status", None) or getattr(e, "status_code", None)
+        text = str(e)
+        if status in (401, 403) or "401" in text or "403" in text:
+            return (
+                "❌ FOMO 接口拒绝访问(登录态失效,或 Cloudflare 拦截)\n"
+                "先试 <code>.\\bot.ps1 --login</code>;仍不行则把 FOMO_CLIENT_IMPL 改成 playwright"
+            )
+        if isinstance(e, FomoAPIError):
+            logger.warning("get_token_thesis 失败 | {} | {}", ca[:16], e)
+            return f"❌ FOMO 接口异常: {_esc(text[:150])}"
+        logger.exception("get_token_thesis 未知异常 | {}", ca[:16])
+        return f"❌ 查询失败: {_esc(text[:150])}"
+
+
+# ============================================================
+# /ca 辅助渲染(纯函数,不碰网络 / DB)
+# ============================================================
+def _ca_cost_usd(it: dict) -> float | None:
+    """
+    这位作者在这个币上**投入过多少本金**。排序键用;两半都算不出来时返回 None。
+
+    ⚠️ 排序键绝不能用 usdValue。那是"卖完之后还剩多少",对已清仓的人**恒等于 0** ——
+       不是他的仓位规模。真实抓包 100 条按 usdValue 排,6 条清仓条目(去重后是 5 位
+       清仓作者)被整整齐齐钉在 #95–#100,而展示上限只有 8 行,
+       于是"已清仓的人显示已实现盈亏"那条修复
+       在真实数据上一行都渲染不出来。本金对两类人都可比:巨鲸投十几万排前面是**对的**,
+       而一个投了 $5000 的清仓者能压过一个还拿着 $50 的人 —— 这才是这条命令的价值。
+
+    两半各自反推(实测两个百分比各是对**自己那一半成本**算的):
+      还拿着的一半: usdValue - unrealizedPnlUsd
+        验算 @change:51474.66 - 16859.28 = 34615.38,16859.28 / 34615.38 = +48.70% ✓
+      已卖掉的一半: realizedPnlUsd / (percentageRealizedPnl / 100)
+        验算 @Pastrami_A:611.94 / 0.613265 = 997.85,与"赚 611.94 是 +61.3%"自洽 ✓
+
+    ⚠️ 算不出来的一半**绝不补 0**:0 的含义是"没投过钱",而我们只是"不知道"
+       (percentageRealizedPnl 为 0 或缺失时,除法根本没有定义)。
+       只算得出一半就用那一半 —— 它是本金的**下界**,方向不会错;
+       两半都算不出就返回 None,由 _ca_rank_key 把未知统一垫底,
+       不让一个"不知道"冒充具体数字去跟真实值比大小。
+    """
+    trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
+    total: float | None = None
+
+    held = _f(trade.get("usdValue"))
+    unreal = _f(trade.get("unrealizedPnlUsd"))
+    if held is not None and unreal is not None:
+        total = held - unreal
+
+    realized = _f(trade.get("realizedPnlUsd"))
+    realized_pct = _f(trade.get("percentageRealizedPnl"))
+    if realized is not None and realized_pct is not None and realized_pct != 0:
+        # 写成 realized * 100 / pct 而不是 realized / (pct / 100):后者在 pct 是次正规数
+        # (如 5e-324)时,pct / 100 会下溢成 0.0,一个 ZeroDivisionError 直接崩掉整条命令
+        sold = realized * 100.0 / realized_pct
+        total = sold if total is None else total + sold
+
+    if total is None or not math.isfinite(total):
+        return None
+    # 负本金没有物理含义,只可能来自浮点尘埃(清仓后 usdValue = -3.2e-13)或脏数据。
+    # 压回 0 而不是返回 None:我们**知道**这个人投得极少,这是事实不是未知
+    return max(total, 0.0)
+
+
+def _ca_rank_key(it: dict) -> tuple[int, float]:
+    """
+    排序键:本金已知的按本金从大到小,本金**未知**的一律垫底。
+
+    ⚠️ 元组第一位就是"知不知道"这一位。reverse=True 下 1 排在 0 前面,未知全部并列垫底;
+       并列部分靠 sorted 的稳定性保持接口原本的顺序。
+       不把未知折成 0 塞进数字里比大小 —— 那等于把"不知道"当成"没投过钱"来陈述。
+    """
+    cost = _ca_cost_usd(it)
+    return (0, 0.0) if cost is None else (1, cost)
+
+
+def _ca_fit_line(s: str, limit: int = CA_LINE_CHARS) -> str:
+    """
+    任意一行 → 长度 ≤ limit、且**必定**是合法 TG HTML 的一行。
+
+    这是出口不变式(见 _ca_assemble)唯一允许"切进一行内部"的地方,所以只按**原子**切:
+    一个完整实体 `&amp;`、一个完整标签各算一个原子,绝不切到一半 —— 残缺实体与未闭合
+    标签都让 TG 整条消息 400(本仓库历史事故,见 CA_MSG_BUDGET 的注释)。
+    切点之后把还开着的标签按逆序补齐,所以 `<code>` 里的内容被截短之后仍然是
+    `<code>…</code>`,而不是一个开着口的 `<code>`。
+
+    ⚠️ 不认识的标签、配不上对的闭标签、落单的 `<` / `&` 一律**当普通文本转义掉**。
+       这一条是本函数"对任意输入都成立"的关键:调用方不必再逐个字段证明自己转义干净、
+       也不必逐个字段封顶,漏一个也顶多是这一行难看,不会是整条消息 400。
+    ⚠️ 这里**不**做"叠平空白 → 截断 → 转义"那一套(见 _ca_clip):传进来的已经是转义后的
+       成品行,再转义一次就是双重转义。两者分工不同 —— _ca_clip 管"字段进来时",
+       本函数管"整行出去时",谁都替代不了谁。
+    """
+    line = _CA_LINE_BREAK.sub(" ", s)
+    # ⚠️ 快速路径的判据必须把 `>` 也算上:穷举扫描逮到过一条只有一个 `>` 的行,
+    #    它既不超长也没有 `<` / `&`,于是被原样放行 —— 一个裸 `>` 照样是非法 HTML。
+    if len(line) <= limit and not _CA_MARKUP.search(line):
+        return line                       # 纯文本且够短:绝大多数行走这条,零开销
+    out: list[str] = []
+    stack: list[str] = []                 # 还开着的标签,用来算"补齐闭标签要占多少"
+    used = 0
+    cut = False
+    for m in _CA_ATOM.finditer(line):
+        atom = m.group(0)
+        nxt = stack
+        if atom.startswith("</") and atom.endswith(">"):
+            name = atom[2:-1].strip().lower()
+            if stack and stack[-1] == name:
+                nxt = stack[:-1]
+            else:
+                atom = _esc(atom)         # 配不上对 = 上游漏了转义,当文本处理
+        elif atom.startswith("<") and atom.endswith(">"):
+            name = (atom[1:-1].split() or [""])[0].lower()
+            if name in _CA_OK_TAGS:
+                nxt = [*stack, name]
+            else:
+                atom = _esc(atom)
+        elif atom in ("<", ">", "&"):
+            atom = _esc(atom)
+        # 预留:补齐当前还开着的标签 + 省略号,免得刚好卡在"塞得下内容、塞不下闭标签"
+        reserve = sum(len(t) + 3 for t in nxt) + len(_CA_ELLIPSIS)
+        if used + len(atom) + reserve > limit:
+            cut = True
+            break
+        out.append(atom)
+        used += len(atom)
+        stack = nxt
+    if cut:
+        out.append(_CA_ELLIPSIS)
+    out.extend(f"</{t}>" for t in reversed(stack))
+    return "".join(out)
+
+
+def _ca_anchor(ca: str) -> str:
+    """
+    CA 锚点(整行 <code>,点击即复制,设计文档 §10.3 的必备项)。
+
+    ⚠️ 必须过一遍 _ca_fit_line:models.normalize_token_address 对非 0x/42 位的输入
+       **原样透传**,不做任何长度校验 —— 用户粘一个几千字符的"地址"上来,锚点自己
+       就超预算。而锚点是唯一"砍无可砍时也要贴上去"的那一行,不先收口的话,
+       _ca_assemble 最后贴上去的就是一颗炸弹(整条消息超长 → notifier 盲切 → 400)。
+    """
+    return _ca_fit_line(f"<code>{_esc(ca)}</code>")
+
+
+def _ca_clip(s: str, limit: int) -> str:
+    """
+    接口来的短字段 → 单行、限长、已转义。
+
+    ⚠️ 这一层管的是**可读性**不是安全性:安全性由 _ca_fit_line 在装配出口兜底
+       (哪个字段忘了 clip 都撑不破消息)。这里把 ticker / handle / 链名压到
+       十几二十个字符,是为了不让一个字段白吃掉别人的展示位 —— 出口那道闸只保证
+       "消息发得出去",保证不了"消息里还剩几位作者"。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义",与 _ca_thesis_text 同一条理由:
+       反过来会在截断点切断一个 `&amp;`,残缺实体照样让整条消息 400。
+       叠平空白也是必需的:ticker 里塞几个换行就能把一行变成十行,绕开按行算的预算。
+    """
+    flat = _CA_WS_RUN.sub(" ", s).strip()
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return _esc(flat)
+
+
+def _ca_thesis_text(raw: dict) -> str:
+    """
+    观点正文 → 单行摘要,已转义。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义":反过来的话会在截断点切断一个 `&amp;`
+       之类的实体,残缺实体照样让整条消息 400(formatter._thesis_line 早踩过这个坑)。
+    ⚠️ 实测顶层 comment 就是正文字符串本身;poller.py 另一路(活动流)记录过
+       {"comment": {"comment": "正文", ...}} 这种嵌套形状,两种都认,不猜死一种。
+    """
+    text = _pick_str(raw, "comment")
+    if not text:
+        c = raw.get("comment") if isinstance(raw, dict) else None
+        if isinstance(c, dict):
+            text = _pick_str(c, "comment", "text", "content", "body")
+    if not text:
+        return ""
+    flat = _CA_WS_RUN.sub(" ", text).strip()
+    if not flat:
+        return ""
+    if len(flat) > CA_THESIS_SNIPPET_CHARS:
+        flat = flat[:CA_THESIS_SNIPPET_CHARS].rstrip() + "…"
+    return _esc(flat)
+
+
+def _ca_money(v: float) -> str:
+    """
+    /ca 里的金额展示。与 _ca_pct_str 同一条理由,只是换了个值域:
+
+    ⚠️ usdValue / pnl 也直接来自接口、同样没有上限,而 _money 每三位插一个逗号:
+       `_money(1e300)` 是 **391 个字符**,一行有两处(持仓额 + 盈亏)。出口不变式只保证
+       这条消息发得出去,保证不了它还剩几位作者 —— 与 pct 是同一个"白吃展示位"。
+       所以超出人能读的量级就换科学计数法。
+    ⚠️ 只在 /ca 这一层加,**不动 _money 本身**:那是 /hot 等命令共用的排名展示格式
+       ($51.47K),已被两轮验证判定 PASS,不为本命令去改公用函数。
+    """
+    if abs(v) >= _CA_MONEY_SCI:
+        return f"{'-' if v < 0 else ''}${abs(v):.2e}"
+    return _money(v)
+
+
+def _signed_money(v: float) -> str:
+    """带正负号的金额,用于盈亏 —— 正值也要显式带 '+' 才看得出是在赚钱(_money 只标负号)"""
+    s = _ca_money(v)
+    return s if s.startswith("-") else f"+{s}"
+
+
+def _ca_pos_str(v: float) -> str:
+    """
+    持仓额展示。
+
+    ⚠️ 阈值的语义是"_money 的显示精度只到分",不是"约等于 0 就当没有":
+       线上真实值 usdValue = -2.4e-14(清仓后留下的尘埃残值)被 _money 印成 `-$0.00`,
+       一个带负号的零;真实的小额仓位 $0.004 也印成 `$0.00`,与它旁边那行
+       "未实现 +$50.00" 自相矛盾。所以**只**把落在显示精度以下的**非零**值改写掉,
+       恰好为 0 仍然照常显示 $0.00 —— 0 是"清仓了"这个有意义的真实值。
+       ⚠️ 这里绝不能用真值判断代替:`if not v` 会把恰好 0 和尘埃一起吞掉。
+    """
+    if v != 0 and abs(v) < _CA_DUST_USD:
+        return "不足 $0.01"
+    return _ca_money(v)
+
+
+def _ca_pct_str(v: float) -> str:
+    """
+    百分比展示。
+
+    ⚠️ 为什么出口不变式不足以覆盖这一处:pct 直接来自接口,没有任何天然上限,
+       `f"{1e300:+.1f}%"` 是 **302 个字符**,而一行里有两处(未实现 + 已实现)。
+       不变式保证的是"这条消息发得出去",保证不了"这条消息里还剩几位作者" ——
+       实测(pct=1e300 × 8 位作者)只渲染得出 5 位,一个字段白吃掉三分之一展示位。
+       所以这里仍然单独管,但管的是**记法**不是长度:超出人还读得动的量级
+       (十亿个点 = 一千万倍)就换科学计数法,信息一个数量级都不少,
+       长度从最坏 302 个字符回到最多 11 个。
+       ⚠️ 阈值取 1e9 而不是更小:真实的百倍千倍(+10000%)必须照原样显示,
+          换记法反而更难读。_f 已经把 NaN / Infinity 过滤成 None,这里不会拿到非有限值。
+    """
+    return f"{v:+.2e}%" if abs(v) >= 1e9 else f"{v:+.1f}%"
+
+
+def _ca_append_pnl(seg: list[str], label: str, pnl: float | None, pct: float | None) -> None:
+    """
+    往行里追加一段 `已实现 +$88.00 (+12.0%)`。
+
+    ⚠️ 缺失的判据只用 is None:pnl 恰好 0.0 是"不赚不亏"这个真实值,照常成段;
+       只有真的取不到(None)才整段消失,绝不打 "N/A" / "--" / 0。百分比同理,
+       它缺失时只掉括号那一小段,金额那半段不受牵连。
+    ⚠️ 尘埃值走 _CA_DUST_USD 这道守卫,与 _ca_pos_str 同一条理由:|pnl| 落在 _money 的
+       显示精度(分)以下时直接印出来就是 `+$0.00 (+0.0%)` —— 读者只会读成"卖过、
+       刚好打平",而真相是"卖了,金额小到印不出来"。恰好 0.0 不走这条:那是真的打平。
+    """
+    if pnl is None:
+        return
+    if pnl != 0 and abs(pnl) < _CA_DUST_USD:
+        # 方向必须留住:一个不带方向的"不足 $0.01"读者分不清是赚是亏
+        amount = "赚不足 $0.01" if pnl > 0 else "亏不足 $0.01"
+    else:
+        amount = _signed_money(pnl)
+    piece = f"{label} {amount}"
+    if pct is not None:
+        piece += f" ({_ca_pct_str(pct)})"
+    seg.append(piece)
+
+
+def _ca_thesis_row(it: dict) -> list[str]:
+    """
+    一条观点渲染成 1~2 行:@作者 · 持仓/已清仓 · 已实现|未实现盈亏(百分比);下跟正文摘要。
+
+    ⚠️ closedAt 非空 = 这个人**已经清仓**,他的 usdValue / unrealizedPnlUsd 全是 0,
+       落袋的盈亏在 realizedPnlUsd 里。只读未实现那三个字段的话,线上真实数据里
+       落袋赚 $611.94 的人、实亏 $95.94 的人、实亏 $59.03 的人会被渲染成逐字节相同的
+       `@某人 · $0.00 · +$0.00 (+0.0%)` —— 这不是"字段缺失整行消失",是凭空断言了
+       一个假事实:读者只会把 +$0.00 (+0.0%) 读成"这人打平了",而且还带着正号。
+    ⚠️ 两种盈亏混在同一列而不加标签同样误导,所以 _CA_LABEL_* 是必需的不是可选的。
+       取舍与 formatter._pnl_line 完全一致(那边卖出看已实现、其余看未实现)。
+    ⚠️ "仍在持仓"**不等于**"一分钱还没落袋"。真实抓包 100 条里 74 条是
+       "还拿着 + 已经卖掉一部分":首行 @change 手上 $51,474.66,已经落袋 $35,901.03。
+       只报未实现那一段的话,这 3.59 万一分不显示,而且盈亏方向可能整个反过来
+       (账面在浮亏、但落袋赚得更多)。所以仍在持仓时也要把已实现那段带出来。
+    """
+    trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), dict) else {}
+    handle = _pick_str(it, "userHandle") or _pick_str(it, "displayName") or "?"
+    # handle 是陌生人自己起的名字,长度不受任何约束,见 CA_HANDLE_CHARS
+    seg = [f"@{_ca_clip(handle, CA_HANDLE_CHARS)}"]
+
+    closed_at = _pick_str(trade, "closedAt")
+    if closed_at is not None:
+        # 已清仓:再报 $0.00 持仓只会被读成"他现在空仓且不赚不亏",前半句对、后半句是假的
+        seg.append(_CA_CLOSED_MARK)
+        _ca_append_pnl(seg, _CA_LABEL_REALIZED,
+                       _f(trade.get("realizedPnlUsd")), _f(trade.get("percentageRealizedPnl")))
+    else:
+        pos = _f(trade.get("usdValue"))
+        if pos is not None:                  # 0 是"刚好清完"的真实值,必须照常显示,不能省
+            seg.append(_ca_pos_str(pos))
+        _ca_append_pnl(seg, _CA_LABEL_UNREALIZED,
+                       _f(trade.get("unrealizedPnlUsd")), _f(trade.get("percentageUnrealizedPnl")))
+        # "已经落袋了多少"在这条路径上有**三种**状态,必须给出三种不同的输出 ——
+        # 压成两种就等于替读者编一个他分辨不出的事实(上一轮把 None 和 0.0 压成了
+        # 逐字节相同的输出,那正是这次要拆开的)。
+        #
+        #   卖过(realized != 0)—— 照常报金额与百分比。
+        #   一次没卖过(恰好 0.0)—— 整段**不出现**。这一段回答的是"已经落袋了多少",
+        #     而"仍在持仓"这条路径的基线本来就是一分没落袋,不写就是这个意思;
+        #     写成 `已实现 +$0.00 (+0.0%)` 反而多断言一次"卖过、只是刚好打平",
+        #     那跟"一次都没卖过"是两件事,数据分不出来,不该替读者选一个。
+        #     ⚠️ 这是**显示口径**的取舍,不是拿真值判断代替 is None:缺失判据仍然只有
+        #        is None,而且持仓额那一列的 0 照常显示(那里的 0 是"清仓了"这个独一无二的
+        #        事实,省掉读者就不知道他还剩多少;这里省掉的这一段信息量恒为 0)。
+        #   不知道(None,接口没给这个字段)—— 上面那条已经把"沉默"定义成了"没卖过",
+        #     所以这里再沉默就是断言了一件我们不知道的事。写明"未知",与 _day_str 的
+        #     "时间未知"同一套处理(绝不打 N/A / -- / 0)。
+        #     ⚠️ 只有这一行**已经在陈述他的仓位**时才需要这句澄清:authorTrade 整个缺失、
+        #        上面一段都没渲染出来的行本来就没许诺任何事,再挂一句"已实现 未知"是噪音。
+        realized = _f(trade.get("realizedPnlUsd"))
+        told_position = len(seg) > 1
+        if realized is None:
+            if told_position:
+                seg.append(f"{_CA_LABEL_REALIZED} 未知")
+        elif realized != 0:
+            _ca_append_pnl(seg, _CA_LABEL_REALIZED, realized,
+                           _f(trade.get("percentageRealizedPnl")))
+
+    lines = [" · ".join(seg)]
+    text = _ca_thesis_text(it)
+    if text:
+        lines.append(f"  {text}")
+    return lines
+
+
+def _ca_one_row_per_author(items: list[dict]) -> list[dict]:
+    """
+    一位作者只占一行:同一作者的多条观点里留**最新**那条。
+
+    ⚠️ MAX_CA_THESIS_ROWS 的本意是"看 8 个人怎么看",按**行**截断的话一个人发 4 条
+       就能占掉半张表(线上真实数据里 @leiff 一人 4 条、持仓完全相同),把别人挤下去。
+    ⚠️ 认不出作者(userId / userHandle 都没有)时**不合并** —— 宁可多占一行,
+       也不能把两个陌生人并成同一个人。
+    """
+    best: dict[str, dict] = {}
+    for i, it in enumerate(items):
+        key = _pick_str(it, "userId") or _pick_str(it, "userHandle") or f"\x00#{i}"
+        cur = best.get(key)
+        if cur is None or (_pick_str(it, "createdAt") or "") >= (_pick_str(cur, "createdAt") or ""):
+            best[key] = it
+    return list(best.values())
+
+
+def _ca_size(lines: list[str]) -> int:
+    """这些行拼进消息要占多少字符(含各自的换行)。⚠️ 传进来的必须是**已转义**的成品行"""
+    return sum(len(x) + 1 for x in lines)
+
+
+def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str) -> str:
+    """
+    头部 + 观点行 + 本地名单区 + CA 锚点 → 最终消息。
+
+    ## 出口不变式(**无论四个入参是什么**,返回值一定同时满足这三条)
+      1. len(返回值) <= CA_MSG_BUDGET
+      2. 返回值是合法的 TG HTML 子集:没有残缺实体,标签全部配对闭合
+      3. CA 锚点是最后一行且完整闭合 —— 锚点自己都超预算时**截短它**,不是丢掉它
+
+    这条不变式是本函数的**职责**,不是调用方的:上游任何一个来自接口/用户的字段
+    忘了限长(ticker、handle、链名、接口错误文案、已试链名、本地买家名……全都无界),
+    顶多让这一行难看,绝不会让整条消息发不出去。逐个字段去追是打地鼠,
+    第八处第九处永远追不完。
+
+    怎么做到的 —— 三步,缺一不可:
+      a) 每一行都先过 _ca_fit_line:单行 ≤ CA_LINE_CHARS,且切在原子边界上。
+         没有这一步,"按整行砍"就不完备:一行就能单独超过整条预算。
+      b) 总长超预算时**只按整行边界**砍,绝不切进行内 ——
+         切在 `&amp;` 中间就是残缺实体,整条消息 400(见 CA_MSG_BUDGET 的注释)。
+         这活儿也绝不能留给 notifier.send 去盲切,它切的就是字节。
+      c) 锚点最后贴,而 (a) 已经保证 len(anchor) <= CA_LINE_CHARS < CA_MSG_BUDGET,
+         所以"砍到一行不剩 + 贴上锚点"这个最坏情况仍然在预算内 —— 第 1 条成立。
+         (旧写法在这里破功:掏空 lines 之后仍然无条件 append 一个可能几千字符的锚点。)
+    """
+    head = [_ca_fit_line(x) for x in head]
+    tail = [_ca_fit_line(x) for x in tail]
+    anchor = _ca_fit_line(anchor)         # 幂等:调用方已经收过口也不会二次损坏
+    room = CA_MSG_BUDGET - _ca_size(head) - _ca_size(tail) - len(anchor) - _CA_OMIT_RESERVE
+    body: list[str] = []
+    used = 0
+    shown = 0
+    for it in rows[:MAX_CA_THESIS_ROWS]:
+        block = [_ca_fit_line(x) for x in _ca_thesis_row(it)]
+        cost = _ca_size(block)
+        if used + cost > room:
+            # ⚠️ 必须 continue 不能 break:break 会让一条长评论(正常人就写得出来)
+            #    把排在它**后面**、本来完全塞得下的短行全部连带丢掉 —— 一个人话多,
+            #    后面所有人就都消失了。跳过这一条,继续试下一条。
+            #    整行边界上停手这一点不变:不切半行,更不切半个 HTML 实体。
+            continue
+        body.extend(block)
+        used += cost
+        shown += 1
+
+    lines = [*head, *body]
+    # 未显示 = 总作者数 - **真正渲染出来的**条数。跳过的和超出 MAX_CA_THESIS_ROWS 的
+    # 都算在里面,shown 只在真正 extend 之后才自增,所以 continue 不会让它少报/多报
+    omitted = len(rows) - shown
+    if omitted:
+        lines.append(f"…按投入本金排序,还有 {omitted} 位未显示")
+    lines.extend(tail)
+    # 兜底:哪一段自己就撑破预算都照样只按整行砍(_ca_size(lines) + len(anchor)
+    # 恰好等于 "\n".join(lines + [anchor]) 的长度,不是估算)
+    while lines and _ca_size(lines) + len(anchor) > CA_MSG_BUDGET:
+        lines.pop()
+    lines.append(anchor)
+    return "\n".join(lines)
