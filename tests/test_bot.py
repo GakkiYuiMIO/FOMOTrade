@@ -10,6 +10,7 @@
 # ruff: noqa: N802
 from __future__ import annotations
 
+import random
 import re
 
 import pytest
@@ -33,6 +34,68 @@ def _assert_tg_safe(out: str) -> None:
     assert out.count("<code>") == out.count("</code>"), "<code> 没闭合"
     assert out.count("<b>") == out.count("</b>"), "<b> 没闭合"
     assert out.endswith("</code>"), f"CA 锚点必须活到最后一行,实际结尾: {out[-80:]!r}"
+
+
+# Telegram sendMessage 的协议上限。⚠️ 这是**外部事实**,故意写成字面量而不是从
+# src.notifier / src.bot import —— 门槛一旦从被测模块来,实现把上限调宽,断言就跟着调宽
+# (test_超长handle被裁剪且不挤掉别人 就在这个坑里空转过一整轮)。
+_TG_HARD_LIMIT = 4096
+_TAG = re.compile(r"<(/?)([a-zA-Z][^<>]*)>")
+
+
+def _tag_fault(s: str) -> str:
+    """标签有没有配对闭合。自己数一遍,不复用 src.bot 里的任何东西(复用就又成自指了)"""
+    stack: list[str] = []
+    for m in _TAG.finditer(s):
+        name = m.group(2).split()[0].lower()
+        if m.group(1):
+            if not stack or stack[-1] != name:
+                return f"闭标签配不上开标签: {m.group(0)}"
+            stack.pop()
+        else:
+            stack.append(name)
+    return f"标签没闭合: {stack}" if stack else ""
+
+
+def _assert_ca_invariant(out: str, *, anchored: bool = True) -> None:
+    """
+    /ca 装配出口的不变式(见 src.bot._ca_assemble 的 docstring):
+
+      1. 长度必然在预算内 —— 超了 notifier 就盲切,切点落在实体中间即整条 400
+      2. HTML 必然合法 —— 没有残缺实体、没有裸 `<` / `>`、标签全部配对闭合
+      3. CA 锚点必然在,而且是完整闭合的最后一行
+
+    ⚠️ anchored=False 只给"用法提示"这类本来就没有锚点的短回执用,前两条照查。
+    """
+    from src.bot import CA_MSG_BUDGET
+
+    assert len(out) <= _TG_HARD_LIMIT, f"超过 TG 协议上限 → notifier 盲切 → 400(实际 {len(out)})"
+    assert len(out) <= CA_MSG_BUDGET, f"超过本命令自己给自己定的预算(实际 {len(out)})"
+    m = _BROKEN_ENTITY.search(out)
+    assert m is None, f"残缺 HTML 实体 @{m.start() if m else -1}: {out[max(0, (m.start() if m else 0) - 25):][:60]!r}"
+    fault = _tag_fault(out)
+    assert not fault, f"{fault}\n{out[:200]!r}"
+    n_tags = len(_TAG.findall(out))
+    assert out.count("<") == n_tags, f"出现了不属于任何标签的裸 `<`:{out[:200]!r}"
+    assert out.count(">") == n_tags, f"出现了不属于任何标签的裸 `>`:{out[:200]!r}"
+    if anchored:
+        assert out.endswith("</code>"), f"CA 锚点必须活到最后一行,实际结尾: {out[-80:]!r}"
+        assert "<code>" in out, "锚点的开标签也得在"
+
+
+# 喂给不变式扫描的"最坏输入"零件表:实体的每一种形态、我们自己会写的标签、
+# 不该出现的标签、各种换行/不可见字符、以及会把 _esc 撑成 6 倍的引号。
+_EVIL_FRAGMENTS = (
+    "&", "<", ">", '"', "'", "&amp;", "&lt;", "&gt;", "&quot;", "&#x27;", "&#39;",
+    "&am", "&#x2", "<code>", "</code>", "<b>", "</b>", "<a href='x'>", "</a>",
+    "<script>", "</script>", "<3", "a>b",
+    "\n", "\r\n", "\t", "\x85", "\u2028", " ", "\u3000",
+    "A", "中", "…", "😀", "0", "$", "/", "\\", "%",
+)
+
+
+def _evil_text(rng, n: int) -> str:
+    return "".join(rng.choice(_EVIL_FRAGMENTS) for _ in range(n))
 
 
 class _FakeClient:
@@ -279,7 +342,7 @@ def test_清仓者按本金排序而不是按卖完之后剩下的0(monkeypatch,
     """
     usdValue 对已清仓的人**恒等于 0** —— 那是他卖完之后的剩余,不是他的仓位规模。
     拿剩余当规模排序等于把所有清仓者钉死在队尾:真实抓包 100 条按 usdValue 排,
-    6 个清仓者整整齐齐落在 #95–#100,而展示上限只有 8 行 ——
+    6 条清仓条目(去重后是 5 位清仓作者)整整齐齐落在 #95–#100,而展示上限只有 8 行 ——
     于是"已清仓者显示已实现盈亏"那条修复在真实数据上一行都渲染不出来。
 
     ⚠️ 验收标准**不是**"清仓者必须排前面"。巨鲸拿着几万、清仓者本金才一千,
@@ -338,6 +401,15 @@ def test_本金算不出来的人垫底而不是被当成没投过钱(monkeypatc
     ({"usdValue": 0.0, "unrealizedPnlUsd": 1000.0}, 0.0,
      "浮盈大于市值 → 本金算出负数,没有物理含义,压回 0(我们知道他投得极少,不是未知)"),
     ({}, None, "两半都取不到 → 未知,不是 0"),
+    # ⚠️ 下面三格补的是"**在持**那一半算不出"。原来的表只覆盖了"已卖那半算不出"和
+    #    "两半全缺",于是给在持那半补 0(`held - (unreal or 0)`)照样 531 全绿 ——
+    #    而 _ca_cost_usd 的 docstring 把"算不出的一半绝不补 0"写成了本次修复的核心。
+    ({"usdValue": 1000.0, "realizedPnlUsd": 500.0, "percentageRealizedPnl": 50.0}, 1000.0,
+     "缺 unrealizedPnlUsd → 在持那半算不出,只用已卖那半 500/50%=1000;补 0 会变成 2000"),
+    ({"usdValue": 1000.0}, None,
+     "只有市值、没有浮盈 → 在持那半是**不知道**,不是 1000;两半都算不出就该是 None"),
+    ({"unrealizedPnlUsd": 200.0}, None,
+     "反过来只有浮盈没有市值,同样算不出;补 0 会得出 -200 这种没有物理含义的本金"),
 ])
 def test_本金反推对各种脏字段都有确定行为(trade, want, why):
     """⚠️ 这些组合全都来自"陌生人可控 + 服务端可变"的字段,崩一次整条命令就没了回执"""
@@ -737,47 +809,62 @@ def test_一条塞不下的长观点不连带丢掉后面塞得下的短观点(m
 # ============================================================
 # 短字段限长 —— ticker / handle / 链名都由陌生人或服务端决定,长度不受任何天然约束
 # ============================================================
+def _line_starting_with(out: str, prefix: str) -> str:
+    """取出以 prefix 开头的那一行 —— 断言"这一行有多长"用,找不到直接失败而不是抛 StopIteration"""
+    for ln in out.split("\n"):
+        if ln.startswith(prefix):
+            return ln
+    raise AssertionError(f"输出里没有以 {prefix!r} 开头的行:\n{out[:400]}")
+
+
+# ⚠️ 下面三条测试的门槛**故意写成字面量**,不从 src.bot import 上限常量。
+#    原来写的是 `assert "H" * (CA_HANDLE_CHARS + 1) not in out` —— CA_HANDLE_CHARS
+#    就是实现里那个上限,实现把它从 24 放宽到 2900,断言的门槛跟着一起放宽,照样全绿
+#    (实测过),只有把上限调**小**才会红。自指的断言等于没有断言,本仓库栽过这一跤。
+#    改成钉一个与实现无关的**绝对**事实:手机上一行放不下的东西,再多也没有意义。
+_MAX_SANE_HEAD_LINE = 80
+_MAX_SANE_ROW_LINE = 120
+
+
 def test_超长ticker不把观点区整段掏空(monkeypatch, tmp_path):
     """
     head 段是 _ca_assemble 最后才会砍到的一段。ticker 不限长的话,一个字段就能把
     room 顶成负数,观点一条都渲染不出来,最后只剩一个 CA 锚点。
     """
-    from src.bot import CA_MSG_BUDGET, CA_TICKER_CHARS
-
     items = [_item(handle=f"u{i}", usd=float(900 - i), ticker="A" * 5000) for i in range(3)]
     client = _FakeClient({"56": items})
     b, _ = _bot(monkeypatch, tmp_path, client)
 
     out = b._cmd_ca(f"{CA_BSC} bsc")
 
-    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
-    assert "A" * (CA_TICKER_CHARS + 1) not in out, "ticker 必须被裁到上限以内"
+    head_line = _line_starting_with(out, "<b>$")
+    assert len(head_line) <= _MAX_SANE_HEAD_LINE, \
+        f"一个 ticker 把头部撑到了 {len(head_line)} 字符:{head_line[:60]!r}…"
+    assert "…" in head_line, "被裁剪必须留下痕迹,否则读者以为这就是完整的 ticker"
     for i in range(3):
         assert f"@u{i}" in out, f"一个超长 ticker 不该把 @u{i} 挤掉:\n{out[:300]}"
-    _assert_tg_safe(out)
+    _assert_ca_invariant(out)
 
 
 def test_超长链名不把观点区整段掏空(monkeypatch, tmp_path):
     """networkId 是服务端回读的,normalize_network 对未收录的值**原样透传**"""
-    from src.bot import CA_CHAIN_CHARS, CA_MSG_BUDGET
-
     items = [_item(handle=f"c{i}", usd=float(900 - i), network="Z" * 5000) for i in range(3)]
     client = _FakeClient({"56": items})
     b, _ = _bot(monkeypatch, tmp_path, client)
 
     out = b._cmd_ca(f"{CA_BSC} bsc")
 
-    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
-    assert "Z" * (CA_CHAIN_CHARS + 1) not in out, "链名必须被裁到上限以内"
+    head_line = _line_starting_with(out, "<b>$")
+    assert len(head_line) <= _MAX_SANE_HEAD_LINE, \
+        f"一个链名把头部撑到了 {len(head_line)} 字符:{head_line[:60]!r}…"
+    assert "…" in head_line, "被裁剪必须留下痕迹"
     for i in range(3):
         assert f"@c{i}" in out, f"一个超长链名不该把 @c{i} 挤掉:\n{out[:300]}"
-    _assert_tg_safe(out)
+    _assert_ca_invariant(out)
 
 
 def test_超长handle被裁剪且不挤掉别人(monkeypatch, tmp_path):
     """handle 是陌生人自己起的名字 —— 一行 3000 字符就能吃掉大半个预算"""
-    from src.bot import CA_HANDLE_CHARS, CA_MSG_BUDGET
-
     items = [_item(handle="H" * 3000, usd=900.0)]
     items += [_item(handle=f"n{i}", usd=float(100 - i), text="短") for i in range(3)]
     client = _FakeClient({"56": items})
@@ -785,11 +872,13 @@ def test_超长handle被裁剪且不挤掉别人(monkeypatch, tmp_path):
 
     out = b._cmd_ca(f"{CA_BSC} bsc")
 
-    assert len(out) <= CA_MSG_BUDGET, f"实际 {len(out)}"
-    assert "H" * (CA_HANDLE_CHARS + 1) not in out, "handle 必须被裁到上限以内"
+    row = _line_starting_with(out, "@H")
+    assert len(row) <= _MAX_SANE_ROW_LINE, \
+        f"一个 handle 把整行撑到了 {len(row)} 字符:{row[:60]!r}…"
+    assert "…" in row, "被裁剪必须留下痕迹,否则读者以为这就是他的全名"
     for i in range(3):
         assert f"@n{i}" in out, f"一个超长 handle 不该把 @n{i} 挤掉:\n{out[:300]}"
-    _assert_tg_safe(out)
+    _assert_ca_invariant(out)
 
 
 def test_短字段里的换行被叠平不另起新行(monkeypatch, tmp_path):
@@ -878,19 +967,21 @@ def test_观点正文超长时先截断再转义_不留残缺实体(monkeypatch,
 # ============================================================
 # 接口异常:本地那半段已经算好了,不能被一起丢掉
 # ============================================================
-def _seed_local(store_, handle="bob", amount_usd=500.0, market_cap=100_000.0, snap_mc=300_000.0):
+def _seed_local(store_, handle="bob", amount_usd=500.0, market_cap=100_000.0, snap_mc=300_000.0,
+                network="bsc"):
+    """⚠️ network 也要可参数化:它来自接口、直接落进 network_id 列,长度同样没人校过"""
     with store_.get_conn() as conn:
         store_.add_watch_user(conn, "u1", handle, handle.title())
         store_.mark_stats_ready(conn, "u1")
         store_.insert_event(conn, FomoEvent(
             event_id="e1", event_type=EVENT_BUY, user_id="u1",
             event_ts="2026-08-01T00:00:00+00:00", raw_json="{}",
-            network_id="bsc", token_address=CA_BSC, token_symbol="ELOY",
+            network_id=network, token_address=CA_BSC, token_symbol="ELOY",
             amount_usd=amount_usd, market_cap=market_cap, badge_reason=REASON_LOCAL_STATS,
             user_handle=handle,
         ))
         if snap_mc is not None:
-            store_.upsert_token_snapshots(conn, [("bsc", CA_BSC, "ELOY", 1.0, snap_mc)])
+            store_.upsert_token_snapshots(conn, [(network, CA_BSC, "ELOY", 1.0, snap_mc)])
 
 
 def test_接口异常时本地名单区照常输出(monkeypatch, tmp_path):
@@ -1079,3 +1170,439 @@ def test_金额部分未知时仍按已知的那部分报(monkeypatch, tmp_path)
     out = b._cmd_ca(CA_BSC)
 
     assert "$250.00(2 笔)" in out
+
+
+# ============================================================
+# 装配出口的不变式 —— 用穷举扫描守,而不是逐个场景/逐个字段追
+# ============================================================
+# 扫描规模。⚠️ 刻意**不**逐个场景写用例:逐个场景就是逐个字段封顶的翻版,
+#    上一轮封了 ticker / handle / 链名三处,这一轮验证者又找出四处(本地买家名、
+#    接口错误文案、已试链名、百分比),下一轮还会有第八处第九处。守出口才守得完。
+#    规模按"跑得起"取:装配层 2000 条约 5s、命令层 400 条约 2s。种子写死,可复现。
+#    离线又扫过 200000 + 20000 条(同一套生成器,不同种子),零反例。
+_FUZZ_ASSEMBLE_CASES = 2000
+_FUZZ_CMD_CASES = 400
+
+# 数值零件表:全都取自"接口可以返回、_f 必须扛得住"的真实形态
+_EVIL_NUMS = (
+    None, 0.0, -0.0, 1e-13, -1e-13, 0.004, -0.004, 123.45, -99.9,
+    1e300, -1e300, 5e-324, 1e15, 1e9, float("inf"), float("nan"),
+    "x", "", "1,234.5", "$12", True, [1], {"a": 1},
+)
+
+
+def _evil_token(rng, n: int) -> str:
+    """不含空白的一段垃圾 —— 当"地址"或"链名"用(arg.split() 之后必须还是一个 token)"""
+    pool = tuple(f for f in _EVIL_FRAGMENTS if not any(c.isspace() for c in f))
+    return "".join(rng.choice(pool) for _ in range(n))
+
+
+def _evil_row(rng) -> dict:
+    """一条最坏情况的观点:每个字段都可能是垃圾、缺失、超长或者根本不是那个类型"""
+    def num():
+        return rng.choice(_EVIL_NUMS)
+
+    return {
+        "ticker": _evil_text(rng, rng.randrange(0, 10)),
+        "networkId": _evil_text(rng, rng.randrange(0, 10)),
+        "userHandle": _evil_text(rng, rng.randrange(0, 12)),
+        "displayName": _evil_text(rng, rng.randrange(0, 12)),
+        "userId": rng.choice([None, "u", _evil_text(rng, 3)]),
+        "createdAt": rng.choice([None, "", "2026-08-20T00:00:00.000Z"]),
+        "comment": rng.choice([
+            _evil_text(rng, rng.randrange(0, 40)),
+            {"comment": _evil_text(rng, rng.randrange(0, 40))},
+        ]),
+        "authorTrade": rng.choice([
+            {
+                "usdValue": num(), "unrealizedPnlUsd": num(), "percentageUnrealizedPnl": num(),
+                "realizedPnlUsd": num(), "percentageRealizedPnl": num(),
+                "closedAt": rng.choice([None, "2026-01-01T00:00:00Z", ""]),
+            },
+            None, "not-a-dict",
+        ]),
+    }
+
+
+def test_锚点自己超预算时被截短而不是撑破整条消息():
+    """
+    直接缺陷:旧写法把 lines 掏空之后**无条件** append 锚点 —— 锚点自己就超预算时
+    整条消息照样超长 → notifier 盲切 → 400 → 用户什么都收不到。
+
+    触发路径不需要任何攻击技巧:models.normalize_token_address 对非 0x/42 位的输入
+    **原样透传**,不做任何长度校验,粘一个几千字符的"地址"上来就到了。
+    修好之后锚点该被**截短**而不是被丢掉 —— 它是设计文档 §10.3 的必备锚点。
+
+    ⚠️ 两条路都要扫:
+       a) _ca_anchor 造出来的锚点(生产路径,_cmd_ca 走的就是它);
+       b) 调用方按老写法**内联拼**、一个字都没收口的锚点 —— 不变式说的是
+          "无论入参是什么",_ca_assemble 自己就得扛住,不能把责任推给调用方。
+          少了 (b),把 _ca_assemble 里那句 anchor 收口删掉,测试照样全绿(实测过)。
+    """
+    from src.bot import _ca_anchor, _ca_assemble, _esc
+
+    for n in (30, 3000, 20000):
+        for anchor in (_ca_anchor("Z" * n), f"<code>{_esc('Z' * n)}</code>"):
+            out = _ca_assemble(["<b>$X</b> · bsc"], [], ["", "👥 你的名单:无人持有"], anchor)
+            _assert_ca_invariant(out)
+            assert "ZZZZZZZZZZ" in out, f"锚点该被截短,不是被丢掉:{out[-60:]!r}"
+
+
+def test_装配出口不变式对随机极端输入恒成立():
+    """
+    穷举式地守:随机生成一大批极端输入喂给 _ca_assemble,每一条输出都断言同一组不变式
+    (长度 ≤ 预算、HTML 合法、CA 锚点完整收尾)。
+
+    ⚠️ 一半用例故意**不转义**就往里灌:不变式声明的是"无论输入什么",
+       上游哪个字段漏了一次 _esc 也不能让整条消息 400。
+    """
+    from src.bot import _ca_anchor, _ca_assemble, _esc
+
+    rng = random.Random(20260825)
+    for _ in range(_FUZZ_ASSEMBLE_CASES):
+        wrap = _esc if rng.random() < 0.5 else str
+        head = [wrap(_evil_text(rng, rng.randrange(0, 60))) for _ in range(rng.randrange(0, 4))]
+        tail = [wrap(_evil_text(rng, rng.randrange(0, 120))) for _ in range(rng.randrange(0, 12))]
+        rows = [_evil_row(rng) for _ in range(rng.randrange(0, 12))]
+        addr = _evil_text(rng, rng.randrange(0, 400))
+        # 三种锚点形状都扫。第三种(锚点自己就远超预算)是必须的:
+        # 只扫前两种的话,把 _ca_assemble 里那句 anchor 收口删掉照样全绿 —— 因为
+        # _ca_anchor 已经替它收过口了,而内联那种随机长度很少真的顶破 3600。
+        anchor = rng.choice([
+            _ca_anchor(addr),
+            f"<code>{_esc(addr)}</code>",
+            f"<code>{_esc('Z' * rng.randrange(0, 8000))}</code>",
+        ])
+
+        _assert_ca_invariant(_ca_assemble(head, rows, tail, anchor))
+
+
+def test_命令出口不变式端到端对随机极端输入恒成立(monkeypatch, tmp_path):
+    """
+    _ca_assemble 不是 /ca 唯一的出口:查不到时还有几条**不走装配函数**的早退回执,
+    而地址(normalize_token_address 对非 0x/42 位原样透传)和链名(normalize_network
+    对未收录的值原样透传)都是用户可控的无界字符串。这里从命令入口整条扫,
+    把 normalize → _ca_clip → 渲染行 → 装配 这条链路一起罩住。
+    """
+    class _Mut:
+        items: list = []
+
+        def get_token_thesis(self, token_address, network_id, after_ms=None, limit=100):
+            return self.items
+
+    client = _Mut()
+    b, _ = _bot(monkeypatch, tmp_path, client)
+    rng = random.Random(4242)
+    for _ in range(_FUZZ_CMD_CASES):
+        client.items = [_evil_row(rng) for _ in range(rng.randrange(0, 12))]
+        addr = _evil_token(rng, rng.randrange(1, 30))
+        arg = addr if rng.random() < 0.5 else f"{addr} {_evil_token(rng, rng.randrange(1, 20))}"
+
+        out = b._cmd_ca(arg)
+
+        if client.items:
+            _assert_ca_invariant(out)                      # 有观点 → 走装配,锚点收尾
+        else:
+            _assert_ca_invariant(out, anchored=False)      # 早退回执:锚点在第一行
+            assert "<code>" in out, f"早退回执里 CA 锚点同样必须在:{out[:120]!r}"
+
+
+def test_上游把字段上限拿掉后出口不变式仍然兜住(monkeypatch, tmp_path):
+    """
+    这条测试就是本轮的**主张**本身:安全性不许依赖"每个字段都记得 clip"。
+
+    把 ticker / handle / 链名 / 摘要四处上限统统放宽到 50000(等价于"上游哪天忘了限长",
+    或者"接口新加了一个没人 clip 的字段"),出口不变式必须照样成立。
+    ⚠️ 而且要求比"发得出去"更进一步:那些超长的行该被**截短后照常展示**,
+       不是被整块跳过 —— 一个人名字长,不该等于这个人从消息里消失。
+    """
+    import src.bot as bot_mod
+
+    for name in ("CA_TICKER_CHARS", "CA_HANDLE_CHARS", "CA_CHAIN_CHARS",
+                 "CA_THESIS_SNIPPET_CHARS"):
+        monkeypatch.setattr(bot_mod, name, 50_000)
+    # 每人 handle 不同,否则 _ca_one_row_per_author 会把八条并成一位作者
+    items = [_item(handle="H" * 9000 + str(i), usd=float(900 - i), ticker="T" * 9000,
+                   network="N" * 9000, text="'" * 9000) for i in range(8)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    _assert_ca_invariant(out)
+    assert "@" + "H" * 100 in out, \
+        f"超长的行该被截短后照常展示,不该被整块跳过:\n{out[:200]!r}"
+    assert "位未显示" in out, "塞不下的必须如实说"
+
+
+def test_单行收口只在原子边界上切():
+    """
+    _ca_fit_line 是出口不变式唯一"切进一行内部"的地方,所以它切错就等于不变式失效。
+    ⚠️ 上限一律用字面量传进来,不从被测模块 import(自指的门槛等于没有门槛)。
+    """
+    from src.bot import _ca_fit_line
+
+    # 实体是一个原子:limit 卡在 `&amp;` 中间时整个实体一起让位,绝不切出 `&am`
+    assert _ca_fit_line("A&amp;B&amp;C", 8) == "A&amp;B…"
+    assert _BROKEN_ENTITY.search(_ca_fit_line("A&amp;B&amp;C", 8)) is None
+    # 标签也是一个原子,而且切点之后要把还开着的标签补齐 —— 否则 `<code>` 开着口
+    assert _ca_fit_line("<code>" + "Z" * 50 + "</code>", 20) == "<code>ZZZZZZ…</code>"
+    # 不认识的标签当普通文本转义掉(上游漏 _esc 时唯一安全的处置)
+    assert _ca_fit_line("<script>x</script>") == "&lt;script&gt;x&lt;/script&gt;"
+    # 落单的 `&` / `<` 同样转义掉
+    assert _ca_fit_line("a & b <3") == "a &amp; b &lt;3"
+    # 换行叠平:预算按行算,行数被上游控制就等于预算被上游控制
+    assert _ca_fit_line("a\nb\tc") == "a b c"
+    # 够短的普通行原样返回(绝大多数行走这条,不能被顺手改了样子)
+    assert _ca_fit_line("@alice · $28.52 · 未实现 +$10.72 (+60.3%)") == \
+        "@alice · $28.52 · 未实现 +$10.72 (+60.3%)"
+    assert _ca_fit_line("   @bob · 💎$1.00K 进场") == "   @bob · 💎$1.00K 进场"
+
+
+def test_最长的合法正文不会被单行上限误伤(monkeypatch, tmp_path):
+    """
+    出口的单行上限是**兜底**,不是排版规则:本命令自己渲染得出的最长一行 ——
+    140 个 `'` 的观点摘要,转义后 846 字符 —— 必须一个字都不少地出来。
+    上限调得太紧(比如 320)就会开始切正常内容,那是把兜底当成了排版规则。
+    """
+    client = _FakeClient({"56": [_item(handle="talky", text="'" * 300)]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert out.count("&#x27;") == 140, \
+        f"摘要上限是 140 个字符,转义后就该是 140 个完整实体,实际 {out.count('&#x27;')}"
+    _assert_ca_invariant(out)
+
+
+# ============================================================
+# 上一轮漏掉的那四处无界字段 —— 现在应当由出口不变式自动兜住
+# ============================================================
+def test_接口错误文案再长也撑不破消息且不被整段丢掉(monkeypatch, tmp_path):
+    """
+    `💭 观点没拉到:{err}` 里的 err 来自服务端返回体,转义后能到近千字符。
+    ⚠️ 断言不止"没撑破":还要求这一行**被截短而不是被整段砍掉** ——
+       head 是最后才砍的一段,不收口的话兜底循环只能把它整条 pop 掉,
+       于是用户既看不到错误原因,也不知道发生了什么。
+    """
+    client = _FakeClient(raise_exc=FomoAPIError("'" * 5000))
+    b, store_ = _bot(monkeypatch, tmp_path, client)
+    _seed_local(store_, handle="holder", amount_usd=500.0, market_cap=100_000.0)
+
+    out = b._cmd_ca(CA_BSC)
+
+    _assert_ca_invariant(out)
+    assert "观点没拉到" in out, "错误那一行不该被整段砍掉"
+    assert "@holder" in out, "本地那半段照常出,不跟着接口异常一起丢(两段解耦)"
+
+
+def test_已试链名再长也撑不破消息且不被整段丢掉(monkeypatch, tmp_path):
+    """
+    `💭 没查到观点(已试 {链名})` 的链名来自本地库的 network_id,**一个字符都没限过**。
+    """
+    client = _FakeClient({})
+    b, store_ = _bot(monkeypatch, tmp_path, client)
+    _seed_local(store_, handle="holder", amount_usd=500.0, market_cap=100_000.0,
+                network="N" * 5000)
+
+    out = b._cmd_ca(CA_BSC)
+
+    _assert_ca_invariant(out)
+    assert "没查到观点" in out, "这一行不该被整段砍掉"
+    assert "NNNNNNNNNN" in out, "链名该被截短,不是整行消失"
+
+
+def test_本地名单区的买家名再长也撑不破消息且不被整段丢掉(monkeypatch, tmp_path):
+    """买家 handle 来自接口、经 DB 落地,一路上没有任何长度校验"""
+    client = _FakeClient({"56": []})
+    b, store_ = _bot(monkeypatch, tmp_path, client)
+    _seed_local(store_, handle="B" * 5000, amount_usd=500.0, market_cap=100_000.0)
+
+    out = b._cmd_ca(CA_BSC)
+
+    _assert_ca_invariant(out)
+    assert "@" + "B" * 100 in out, "买家那一行该被截短,不是被整行丢掉"
+
+
+def test_百分比大到离谱时不白吃掉别人的展示位(monkeypatch, tmp_path):
+    """
+    ⚠️ 这一处出口不变式**覆盖不了**,所以仍然单独管 —— 但管的是**记法**不是长度:
+       不变式保证"这条消息发得出去",保证不了"这条消息里还剩几位作者"。
+       pct 直接来自接口没有上限,`f"{1e300:+.1f}%"` 是 302 个字符、一行两处 ——
+       实测(修复前)8 位作者只渲染得出 5 位,一个字段白吃掉三分之一的展示位。
+    """
+    items = [_item(handle=f"p{i}", usd=float(900 - i), pnl=10.0, pct=1e300,
+                   realized=5.0, realized_pct=1e300) for i in range(8)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    for i in range(8):
+        assert f"@p{i}" in out, f"@p{i} 被一个百分比挤掉了:\n{out[:400]}"
+    assert "位未显示" not in out
+    row = _thesis_line_of(out, "p0")
+    assert len(row) <= _MAX_SANE_ROW_LINE, f"一行 {len(row)} 字符,百分比还在白吃展示位:{row[:80]!r}"
+    _assert_ca_invariant(out)
+
+
+def test_金额大到离谱时不白吃掉别人的展示位(monkeypatch, tmp_path):
+    """
+    与百分比同一件事的另一半:_money 每三位插一个逗号,`_money(1e300)` 是 391 个字符,
+    一行同样有两处(持仓额 + 盈亏)。实测(修复前)8 位作者只渲染得出 4 位。
+    ⚠️ 只在 /ca 这一层换记法,不动 _money 本身 —— 那是 /hot 等命令共用的排名展示格式。
+    """
+    items = [_item(handle=f"m{i}", usd=1e300, pnl=1e300, pct=10.0,
+                   realized=1e300, realized_pct=5.0) for i in range(8)]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    for i in range(8):
+        assert f"@m{i}" in out, f"@m{i} 被一个金额挤掉了:\n{out[:400]}"
+    assert "位未显示" not in out
+    row = _thesis_line_of(out, "m0")
+    assert len(row) <= _MAX_SANE_ROW_LINE, f"一行 {len(row)} 字符,金额还在白吃展示位:{row[:80]!r}"
+    _assert_ca_invariant(out)
+
+
+# ============================================================
+# 短字段收口的**顺序** —— 铁律写在 docstring 里,却一直零覆盖
+# ============================================================
+def test_短字段必须先截断后转义否则切出残缺实体():
+    """
+    _ca_clip 的"叠平空白 → 按原文截断 → 转义"这个顺序是本仓库的历史事故换来的,
+    可它一直**零覆盖**:把顺序改成先转义后截断,531 个测试全绿,而输出确实是
+    `&am` 这种残缺实体,整条 TG 消息 400。两位验证者独立发现了同一条。
+
+    ⚠️ limit 用字面量传,断言写成逐字符相等 —— 不从被测模块 import 任何门槛。
+    """
+    from src.bot import _ca_clip
+
+    # 原文 13 个字符,取前 10 个 → 8 个 A + 2 个 `&`,转义后是两个**完整**的 &amp;
+    # 反过来(先把 `&` 转义成 `&amp;` 再取前 10 个)必然切在 `&am` 上
+    assert _ca_clip("AAAAAAAA" + "&" * 5, 10) == "AAAAAAAA&amp;&amp;…"
+    assert _BROKEN_ENTITY.search(_ca_clip("AAAAAAAA" + "&" * 5, 10)) is None
+    # 尖括号同理:先截断再转义永远得到成对的 &lt; / &gt;
+    assert _ca_clip("<b>hello</b>", 5) == "&lt;b&gt;he…"
+    # 没超长就不该有省略号,也不该被动过
+    assert _ca_clip("&x", 10) == "&amp;x"
+
+
+def test_本金是两半相加而不是取其中一半():
+    """
+    这条命令最核心的那个公式**一个测试都没有**:把 `total + sold` 改成
+    `max(total, sold)`,531 个测试全绿 —— 而拿 data/fomo_probe/thesis.json 的真实 100 条
+    实算过,它会改变展示顺序:前 8 位里 @DukerzBreadz 从第 5 掉到第 8。
+
+    在持那半 500 - 200 = 300,已卖那半 500 / 50% = 1000,相加 1300。
+    这三个数互不相同,取 max、取 min、只取任何一半都对不上 1300。
+    """
+    from src.bot import _ca_cost_usd
+
+    got = _ca_cost_usd({"authorTrade": {
+        "usdValue": 500.0, "unrealizedPnlUsd": 200.0,
+        "realizedPnlUsd": 500.0, "percentageRealizedPnl": 50.0,
+    }})
+
+    assert got == pytest.approx(1300.0), f"两半必须相加(300 + 1000),实际 {got!r}"
+
+
+def test_两半相加改变排序_不是纯粹的数值细节(monkeypatch, tmp_path):
+    """
+    上一条钉住公式本身,这一条钉住它**看得见的后果** —— 两个数必须挑得刚好:
+    @both 在持那半 500、已卖那半 600,相加 1100 压过 @held 的 900;
+    可只要取较大的那一半(600),他反过来被 @held 压下去,展示顺序当场就变了。
+    ⚠️ 数挑不好这条测试就是空转:第一版写的是 500/1000,取 max 得 1000 仍然 > 900,
+       变异照样全绿 —— 变异验证当场逮到了这一点。
+    """
+    items = [
+        # 在持 700 - 200 = 500,已卖 300 / 50% = 600,两半相加 1100
+        _item(handle="both", usd=700.0, pnl=200.0, pct=40.0, realized=300.0, realized_pct=50.0),
+        # 纯在持 900:比 1100 小,但比 600 大
+        _item(handle="held", usd=900.0, pnl=0.0, pct=0.0),
+    ]
+    client = _FakeClient({"56": items})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert out.index("@both") < out.index("@held"), \
+        f"1100 > 900,@both 必须排在前面;取较大那半就是 600 < 900,顺序会反过来:\n{out}"
+
+
+# ============================================================
+# "已经落袋了多少"的三种状态:卖过 / 一次没卖过 / 不知道
+# ============================================================
+def test_已实现的三种状态输出必须各不相同(monkeypatch, tmp_path):
+    """
+    ⚠️ 上一轮的 `realized is not None and realized != 0` 把后两种压成了**逐字节相同**的
+       输出:实测 realized=0.0 与 realized=None 一模一样,读者无法区分。
+       "一次没卖过就不显示这一段"这个决定本身是合理的(信息量恒为 0),
+       问题在于沉默已经被定义成"没卖过"了,再拿沉默表示"不知道"就是断言了一件
+       我们不知道的事。所以 None 要写明"未知"(与 _day_str 的"时间未知"同一套处理)。
+    """
+    unknown = _item(handle="unknown", usd=200.0, pnl=25.0, pct=14.0)
+    unknown["authorTrade"].pop("realizedPnlUsd")
+    unknown["authorTrade"].pop("percentageRealizedPnl")
+    client = _FakeClient({"56": [
+        _item(handle="sold", usd=200.0, pnl=25.0, pct=14.0, realized=80.0, realized_pct=40.0),
+        _item(handle="never", usd=200.0, pnl=25.0, pct=14.0, realized=0.0, realized_pct=0.0),
+        unknown,
+    ]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "sold") == \
+        "@sold · $200.00 · 未实现 +$25.00 (+14.0%) · 已实现 +$80.00 (+40.0%)"
+    assert _thesis_line_of(out, "never") == \
+        "@never · $200.00 · 未实现 +$25.00 (+14.0%)"
+    assert _thesis_line_of(out, "unknown") == \
+        "@unknown · $200.00 · 未实现 +$25.00 (+14.0%) · 已实现 未知"
+    bodies = {_thesis_line_of(out, h).split(" · ", 1)[1] for h in ("sold", "never", "unknown")}
+    assert len(bodies) == 3, f"三种状态必须给出三种输出,实际只有 {len(bodies)} 种:{bodies}"
+    assert "N/A" not in out and "--" not in out and "None" not in out
+
+
+def test_整行都没渲染出来时不再挂一句已实现未知(monkeypatch, tmp_path):
+    """
+    "未知"那句是给**已经在陈述仓位**的行做澄清用的。authorTrade 整个缺失、上面一段都
+    没渲染出来的行本来就没许诺任何事,再挂一句"已实现 未知"只是噪音。
+    """
+    it = {
+        "ticker": "ELOY", "networkId": "bsc", "comment": "还行",
+        "userHandle": "nodata", "displayName": "nodata",
+    }
+    client = _FakeClient({"56": [it]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "nodata") == "@nodata"
+
+
+def test_在持路径上尘埃已实现不印成假的打平(monkeypatch, tmp_path):
+    """
+    realized = 0.004 / -1e-13 都能穿过 `realized != 0`,再被 _money 印成 `+$0.00` ——
+    正是上一轮论证要避免的那句假事实("卖过、只是刚好打平")。
+    _CA_DUST_USD 这道守卫 _ca_pos_str 早就在用,这条路径一直没用上。
+    ⚠️ 方向必须留住:一个不带方向的"不足 $0.01"读者分不清是赚是亏。
+    """
+    client = _FakeClient({"56": [
+        _item(handle="dustwin", usd=200.0, pnl=25.0, pct=14.0,
+              realized=0.004, realized_pct=1.0),
+        _item(handle="dustloss", usd=200.0, pnl=25.0, pct=14.0,
+              realized=-1e-13, realized_pct=-0.5),
+    ]})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} bsc")
+
+    assert _thesis_line_of(out, "dustwin") == \
+        "@dustwin · $200.00 · 未实现 +$25.00 (+14.0%) · 已实现 赚不足 $0.01 (+1.0%)"
+    assert _thesis_line_of(out, "dustloss") == \
+        "@dustloss · $200.00 · 未实现 +$25.00 (+14.0%) · 已实现 亏不足 $0.01 (-0.5%)"
+    assert "+$0.00" not in out, "尘埃被印成 +$0.00 就是凭空断言「卖过、刚好打平」"
+    assert "-$0.00" not in out, "带负号的零是纯粹的浮点垃圾"
