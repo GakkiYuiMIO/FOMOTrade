@@ -1412,6 +1412,22 @@ def test_已试链名再长也撑不破消息且不被整段丢掉(monkeypatch, 
     assert "NNNNNNNNNN" in out, "链名该被截短,不是整行消失"
 
 
+def test_指定链时超长链名也撑不破这条早退回执(monkeypatch, tmp_path):
+    """
+    指定链却查不到时,那条回执**直接 return、不走 _ca_assemble** —— 出口不变式
+    管不到它,得靠这一行自己过 _ca_fit_line。而 normalize_network 对未收录的值
+    原样透传,用户打一个几千字符的"链名"就能撑破消息。
+    """
+    client = _FakeClient({})
+    b, _ = _bot(monkeypatch, tmp_path, client)
+
+    out = b._cmd_ca(f"{CA_BSC} {'C' * 6000}")
+
+    _assert_ca_invariant(out, anchored=False)
+    assert "没查到观点" in out, "这条回执本身不该消失"
+    assert "cccccccccc" in out, "链名该被截短,不是整行消失(normalize_network 会转小写)"
+
+
 def test_本地名单区的买家名再长也撑不破消息且不被整段丢掉(monkeypatch, tmp_path):
     """买家 handle 来自接口、经 DB 落地,一路上没有任何长度校验"""
     client = _FakeClient({"56": []})
