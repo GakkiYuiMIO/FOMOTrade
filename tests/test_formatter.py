@@ -715,6 +715,41 @@ def test_长handle吃掉版面时未显示人数要把被跳过的也算进去()
     assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>"
 
 
+def test_一个人名字长不许把排在他后面的短名字连带丢掉():
+    """
+    ⚠️ _receiver_rows 里装不下的那一行必须 `continue` 而不是 `break`。
+       break 会让一个长 handle 把排在它**后面**、本来完全塞得下的短行全部连带丢掉 ——
+       一个人名字长,后面所有人就都消失了。(与 bot._ca_assemble 同一条教训。)
+
+    ⚠️ 这条**必须直接测那个循环**,不能走整条消息渲染:实测走 _sig() 时 room 有
+       八百多,三个长行全都塞得下,那个分支根本不会被走到 —— 我第一版就是这么写的,
+       把 continue 改成 break 之后 631 条全绿。空转测试就是这么来的。
+    ⚠️ room=300 是实测挑的:长行成本 190、短行 51。
+       continue → 长行 1 个 + 短行 2 个 = 3 行;break → 只有 1 行。
+       门槛全是写死的字面量,不从被测模块 import 任何常量。
+    """
+    def _r(who):
+        return {"who": who, "usd": 900.0, "mcap": 1.98e5, "hits": 1,
+                "ts": "2026-08-26T00:32:17+00:00"}
+
+    evil = "'" * 24                       # 转义后 144 字符 → 整行 190
+    recv = [_r(f"{evil}{i}") for i in range(3)] + [_r(f"Short{i}") for i in range(3, 8)]
+
+    # 前提自检:长行确实塞不下第二个,短行确实塞得下 —— 前提垮了这条测试就没意义
+    costs = [len(formatter._receiver_row(r, None)) + 1 for r in recv]
+    assert costs[0] > 150 and costs[-1] < 60, f"前提不成立,行成本变了:{costs}"
+    assert costs[0] * 2 > 300, "前提不成立:两个长行居然塞得进 room"
+
+    body, shown = formatter._receiver_rows(recv, None, 300)
+
+    kept = [ln for ln in body if "Short" in ln]
+    assert kept, (
+        "长 handle 把排在它后面、本来塞得下的短行连带丢掉了 —— "
+        f"这正是 continue 改成 break 的后果。渲染出的行数={shown},内容={body}"
+    )
+    assert shown == len(body), "shown 与实际行数对不上,「还有 N 人未显示」会算错"
+
+
 def test_恶意handle不会撑破消息也不会切碎实体():
     """
     ⚠️ handle 与 ticker 由陌生人决定,长度不受任何天然约束。
