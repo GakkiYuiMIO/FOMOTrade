@@ -180,6 +180,13 @@ CREATE INDEX IF NOT EXISTS idx_copy_time ON copytrade_signals(triggered_at);
 --    这个币的跟单信号也会被当成"已经跟过"而静默跳过。
 -- ⚠️⚠️ 这张表与跟单执行器**没有任何关系**,永远不要让它参与下单判定:
 --    「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义。它只驱动一条推送。
+--
+-- 【产品决定,不是漏洞】一个币这辈子只告警一次 —— 触发之后哪怕收到的人
+--    从 3 个涨到 15 个、金额从 $1 万涨到 $50 万,**也不会有任何后续推送**。
+--    用户 2026-08-26 明确拍板过"只报一次"(问的就是要不要做阶梯再报,答案是不要)。
+--    ⚠️ 这一条很像缺陷,历次审查大概率会有人把它当 bug 报上来。
+--       要改成阶梯再报(如 5 人/10 人各再报一次)必须**先问用户**,不要"顺手修好"。
+--       真要做,主键得让位给 (network_id, token_address, 档位),而不是删去重。
 CREATE TABLE IF NOT EXISTS transfer_in_signals (
     network_id     TEXT NOT NULL,
     token_address  TEXT NOT NULL,
