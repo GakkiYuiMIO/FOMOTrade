@@ -845,9 +845,37 @@ def cmd_run() -> int:
         next_run_time=datetime.now(UTC),  # 别等第一个间隔,立刻跑一轮
     )
 
+    # ---- 第二个 job:币安 Alpha 新上架 ----
+    # ⚠️ 刻意**不塞进 _tick_job**。三条理由,每条都够独立成立:
+    #   1) tick 实测 5~18s,轮询间隔 27s,余量本来就只剩几秒,再挂一个外部请求就溢出;
+    #   2) 上面那个 except AuthError 会 sched.shutdown() —— 币安接口抖一下
+    #      绝不该有权力停掉整条 FOMO 推送链路;
+    #   3) 节奏差两个量级:FOMO 是 27 秒级,Alpha 上新是天级(实测约 3~4 天一个)。
+    # BlockingScheduler 默认 10 个 worker,这个 job 天然跑在另一条线程上;
+    # 它自己开 store.get_conn()(WAL + busy_timeout=5000,双线程安全),写事务只有一条
+    # set_state,短到不会跟 tick 的 BEGIN IMMEDIATE 打架。
+    alpha_watcher = None
+    if s.fomo_alpha_enabled:
+        from src.binance_alpha import AlphaWatcher
+
+        alpha_watcher = AlphaWatcher(notifier)
+        sched.add_job(
+            # run_once 契约上**绝不抛异常**(自己吞掉并记日志),所以这里不再包一层
+            alpha_watcher.run_once, "interval",
+            seconds=s.fomo_alpha_interval_sec,
+            id="binance_alpha",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=s.fomo_alpha_interval_sec,
+            next_run_time=datetime.now(UTC),  # 第一轮只播种水位线,不会推任何东西
+        )
+
     logger.info("=" * 60)
     logger.info("FOMO 监控启动 | 轮询 {}s | client={} | Ctrl+C 退出",
                 s.fomo_poll_interval_sec, s.fomo_client_impl)
+    if alpha_watcher is not None:
+        logger.info("币安 Alpha 上新监控已启用 | 巡检 {}s | 板块标注 {} 个",
+                    s.fomo_alpha_interval_sec, len(s.alpha_sectors))
     logger.info("=" * 60)
     try:
         sched.start()
@@ -866,6 +894,9 @@ def cmd_run() -> int:
             poller.close()
         with suppress(Exception):
             client.close()
+        if alpha_watcher is not None:
+            with suppress(Exception):
+                alpha_watcher.close()
     logger.info("已退出")
     return 0
 

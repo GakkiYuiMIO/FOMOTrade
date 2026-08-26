@@ -1068,3 +1068,49 @@ $47.90 available   [Max]
 ⚠️ 这个行为很像缺陷，审查时大概率会被当 bug 报上来。**不要顺手修好。**
 要改必须先问用户；真要做的话主键得改成 (network_id, token_address, 档位)，
 而不是把去重删掉。已在 `src/store.py` 的 `transfer_in_signals` 建表注释里就地标注。
+
+---
+
+## 币安 Alpha 新上架推送(2026-08-26)
+
+**做了什么**:币安 Alpha 全量名单里出现新代币 → 推一条 Telegram。
+用户看到的是 App 钱包页「市場焦點」板块,但主干**刻意不是板块**。
+
+**为什么主干是「全量名单新增」而不是「板块成员新增」**
+板块是币安运营编排出来的:没有任何文档、不在 web config 里(60/StockMemeCoins
+是前端硬编码)、随时可能改名或下线。而 Alpha 全量名单是官方文档化的公开集合。
+板块哪天没了,推送退化成「Alpha 新上架 XXX」,少一行标注而已,功能不死。
+反过来做的话,板块一下线整个功能当场失明。
+
+**关键决定**
+- [x] 水位线(见过的最大 listingTime)而不是全量快照差集 —— 665 条有 listingTime,不必存快照
+- [x] **冷启动静默播种**:第一次跑把水位线设成当前最大值,一条都不推(否则 665 条全炸出来)
+- [x] 水位线落 `runtime_state`(键 `binance_alpha_watermark_ms`),重启不丢
+- [x] 比较用 **`>`** 不是 `>=`:`>=` 会让 listingTime 等于水位线的那个币每轮重推
+- [x] 独立的第二个 APScheduler job(5 分钟),**不塞进 poller.tick()**
+- [x] 独立 client 模块,不复用 `src/client.py`(它的 AuthError 会 sched.shutdown())
+- [x] `AlphaWatcher.run_once()` 绝不抛异常 —— 与调度器的唯一接触面
+- [x] 板块条数上限 500:未知 tabId 币安**不报错、直接返回全量 3139 条**,
+      判据必须看 `data.total`(请求带 size=100,tokens 永远表现为 100 条,只看 len 这道闸不会响)
+- [x] 板块拉取失败 → 推送照发,只是没有那一行(缺失整行消失)
+- [x] 单轮超过 10 个新币改推一条汇总,防上游重写 listingTime 时把 TG 打爆
+
+**⚠️⚠️ 这个信号绝不接入跟单执行器。** 不进 CopyConfig、不写 copytrade_signals。
+「币安上了个新币」与「名单里的人掏钱买了」是完全不同的含义。
+
+**接口(都探过,免登录免 key,别再探)**
+- 全量名单 `GET /bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list`
+  实测 665 条,`listingTime` 665/665 有值;上新频率近 7 天 2 个、近 30 天 8 个
+- 板块成员 `POST .../buw/wallet/market/token/pulse/unified/rank/list`
+  body `{"rankType":60,"period":50,"chainId":"56","tabId":61,"size":100,"sortBy":10}`,实测 21 个成员
+- 离线夹具:`tests/fixtures/binance_alpha_token_list.json`(真实响应裁到 30 行,字段一个没动)
+  与 `tests/fixtures/binance_sector_rank.json`(真实响应原样)。测试**一次网络都不打**
+
+**已知残留(判定为低价值,别当成漏了)**
+1. 「Cat Meme」板块**不在** web config 的 `marketRankConfig.tabs` 里(App 端目录更多),
+   本轮没追。要加的话只需往 `FOMO_ALPHA_SECTORS` 里补一条 `rankType:tabId:名称`。
+2. 推送里没有币安自己的代币页链接:URL 形态没实测过,而**错的链接比没有链接更糟**。
+   现在用的是仓库既有的 FOMO / GMGN 拼法。
+3. 同一毫秒的漏推理论口子:若某个币晚于水位线才进名单、且 listingTime 恰好等于水位线,
+   会被 `>` 漏掉。币安是整份名单一起更新的,同毫秒的币必然同批出现;
+   用 `>=` 换来的却是**必然**的重复推送,权衡后取 `>`。
