@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,18 @@ def _mark() -> int | None:
     with store.get_conn() as c:
         raw = store.get_state(c, WATERMARK_KEY)
     return None if raw is None else int(raw)
+
+
+def _ledger() -> set[tuple[str, str]]:
+    """已推送台账里现有的键。⚠️ 表名/列名写死,不从被测模块 import。"""
+    with store.get_conn() as c:
+        rows = c.execute("SELECT network_id, token_address FROM binance_alpha_pushed").fetchall()
+    return {(r["network_id"], r["token_address"]) for r in rows}
+
+
+# 宽限窗口 7 天。⚠️ 同样刻意写死:从 ba.GRACE_WINDOW_MS 取的话,
+# 谁把它改成 0(= 退回纯水位线、同毫秒的币照样漏)测试也不会红。
+WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
 
 def _watcher(client, notifier=None, sectors=()) -> ba.AlphaWatcher:
@@ -602,3 +615,446 @@ def test_板块留空就是不标注():
     from src.config import FomoSettings
 
     assert FomoSettings(fomo_alpha_sectors="").alpha_sectors == []
+
+
+# ============================================================
+# 【必修 1】同毫秒代币分批到达 —— 已推送台账
+# ============================================================
+def test_同毫秒上架的币分两轮到达三个都要推到且不重复(db):
+    """
+    ⚠️⚠️ 这是 `listingTime > 水位线` 那个写法**永久静默漏推**的实测复现。
+
+    一次真实响应的统计:665 条名单里 32 组代币共享同一个 listingTime,
+    覆盖 100 个币(15%),最大一组 10 个 —— 15% 的代币都处在这个风险里。
+    「进名单的时刻」与「listingTime」是脱钩的两件事(名单里存在尚未到上架时刻的币,
+    formatter 那个「即将上架」分支就是为它写的),所以同组分两轮进名单完全可能,
+    而巡检间隔是 5 分钟。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种,水位线 = DEBIT_MS
+    n.sent.clear()
+
+    same = DEBIT_MS + 60_000
+    a = _tok(symbol="SAMEA", listing_time_ms=same, contract_address="0x" + "a" * 40)
+    b = _tok(symbol="SAMEB", listing_time_ms=same, contract_address="0x" + "b" * 40)
+    c = _tok(symbol="SAMEC", listing_time_ms=same, contract_address="0x" + "c" * 40)
+
+    # 第一轮:同毫秒的三个里先进名单两个
+    assert _watcher(FakeClient(tokens=[*toks, a, b]), n).run_once() == 2
+    assert _mark() == same, "水位线被这一批顶到了同一毫秒上"
+
+    # 第二轮:第三个才进名单,它的 listingTime 与水位线**一模一样**
+    assert _watcher(FakeClient(tokens=[*toks, a, b, c]), n).run_once() == 1, \
+        "用 `listingTime > 水位线` 的话这里是 0 —— 该币永久丢失,且没有任何日志留痕"
+
+    got = [s for s in ("SAMEA", "SAMEB", "SAMEC") if any(f"${s}" in m for m in n.sent)]
+    assert got == ["SAMEA", "SAMEB", "SAMEC"], "三个都要推到"
+    assert len(n.sent) == 3, "而且一条都不许重复 —— 改用 `>=` 换来的就是这里变成 5 条"
+
+
+def test_推过的币在宽限窗口内不会被重推(db):
+    """
+    候选窗口放宽到「水位线 - 7 天」之后,**去重必须由台账负责**:
+    否则窗口里的每个币每 5 分钟重推一次,比原来的漏推还糟。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种
+    n.sent.clear()
+
+    fresh = _tok(symbol="ONCE", listing_time_ms=DEBIT_MS + 1, contract_address="0x" + "e" * 40)
+    full = [*toks, fresh]
+    assert _watcher(FakeClient(tokens=full), n).run_once() == 1
+    for _ in range(3):
+        assert _watcher(FakeClient(tokens=full), n).run_once() == 0
+    assert len(n.sent) == 1, "同一个币这辈子只推一次"
+
+
+def test_推送失败的币下一轮补推(db):
+    """
+    ⚠️ 台账只记**真正发出去的**。把发失败的也记进去就等于把这个币判死:
+       一次 TG 400 或代理抖动 = 永久漏推,而日志里只有一行 error。
+       (水位线仍然照常前移 —— 它的语义是「已经处理过」,不是「已经送达」。)
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    ok = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), ok).run_once()         # 播种
+    fresh = _tok(symbol="RETRY", listing_time_ms=DEBIT_MS + 1, contract_address="0x" + "f" * 40)
+
+    dead = FakeNotifier(ok=False)
+    assert _watcher(FakeClient(tokens=[*toks, fresh]), dead).run_once() == 0
+    assert ("bsc", "0x" + "f" * 40) not in _ledger(), "没发出去的绝不能记进台账"
+
+    ok.sent.clear()
+    assert _watcher(FakeClient(tokens=[*toks, fresh]), ok).run_once() == 1, \
+        "上一轮没发出去,这一轮必须补上"
+    assert "$RETRY" in ok.sent[0]
+
+
+def test_台账会清掉掉出宽限窗口的行不会无限增长(db):
+    """
+    ⚠️ 去重表必须有清理策略,否则每上一个新币就多一行、永不回收。
+       阈值 = 新水位线 - 宽限窗口:掉到窗口外的币永远不会再成为候选,留着纯属浪费。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种,水位线 DEBIT_MS
+
+    old = _tok(symbol="OLDONE", listing_time_ms=DEBIT_MS + 1, contract_address="0x" + "1" * 40)
+    _watcher(FakeClient(tokens=[*toks, old]), n).run_once()
+    assert ("bsc", "0x" + "1" * 40) in _ledger(), "刚推过的币当然在台账里"
+
+    # 一个整整 7 天之后上架的币把水位线顶过去 → OLDONE 掉到窗口下界上,该被清掉
+    far = _tok(symbol="FARONE", listing_time_ms=DEBIT_MS + 1 + WEEK_MS,
+               contract_address="0x" + "2" * 40)
+    _watcher(FakeClient(tokens=[*toks, old, far]), n).run_once()
+    led = _ledger()
+    assert ("bsc", "0x" + "2" * 40) in led, "还在窗口里的必须留着,否则它下一轮就被重推"
+    assert ("bsc", "0x" + "1" * 40) not in led, "掉出宽限窗口的行必须清掉,否则台账永不回收"
+
+
+def test_台账掉出窗口之后那个币也不会被重推(db):
+    """清理不能把「已处理」清成「没处理过」—— 窗口下界本身就挡着它。"""
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()
+    old = _tok(symbol="OLDONE", listing_time_ms=DEBIT_MS + 1, contract_address="0x" + "1" * 40)
+    far = _tok(symbol="FARONE", listing_time_ms=DEBIT_MS + 1 + WEEK_MS,
+               contract_address="0x" + "2" * 40)
+    _watcher(FakeClient(tokens=[*toks, old]), n).run_once()
+    _watcher(FakeClient(tokens=[*toks, old, far]), n).run_once()
+    n.sent.clear()
+
+    assert _watcher(FakeClient(tokens=[*toks, old, far]), n).run_once() == 0
+    assert n.sent == []
+
+
+def test_老库升级不会重推历史上已经推过的币(db):
+    """
+    ⚠️ 台账是新加的表,老库里它是空的 —— 若把「不在台账里」直接当成「没推过」,
+       升级那一轮会把宽限窗口内的历史币全部重推一遍。
+       水位线的语义本来就是「这个时刻(含)之前的都已处理过」,照它初始化台账即可,
+       而且 base 之上那些**同一轮就推出来**,不该白等一个巡检间隔。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    with store.get_conn() as c, store.tx(c):
+        store.set_state(c, WATERMARK_KEY, str(TMX_MS))       # 模拟老版本留下的水位线
+
+    n = FakeNotifier()
+    assert _watcher(FakeClient(tokens=toks), n).run_once() == 1, \
+        "只有比老水位线新的 DEBIT 该推,窗口内的历史币一个都不许重推"
+    assert "$DEBIT" in n.sent[0]
+    assert not any("$TMX" in m for m in n.sent), "TMX 的上架时间等于老水位线,历史上已经推过"
+
+
+def test_台账为空是正常状态不能被当成没初始化过(db):
+    """
+    ⚠️ 清理会把台账清空(窗口内一个币都没有时),这是**正常状态**。
+       靠「表是不是空的」判有没有初始化过,会让一个迟到的同毫秒币被当成历史存量
+       二次播种 —— 于是它又一次静默丢失。所以初始化标记必须是独立的一位。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种
+    with store.get_conn() as c, store.tx(c):
+        c.execute("DELETE FROM binance_alpha_pushed")        # 手工模拟"被清理干净了"
+    assert _ledger() == set()
+    n.sent.clear()
+
+    late = _tok(symbol="LATESAME", listing_time_ms=DEBIT_MS, contract_address="0x" + "7" * 40)
+    _watcher(FakeClient(tokens=[*toks, late]), n).run_once()
+    assert any("$LATESAME" in m for m in n.sent), \
+        "台账空了不等于没初始化过 —— 二次播种会把这个迟到的同毫秒币再吃掉一次"
+
+
+def test_名单里最新的币被撤下时水位线也不许后退(db):
+    """
+    ⚠️ 水位线后退 = 候选窗口下界跟着后退,而那段区间的台账早被清理掉了 ——
+       于是一批老币重新变成「没推过」,全部重推一遍。
+       既有的「只前移不后退」测的是**没有新币可推**的情形;这条补上有新币可推的那一半,
+       那才是水位线真正被写回去的那条路径。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种,水位线 DEBIT_MS
+    n.sent.clear()
+
+    # 币安把最新的 DEBIT 撤下,同时一个更早的币迟到进名单
+    without_newest = [t for t in toks if t.listing_time_ms != DEBIT_MS]
+    late = _tok(symbol="LATECOMER", listing_time_ms=TMX_MS + 1,
+                contract_address="0x" + "3" * 40)
+    assert _watcher(FakeClient(tokens=[*without_newest, late]), n).run_once() == 1
+    assert "$LATECOMER" in n.sent[0]
+    assert _mark() == DEBIT_MS, "推了一个更早的币,水位线绝不能被拽回到它那里"
+
+
+def test_台账重复写同一个币不抛也不重复(db):
+    """
+    ⚠️ 主键冲突不是错误:播种与后续推送本来就会碰上同一个币。
+       写成裸 INSERT 的话一次冲突就让整个事务回滚 —— 水位线跟着不动、台账也没记上,
+       下一轮撞同一处,从此原地卡死。
+    """
+    row = ("bsc", "0x" + "4" * 40, "DUP", DEBIT_MS)
+    with store.get_conn() as c:
+        with store.tx(c):
+            store.record_alpha_pushed(c, [row])
+        with store.tx(c):
+            store.record_alpha_pushed(c, [row, row])         # 同一轮里也撞
+        cnt = c.execute("SELECT COUNT(*) AS n FROM binance_alpha_pushed").fetchone()["n"]
+    assert cnt == 1, "同一个键只该有一行"
+
+
+# ============================================================
+# 【必修 2】链解析:chainId 不是纯数字
+# ============================================================
+# 线上一次真实调用的全部 9 种 chainId,以及各自该解析成什么、该不该有链接行。
+# 分布:56:490 / CT_501:70 / 8453:42 / 1:38 / CT_784:13 / 42161:4 / 146:4 / CT_195:3 / 59144:1
+# ⚠️ 期望值全部写死字面量,不从 models 的 slug 表反推 —— 那样等于 `x == x`。
+_LIVE_CHAINS = [
+    ("56", "BSC", "bsc", True, "BNB Chain"),
+    ("CT_501", "Solana", "solana", True, "Solana"),
+    ("8453", "Base", "base", True, "Base"),
+    ("1", "Ethereum", "ethereum", True, "Ethereum"),
+    # 下面五条本仓库没有 slug:解析结果就是原始 chainId 透传(= "我们不认识这条链"),
+    # 链接行整行消失,其余各行照常。
+    ("CT_784", "Sui", "ct_784", False, "Sui"),
+    ("42161", "Arbitrum", "42161", False, "Arbitrum"),
+    ("146", "Sonic", "146", False, "Sonic"),
+    ("CT_195", "TRON", "ct_195", False, "TRON"),
+    ("59144", "Linea", "59144", False, "Linea"),
+]
+
+
+@pytest.mark.parametrize(("chain_id", "chain_name", "net", "has_link", "display"), _LIVE_CHAINS)
+def test_线上九种链逐个解析与渲染(chain_id, chain_name, net, has_link, display):
+    """
+    ⚠️⚠️ 原来代码里写着「实测 665 条名单里 chainId 清一色 56」——**那是假的**,
+       BSC 只占 490/665。靠 chainId 数字去映射,70 个 Solana 币(chainId 是 `CT_501`)
+       会直接丢掉整行链接,而 Solana 是本仓库完整支持的链。
+    ⚠️ 未收录的链没有链接行是**正确行为**:硬拼一个必然 404 的链接比没有链接更糟。
+       但它绝不能影响其余各行。
+    """
+    assert ba.resolve_network(chain_name, chain_id) == net
+
+    msg = _render(symbol="TESTSYM", name="Test Token", network_id=net, chain_name=chain_name)
+    assert ("🔗" in msg) is has_link
+    if has_link:
+        assert "fomo.family" in msg and "gmgn.ai" in msg
+    assert f"🧬 {display}" in msg, "链那一行任何情况下都在(内部展示名,查不到才用币安原始链名)"
+    # 链接有没有都不影响其余各行
+    assert "$TESTSYM" in msg
+    assert "$20.04M" in msg
+    assert msg.split("\n")[-1].startswith("<code>"), "CA 永远独占最后一行"
+
+
+def test_Solana代币的推送必须带链接行(db):
+    """
+    ⚠️ 上一条测的是纯函数;这一条走完整的 run_once 链路,钉住**接线本身** ——
+       把 _push 里的 network_id 改回 normalize_network(chain_id) 时,上一条照样绿。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种
+    n.sent.clear()
+
+    sol_ca = "G7vQWurMkMMm2dU3iZpXYFTHT9Biio4F4gZCrwFpKNwG"
+    sol = ba.AlphaToken(listing_time_ms=DEBIT_MS + 1, symbol="BIRB", name="Moonbirds",
+                        chain_id="CT_501", chain_name="Solana", contract_address=sol_ca,
+                        market_cap="15570000", holders="15135", alpha_id="ALPHA_999")
+    assert _watcher(FakeClient(tokens=[*toks, sol]), n).run_once() == 1
+    assert f"https://fomo.family/tokens/solana/{sol_ca}" in n.sent[0]
+    assert f"https://gmgn.ai/sol/token/{sol_ca}" in n.sent[0]
+
+
+def test_未收录的链照常推只是没有链接行(db):
+    """⚠️ 拼不出链接绝不能升级成「不推」—— 那是把一行的缺失变成整条消息的缺失。"""
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()
+    n.sent.clear()
+
+    sui_ca = "0x97c7571f4406cdd7a95f3027075ab80d3e9c937c2a567690d31e14ab1872ccee::xmn::XMN"
+    sui = ba.AlphaToken(listing_time_ms=DEBIT_MS + 1, symbol="XMN", name="Ximen",
+                        chain_id="CT_784", chain_name="Sui", contract_address=sui_ca,
+                        market_cap="1234567", holders="88", alpha_id="ALPHA_888")
+    assert _watcher(FakeClient(tokens=[*toks, sui]), n).run_once() == 1
+    assert "🔗" not in n.sent[0]
+    assert "$XMN" in n.sent[0] and "$1.23M" in n.sent[0] and "🧬 Sui" in n.sent[0]
+    assert n.sent[0].split("\n")[-1] == f"<code>{sui_ca}</code>"
+
+
+def test_链名缺失时退回chainId():
+    """chainName 是这次修复的首选依据,但它不是必填 —— 缺了要能退回 chainId。"""
+    assert ba.resolve_network(None, "56") == "bsc"
+    assert ba.resolve_network("", "8453") == "base"
+    assert ba.resolve_network(None, None) is None
+
+
+# ============================================================
+# 【必修 3】未来时间戳不许顶死水位线
+# ============================================================
+def test_未来时间戳不许顶高水位线功能不能因此死掉(db):
+    """
+    ⚠️⚠️ 没有上界的话,一行 listingTime=99999999999999(公元 5138 年)就把水位线顶到那里,
+       此后**再也没有任何代币比水位线新** —— 功能永久静默死亡,没有日志、没有告警,
+       用户只会以为币安很久没上新了。
+       不是纯假想:formatter 里那个「即将上架」分支的存在,说明名单里确实出现过未来时间戳,
+       一次预挂牌公告就够了。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种
+    n.sent.clear()
+
+    bogus = _tok(symbol="Y5138", listing_time_ms=99999999999999,
+                 contract_address="0x" + "9" * 40)
+    _watcher(FakeClient(tokens=[*toks, bogus]), n).run_once()
+    assert _mark() == DEBIT_MS, "水位线绝不能跟着未来时间戳走"
+
+    # 证据:功能没死 —— 后面来的正常新币照样推得出来
+    n.sent.clear()
+    later = _tok(symbol="STILLALIVE", listing_time_ms=DEBIT_MS + 1000,
+                 contract_address="0x" + "8" * 40)
+    assert _watcher(FakeClient(tokens=[*toks, bogus, later]), n).run_once() == 1, \
+        "水位线被顶到公元 5138 年的话,这里永远是 0,而且一条日志都没有"
+    assert "$STILLALIVE" in n.sent[0]
+
+
+def test_整份名单全是未来时间戳时水位线一动不动(db):
+    """一个可信值都没有 ≠ 没有新币。宁可这一轮什么都不做,下一轮重来。"""
+    toks = ba.parse_tokens(_alpha_payload())
+    _watcher(FakeClient(tokens=toks)).run_once()             # 播种
+
+    n = FakeNotifier()
+    junk = [_tok(symbol="J1", listing_time_ms=99999999999999,
+                 contract_address="0x" + "a" * 40)]
+    assert _watcher(FakeClient(tokens=junk), n).run_once() == 0
+    assert _mark() == DEBIT_MS
+    assert n.sent == []
+
+
+def test_几小时后才上架的币是正常业务不能被当成脏数据(db):
+    """
+    ⚠️ 上界不能一刀切:名单里确实会出现尚未到上架时刻的币(实测 DEBIT 在 10:00 前
+       就已经在名单里)。预挂牌是正常业务,把它判脏就是把真实的上新吃掉。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()
+    n.sent.clear()
+
+    soon_ms = int(time.time() * 1000) + 6 * 3600 * 1000
+    soon = _tok(symbol="SOON", listing_time_ms=soon_ms, contract_address="0x" + "5" * 40)
+    assert _watcher(FakeClient(tokens=[*toks, soon]), n).run_once() == 1
+    assert "即将上架" in n.sent[0]
+    assert _mark() == soon_ms, "6 小时后上架在上界之内,水位线该跟上"
+
+
+def test_一个月之后的上架时间不可信不许顶高水位线(db):
+    """
+    ⚠️ 光"拒绝公元 5138 年"是不够的:上界只要放得够松(比如 100 年),
+       一个 2100 年的脏值照样能把水位线顶死,而测试全绿。
+       这条把余量的**上限**钉住 —— 实测预告提前量是几小时级,一个月已经宽出两个数量级,
+       再往后的值只能是脏数据。与上一条一起把余量夹在 (6 小时, 30 天) 之间。
+    """
+    toks = ba.parse_tokens(_alpha_payload())
+    n = FakeNotifier()
+    _watcher(FakeClient(tokens=toks), n).run_once()          # 播种
+    n.sent.clear()
+
+    far_ms = int(time.time() * 1000) + 30 * 24 * 3600 * 1000
+    far = _tok(symbol="MONTHLATER", listing_time_ms=far_ms, contract_address="0x" + "6" * 40)
+    _watcher(FakeClient(tokens=[*toks, far]), n).run_once()
+    assert _mark() == DEBIT_MS, "一个月之后的上架时间只能是脏数据,水位线绝不能跟着走"
+
+
+# ============================================================
+# 【必修 4】symbol 的转义
+# ============================================================
+def test_符号里的尖括号与和号必须转义且只转一次():
+    """
+    ⚠️⚠️ symbol 与 name 一样是**陌生人可控的链上文本**,一个裸 '<' 就让整条消息 400 ——
+       既是稳定性问题,更是「改个币名就让监控静默失效」的攻击面。
+    ⚠️ 原来那条用例虽然也传了带标签的 symbol,但三条断言**全部落在 name 上**:
+       把 render_alpha_listing 里 symbol 那一路的转义删掉,131 条测试照样全绿。
+       这条专门守 symbol。
+    """
+    msg = _render(symbol="<i>A & B</i>", name="Teller")
+    assert "&lt;i&gt;A &amp; B&lt;/i&gt;" in msg, "符号必须转义"
+    assert "<i>" not in msg and "</i>" not in msg, "裸标签一个都不许漏进去"
+    assert "&amp;amp;" not in msg and "&amp;lt;" not in msg, "转两次的话用户看到的是 &lt;"
+    assert _html_ok(msg)
+
+
+def test_汇总消息里的符号也必须转义():
+    """汇总走的是另一条渲染路径,同样是陌生人可控文本。"""
+    from src.formatter import render_alpha_batch
+
+    msg = render_alpha_batch([("<i>X & Y</i>", DEBIT_MS)])
+    assert "&lt;i&gt;X &amp; Y&lt;/i&gt;" in msg
+    assert "<i>" not in msg and "</i>" not in msg
+    assert "&amp;amp;" not in msg
+    assert _html_ok(msg)
+
+
+# ============================================================
+# 【必修 6】市值恰为 0
+# ============================================================
+def test_市值恰为0照常显示():
+    """
+    ⚠️ 0 是有意义的真实值 —— 实测线上此刻就有 1 个 marketCap 为 "0" 的代币(PORT3)。
+       这一格用真值判断的话整行会消失,用户读到的是「这个币没有市值数据」,
+       而事实是「这个币的市值是 0」。持有人那一侧有测试守着,市值这一侧原先漏了。
+    """
+    assert "市值 $0.00" in _render(market_cap="0")
+    assert "市值 $0.00" in _render(market_cap=0)
+
+
+# ============================================================
+# 【必修 7】板块映射的地址归一化
+# ============================================================
+def test_板块映射对地址大小写不敏感(db):
+    """
+    ⚠️⚠️ 这正是代码自己注释里警告过的失效模式:「两边必须用同一个函数,
+       大小写一差就永远命不中」。两份夹具恰好都是小写,构造不出差异 ——
+       这里手工造一个 checksum 大小写的名单地址,与板块侧的小写地址配对。
+    """
+    ca_lower = "0xbeea1d618e533a387d941f58a7d4c9b7bd377777"
+    ca_mixed = "0xBEEA1d618E533a387D941f58A7d4C9b7bd377777"
+    assert ca_mixed != ca_lower and ca_mixed.lower() == ca_lower
+
+    toks = ba.parse_tokens(_alpha_payload())
+    older = [t for t in toks if t.listing_time_ms < NIULAI_MS]
+    n = FakeNotifier()
+    c = FakeClient(tokens=older, sector=[("56", ca_lower)])
+    ba.AlphaWatcher(n, client=c, sectors=[(60, 61, "股票 Meme 幣")]).run_once()   # 播种
+    n.sent.clear()
+
+    mixed = _tok(symbol="MIXED", name="Mixed Case", listing_time_ms=NIULAI_MS,
+                 contract_address=ca_mixed)
+    c.tokens = [*older, mixed]
+    assert ba.AlphaWatcher(n, client=c, sectors=[(60, 61, "股票 Meme 幣")]).run_once() == 1
+    assert "股票 Meme 幣" in n.sent[0], \
+        "名单侧是 checksum 大小写、板块侧是小写,两边归一化后必须命中"
+
+
+def test_板块响应里的大小写地址也要归一化():
+    """归一化的另一半:板块侧返回 checksum 大小写时同样要压平。"""
+    payload = {"code": "000000", "success": True, "data": {"total": 1, "tokens": [
+        {"chainId": "56", "contractAddress": "0xBEEA1d618E533a387D941f58A7d4C9b7bd377777"},
+    ]}}
+    assert ba.parse_sector(payload, rank_type=60, tab_id=61) == [
+        ("56", "0xbeea1d618e533a387d941f58a7d4c9b7bd377777")]
+
+
+def test_Solana地址绝不能被小写掉():
+    """
+    ⚠️ Solana 是 base58,**大小写敏感**。归一化若无脑 lower(),
+       板块映射永远命不中,去重台账也会跟真实地址对不上。
+    """
+    sol_ca = "G7vQWurMkMMm2dU3iZpXYFTHT9Biio4F4gZCrwFpKNwG"
+    tok = ba.AlphaToken(listing_time_ms=DEBIT_MS, symbol="BIRB", chain_id="CT_501",
+                        chain_name="Solana", contract_address=sol_ca)
+    assert tok.sector_key == ("CT_501", sol_ca)
+    assert tok.dedupe_key == ("solana", sol_ca)
