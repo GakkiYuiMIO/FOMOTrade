@@ -276,6 +276,31 @@ def test_从没跑过时健康度是None而不是0(conn):
     assert queries.dashboard(conn)["last_tick_age_sec"] is None
 
 
+def test_今日事件不把转账算进去(conn):
+    """
+    ⚠️「今日事件」这张卡片的含义一直是"名单今天动了多少次"(买/卖/发观点)。
+       转账是 2026-08 才加的采集,实测非稳定币转入 13.1 条/人/天 ——
+       算进来这个数字会虚增约 10 倍(实测注入 60 条 TRANSFER_IN:136 → 196)。
+       卡片没变、数字换了含义,用户只会以为名单突然活跃了十倍。
+       转账有它自己的出口(筹码分发告警),不该在这里充数。
+    """
+    from src.models import EVENT_TRANSFER_IN, EVENT_TRANSFER_OUT, FomoEvent, dump_raw, now_iso
+
+    today = now_iso()
+    _ready(conn, "u1", "alice")
+    _buy(conn, "u1", "alice", "ca1", today, 100_000.0)
+    for i, kind in enumerate([EVENT_TRANSFER_IN] * 5 + [EVENT_TRANSFER_OUT] * 3):
+        store.insert_event(conn, FomoEvent(
+            event_id=f"{kind}:{i}", event_type=kind, user_id="u1", event_ts=today,
+            raw_json=dump_raw({}), handle="alice", network_id="solana",
+            token_address="ca1", token_symbol="X", amount_usd=900.0))
+
+    assert conn.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 9, \
+        "前提不成立:九条事件没都落库,这条测试挡不住任何东西"
+    assert queries.dashboard(conn)["events_today"] == 1, \
+        "转账把「今日事件」灌水了 —— 1 次真动作被报成了 9 次"
+
+
 # ============================================================
 # 信号卡片流(queries.signal_feed)
 # ============================================================

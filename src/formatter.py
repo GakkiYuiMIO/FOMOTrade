@@ -24,6 +24,7 @@ import html
 import math
 import re
 import time
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 
 from loguru import logger
@@ -40,6 +41,12 @@ from src.models import (
     NETWORK_SLUG,
     FomoEvent,
 )
+
+# ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
+#    转入告警要自己算长度预算,而"上限是多少"必须与真正发消息的那一侧同源 ——
+#    两处各写一个数字,改了一处另一处就变成一颗定时炸弹。
+#    notifier 只依赖 config,不依赖本模块,所以这个 import 不会成环。
+from src.notifier import MAX_MESSAGE_LEN
 
 # ============================================================
 # 行首锚点(§10.1)—— 全局唯一,永不重复,永不被别的字符挤掉
@@ -731,3 +738,332 @@ def _fake_ev(net: str, ca: str):
     """_links_line 只用到这两个字段 —— 复用它,免得链接拼装出现第二份实现"""
     return FomoEvent(event_id="", event_type=EVENT_BUY, user_id="", event_ts="", raw_json="",
                      network_id=net or None, token_address=ca)
+
+
+# ============================================================
+# 转入告警:N 个名单成员「收到」了同一个币
+# ============================================================
+# 行首锚点。⚠️ 全局唯一(铁律 1),与买卖那六个、与跟单的 🧪/🛒 都不重样 ——
+#    这条消息在聊天列表预览里必须一眼能跟别的区分开:它说的是"有人白拿到了筹码",
+#    与"有人买入"含义相反,认错锚点就是把相反的信号读成同一件事。
+EMOJI_DISTRIBUTION = "🚨"
+# 单条消息的**转义后**字符预算,与 /ca 同一套规矩(见 bot.CA_MSG_BUDGET 的事故记录):
+# notifier.send 超限时做的是盲切,切点落在 `&amp;` 中间就是残缺实体 → 整条 400,
+# 用户什么都收不到。所以长度必须由渲染方按转义后的真实长度自己算,且只在整行边界停手。
+TRANSFER_MSG_BUDGET = MAX_MESSAGE_LEN - 400
+# handle / ticker 由陌生人和服务端决定,长度不受任何天然约束 —— 一个 3000 字符的
+# ticker 就能把标题撑到顶破预算。先按**转义前**的字符数压一压再转义(顺序见 _clip)。
+_SIG_HANDLE_CHARS = 24
+_SIG_SYMBOL_CHARS = 16
+# CA 也要收口:normalize_token_address 对非 0x/42 位的输入原样透传、不做长度校验,
+# 而 CA 是"砍无可砍时也要贴上去"的那一行。Solana 44 位 / EVM 42 位,128 绰绰有余。
+_SIG_CA_CHARS = 128
+# 发货地址在消息里的显示形态:头 6 位 + 尾 5 位。⚠️ 截短只是为了好读,
+# 判定用的永远是完整地址(在 store 里比对);而且地址同样是陌生人可控内容,
+# 截短之后仍然要走 _clip(叠平空白 → 限长 → 转义)。
+_SIG_ADDR_HEAD = 6
+_SIG_ADDR_TAIL = 5
+# 消息里最多展开几个收到者。
+# ⚠️ 这个上限**只属于展示层**,它曾经漏在 store.transfer_receivers 的 LIMIT 上 ——
+#    于是"合计"和台账都只算了这 10 个人,却被摆在全量人数旁边(见 render 里的说明)。
+#    查询取全量、这里只决定"列几行",是两件必须分开的事。
+#    10 行:名单当前 91 人,全列出来既撑破预算也没人会读;而分发事件里排在最前面的
+#    (按到账时间正序)恰恰是最早拿到货的那几个,信息密度最高。
+_SIG_RECEIVER_ROWS = 10
+# 给"…还有 N 人未显示"那行预留的位置 —— 免得为了塞进这行提示反而把预算顶破。
+# 与 bot._CA_OMIT_RESERVE 同一个理由。
+_SIG_OMIT_RESERVE = 40
+EMOJI_SENDER = "📮"          # 发货地址(转入告警专用)
+EMOJI_CLOCK = "⏱"           # 到账时刻
+
+
+def _clip(s, limit: int) -> str:
+    """
+    任意短字段 → 单行、限长、**已转义**。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义",与 bot._ca_clip 同一条理由:
+       反过来会在截断点切断一个 `&amp;`,残缺实体照样让整条消息 400。
+       叠平空白也是必需的:一个 handle 里塞几个换行就能把一行变成十行,
+       绕开"按行算预算"这个前提。
+    """
+    flat = " ".join(str(s or "").split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return _esc(flat)
+
+
+def _fit_signal(lines: list[str], anchor: str) -> str:
+    """
+    整条信号消息的出口:按**整行边界**砍到预算内,锚点最后贴。
+
+    出口不变式(无论入参是什么都成立):
+      1. len(返回值) <= TRANSFER_MSG_BUDGET
+      2. CA 锚点是最后一行
+
+    ⚠️ 只按整行砍,绝不切进行内 —— 切在实体中间就是残缺实体、整条 400。
+    ⚠️ 锚点最后贴,且它自己已经过 _clip 收口(≤ _SIG_CA_CHARS 转义后)——
+       所以"砍到一行不剩 + 贴上锚点"这个最坏情况仍然在预算内。
+    """
+    kept = [ln for ln in lines if ln]
+    while kept and len("\n".join([*kept, anchor])) > TRANSFER_MSG_BUDGET:
+        kept.pop()
+    return "\n".join([*kept, anchor])
+
+
+def _sig_size(lines: list[str]) -> int:
+    """
+    这几行拼进消息要占多少字符(含各自那个换行)。
+
+    ⚠️ 算的是**转义后**的真实长度,不是估算:len(x) + 1 逐行加起来,恰好等于
+       "\\n".join 之后的长度 + 1。多算的那 1 个字符留给锚点前的换行,宁可保守。
+    """
+    return sum(len(x) + 1 for x in lines)
+
+
+def _short_addr(addr) -> str | None:
+    """钱包地址 → `8FtY7n…cZx72`(已转义)。空/非字符串返回 None,让那一格消失。"""
+    flat = " ".join(str(addr or "").split())
+    if not flat:
+        return None
+    if len(flat) > _SIG_ADDR_HEAD + _SIG_ADDR_TAIL + 1:
+        flat = f"{flat[:_SIG_ADDR_HEAD]}…{flat[-_SIG_ADDR_TAIL:]}"
+    return _esc(flat)
+
+
+def _parse_ts(ts) -> float | None:
+    """ISO 时间串 → unix 秒。解析不出来返回 None(对应那一格整格消失,绝不拿 0 冒充)。"""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def _fmt_span(sec) -> str | None:
+    """
+    一段时长 → 「23 秒」「5 分 23 秒」「2 小时 11 分」「1 天 4 小时」。
+
+    ⚠️ 这一格是这条告警里信息量最大的东西之一:「5 分钟内到齐」和「散在 20 小时里」
+       是完全不同的信号,前者几乎不可能是三个人各自去买了充进来。
+    ⚠️ 负数/NaN 一律 None —— 宁可不显示,也不能出现「-3 分钟内」。
+    """
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(s) or s < 0:
+        return None
+    s = int(s)
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return f"{m} 分 {r} 秒" if r else f"{m} 分"
+    if s < 86400:
+        h, r = divmod(s, 3600)
+        m = r // 60
+        return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+    d, r = divmod(s, 86400)
+    h = r // 3600
+    return f"{d} 天 {h} 小时" if h else f"{d} 天"
+
+
+def _sender_line(senders: dict | None) -> str | None:
+    """
+    发货地址那一行 —— 整条告警里**唯一可证**的证据。
+
+    ⚠️ 为什么必须有这一行:报文里只有 fromAddress/toAddress,**没有 userId**
+       (8404 条真实转账里 userId 键出现 0 次)。所以这两件事在数据上一模一样:
+         (a) 项目方/内部人在给一群人分发筹码
+         (b) 这个人把自己在别处买的币充进 FOMO —— 那其实**就是买入**
+       "他们一分钱没花"这种话是在断言别人的意图,数据证不了。
+       而"同一个钱包 5 分 23 秒内发给了名单里三个人"是地址比对出来的事实,
+       它不能证明 (a),但把天平明显压向 (a),而且经得起追问。
+    ⚠️ 三种情况必须分开说,一句都不能串:
+         有聚类   → 点名几个人、多长时间、哪个地址
+         无聚类   → 只说"地址各不相同",绝不因此就不告警(聚类是加强证据,不是触发条件)
+         查不到   → 整行消失(老库没有这一列、或上游没给地址),绝不说"没有共同发货方"
+    """
+    if not senders or not senders.get("known"):
+        return None
+    top = senders.get("top") or {}
+    n = top.get("receivers") or 0
+    if n >= 2:
+        addr = _short_addr(top.get("address"))
+        if addr is None:
+            return None
+        line = f"{EMOJI_SENDER} 其中 <b>{n} 人</b>的币来自<b>同一个发货地址</b>{SEP}{addr}"
+        first, last = _parse_ts(top.get("first_ts")), _parse_ts(top.get("last_ts"))
+        span = _fmt_span(last - first) if (first is not None and last is not None) else None
+        if span is not None:
+            line += f"{SEP}前后 {span}"
+        return line
+    known = senders["known"]
+    if known >= 2 and senders.get("distinct") == known:
+        return f"{EMOJI_SENDER} 这 {known} 人的发货地址{SEP}<b>各不相同</b>"
+    return None
+
+
+def _receiver_row(r: dict, now: float | None) -> str:
+    """一个收到者一行。缺哪个键就少哪一格(铁律 2:缺失整格消失,绝不打 0 / N/A)。"""
+    cells = [f"{EMOJI_COUNTERPARTY} {_clip(r.get('who') or TEXT_UNKNOWN_USER, _SIG_HANDLE_CHARS)}"]
+    usd = _fmt_usd(r.get("usd"))
+    if usd is not None:
+        cells.append(usd)
+    mc = _fmt_usd_compact(r.get("mcap"))
+    if mc is not None:
+        # 「收到时」这个说法只有在市值确实取自那个时刻才成立 ——
+        # poller 用新鲜度闸门保证了这一点,取不到就是 None,这一格直接不出现
+        cells.append(f"{EMOJI_MARKET_CAP} 收到时 {mc}")
+    hits = r.get("hits")
+    if hits is not None and hits > 1:
+        cells.append(f"{EMOJI_TRADE_COUNT} {hits} 笔")
+    # 各自什么时候到的账。⚠️「5 分钟内到齐」和「散落在 20 小时里」是完全不同的信号,
+    #    只报人数等于把这个差别抹平。取不到时间就整格消失,不拿"刚刚"凑数。
+    got_at = _parse_ts(r.get("ts"))
+    ago = None if got_at is None else _fmt_span(
+        (time.time() if now is None else now) - got_at)
+    if ago is not None:
+        cells.append(f"{EMOJI_CLOCK} {ago}前")
+    return SEP.join(cells)
+
+
+def _receiver_rows(receivers: list[dict], now: float | None,
+                   room: int) -> tuple[list[str], int]:
+    """
+    收到者明细 → (要渲染的行, 真正渲染出来的行数)。**截断在这里,不在 SQL 里。**
+
+    ⚠️ 两道闸各管一件事,少哪道都不行:
+      1. `_SIG_RECEIVER_ROWS` —— 名单 91 人时不能真往消息里塞 91 行。
+      2. `room` —— handle 由陌生人决定、_esc 会把 `'` 撑成 6 个字符,
+         10 行也可能吃光预算。行数够少不等于字符够少。
+    ⚠️ 装不下的那一行必须 `continue` 而不是 `break`:break 会让一个长 handle 把排在
+       它**后面**、本来完全塞得下的短行全部连带丢掉 —— 一个人名字长,后面所有人就都
+       消失了。(与 bot._ca_assemble 同一条教训。)
+    ⚠️ 只在**整行边界**上停手,绝不切进行内:切在 `&amp;` 中间就是残缺实体 → 整条 400。
+    ⚠️ 返回 shown 而不是让调用方去数:"还有 N 人未显示"的 N 必须扣掉**真正渲染出来的**
+       行数,被 room 跳过的那几行也算未显示 —— 拿 _SIG_RECEIVER_ROWS 去减就会少报。
+    """
+    body: list[str] = []
+    used = 0
+    shown = 0
+    for r in receivers[:_SIG_RECEIVER_ROWS]:
+        line = _receiver_row(r, now)
+        cost = len(line) + 1
+        if used + cost > room:
+            continue
+        body.append(line)
+        used += cost
+        shown += 1
+    return body, shown
+
+
+def render_transfer_in_signal(
+    *,
+    network_id: str | None,
+    token_address: str,
+    token_symbol: str | None,
+    receiver_count: int,
+    receivers: list[dict],
+    window_hours: int,
+    buyers: list[str] | None = None,
+    senders: dict | None = None,
+    now: float | None = None,
+) -> str:
+    """
+    「同一个币被 N 个名单成员『收到』」的告警。
+
+    参数:
+        receiver_count  窗口内合格收到者总人数。与 receivers 必须是**同一批人**
+                        (poller 那边分别来自 count_recent_receivers 与 transfer_receivers,
+                         两处谓词漂移时会打 WARNING)。
+        receivers       窗口内**全部**收到者,一人一条,按到账时间正序:
+                        [{"who": handle, "usd": 到账美元, "mcap": 收到时市值,
+                          "hits": 笔数, "ts": 最早到账时刻 ISO}, …]
+                        缺哪个键就少哪一格(铁律 2:缺失整格消失,绝不打 0 / N/A)
+                        ⚠️ 调用方**不要**替本函数截断:合计要对全量求和,而"消息里列几行"
+                           是展示层的事,由 _receiver_rows 负责,末尾如实写"还有 N 人未显示"。
+        buyers          名单里**真金白银买过**这个币的人。
+                        ⚠️ None 与 [] 语义不同:None = 查不出来(那一行整行消失),
+                           [] = 查过了、确实没人买过 —— 后者是有价值的信息,要显示。
+        senders         发货地址聚类,见 store.transfer_senders / 本模块 _sender_line。
+                        None = 查不到地址 → 那一行整行消失。
+        now             渲染时刻(unix 秒),只用来算"多久之前到账"。默认取当前时间。
+
+    ⚠️ 这条消息的第一职责是**让人一眼看出这不是在 FOMO 上买的**:「收到」= 从外部钱包
+       转进来,与"他自己在 FOMO 上掏钱买"是两回事,不能扫一眼读成"三个人在抢这个币"。
+    ⚠️⚠️ 但**到此为止**,再往前一步就是编。这里曾经写着「他们一分钱没花」——
+       那句话数据证不了:报文里只有 fromAddress/toAddress,**没有 userId**
+       (8404 条真实转账里 userId 键出现 0 次),所以下面两件事完全无法区分:
+         (a) 项目方/内部人在分发筹码        ← 用户关心的
+         (b) 本人把在 Jupiter/OKX 买的币充进 FOMO ← 这恰恰**是**花了钱的买入
+       说"一分钱没花"就是在替别人断言意图,与刚在 /ca 修掉的那类假事实同级。
+       现在只说数据能证明的:不是在 FOMO 上买的、几个人、什么时候到的、
+       是不是同一个发货地址(见 _sender_line —— 那才是真正有力的那条证据)。
+    ⚠️ 本函数是纯函数,不查库(铁律 7)。所有事实由 poller 取好传进来。
+    """
+    sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    net = (network_id or "").strip()
+
+    title = (f"{EMOJI_DISTRIBUTION} <b>筹码分发预警</b>{SEP}"
+             f"<b>{receiver_count} 人「收到」同一个币</b>")
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+    head_lines = [
+        title,
+        f"{EMOJI_TRANSFER_IN} <b>不是在 FOMO 上买的</b> —— 币是从外部钱包转进来的",
+    ]
+
+    # ⚠️⚠️ 合计对 **receivers 全量**求和,不是对下面渲染得出的那几行 ——
+    #    它旁边写的是 receiver_count(全量人数),两个数字必须是同一批人。
+    #    这里曾经是对的、而 poller 传进来的 receivers 被 SQL 的 LIMIT 砍到 10 行,
+    #    于是「25 人收到 · 合计 $X」里的 X 只是其中 10 个人的合计。
+    #    截断是**这个函数**的职责(见下面的 _SIG_RECEIVER_ROWS),调用方必须给全量。
+    # ⚠️ 判空一律 is None(模块铁律):一个人也没报出金额时 total 是 None、那一段消失;
+    #    而 $0.00 是有意义的真实值,不能被 `if total` 连同 None 一起吞掉。
+    priced = [r["usd"] for r in receivers if r.get("usd") is not None]
+    total_str = _fmt_usd(sum(priced)) if priced else None
+    head = f"{EMOJI_CONSENSUS} 最近 {window_hours} 小时内 {receiver_count} 人收到"
+    if total_str is not None:
+        head += f"{SEP}合计 {total_str}"
+    head_lines.append(head)
+
+    # 尾段先算出来:收到者能占多少地方,取决于尾段吃掉多少 ——
+    # 而且尾段(发货地址证据 / 买家对照 / 链接 / CA)一行都不能被收到者挤掉。
+    tail_lines: list[str] = []
+    # 发货地址聚类 —— 这条告警里唯一可证的硬证据,见 _sender_line 的说明
+    sender_line = _sender_line(senders)
+    if sender_line is not None:
+        tail_lines.append(sender_line)
+    # 有没有人真金白银买过 —— 有对比才有判断力
+    if buyers is not None:
+        if buyers:
+            who = "、".join(_clip(b, _SIG_HANDLE_CHARS) for b in buyers)
+            tail_lines.append(f"{EMOJI_AMOUNT_IN} 名单里另有 {len(buyers)} 人"
+                              f"<b>真金白银</b>买过:{who}")
+        else:
+            tail_lines.append(f"{EMOJI_AMOUNT_IN} 名单里<b>还没有人</b>真金白银买过这个币")
+    if net:
+        tail_lines.append(f"{EMOJI_NETWORK} {_esc(NETWORK_DISPLAY.get(net, net))}")
+    link = _links_line(_fake_ev(net, token_address))
+    if link:
+        tail_lines.append(link)
+
+    # CA 独占最后一行、纯 <code>(铁律 6)
+    anchor = f"<code>{_clip(token_address, _SIG_CA_CHARS)}</code>"
+    room = (TRANSFER_MSG_BUDGET - _sig_size(head_lines) - _sig_size(tail_lines)
+            - len(anchor) - _SIG_OMIT_RESERVE)
+    body, shown = _receiver_rows(receivers, now, room)
+
+    lines = [*head_lines, *body]
+    # 未显示 = 全量人数 - **真正渲染出来的**行数。被 room 跳过的和超出
+    # _SIG_RECEIVER_ROWS 的都算在里面,shown 只在真正 append 之后才自增。
+    omitted = receiver_count - shown
+    if omitted > 0:
+        lines.append(f"…还有 {omitted} 人未显示")
+    lines.extend(tail_lines)
+    return _fit_signal(lines, anchor)

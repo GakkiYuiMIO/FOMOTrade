@@ -383,19 +383,24 @@ def test_to_row只输出落库字段():
     展示字段(市值/持仓/观点正文)与内存标志(ts_fallback/side_unknown)不在 fomo_events 表里。
     多输出一个键 insert_event 的具名参数绑定就会报错。
     """
-    ev = make_event(market_cap=1.9e7, holding_usd=2498.1, ts_fallback=True, side_unknown=True)
+    ev = make_event(market_cap=1.9e7, holding_usd=2498.1, ts_fallback=True, side_unknown=True,
+                    counterparty_handle="whale", counterparty_address="8FtY7n1ad4Lv")
     row = ev.to_row()
     assert set(row) == {
         "event_id", "event_type", "user_id", "handle", "user_handle",
         "network_id", "token_address", "token_symbol", "amount_usd", "token_amount",
         "price_usd", "market_cap", "token_created_at", "tx_hash", "event_ts", "ingested_at",
-        "badge", "badge_reason", "raw_json",
+        "badge", "badge_reason", "counterparty_address", "raw_json",
     }
     assert "ts_fallback" not in row
     # 持仓与盈亏是展示字段(每 tick 从 /trades 重新拿),不落库
     assert "holding_usd" not in row
     assert "realized_pnl" not in row
     assert "unrealized_pnl" not in row
+    # ⚠️ 对手方**名字**不落库(展示字段,渲染时现取);对手方**地址**落库 ——
+    #    "同一个钱包发给了几个人"事后无法从别处补回来,而它是转入告警里唯一可证的证据
+    assert "counterparty_handle" not in row
+    assert row["counterparty_address"] == "8FtY7n1ad4Lv"
     # ⚠️ market_cap 例外:它是**时点值,事后无法重算**,
     #    /hot 的"买入时市值 → 现在市值"倍数全靠它,所以必须落库(与 cs_* 同理)
     assert row["market_cap"] == 1.9e7

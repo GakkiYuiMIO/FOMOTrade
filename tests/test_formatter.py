@@ -11,6 +11,8 @@ formatter.py 的单测 —— Telegram HTML 消息渲染(设计文档 §10)。
 # 测试函数名刻意用中文:pytest -v 的输出就是一份可读的验收清单。ruff 的 N802 只认 ASCII 小写。
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.models import (
@@ -410,3 +412,412 @@ def test_有币龄就出行没有就整行消失():
     ev = make_event(event_type=EVENT_BUY, token_created_at=int(_t.time()) - 86400 * 5)
     assert "🕐 币龄 5D" in render(ev)
     assert "币龄" not in render(make_event(event_type=EVENT_BUY))
+
+
+# ============================================================
+# 转入告警:N 个名单成员「收到」了同一个币
+# ============================================================
+# ⚠️ 阈值/预算一律写死字面量,不从被测模块 import ——
+#    从 formatter 里 import 预算再拿它去断言,等于用被测代码给自己打分。
+_TG_HARD_LIMIT = 4096          # Telegram 单条消息硬上限(与 notifier 的实现无关的外部事实)
+_SIG_CA = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
+# $fih 真实案例里三笔到账的发货地址(报文原件里那个)
+_SIG_SENDER = "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72"
+# 渲染时刻:最后一笔到账(00:37:40)之后整整 1 小时。写死时刻是为了让
+# "多久之前到账"这一格可断言 —— 用 time.time() 的话断言只能写成模糊匹配。
+_NOW_FIH = datetime(2026, 8, 26, 1, 37, 40, tzinfo=UTC).timestamp()
+
+render_transfer_in_signal = formatter.render_transfer_in_signal
+
+
+def _sig(**kw):
+    base = {
+        "network_id": "solana",
+        "token_address": _SIG_CA,
+        "token_symbol": "fih",
+        "receiver_count": 3,
+        # 时间取真实的 $fih 案例:00:32:17 / 00:35:11 / 00:37:40(前后 5 分 23 秒)
+        "receivers": [
+            {"who": "unipcs", "usd": 901.37, "mcap": 198_200.0, "hits": 1,
+             "ts": "2026-08-26T00:32:17+00:00"},
+            {"who": "Quanterty", "usd": 912.05, "mcap": 201_400.0, "hits": 1,
+             "ts": "2026-08-26T00:35:11+00:00"},
+            {"who": "PoorGoat_", "usd": 2439.09, "mcap": 203_000.0, "hits": 1,
+             "ts": "2026-08-26T00:37:40+00:00"},
+        ],
+        "window_hours": 24,
+        "buyers": ["CryptoTalkMan"],
+        # 渲染时刻写死,否则"多久之前到账"那一格会随着测试运行的日期漂
+        "now": _NOW_FIH,
+    }
+    base.update(kw)
+    return render_transfer_in_signal(**base)
+
+
+def _tags(msg: str) -> list[tuple[str, str]]:
+    """按出现顺序抽出所有标签 —— (是否闭标签, 标签名)"""
+    import re
+
+    return re.findall(r"<(/?)([a-zA-Z]+)[^<>]*>", msg)
+
+
+def _html_ok(msg: str) -> bool:
+    """标签是否全部配对闭合 —— 未闭合标签让 TG 整条 400,用户什么都收不到"""
+    stack: list[str] = []
+    for slash, name in _tags(msg):
+        if slash:
+            if not stack or stack.pop() != name:
+                return False
+        else:
+            stack.append(name)
+    return not stack
+
+
+def test_转入告警一眼就能看出不是在FOMO上买的():
+    """
+    这条消息的第一职责:让人扫一眼**不会**读成"三个人在抢这个币"。
+    「收到」= 从外部钱包转进来,与"他自己在 FOMO 上掏钱买"是两回事。
+    """
+    msg = _sig()
+    head = msg.split("\n")[0]
+    assert head.startswith("🚨"), "标题必须有醒目的行首锚点,且与买卖那六个都不重样"
+    assert "收到" in head
+    assert "不是在 FOMO 上买的" in msg, "必须显式否定一次,宁可啰嗦"
+    # 行首锚点全局唯一:别撞上买/卖/观点/转账/跟单那几个
+    assert head[0] not in "🌱🟢🔴💭📥📤🧪🛒"
+
+
+def test_绝不断言收到者的意图():
+    """
+    ⚠️⚠️ 这条消息曾经写着「他们一分钱没花」。数据证不了这句话:
+       报文里只有 fromAddress/toAddress、**没有 userId**(8404 条真实转账里
+       userId 键出现 0 次),所以下面两件事在数据上一模一样 ——
+         (a) 项目方/内部人在分发筹码
+         (b) 本人把在 Jupiter/OKX 买的币充进 FOMO ← 这**恰恰是**花了钱的买入
+       说"没花钱"就是在替别人断言意图,与刚在 /ca 修掉的假事实同级。
+
+    ⚠️ 断言的是"这些说法**不出现**",不是"文案长什么样" —— 换个措辞不该让它变红,
+       但只要有人把任何一句意图断言塞回来就必须红。
+    """
+    msg = _sig()
+    for claim in ("没花", "一分钱", "免费", "白拿", "空投", "项目方", "内部人"):
+        assert claim not in msg, f"消息里出现了数据证明不了的断言:{claim}"
+
+
+def test_转入告警包含用户要的四项事实():
+    """谁收到的 / 各自多少 / 什么市值 / 名单里有没有人真金白银买过"""
+    msg = _sig()
+    for who in ("unipcs", "Quanterty", "PoorGoat_"):
+        assert who in msg
+    assert "$901.37" in msg and "$2,439.09" in msg
+    assert "$198.20K" in msg, "收到时的市值"
+    assert "CryptoTalkMan" in msg and "真金白银" in msg
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "CA 必须独占最后一行、纯 code"
+
+
+def test_同一个发货地址发给多人时必须明确点出来():
+    """
+    ⚠️ 这是整条告警里**唯一可证**的证据,比"他们一分钱没花"有力得多:
+       $fih 真实案例 —— 5 分 23 秒内,同一个 fromAddress 发给名单里三个人。
+       三个人各自去别处买了同一个币、又在 5 分钟内先后充进 FOMO,可能;
+       但同一个钱包在 5 分钟内给这三个人发货,是另一回事。
+    ⚠️ 三项都要出现:几个人 / 同一个地址(截短显示)/ 多长时间窗内。
+       少任何一项这句话都会退化成模糊印象。
+    """
+    msg = _sig(senders={
+        "known": 3, "distinct": 1,
+        "top": {"address": _SIG_SENDER, "receivers": 3,
+                "first_ts": "2026-08-26T00:32:17+00:00",
+                "last_ts": "2026-08-26T00:37:40+00:00"},
+    })
+    assert "同一个发货地址" in msg
+    assert "3 人" in msg
+    assert "8FtY7n…cZx72" in msg, "地址要截短显示(头 6 尾 5)"
+    assert _SIG_SENDER not in msg, "整串 44 位地址塞进消息只会挤掉真正要看的行"
+    assert "5 分 23 秒" in msg, "时间窗必须精确到可核对,「几分钟内」不算"
+
+
+def test_发货地址各不相同时不许声称有聚类():
+    """
+    ⚠️ 聚类是**加强证据,不是触发条件**:地址各不相同照样是"N 个人同时收到同一个币",
+       照样该告警 —— 但文案里一个字都不能暗示有共同发货方。
+       而"三个人来自三个不同地址"本身也是有价值的信息(它把天平推向另一边),要说出来。
+    """
+    msg = _sig(senders={"known": 3, "distinct": 3, "top": None})
+    assert "同一个发货地址" not in msg
+    assert "各不相同" in msg
+    assert "3 人「收到」同一个币" in msg, "没聚类不代表不告警"
+
+
+def test_查不到发货地址时那一行整行消失():
+    """
+    ⚠️ 铁律 2:查不出来就整行消失,绝不打 N/A。
+       尤其不能因为"没查到聚类"就写成「各不相同」—— 那是把"不知道"说成"知道是否定的",
+       和印反话同级(老库没有 counterparty_address 这一列时正是这个场景)。
+    """
+    for blind in (None, {"known": 0, "distinct": 0, "top": None}):
+        msg = _sig(senders=blind)
+        assert "发货地址" not in msg
+        assert "各不相同" not in msg
+        assert "N/A" not in msg
+
+
+def test_各自到账的时间必须出现():
+    """
+    ⚠️「5 分钟内到齐」和「散落在 20 小时里」是完全不同的信号,只报人数等于把这个差别抹平。
+       这里三笔分别在渲染时刻之前 65 分 23 秒 / 62 分 29 秒 / 60 分 0 秒到账。
+    """
+    msg = _sig()
+    assert "1 小时 5 分前" in msg, "unipcs 那笔:00:32:17,距渲染时刻 1 小时 5 分"
+    assert "1 小时 0 分前" in msg or "1 小时前" in msg, "PoorGoat_ 那笔:整整 1 小时"
+
+
+def test_到账时间取不到就整格消失而不是写刚刚():
+    msg = _sig(receivers=[{"who": "unipcs", "usd": 901.37},
+                          {"who": "Quanterty", "usd": 912.05, "ts": "看不懂的时间"}])
+    assert "前" not in msg.split("\n")[3], f"实际渲染:{msg.split(chr(10))[3]}"
+    assert "刚刚" not in msg and "N/A" not in msg
+
+
+def test_没人真金白银买过与查不出来必须分开():
+    """
+    ⚠️ [] 与 None 语义完全不同:
+       [] = 查过了、确实没人买 —— 这是有价值的信息(纯分发,没人跟进);
+       None = 查不出来 —— 那一行必须整行消失,绝不能假装"没人买过"。
+    """
+    assert "还没有人" in _sig(buyers=[])
+    none_msg = _sig(buyers=None)
+    assert "还没有人" not in none_msg and "真金白银" not in none_msg
+
+
+def test_缺失字段整格消失而不是打0():
+    """铁律 2:缺失一律整格消失,绝不打 N/A / -- / 0"""
+    msg = _sig(receivers=[{"who": "unipcs"}, {"who": "Quanterty"}, {"who": "PoorGoat_"}],
+               token_symbol=None)
+    assert "N/A" not in msg and "--" not in msg
+    assert "$0" not in msg and "💎" not in msg
+    assert "$None" not in msg and "None" not in msg
+    assert "unipcs" in msg
+
+
+def test_金额为0是真实值不该被吞掉():
+    """⚠️ 判空一律 is None:0 是有意义的真实值,用真值判断会把它连同 None 一起吞掉"""
+    msg = _sig(receivers=[{"who": "unipcs", "usd": 0.0}], receiver_count=1)
+    assert "$0.00" in msg
+
+
+def test_展示不下的收到者要如实说明():
+    msg = _sig(receiver_count=41,
+               receivers=[{"who": f"Holder{i}", "usd": 900.0} for i in range(10)])
+    assert "还有 31 人未显示" in msg
+
+
+# ---- 截断归展示层:合计是全量的,列出来的只是前几个 ----------------------------
+def _receiver_row_count(msg: str) -> int:
+    """消息里真正渲染出来的收到者行数 —— 只认行首的 👤(尾段那几行都不是这个锚点)"""
+    return sum(1 for ln in msg.split("\n") if ln.startswith("👤 "))
+
+
+def test_收到者二十五人时合计是全部人的而不是列出来那几行的():
+    """
+    ⚠️⚠️ 这条盯的是**合计陈述了一个错误的事实**:
+       poller 曾经用 `transfer_receivers(..., limit=10)` 取明细、对这 10 行求和,
+       却把结果摆在 count_recent_receivers 数出来的**全量人数**旁边 ——
+       渲染成「25 人收到 · 合计 $X」,而 X 只是其中 10 个人的合计。
+       与"已清仓的人显示 +$0.00""他们一分钱没花"同级:数字本身没错,
+       它被摆的位置让它变成了假话。
+
+    ⚠️ 现在契约反过来:调用方给**全量**,合计对全量求和,
+       "列几行"由本模块决定并如实写出未显示人数。
+    ⚠️ 期望值是测试自己按那串金额算的,不从 formatter import 任何常量/门槛。
+    """
+    usd = [901.37 + i for i in range(25)]
+    msg = _sig(receiver_count=25,
+               receivers=[{"who": f"Holder{i}", "usd": u} for i, u in enumerate(usd)])
+
+    # 25 个人的真实合计:901.37 + 902.37 + … + 925.37 = 22834.25
+    assert "合计 $22,834.25" in msg, \
+        f"合计不是全部 25 人的(应为 ${sum(usd):,.2f}),实际那一行:" \
+        f"{[ln for ln in msg.split(chr(10)) if ln.startswith('👥')]}"
+    assert "25 人收到" in msg, "人数那一半必须还是全量,否则这条测试没在测两者一致"
+
+    # 展示层照样要收口:不能真往一条 TG 消息里塞 25 行
+    shown = _receiver_row_count(msg)
+    assert shown == 10, f"消息里列出了 {shown} 行收到者"
+    assert "Holder0" in msg and "Holder9" in msg, "列的是按到账时间排在最前面的那几个"
+    assert "Holder10" not in msg and "Holder24" not in msg
+    # 未显示人数必须扣掉**真正渲染出来的**行数,差一个都是在报假数
+    assert "…还有 15 人未显示" in msg, \
+        f"未显示人数算错了:{[ln for ln in msg.split(chr(10)) if '未显示' in ln]}"
+
+
+def test_名单全员收到时尾段一行都不许被挤掉():
+    """
+    ⚠️ 名单当前 91 人,一次平台级批量发放就能让全员都"收到"(config 里记着实测:
+       一个美股代币化的币有 41 人收到)。91 行收到者会把整条消息撑到 5000+ 字符,
+       而 _fit_signal 只会**从尾巴往前砍** —— 于是最先没的恰恰是这条告警里
+       最有价值的几行:发货地址证据、真金白银买过的人、链接。
+       用户收到一条"91 个人收到了"然后什么都没有。
+    ⚠️ 所以截断必须发生在**收到者明细这一段**,而不是靠出口那道闸去兜底。
+       出口闸是"消息发得出去"的保险,保证不了"消息里还剩什么"(与 /ca 同一条教训)。
+    ⚠️ 4096 是 Telegram 的硬上限(与本模块的实现无关的外部事实),不从被测模块 import。
+    """
+    msg = _sig(
+        receiver_count=91,
+        receivers=[{"who": f"Holder{i:02d}", "usd": 900.0 + i, "mcap": 1.98e5,
+                    "ts": "2026-08-26T00:32:17+00:00"} for i in range(91)],
+        senders={"known": 91, "distinct": 1,
+                 "top": {"address": _SIG_SENDER, "receivers": 91,
+                         "first_ts": "2026-08-26T00:32:17+00:00",
+                         "last_ts": "2026-08-26T00:37:40+00:00"}},
+    )
+    lines = msg.split("\n")
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符,会被 notifier 盲切"
+    assert _html_ok(msg), "标签必须全部配对闭合"
+    assert _receiver_row_count(msg) == 10, \
+        f"收到者明细没有在展示层收口,列了 {_receiver_row_count(msg)} 行"
+    assert "…还有 81 人未显示" in msg
+    # 尾段四行:这条告警的证据与出口,一行都不能被收到者挤掉
+    assert "同一个发货地址" in msg, "唯一可证的硬证据被挤掉了"
+    assert "真金白银" in msg, "买家对照被挤掉了"
+    assert "🧬 Solana" in msg, "链名被挤掉了"
+    assert "fomo.family" in msg, "链接被挤掉了"
+    assert lines[-1] == f"<code>{_SIG_CA}</code>", "锚点必须活到最后且完整闭合"
+
+
+def test_长handle吃掉版面时未显示人数要把被跳过的也算进去():
+    """
+    ⚠️ 两道闸各管一件事:行数上限管"不塞 91 行",预算管"10 行也可能吃光字符"
+       (_esc 把一个 `'` 撑成 6 个字符,handle 由陌生人决定)。
+       被预算跳过的那几行**也是未显示**,拿行数上限去减就会少报 ——
+       消息会说"还有 15 人未显示",而实际没显示的是 20 人。
+    ⚠️ 断言方式是"消息自己对自己自洽":从渲染结果里数出真正列了几行,
+       再要求那句话正好等于 25 减去它。不引用被测模块的任何常量。
+    ⚠️ 这里的 ticker / handle / 买家名全取最坏形态(_esc 把 `'` 撑成 6 个字符),
+       目的就是把版面挤到"10 行放不下"—— 出口不变式是**渲染方**的职责,
+       调用方传多少行、传多长的名字都不该让这条消息说假话。
+    """
+    evil = "'" * 24                      # 转义后 144 字符/个,10 行就吃掉四千
+    msg = _sig(
+        token_symbol="'" * 40,
+        receiver_count=25,
+        receivers=[{"who": f"{evil}{i}", "usd": 900.0 + i, "mcap": 1.98e5,
+                    "ts": "2026-08-26T00:32:17+00:00"} for i in range(25)],
+        buyers=[evil] * 12,
+    )
+    shown = _receiver_row_count(msg)
+    assert 0 < shown < 10, f"前提不成立:预算没有真的把行挤掉(shown={shown})"
+    assert f"…还有 {25 - shown} 人未显示" in msg, \
+        f"实际列了 {shown} 行,那句话却是:" \
+        f"{[ln for ln in msg.split(chr(10)) if '未显示' in ln]}"
+    assert len(msg) <= _TG_HARD_LIMIT
+    assert _html_ok(msg)
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>"
+
+
+def test_一个人名字长不许把排在他后面的短名字连带丢掉():
+    """
+    ⚠️ _receiver_rows 里装不下的那一行必须 `continue` 而不是 `break`。
+       break 会让一个长 handle 把排在它**后面**、本来完全塞得下的短行全部连带丢掉 ——
+       一个人名字长,后面所有人就都消失了。(与 bot._ca_assemble 同一条教训。)
+
+    ⚠️ 这条**必须直接测那个循环**,不能走整条消息渲染:实测走 _sig() 时 room 有
+       八百多,三个长行全都塞得下,那个分支根本不会被走到 —— 我第一版就是这么写的,
+       把 continue 改成 break 之后 631 条全绿。空转测试就是这么来的。
+    ⚠️ room=300 是实测挑的:长行成本 190、短行 51。
+       continue → 长行 1 个 + 短行 2 个 = 3 行;break → 只有 1 行。
+       门槛全是写死的字面量,不从被测模块 import 任何常量。
+    """
+    def _r(who):
+        return {"who": who, "usd": 900.0, "mcap": 1.98e5, "hits": 1,
+                "ts": "2026-08-26T00:32:17+00:00"}
+
+    evil = "'" * 24                       # 转义后 144 字符 → 整行 190
+    recv = [_r(f"{evil}{i}") for i in range(3)] + [_r(f"Short{i}") for i in range(3, 8)]
+
+    # 前提自检:长行确实塞不下第二个,短行确实塞得下 —— 前提垮了这条测试就没意义
+    costs = [len(formatter._receiver_row(r, None)) + 1 for r in recv]
+    assert costs[0] > 150 and costs[-1] < 60, f"前提不成立,行成本变了:{costs}"
+    assert costs[0] * 2 > 300, "前提不成立:两个长行居然塞得进 room"
+
+    body, shown = formatter._receiver_rows(recv, None, 300)
+
+    kept = [ln for ln in body if "Short" in ln]
+    assert kept, (
+        "长 handle 把排在它后面、本来塞得下的短行连带丢掉了 —— "
+        f"这正是 continue 改成 break 的后果。渲染出的行数={shown},内容={body}"
+    )
+    assert shown == len(body), "shown 与实际行数对不上,「还有 N 人未显示」会算错"
+
+
+def test_恶意handle不会撑破消息也不会切碎实体():
+    """
+    ⚠️ handle 与 ticker 由陌生人决定,长度不受任何天然约束。
+       而 _esc 会把 ' 撑成 6 个字符 —— 一个 3000 字符的 handle 就能把消息顶破预算,
+       notifier 超限时做的是**盲切**,切点落在 &#x27; 中间就是残缺实体 → 整条 400
+       → 用户什么都收不到,只在日志里留一行。攻击者能自由控制长度,也就能自由挑切点。
+    """
+    evil = "'" * 3000 + "<script>x</script>"
+    msg = _sig(
+        token_symbol=evil,
+        receivers=[{"who": evil, "usd": 900.0 + i, "mcap": 1e5} for i in range(10)],
+        receiver_count=10,
+        buyers=[evil] * 6,
+    )
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符,会被 notifier 盲切"
+    assert _html_ok(msg), "标签必须全部配对闭合"
+    assert "<script>" not in msg, "陌生人写的标签必须被转义成文本"
+    # 每一个 & 都必须是一个**完整**实体的开头。残缺实体("&#x2" 这种)照样让整条 400
+    import re
+    assert re.search(r"&(?!(amp|lt|gt|quot|#x27|#39);)", msg) is None, "出现了残缺实体"
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "锚点必须活到最后且完整闭合"
+
+
+def test_收到者多到装不下时按整行砍且锚点必须活到最后():
+    """
+    ⚠️ 出口不变式是**本函数的职责**,不是调用方的:poller 现在只传 10 行,
+       但"传多少行"是调用方的选择,而"消息发不发得出去"必须由渲染方自己保证。
+       这里直接喂 60 个收到者(每个 handle 还都是最坏形态),模拟哪天有人把
+       上限调大、或者换了个调用方忘了限量。
+
+    ⚠️ 只能按**整行边界**砍。切进行内就会切碎 HTML 实体 → 整条 400 → 用户什么都收不到,
+       而这活儿绝不能留给 notifier.send 去盲切,它切的是字节。
+    """
+    evil = "'" * 40
+    msg = _sig(
+        receiver_count=60,
+        receivers=[{"who": f"{evil}{i}", "usd": 900.0 + i, "mcap": 1e5} for i in range(60)],
+        buyers=[evil] * 6,
+    )
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符"
+    assert _html_ok(msg)
+    lines = msg.split("\n")
+    assert lines[-1] == f"<code>{_SIG_CA}</code>", "锚点必须是最后一行且完整闭合"
+    assert len(lines) < 63, "装不下的行必须真的被砍掉,而不是原样拼出去"
+    import re
+    assert re.search(r"&(?!(amp|lt|gt|quot|#x27|#39);)", msg) is None, "出现了残缺实体"
+
+
+def test_超长CA也要收口而不是把消息撑破():
+    """
+    ⚠️ normalize_token_address 对非 0x/42 位的输入**原样透传**、不做长度校验。
+       而 CA 是"砍无可砍时也要贴上去"的那一行 —— 不先收口的话它就是一颗炸弹。
+    """
+    msg = _sig(token_address="Z" * 9000)
+    assert len(msg) <= _TG_HARD_LIMIT
+    assert _html_ok(msg)
+    assert msg.split("\n")[-1].startswith("<code>")
+    assert msg.split("\n")[-1].endswith("</code>")
+
+
+def test_未收录的链不出链接而不是拼一个404():
+    """错的链接比没有链接更糟(§10.3)。GMGN 不支持 Monad,那个链接就该整个不出。"""
+    msg = _sig(network_id="monad", token_address="0x" + "a" * 40)
+    assert "gmgn.ai" not in msg
+    assert "fomo.family" in msg
+
+
+def test_没有链名时不出链接段():
+    msg = _sig(network_id=None)
+    assert "http" not in msg
+    assert "🧬" not in msg

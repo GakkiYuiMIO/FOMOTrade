@@ -34,6 +34,8 @@ from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
 from src.models import (
     COUNTABLE_REASONS,
+    EVENT_TRANSFER_IN,
+    EVENT_TRANSFER_OUT,
     NETWORK_DISPLAY,
     normalize_network,
     normalize_token_address,
@@ -1152,9 +1154,14 @@ class CommandBot:
             active = len(store.list_active_users(conn))
             ready = len(store.ready_user_ids(conn))
             # 今日事件数:ingested_at 是 ISO 字符串,与日期前缀做字典序比较即可
+            # ⚠️ 排掉转入/转出,与网页版「今日事件」卡片同一口径(见 web.queries.dashboard):
+            #    这个数字回答的是"名单今天动了多少次",而转账是 2026-08 才加的采集,
+            #    算进来会让它虚增约 10 倍 —— 同一个数字换了含义,比数字错了更难发现。
             today_key = datetime.now(UTC).strftime("%Y-%m-%d")
             today = conn.execute(
-                "SELECT COUNT(*) AS n FROM fomo_events WHERE ingested_at >= ?", (today_key,)
+                "SELECT COUNT(*) AS n FROM fomo_events "
+                "WHERE ingested_at >= ? AND event_type NOT IN (?, ?)",
+                (today_key, EVENT_TRANSFER_IN, EVENT_TRANSFER_OUT),
             ).fetchone()["n"]
             unsent = conn.execute(
                 "SELECT COUNT(*) AS n FROM fomo_events WHERE sent = 0"

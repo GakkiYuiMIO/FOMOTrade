@@ -13,7 +13,12 @@ import statistics as st
 from datetime import UTC, datetime
 
 from src import store as _store
-from src.models import COUNTABLE_REASONS, iso_minutes_ago
+from src.models import (
+    COUNTABLE_REASONS,
+    EVENT_TRANSFER_IN,
+    EVENT_TRANSFER_OUT,
+    iso_minutes_ago,
+)
 
 # 少于这么多个币就不给排名。⚠️ 不是不显示,是不参与排序 ——
 # 3 个币的「胜率 100%」是噪声,放进榜单顶端会直接误导决策。
@@ -194,8 +199,15 @@ def dashboard(conn: sqlite3.Connection) -> dict:
             age = None
 
     today = _store.now_iso()[:10] + "T00:00:00+00:00"
+    # ⚠️ 必须排掉转入/转出。「今日事件」这张卡片的含义一直是"名单今天动了多少次"
+    #    (买、卖、发观点),而转账是 2026-08 新加的采集,实测把它算进来会让这个数
+    #    虚增约 10 倍(注入 60 条 TRANSFER_IN 实测 136 → 196)—— 卡片还是那张卡片,
+    #    数字却换了含义,用户会以为名单突然活跃了十倍。
+    #    转账有它自己的出口(筹码分发告警),不该在这里充数。
     n_events = conn.execute(
-        "SELECT COUNT(*) n FROM fomo_events WHERE event_ts >= ?", (today,)
+        "SELECT COUNT(*) n FROM fomo_events "
+        "WHERE event_ts >= ? AND event_type NOT IN (?, ?)",
+        (today, EVENT_TRANSFER_IN, EVENT_TRANSFER_OUT),
     ).fetchone()["n"]
     n_tokens = conn.execute(
         "SELECT COUNT(DISTINCT token_address) n FROM fomo_events "
