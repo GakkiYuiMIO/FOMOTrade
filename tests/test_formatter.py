@@ -612,6 +612,109 @@ def test_展示不下的收到者要如实说明():
     assert "还有 31 人未显示" in msg
 
 
+# ---- 截断归展示层:合计是全量的,列出来的只是前几个 ----------------------------
+def _receiver_row_count(msg: str) -> int:
+    """消息里真正渲染出来的收到者行数 —— 只认行首的 👤(尾段那几行都不是这个锚点)"""
+    return sum(1 for ln in msg.split("\n") if ln.startswith("👤 "))
+
+
+def test_收到者二十五人时合计是全部人的而不是列出来那几行的():
+    """
+    ⚠️⚠️ 这条盯的是**合计陈述了一个错误的事实**:
+       poller 曾经用 `transfer_receivers(..., limit=10)` 取明细、对这 10 行求和,
+       却把结果摆在 count_recent_receivers 数出来的**全量人数**旁边 ——
+       渲染成「25 人收到 · 合计 $X」,而 X 只是其中 10 个人的合计。
+       与"已清仓的人显示 +$0.00""他们一分钱没花"同级:数字本身没错,
+       它被摆的位置让它变成了假话。
+
+    ⚠️ 现在契约反过来:调用方给**全量**,合计对全量求和,
+       "列几行"由本模块决定并如实写出未显示人数。
+    ⚠️ 期望值是测试自己按那串金额算的,不从 formatter import 任何常量/门槛。
+    """
+    usd = [901.37 + i for i in range(25)]
+    msg = _sig(receiver_count=25,
+               receivers=[{"who": f"Holder{i}", "usd": u} for i, u in enumerate(usd)])
+
+    # 25 个人的真实合计:901.37 + 902.37 + … + 925.37 = 22834.25
+    assert "合计 $22,834.25" in msg, \
+        f"合计不是全部 25 人的(应为 ${sum(usd):,.2f}),实际那一行:" \
+        f"{[ln for ln in msg.split(chr(10)) if ln.startswith('👥')]}"
+    assert "25 人收到" in msg, "人数那一半必须还是全量,否则这条测试没在测两者一致"
+
+    # 展示层照样要收口:不能真往一条 TG 消息里塞 25 行
+    shown = _receiver_row_count(msg)
+    assert shown == 10, f"消息里列出了 {shown} 行收到者"
+    assert "Holder0" in msg and "Holder9" in msg, "列的是按到账时间排在最前面的那几个"
+    assert "Holder10" not in msg and "Holder24" not in msg
+    # 未显示人数必须扣掉**真正渲染出来的**行数,差一个都是在报假数
+    assert "…还有 15 人未显示" in msg, \
+        f"未显示人数算错了:{[ln for ln in msg.split(chr(10)) if '未显示' in ln]}"
+
+
+def test_名单全员收到时尾段一行都不许被挤掉():
+    """
+    ⚠️ 名单当前 91 人,一次平台级批量发放就能让全员都"收到"(config 里记着实测:
+       一个美股代币化的币有 41 人收到)。91 行收到者会把整条消息撑到 5000+ 字符,
+       而 _fit_signal 只会**从尾巴往前砍** —— 于是最先没的恰恰是这条告警里
+       最有价值的几行:发货地址证据、真金白银买过的人、链接。
+       用户收到一条"91 个人收到了"然后什么都没有。
+    ⚠️ 所以截断必须发生在**收到者明细这一段**,而不是靠出口那道闸去兜底。
+       出口闸是"消息发得出去"的保险,保证不了"消息里还剩什么"(与 /ca 同一条教训)。
+    ⚠️ 4096 是 Telegram 的硬上限(与本模块的实现无关的外部事实),不从被测模块 import。
+    """
+    msg = _sig(
+        receiver_count=91,
+        receivers=[{"who": f"Holder{i:02d}", "usd": 900.0 + i, "mcap": 1.98e5,
+                    "ts": "2026-08-26T00:32:17+00:00"} for i in range(91)],
+        senders={"known": 91, "distinct": 1,
+                 "top": {"address": _SIG_SENDER, "receivers": 91,
+                         "first_ts": "2026-08-26T00:32:17+00:00",
+                         "last_ts": "2026-08-26T00:37:40+00:00"}},
+    )
+    lines = msg.split("\n")
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符,会被 notifier 盲切"
+    assert _html_ok(msg), "标签必须全部配对闭合"
+    assert _receiver_row_count(msg) == 10, \
+        f"收到者明细没有在展示层收口,列了 {_receiver_row_count(msg)} 行"
+    assert "…还有 81 人未显示" in msg
+    # 尾段四行:这条告警的证据与出口,一行都不能被收到者挤掉
+    assert "同一个发货地址" in msg, "唯一可证的硬证据被挤掉了"
+    assert "真金白银" in msg, "买家对照被挤掉了"
+    assert "🧬 Solana" in msg, "链名被挤掉了"
+    assert "fomo.family" in msg, "链接被挤掉了"
+    assert lines[-1] == f"<code>{_SIG_CA}</code>", "锚点必须活到最后且完整闭合"
+
+
+def test_长handle吃掉版面时未显示人数要把被跳过的也算进去():
+    """
+    ⚠️ 两道闸各管一件事:行数上限管"不塞 91 行",预算管"10 行也可能吃光字符"
+       (_esc 把一个 `'` 撑成 6 个字符,handle 由陌生人决定)。
+       被预算跳过的那几行**也是未显示**,拿行数上限去减就会少报 ——
+       消息会说"还有 15 人未显示",而实际没显示的是 20 人。
+    ⚠️ 断言方式是"消息自己对自己自洽":从渲染结果里数出真正列了几行,
+       再要求那句话正好等于 25 减去它。不引用被测模块的任何常量。
+    ⚠️ 这里的 ticker / handle / 买家名全取最坏形态(_esc 把 `'` 撑成 6 个字符),
+       目的就是把版面挤到"10 行放不下"—— 出口不变式是**渲染方**的职责,
+       调用方传多少行、传多长的名字都不该让这条消息说假话。
+    """
+    evil = "'" * 24                      # 转义后 144 字符/个,10 行就吃掉四千
+    msg = _sig(
+        token_symbol="'" * 40,
+        receiver_count=25,
+        receivers=[{"who": f"{evil}{i}", "usd": 900.0 + i, "mcap": 1.98e5,
+                    "ts": "2026-08-26T00:32:17+00:00"} for i in range(25)],
+        buyers=[evil] * 12,
+    )
+    shown = _receiver_row_count(msg)
+    assert 0 < shown < 10, f"前提不成立:预算没有真的把行挤掉(shown={shown})"
+    assert f"…还有 {25 - shown} 人未显示" in msg, \
+        f"实际列了 {shown} 行,那句话却是:" \
+        f"{[ln for ln in msg.split(chr(10)) if '未显示' in ln]}"
+    assert len(msg) <= _TG_HARD_LIMIT
+    assert _html_ok(msg)
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>"
+
+
 def test_恶意handle不会撑破消息也不会切碎实体():
     """
     ⚠️ handle 与 ticker 由陌生人决定,长度不受任何天然约束。

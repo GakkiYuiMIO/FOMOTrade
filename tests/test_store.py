@@ -1510,6 +1510,50 @@ def test_收到者明细与计数口径完全一致(conn):
     assert rows[1]["mcap"] is None, "拿不到市值就是 NULL,绝不拿别的数去凑"
 
 
+def test_收到者明细不许在查询层截断(conn):
+    """
+    ⚠️⚠️ transfer_receivers 曾经带着 `limit: int = 12`、poller 传 10。
+       于是收到者超过 10 人时,poller 拿这 10 行求和写进
+       transfer_in_signals.total_usd、也渲进消息,却把它摆在
+       count_recent_receivers 数出来的**全量人数**旁边 ——
+       「25 人收到 · 合计 $X」里的 X 只是其中 10 个人的合计,是一句假话。
+       而这个功能抓的恰恰是分发事件,超过 10 人本来就正常
+       (config 里那段实测记录:一个平台级批量发放的币能有 41 人收到)。
+
+    ⚠️ 这条盯的是"查询层一行都不许少",不是"消息里列几行" ——
+       后者是展示层的事,由 formatter 截断并如实写"还有 N 人未显示"。
+    ⚠️ 门槛写死 25 与那串金额的字面量和,不从 store 里取任何常量:
+       把上限 import 回来当门槛,等于用被测代码给自己打分。
+    """
+    usd = [901.37 + i for i in range(25)]
+    for i, u in enumerate(usd):
+        _recv(conn, f"u{i}", f"Holder{i}", usd=u, tag=f"-{i}")
+
+    n = store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    rows = store.transfer_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert n == 25, "前提不成立:25 个人没有都落进库"
+    assert len(rows) == 25, \
+        f"查询层又截断了 —— 只回了 {len(rows)} 行,合计将只是其中一部分人的合计"
+    assert len(rows) == n, "明细行数与计数必须恒等(一人一行,GROUP BY user_id)"
+    # 合计必须是**全部 25 个人**的和,不是排在前面那几个人的
+    assert round(sum(r["usd"] for r in rows), 2) == round(sum(usd), 2)
+    assert {r["who"] for r in rows} == {f"Holder{i}" for i in range(25)}
+
+
+def test_收到者明细的签名里不许再有limit(conn):
+    """
+    ⚠️ 上一条测的是行为,这条测的是**接口**:只要 limit 还是个能传的参数,
+       调用方迟早会顺手传一个(上一次就是 poller 传了 10)——
+       而它一传,"合计"和台账就又变成"其中几个人的合计"。
+       LIMIT 是展示层的关注点,不该出现在这个查询的签名里。
+    """
+    import inspect
+
+    params = inspect.signature(store.transfer_receivers).parameters
+    assert "limit" not in params, \
+        f"limit 又回到查询层了:{list(params)} —— 截断归 formatter,查询必须给全量"
+
+
 # ---- 发货地址聚类:这条告警里唯一可证的证据 ------------------------------
 _ADDR_A = "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72"   # $fih 真实报文里的发货地址
 _ADDR_B = "3nQmLpZq7Rt2Vx9Kd8Hs1Wf4Yc6Ub5Ne0Ja7Mg2Pk3S"

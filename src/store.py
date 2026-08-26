@@ -1568,12 +1568,24 @@ def count_recent_receivers(conn, network_id: str, token_address: str, since_iso:
 
 
 def transfer_receivers(conn, network_id: str, token_address: str, since_iso: str,
-                       min_usd: float, limit: int = 12) -> list[sqlite3.Row]:
+                       min_usd: float) -> list[sqlite3.Row]:
     """
-    窗口内收到这个币的人都是谁、各自收到多少、在什么市值收到的(按时间正序 —— 谁先拿到的排前面)。
+    窗口内收到这个币的人**全部**列出来:谁、各自收到多少、在什么市值收到的
+    (按时间正序 —— 谁先拿到的排前面)。
 
     ⚠️ 谓词必须与 count_recent_receivers **逐条一致**,否则消息里写着 5 人、
        底下只列得出 3 个名字。
+       (这条不再只是一句注释:poller 每轮都把 len(rows) 与 count_recent_receivers
+        的返回值对一次,不等就打 WARNING —— 漂移了总得有人知道。)
+    ⚠️⚠️ **这里没有 LIMIT,而且不许加回来。**
+       它曾经是 `limit: int = 12`、poller 传 10。于是收到者超过 10 人时,
+       poller 拿这 10 行求和,写进 transfer_in_signals.total_usd、也渲进消息,
+       却把它摆在 count_recent_receivers 数出来的**全量人数**旁边 ——
+       「25 人收到 · 合计 $X」里的 X 只是其中 10 个人的合计,是一句假话,
+       而这个功能抓的恰恰是分发事件,超过 10 人本来就正常。
+       LIMIT 是**展示层**的关注点(一条 TG 消息装不下 91 行),漏到查询层就会
+       污染"合计"与台账这两个必须与人数同批的事实。截断现在在 formatter 里做。
+       全取回来没有成本:SQL 是 GROUP BY user_id,一人一行,行数上限就是名单人数。
     ⚠️ mcap 取该用户**最早一笔有市值**的那条:市值来自本 tick 的 balances 索引
        (报文本身没有 marketCap),名单里还没人持有这个币时它就是 NULL。
        取不到就是 NULL,由渲染层让那一格消失 —— 绝不拿"现在的市值"冒充"收到时的市值"。
@@ -1610,10 +1622,9 @@ def transfer_receivers(conn, network_id: str, token_address: str, since_iso: str
         FROM agg a
         LEFT JOIN scoped m ON m.user_id = a.user_id AND m.rn_mcap = 1
         ORDER BY a.ts
-        LIMIT ?
         """,
         (EVENT_TRANSFER_IN, network_id, token_address, since_iso,
-         REASON_NO_SIDE, float(min_usd), int(limit)),
+         REASON_NO_SIDE, float(min_usd)),
     ).fetchall()
 
 

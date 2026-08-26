@@ -243,8 +243,11 @@ _TRANSFER_MCAP_FRESH_SEC = 900
 #    同一个理由:这个问题问的是"名单认不认识这个币",而不是"最近有没有人买" ——
 #    一个月前有人重仓过、现在项目方在给别人发筹码,恰恰是最该看见的对照。
 _TRANSFER_BUYER_LOOKBACK_DAYS = 3650
-# 告警消息里最多展开几个收到者 / 几个买家
-_TRANSFER_RECEIVER_ROWS = 10
+# 告警消息里最多列几个买家。
+# ⚠️ 收到者那一侧**故意没有对应常量**:它的上限是展示层的事,归 formatter
+#    (见 formatter._SIG_RECEIVER_ROWS)。放在这里就会顺手传给 SQL,
+#    而"合计"和台账必须对全量求和 —— 这正是刚修掉的那条假事实。
+#    买家不一样:那一行只是对照,少列几个人不会让任何一个数字变成假的。
 _TRANSFER_BUYER_ROWS = 6
 # 等待重试的转入告警最多攒多少个。⚠️ 必须有上限:TG 长时间不可达时,
 #    每个够门槛的币都会往里塞一个,不封顶就是一条只增不减的内存泄漏,
@@ -1894,8 +1897,20 @@ class Poller:
                     # 否则它会在内存里赖到进程重启
                     self._transfer_retry.pop((net, ca), None)
                     continue
-                rows = store.transfer_receivers(conn, net, ca, since, min_usd,
-                                                limit=_TRANSFER_RECEIVER_ROWS)
+                # ⚠️ **不限行**:rows 必须与 n 是同一批人。这里曾经传 limit=10,
+                #    于是下面的 total 只是其中 10 个人的合计,却被摆在「n 人收到」旁边 ——
+                #    收到者超过 10 人时消息和台账一起在陈述假事实。
+                #    "一条消息装不下 91 行"是**渲染层**的问题,由 formatter 自己截断。
+                rows = store.transfer_receivers(conn, net, ca, since, min_usd)
+                # ⚠️ 把 store 里那句"谓词必须逐条一致"从注释变成**可执行的检查**:
+                #    两个函数各写各的 SQL,一人一行,行数本该恒等于人数。不等就是谓词
+                #    漂移了 —— 消息会写着 25 人却只列得出 20 个,合计也跟着少算。
+                #    只告警不抛异常:漂移是"数字不精确",而中断推送是"用户什么都收不到",
+                #    后者更糟。真出事时日志里有据可查,不至于像现在这样悄无声息。
+                if len(rows) != n:
+                    logger.warning(
+                        "转入告警:两处谓词漂移了 —— 计数 {} 人,明细只列得出 {} 行,"
+                        "合计与人数将不是同一批人 | {} {}", n, len(rows), net, ca)
                 recv = [
                     {"who": r["who"], "usd": r["usd"], "mcap": r["mcap"],
                      "hits": r["hits"], "ts": r["ts"]}

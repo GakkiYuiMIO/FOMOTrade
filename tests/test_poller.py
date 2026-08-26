@@ -2716,3 +2716,85 @@ def test_到账金额都是0时合计是0而不是不知道(db, monkeypatch):
         f"台账里的合计被 `or None` 吞成了 {row['total_usd']!r} —— 『确实是 0』变成了『不知道』"
     assert "合计 $0.00" in p.notifier.sent[0], \
         f"消息里的合计也不该消失:{p.notifier.sent[0]}"
+
+
+# ---- 合计必须与人数是同一批人 -------------------------------------------------
+def test_二十五人收到时合计是全部人的而不是前十个人的(db):
+    """
+    ⚠️⚠️ 病灶原样:人数取自 count_recent_receivers(**全量**),
+       而明细取自 transfer_receivers(..., limit=10),合计对这 10 行求和 ——
+       渲染成「25 人收到 · 合计 $X」,台账 transfer_in_signals.total_usd 也是这个 X。
+       X 只是其中 10 个人的合计,却被摆在"25 人"旁边,是一句假话。
+       迄今 3 次告警都是 3 人所以没暴露,而这功能抓的恰恰是分发事件 ——
+       config 里那段实测记录着:一个平台级批量发放的币有 41 人收到。
+
+    ⚠️ 台账那一列是事后回溯"这次分发一共发了多少钱"的唯一记录,写错 = 永久错。
+       所以断言必须同时落在**台账**和**消息**上,只看一个都漏。
+    ⚠️ 期望值 22834.25 是测试自己按那串金额算的,不从任何被测模块取常量。
+    """
+    usd = [901.37 + i for i in range(25)]          # 901.37 … 925.37,和 = 22834.25
+    p, _ = _seed_receivers(usd)
+    warns, close = _capture_warnings()
+    try:
+        with store.get_conn() as c:
+            p._check_transfer_in(c, dry_run=False)
+            row = c.execute(
+                "SELECT receivers, total_usd FROM transfer_in_signals").fetchone()
+    finally:
+        close()
+
+    assert row["receivers"] == 25, "前提不成立:25 个人没有都被算进来"
+    assert round(row["total_usd"], 2) == 22834.25, \
+        f"台账里的合计是 {row['total_usd']!r} —— 只是其中一部分人的合计," \
+        f"却与 receivers={row['receivers']} 记在同一行"
+
+    assert len(p.notifier.sent) == 1
+    msg = p.notifier.sent[0]
+    assert "25 人收到" in msg and "合计 $22,834.25" in msg, \
+        f"消息里的「N 人 + 合计」不是同一批人:{[ln for ln in msg.split(chr(10)) if '合计' in ln]}"
+    # 展示层照样收口:25 个人不会真的列 25 行,而且未显示人数要如实说出来
+    shown = sum(1 for ln in msg.split("\n") if ln.startswith("👤 "))
+    assert shown == 10, f"消息里列了 {shown} 行收到者"
+    assert "…还有 15 人未显示" in msg
+    # 干净路径上不许有漂移告警,否则那条告警就成了每轮都响的噪音
+    assert [w for w in warns if "漂移" in w] == []
+
+
+def test_两处谓词漂移时必须留下告警而不是悄悄发出假数(db):
+    """
+    ⚠️ store.transfer_receivers 的文档里写着"谓词必须与 count_recent_receivers
+       逐条一致",但那**只是一句注释** —— 真漂移了没有任何人会知道:
+       消息照发,只是写着 3 人、底下列得出 2 个,合计也跟着少算。
+       两个函数各写各的 SQL,一人一行,行数本该恒等于人数;这里把那句注释
+       变成每轮都跑的检查。
+
+    ⚠️ 只告警**不抛异常**:漂移是"数字不精确",中断推送是"用户什么都收不到",
+       后者更糟。所以这条测试同时钉死两件事:告警要有、推送不能停。
+    ⚠️ 打桩必须自己开一份 MonkeyPatch,绝不能用 monkeypatch 夹具再 undo() ——
+       那个夹具是函数级共享的,undo() 会把 db 夹具的 DB_PATH 补丁一起还原,
+       后半段就打到 data/fomo.db(用户正在跑的生产库)上去了。已经踩过一次。
+    """
+    import src.store as smod
+
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    real = smod.transfer_receivers
+
+    def _drifted(*a, **kw):
+        """模拟谓词漂移:明细比计数少一个人(多一条 AND 就是这个效果)"""
+        return real(*a, **kw)[:-1]
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(smod, "transfer_receivers", _drifted)
+    warns, close = _capture_warnings()
+    try:
+        with store.get_conn() as c:
+            p._check_transfer_in(c, dry_run=False)
+    finally:
+        close()
+        mp.undo()
+
+    assert len(p.notifier.sent) == 1, "漂移只该记一笔账,绝不能把推送打断"
+    drift = [w for w in warns if "漂移" in w]
+    assert drift, f"谓词漂移了却一声不吭,日志里只有:{warns}"
+    assert "3" in drift[0] and "2" in drift[0], \
+        f"告警里必须写清楚两边各是多少,否则排查时无从下手:{drift[0]}"
