@@ -23,6 +23,7 @@ from src.models import (
     BADGE_FIRST,
     COUNTABLE_REASONS,  # noqa: F401  —— hot_tokens / token_buyers 的 SQL 参数用到
     EVENT_BUY,
+    EVENT_TRANSFER_IN,
     REASON_LOCAL_STATS,
     REASON_NO_BASELINE,
     REASON_NO_SIDE,
@@ -30,6 +31,7 @@ from src.models import (
     REASON_NOT_BUY,
     REASON_QUOTE_TOKEN,
     FomoEvent,
+    is_quote_token,
     iso_minutes_ago,
     now_iso,
 )
@@ -162,6 +164,27 @@ CREATE TABLE IF NOT EXISTS copytrade_signals (
     PRIMARY KEY (network_id, token_address)
 );
 CREATE INDEX IF NOT EXISTS idx_copy_time ON copytrade_signals(triggered_at);
+
+-- ============ 【转入告警】「N 个名单成员收到同一个币」的去重台账 ============
+-- 命中阈值时记一行,主键保证同一个币**这辈子只告警一次** —— 分发是一次性事件,
+-- 同一个币每 5 分钟提醒一遍等于让用户静音。
+--
+-- ⚠️ **刻意不复用 copytrade_signals**,尽管两张表长得很像。它的主键同样是
+--    (network_id, token_address),一个币只占得下一行 —— 复用的话两类信号会互相
+--    吃掉:一个币先被跟单信号占了行,转入告警就永远发不出;反过来转入告警占了行,
+--    这个币的跟单信号也会被当成"已经跟过"而静默跳过。
+-- ⚠️⚠️ 这张表与跟单执行器**没有任何关系**,永远不要让它参与下单判定:
+--    「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义。它只驱动一条推送。
+CREATE TABLE IF NOT EXISTS transfer_in_signals (
+    network_id     TEXT NOT NULL,
+    token_address  TEXT NOT NULL,
+    token_symbol   TEXT,
+    triggered_at   TEXT NOT NULL,      -- UTC ISO
+    receivers      INTEGER NOT NULL,   -- 触发那一刻窗口内有几个名单成员收到过
+    total_usd      REAL,               -- 这几个人合计收到多少美元(拿不到就 NULL,不写 0)
+    PRIMARY KEY (network_id, token_address)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_in_time ON transfer_in_signals(triggered_at);
 
 -- ============ 【买入榜】代币行情快照 ============
 -- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
@@ -696,11 +719,25 @@ def judge_badge(conn, ev: FomoEvent) -> tuple[str | None, str]:
 
     ⚠️ 必须在把本事件 upsert 进 user_token_stats **之前** 调用,
        否则 buy_count 已经 +1,永远判不出 FIRST。
+
+    ⚠️ side_unknown 必须**先于** event_type 判。badge_reason 是"方向到底可不可信"
+       这件事唯一被落库的痕迹(side_unknown 自己不落库,补发时靠
+       poller._event_from_row 反查 reason == 'no_side' 还原),而 poller 在方向判不出时
+       会把转账**兜底成 TRANSFER_IN**。顺序反过来的话这条记录落库时 reason='not_buy',
+       与一笔真·收到转入完全无法区分 —— 于是「N 个人收到同一个币」可能把一笔实际是
+       **转出**的记录算成收到,补发的消息也会把它渲染成「📥 收到转入」。
+    ⚠️ 影响面(动手前已核对):judge_badge 只在落库那一刻跑一次、存量行永不重算,
+       所以这个改动**不动任何一行历史数据**;对未来的行,只有"非 BUY 且方向判不出"
+       这一类的取值从 'not_buy' 变成 'no_side' —— BUY 走哪个顺序结果都一样。
+       所有按 badge_reason 过滤的 SQL(store.hot_tokens / token_buyers /
+       count_recent_buyers、bot._ca_buyers_with_usd、web.queries 两处)都**同时**带
+       event_type='BUY',非 BUY 的行本来就在门外。实测生产库副本 21984 行里,
+       非 BUY 且 badge_reason 落在 COUNTABLE_REASONS 内的有 **0** 行。
     """
-    if ev.event_type != EVENT_BUY:
-        return None, REASON_NOT_BUY
     if ev.side_unknown:                      # 方向不明:既不写 stats 也不显示共识
         return None, REASON_NO_SIDE
+    if ev.event_type != EVENT_BUY:
+        return None, REASON_NOT_BUY
     if ev.token_key is None:                 # 构造不出聚合键
         return None, REASON_NO_TOKEN_KEY
     if ev.is_quote:                          # 计价币不参与功能 A/B
@@ -1448,6 +1485,152 @@ def set_copy_status(conn, network_id: str, token_address: str, status: str,
         args = (status, now_iso(), note, network_id, token_address, *want)
     with tx(conn):
         cur = conn.execute(sql, args)
+    return cur.rowcount == 1
+
+
+# ============================================================
+# 【转入告警】N 个名单成员收到同一个币
+# ============================================================
+# ⚠️⚠️ 本节与跟单执行器**没有任何关系**,并且永远不该有。
+#    「收到免费筹码」与「自己掏钱买入」是相反的含义:前者多半是项目方/内部人在分发,
+#    拿它去触发花钱的操作方向就是错的。这几个函数只服务于一条推送。
+#    这条边界的落点是 should_count(只认 EVENT_BUY)——**别去动它**。
+
+# 单人到账金额下限的兜底默认值。真正的取值来自配置
+# (fomo_transfer_alert_min_usd),这里只是给不传参的调用方一个安全值。
+# ⚠️ 这道门槛不是可有可无的调味料,它是这个功能能不能上线的分水岭。
+#    用 91 人 × 8404 条真实 transfers 离线重放(全员完整覆盖的 11.9 小时窗口):
+#      24h 窗口 · ≥3 人 · 不设金额门槛  → 命中 69 个币 = 138.8 次/天  ← 用户会直接静音
+#      24h 窗口 · ≥3 人 · 每人 ≥$100    → 命中  5 个币 =  10.1 次/天
+#      24h 窗口 · ≥3 人 · 每人 ≥$500    → 命中  3 个币 =   6.0 次/天  ← 取这个
+#      24h 窗口 · ≥3 人 · 每人 ≥$1000   → 命中  2 个币 =   4.0 次/天  ← $fih 丢了
+#    噪音的真面目是空投灰尘(1 小时窗口 42 次命中里 39 次单人到账不足 $100)和
+#    平台级批量发放(美股代币化 NVDAB/SPYB/TSLAB,单个币能有 41 个名单成员收到)。
+#    $500 与 $300 命中数相同($fih 最低那笔 $901.37 仍安然通过),取 $500 更抗噪。
+TRANSFER_MIN_USD = 500.0
+
+
+def count_recent_receivers(conn, network_id: str, token_address: str, since_iso: str,
+                           min_usd: float = TRANSFER_MIN_USD) -> int:
+    """
+    窗口内**收到**这个币的名单成员数(去重到人)。转入告警的分子。
+
+    ⚠️ 三处与买入侧 count_recent_buyers 刻意不同,照抄任何一条都会静默失效:
+
+    1) **绝不能带 `badge_reason IN COUNTABLE_REASONS`**。judge_badge 对非 BUY 事件
+       一律返回 REASON_NOT_BUY,TRANSFER_IN 永远进不了 COUNTABLE_REASONS ——
+       照抄的话本函数**恒返回 0 且不报任何错**,正是最难查的那类失效。
+       (守这一条的回归测试:tests/test_store.py::test_收到计数不得复用买入侧的可计数过滤)
+
+    2) **必须自己补一条计价币过滤**。买入侧是靠 COUNTABLE_REASONS 顺带把
+       badge_reason='quote_token' 滤掉的;这里没有那层,而 USDC/USDT/WETH 的内部划转
+       量极大(名单里天天有人搬稳定币),不滤就是刷屏。原生币(SOL/ETH/BNB)在
+       poller._transfer_to_event 就按 isNativeToken 显式跳过了,进不到库里。
+
+    3) **必须排除 badge_reason='no_side' 的行**。poller 在方向判不出时会把记录兜底成
+       TRANSFER_IN —— 那可能实际是一笔**转出**。把它算成"收到"就是在报相反的事实。
+
+    可以照抄的只有:JOIN watch_users(active)、时间窗、COUNT(DISTINCT user_id)。
+
+    ⚠️ **不带 stats_ready=1**,与买入侧不同。stats_ready 的语义是"这个人的历史买入基线
+       已经回填好了",它保护的是徽章判定与共识分子分母 —— 而"他收到过这个币"是一条
+       与基线毫无关系的事实,一笔转账就是一笔转账。带上它的唯一效果是让刚 /add 进来、
+       基线还没建完的人在这个信号里凭空消失,而分发信号最该抓的恰恰是刚加进来的新人。
+
+    ⚠️ 金额门槛的判据是 `amount_usd >= ?`,SQL 里 NULL 参与比较结果是 NULL(不成立),
+       所以拿不到金额的记录天然被排除 —— 这正是要的语义:金额未知就不能声称它达标。
+       不能写成 COALESCE(amount_usd, 0) 之类,那会把"不知道"当成"知道是 0"。
+    """
+    # 计价币直接短路。写在函数里而不是留给调用方,是为了让这条过滤**不可能被漏掉**
+    if is_quote_token(network_id, token_address):
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT e.user_id) AS n
+        FROM fomo_events e
+        JOIN watch_users w ON w.user_id = e.user_id AND w.active = 1
+        WHERE e.event_type = ?
+          AND e.network_id = ? AND e.token_address = ?
+          AND e.event_ts >= ?
+          AND COALESCE(e.badge_reason, '') <> ?
+          AND e.amount_usd >= ?
+        """,
+        (EVENT_TRANSFER_IN, network_id, token_address, since_iso,
+         REASON_NO_SIDE, float(min_usd)),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def transfer_receivers(conn, network_id: str, token_address: str, since_iso: str,
+                       min_usd: float = TRANSFER_MIN_USD,
+                       limit: int = 12) -> list[sqlite3.Row]:
+    """
+    窗口内收到这个币的人都是谁、各自收到多少、在什么市值收到的(按时间正序 —— 谁先拿到的排前面)。
+
+    ⚠️ 谓词必须与 count_recent_receivers **逐条一致**,否则消息里写着 5 人、
+       底下只列得出 3 个名字。
+    ⚠️ mcap 取该用户**最早一笔有市值**的那条:市值来自本 tick 的 balances 索引
+       (报文本身没有 marketCap),名单里还没人持有这个币时它就是 NULL。
+       取不到就是 NULL,由渲染层让那一格消失 —— 绝不拿"现在的市值"冒充"收到时的市值"。
+    """
+    if is_quote_token(network_id, token_address):
+        return []
+    return conn.execute(
+        """
+        WITH scoped AS (
+            SELECT e.user_id, e.user_handle, e.handle, e.event_ts, e.amount_usd, e.market_cap,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.user_id
+                       ORDER BY CASE WHEN e.market_cap IS NULL THEN 1 ELSE 0 END, e.event_ts
+                   ) AS rn_mcap
+            FROM fomo_events e
+            JOIN watch_users w ON w.user_id = e.user_id AND w.active = 1
+            WHERE e.event_type = ?
+              AND e.network_id = ? AND e.token_address = ?
+              AND e.event_ts >= ?
+              AND COALESCE(e.badge_reason, '') <> ?
+              AND e.amount_usd >= ?
+        ),
+        agg AS (
+            SELECT user_id,
+                   COALESCE(MAX(user_handle), MAX(handle)) AS who,
+                   MIN(event_ts)                           AS ts,
+                   -- ⚠️ 不用 COALESCE(amount_usd,0):谓词已经保证每行都有金额,
+                   --    SUM 的标准语义在这里就是对的
+                   SUM(amount_usd)                         AS usd,
+                   COUNT(*)                                AS hits
+            FROM scoped GROUP BY user_id
+        )
+        SELECT a.who, a.ts, a.usd, a.hits, m.market_cap AS mcap
+        FROM agg a
+        LEFT JOIN scoped m ON m.user_id = a.user_id AND m.rn_mcap = 1
+        ORDER BY a.ts
+        LIMIT ?
+        """,
+        (EVENT_TRANSFER_IN, network_id, token_address, since_iso,
+         REASON_NO_SIDE, float(min_usd), int(limit)),
+    ).fetchall()
+
+
+def record_transfer_in_signal(conn, *, network_id: str, token_address: str,
+                              token_symbol: str | None, receivers: int,
+                              total_usd: float | None) -> bool:
+    """
+    记一行转入告警台账。返回 True 表示**这次是新的**(该推),False = 这个币已经告警过。
+
+    ⚠️ "单币只告警一次"由主键保证,而不是靠先 SELECT 再 INSERT —— 后者在两个 tick
+       撞上时会推两条。与 copytrade 的 record_copy_signal 同一个道理,但**另起一张表**
+       (理由见 _SCHEMA 里 transfer_in_signals 的注释:共用主键会让两类信号互相吃掉)。
+    """
+    with tx(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO transfer_in_signals
+                (network_id, token_address, token_symbol, triggered_at, receivers, total_usd)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (network_id, token_address, token_symbol, now_iso(), int(receivers), total_usd),
+        )
     return cur.rowcount == 1
 
 

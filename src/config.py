@@ -98,6 +98,27 @@ class FomoSettings(BaseSettings):
         45, ge=0, description="超过这么久没跑就走停机汇总模式(分钟);0=关闭"
     )
 
+    # ---------- 转入告警(「N 个名单成员收到同一个币」)----------
+    # ⚠️⚠️ 这三项**刻意不放进 CopyConfig**。CopyConfig 是跟单开关(默认关、要花钱、
+    #    由 /copy 命令改),而这个信号只推一条通知、永远不下单 ——
+    #    「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义,混在同一个配置对象里
+    #    迟早会有人顺手把它接进执行器。放在 .env,与轮询节奏那些参数同级。
+    fomo_transfer_alert_receivers: int = Field(
+        3, ge=2, description="同一个币有几个名单成员『收到』才告警"
+    )
+    fomo_transfer_alert_window_hours: int = Field(
+        24, ge=1, description="统计『收到』的时间窗(小时),与买入信号保持一致"
+    )
+    # ⚠️ 别把它当成可有可无的调味料 —— 它是这个功能能不能上线的分水岭。
+    #    实测(91 人 × 8404 条真实 transfers,在全员完整覆盖的 11.9 小时窗口上离线重放):
+    #      不设门槛 → 138.8 次/天(用户会直接静音);$100 → 10.1;$500 → 6.0;$1000 → 4.0
+    #    噪音几乎全是空投灰尘和平台级批量发放(美股代币化,单个币能有 41 人收到)。
+    #    $500 与 $300 命中数相同,取 $500 更抗噪;再往上就会把真信号($fih 最低那笔
+    #    $901.37)一起筛掉。详见 store.TRANSFER_MIN_USD。
+    fomo_transfer_alert_min_usd: float = Field(
+        500.0, ge=0, description="单人到账金额下限(美元),低于此不计入『收到』人数"
+    )
+
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")
 

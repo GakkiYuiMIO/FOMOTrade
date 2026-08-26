@@ -41,6 +41,12 @@ from src.models import (
     FomoEvent,
 )
 
+# ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
+#    转入告警要自己算长度预算,而"上限是多少"必须与真正发消息的那一侧同源 ——
+#    两处各写一个数字,改了一处另一处就变成一颗定时炸弹。
+#    notifier 只依赖 config,不依赖本模块,所以这个 import 不会成环。
+from src.notifier import MAX_MESSAGE_LEN
+
 # ============================================================
 # 行首锚点(§10.1)—— 全局唯一,永不重复,永不被别的字符挤掉
 # ============================================================
@@ -731,3 +737,140 @@ def _fake_ev(net: str, ca: str):
     """_links_line 只用到这两个字段 —— 复用它,免得链接拼装出现第二份实现"""
     return FomoEvent(event_id="", event_type=EVENT_BUY, user_id="", event_ts="", raw_json="",
                      network_id=net or None, token_address=ca)
+
+
+# ============================================================
+# 转入告警:N 个名单成员「收到」了同一个币
+# ============================================================
+# 行首锚点。⚠️ 全局唯一(铁律 1),与买卖那六个、与跟单的 🧪/🛒 都不重样 ——
+#    这条消息在聊天列表预览里必须一眼能跟别的区分开:它说的是"有人白拿到了筹码",
+#    与"有人买入"含义相反,认错锚点就是把相反的信号读成同一件事。
+EMOJI_DISTRIBUTION = "🚨"
+# 单条消息的**转义后**字符预算,与 /ca 同一套规矩(见 bot.CA_MSG_BUDGET 的事故记录):
+# notifier.send 超限时做的是盲切,切点落在 `&amp;` 中间就是残缺实体 → 整条 400,
+# 用户什么都收不到。所以长度必须由渲染方按转义后的真实长度自己算,且只在整行边界停手。
+TRANSFER_MSG_BUDGET = MAX_MESSAGE_LEN - 400
+# handle / ticker 由陌生人和服务端决定,长度不受任何天然约束 —— 一个 3000 字符的
+# ticker 就能把标题撑到顶破预算。先按**转义前**的字符数压一压再转义(顺序见 _clip)。
+_SIG_HANDLE_CHARS = 24
+_SIG_SYMBOL_CHARS = 16
+# CA 也要收口:normalize_token_address 对非 0x/42 位的输入原样透传、不做长度校验,
+# 而 CA 是"砍无可砍时也要贴上去"的那一行。Solana 44 位 / EVM 42 位,128 绰绰有余。
+_SIG_CA_CHARS = 128
+
+
+def _clip(s, limit: int) -> str:
+    """
+    任意短字段 → 单行、限长、**已转义**。
+
+    ⚠️ 顺序必须是"叠平空白 → 截断 → 转义",与 bot._ca_clip 同一条理由:
+       反过来会在截断点切断一个 `&amp;`,残缺实体照样让整条消息 400。
+       叠平空白也是必需的:一个 handle 里塞几个换行就能把一行变成十行,
+       绕开"按行算预算"这个前提。
+    """
+    flat = " ".join(str(s or "").split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return _esc(flat)
+
+
+def _fit_signal(lines: list[str], anchor: str) -> str:
+    """
+    整条信号消息的出口:按**整行边界**砍到预算内,锚点最后贴。
+
+    出口不变式(无论入参是什么都成立):
+      1. len(返回值) <= TRANSFER_MSG_BUDGET
+      2. CA 锚点是最后一行
+
+    ⚠️ 只按整行砍,绝不切进行内 —— 切在实体中间就是残缺实体、整条 400。
+    ⚠️ 锚点最后贴,且它自己已经过 _clip 收口(≤ _SIG_CA_CHARS 转义后)——
+       所以"砍到一行不剩 + 贴上锚点"这个最坏情况仍然在预算内。
+    """
+    kept = [ln for ln in lines if ln]
+    while kept and len("\n".join([*kept, anchor])) > TRANSFER_MSG_BUDGET:
+        kept.pop()
+    return "\n".join([*kept, anchor])
+
+
+def render_transfer_in_signal(
+    *,
+    network_id: str | None,
+    token_address: str,
+    token_symbol: str | None,
+    receiver_count: int,
+    receivers: list[dict],
+    window_hours: int,
+    buyers: list[str] | None = None,
+) -> str:
+    """
+    「同一个币被 N 个名单成员『收到』」的告警。
+
+    参数:
+        receiver_count  窗口内合格收到者总人数(可能大于 len(receivers),下面会写"还有 N 人")
+        receivers       [{"who": handle, "usd": 到账美元, "mcap": 收到时市值, "hits": 笔数}, …]
+                        缺哪个键就少哪一格(铁律 2:缺失整格消失,绝不打 0 / N/A)
+        buyers          名单里**真金白银买过**这个币的人。
+                        ⚠️ None 与 [] 语义不同:None = 查不出来(那一行整行消失),
+                           [] = 查过了、确实没人买过 —— 后者是有价值的信息,要显示。
+
+    ⚠️ 这条消息的第一职责是**让人一眼看出这不是买入**。「收到」= 从外部钱包转进来、
+       没花钱,语义上多半是项目方/内部人在分发筹码,与"他自己看好所以掏钱买"是相反的
+       信号。所以标题里带「没花钱」、正文第二行再显式否定一次 —— 宁可啰嗦,
+       也不能让人扫一眼当成"三个人在抢这个币"。
+    ⚠️ 本函数是纯函数,不查库(铁律 7)。所有事实由 poller 取好传进来。
+    """
+    sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    net = (network_id or "").strip()
+
+    title = (f"{EMOJI_DISTRIBUTION} <b>筹码分发预警</b>{SEP}"
+             f"<b>{receiver_count} 人「收到」同一个币</b>")
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+    lines = [
+        title,
+        f"{EMOJI_TRANSFER_IN} <b>不是买入</b> —— 是从外部钱包转进来的,他们一分钱没花",
+    ]
+
+    # ⚠️ 判空一律 is None(模块铁律):一个人也没报出金额时 total 是 None、那一段消失;
+    #    而 $0.00 是有意义的真实值,不能被 `if total` 连同 None 一起吞掉。
+    priced = [r["usd"] for r in receivers if r.get("usd") is not None]
+    total_str = _fmt_usd(sum(priced)) if priced else None
+    head = f"{EMOJI_CONSENSUS} 最近 {window_hours} 小时内 {receiver_count} 人收到"
+    if total_str is not None:
+        head += f"{SEP}合计 {total_str}"
+    lines.append(head)
+
+    for r in receivers:
+        cells = [f"{EMOJI_COUNTERPARTY} {_clip(r.get('who') or TEXT_UNKNOWN_USER, _SIG_HANDLE_CHARS)}"]
+        usd = _fmt_usd(r.get("usd"))
+        if usd is not None:
+            cells.append(usd)
+        mc = _fmt_usd_compact(r.get("mcap"))
+        if mc is not None:
+            # 「收到时」这个说法只有在市值确实取自那个时刻才成立 ——
+            # poller 用新鲜度闸门保证了这一点,取不到就是 None,这一格直接不出现
+            cells.append(f"{EMOJI_MARKET_CAP} 收到时 {mc}")
+        hits = r.get("hits")
+        if hits is not None and hits > 1:
+            cells.append(f"{EMOJI_TRADE_COUNT} {hits} 笔")
+        lines.append(SEP.join(cells))
+    omitted = receiver_count - len(receivers)
+    if omitted > 0:
+        lines.append(f"…还有 {omitted} 人未显示")
+
+    # 有没有人真金白银买过 —— 有对比才有判断力
+    if buyers is not None:
+        if buyers:
+            who = "、".join(_clip(b, _SIG_HANDLE_CHARS) for b in buyers)
+            lines.append(f"{EMOJI_AMOUNT_IN} 名单里另有 {len(buyers)} 人"
+                         f"<b>真金白银</b>买过:{who}")
+        else:
+            lines.append(f"{EMOJI_AMOUNT_IN} 名单里<b>还没有人</b>真金白银买过这个币")
+
+    if net:
+        lines.append(f"{EMOJI_NETWORK} {_esc(NETWORK_DISPLAY.get(net, net))}")
+    link = _links_line(_fake_ev(net, token_address))
+    if link:
+        lines.append(link)
+    # CA 独占最后一行、纯 <code>(铁律 6)
+    return _fit_signal(lines, f"<code>{_clip(token_address, _SIG_CA_CHARS)}</code>")

@@ -33,6 +33,7 @@ from src.models import (
 from .conftest import (
     CA_CATE,
     CA_TOAD,
+    CA_USDC,
     CA_WSOL,
     TS_EARLY,
     TS_LATE,
@@ -400,11 +401,34 @@ def test_前置门优先级_计价币先于基线判定(conn):
     assert reason == REASON_QUOTE_TOKEN
 
 
-def test_前置门优先级_非买入先于一切(conn):
-    """一条方向不明的卖出应报 not_buy,而不是 no_side。"""
+def test_前置门优先级_方向不明先于非买入(conn):
+    """
+    ⚠️ 这条断言与它替换掉的那条(「非买入先于一切」)**方向相反**,是刻意改的。
+
+    badge_reason 是「这条记录的方向到底可不可信」唯一被落库的痕迹:
+    side_unknown 自己不进表,补发时靠 poller._event_from_row 反查
+    reason == 'no_side' 还原。而 poller 在转账方向判不出时会把它**兜底成
+    TRANSFER_IN** —— 若 event_type 那道门排在前面,这条记录落库时 reason='not_buy',
+    与一笔真·收到转入完全无法区分。后果有两个,都很实:
+      1) 「N 个人收到同一个币」会把一笔可能是**转出**的记录算成"收到";
+      2) 补发出去的消息会把它渲染成「📥 收到转入」,而它可能正好是反的。
+
+    对存量数据零影响:judge_badge 只在落库那一刻跑一次、历史行永不重算,
+    而所有按 badge_reason 过滤的 SQL 都同时带 event_type='BUY'。
+    """
     add_user(conn, "u1", "maxpain")
     _, reason = store.judge_badge(conn, make_event(event_type=EVENT_SELL, side_unknown=True))
-    assert reason == REASON_NOT_BUY
+    assert reason == "no_side"
+
+    # 真·收到转入(方向确定)仍然报 not_buy —— 两者必须泾渭分明
+    _, real_in = store.judge_badge(conn, make_event(event_type=EVENT_TRANSFER_IN))
+    assert real_in == "not_buy"
+
+    # 而方向判不出、被兜底成 TRANSFER_IN 的那条,报的是 no_side
+    _, guessed_in = store.judge_badge(
+        conn, make_event(event_type=EVENT_TRANSFER_IN, side_unknown=True))
+    assert guessed_in == "no_side"
+    assert guessed_in != real_in, "兜底成 TRANSFER_IN 的记录必须能与真·收到转入区分开"
 
 
 @pytest.mark.parametrize(
@@ -1290,3 +1314,184 @@ def test_清理分批执行不会一次性超过批数上限(conn):
         assert remaining == 4
     finally:
         store._PRUNE_BATCH_SIZE, store._PRUNE_MAX_BATCHES = monkey_batch, monkey_max
+
+
+# ============================================================
+# 【转入告警】N 个名单成员收到同一个币
+# ============================================================
+# ⚠️ 门槛数字一律**写死字面量**,不从被测模块 import ——
+#    从 store 里 import 阈值再拿它去断言,等于用被测代码给自己打分:
+#    默认值改了测试照样绿,而这几个数字正是这个功能的全部风险所在。
+_CA_FIH2 = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
+_WIN = "2026-08-01T00:00:00+00:00"
+
+
+def _recv(conn, uid, handle, *, usd=1000.0, ca=_CA_FIH2, net="solana",
+          ts=TS_MID, reason="not_buy", active=True, ready=True, mcap=None):
+    """写一条『某人收到了这个币』的库存。reason 默认取 judge_badge 对真·收到转入给出的值"""
+    store.add_watch_user(conn, uid, handle, handle)
+    if ready:
+        store.mark_stats_ready(conn, uid)
+    if not active:
+        conn.execute("UPDATE watch_users SET active = 0 WHERE user_id = ?", (uid,))
+    ev = make_event(
+        event_type=EVENT_TRANSFER_IN, event_id=f"TRANSFER_IN:{uid}-{ca[:6]}-{usd}",
+        user_id=uid, handle=handle, network_id=net, token_address=ca,
+        token_symbol="fih", event_ts=ts, amount_usd=usd, market_cap=mcap,
+    )
+    ev.badge_reason = reason
+    store.insert_event(conn, ev)
+    conn.execute("UPDATE fomo_events SET user_handle = ? WHERE event_id = ?",
+                 (handle, ev.event_id))
+    return ev
+
+
+def test_收到计数_三个人各收到一笔(conn):
+    for i in range(3):
+        _recv(conn, f"u{i}", f"Holder{i}")
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 3
+
+
+def test_收到计数不得复用买入侧的可计数过滤(conn):
+    """
+    ⚠️⚠️ 这条测试守的是本功能**最容易静默失效**的地方。
+
+    买入侧 count_recent_buyers 带着 `badge_reason IN COUNTABLE_REASONS`;
+    而 judge_badge 对非 BUY 事件一律返回 REASON_NOT_BUY,TRANSFER_IN 永远进不了
+    COUNTABLE_REASONS。照抄那一句的话,count_recent_receivers **恒返回 0 且不报错** ——
+    功能整个不工作,日志里一行异常都没有,测试也全绿。
+
+    所以这里刻意用 judge_badge 真正会给出的 reason 建库存:一旦有人把那句过滤加回去,
+    下面这个断言会立刻变红。
+    """
+    for i in range(3):
+        ev = _recv(conn, f"u{i}", f"Holder{i}")
+        assert ev.badge_reason not in ("local_stats", "api_veto"), \
+            "库存必须落在 COUNTABLE_REASONS 之外,否则这条测试挡不住那句过滤"
+    # 再确认一次:judge_badge 对一笔真·收到转入给出的就是这个 reason
+    add_user(conn, "probe", "probe")
+    _, reason = store.judge_badge(conn, make_event(event_type=EVENT_TRANSFER_IN))
+    assert reason == "not_buy"
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 3
+
+
+def test_收到计数必须自己滤掉计价币(conn):
+    """
+    ⚠️ 买入侧是靠 COUNTABLE_REASONS 顺带把 quote_token 滤掉的;这里没有那一层,
+       而 USDC/USDT/WETH 的内部划转量极大(名单里天天有人搬稳定币),
+       不滤就是刷屏 —— 而且刷的全是零信号价值的记账动作。
+    """
+    for i in range(4):
+        _recv(conn, f"u{i}", f"Holder{i}", ca=CA_USDC, usd=50_000.0)
+    assert store.count_recent_receivers(conn, "solana", CA_USDC, _WIN, 500.0) == 0
+    assert store.transfer_receivers(conn, "solana", CA_USDC, _WIN, 500.0) == []
+
+
+def test_收到计数排除方向判不出的兜底记录(conn):
+    """
+    poller 在方向判不出时把记录**兜底成 TRANSFER_IN**(badge_reason='no_side')——
+    那可能实际是一笔**转出**。算成"收到"就是在报相反的事实。
+    """
+    _recv(conn, "u0", "Holder0")
+    _recv(conn, "u1", "Holder1")
+    _recv(conn, "u2", "Holder2", reason="no_side")
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 2
+
+
+def test_收到计数的金额门槛(conn):
+    """
+    $500 这条线是这个功能能不能上线的分水岭(实测不设门槛 138.8 次/天)。
+    ⚠️ 判据是 amount_usd >= ?;金额为 NULL 的行在 SQL 里比较结果是 NULL(不成立),
+       天然被排除 —— 这正是要的语义:金额未知就不能声称它达标。
+    """
+    _recv(conn, "u0", "Holder0", usd=901.37)
+    _recv(conn, "u1", "Holder1", usd=499.99)
+    _recv(conn, "u2", "Holder2", usd=None)
+    _recv(conn, "u3", "Holder3", usd=500.0)
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 2
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 0.0) == 3, \
+        "门槛降到 0 也只有三条有金额的行 —— 金额为 NULL 的那条永远不该被算进来"
+
+
+def test_收到计数去重到人(conn):
+    """一个人被连着发五笔,不构成"五个人收到"。"""
+    for k in range(5):
+        _recv(conn, "u0", "Holder0", usd=1000.0 + k)
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 1
+
+
+def test_收到计数排除已移出名单的人(conn):
+    """/del 是软删除,历史事件仍在表里。不 JOIN active=1 的话早就不看的人还在充人数。"""
+    _recv(conn, "u0", "Holder0")
+    _recv(conn, "u1", "Holder1")
+    _recv(conn, "u2", "Holder2", active=False)
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 2
+
+
+def test_收到计数不看stats_ready(conn):
+    """
+    ⚠️ 与买入侧刻意不同,这是个判断而不是疏忽:stats_ready 的语义是
+       "这个人的历史买入基线已经回填好了",它保护的是徽章判定与共识分子分母 ——
+       而"他收到过这个币"是一条与基线毫无关系的事实,一笔转账就是一笔转账。
+       带上它的唯一效果是让刚 /add 进来的人在这个信号里凭空消失,
+       而分发信号最该抓的恰恰是新加进来的人。
+    """
+    _recv(conn, "u0", "Holder0", ready=False)
+    _recv(conn, "u1", "Holder1", ready=False)
+    _recv(conn, "u2", "Holder2", ready=False)
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 3
+
+
+def test_收到计数带时间窗(conn):
+    _recv(conn, "u0", "Holder0", ts=TS_LATE)
+    _recv(conn, "u1", "Holder1", ts=TS_LATE)
+    _recv(conn, "u2", "Holder2", ts=TS_EARLY)
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, TS_MID, 500.0) == 2
+
+
+def test_收到者明细与计数口径完全一致(conn):
+    """
+    消息里写着 5 人、底下只列得出 3 个名字,是最伤信任的一种不一致。
+    两个函数的谓词必须逐条对齐。
+    """
+    _recv(conn, "u0", "Holder0", usd=901.37, mcap=198_200.0)
+    _recv(conn, "u1", "Holder1", usd=100.0)          # 灰尘,两边都该排除
+    _recv(conn, "u2", "Holder2", usd=2439.09, reason="no_side")   # 方向不明,两边都该排除
+    _recv(conn, "u3", "Holder3", usd=912.05, active=False)        # 已移出名单
+    _recv(conn, "u4", "Holder4", usd=912.05)
+    n = store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    rows = store.transfer_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert n == 2
+    assert len(rows) == n
+    assert {r["who"] for r in rows} == {"Holder0", "Holder4"}
+    assert rows[0]["mcap"] == 198_200.0
+    assert rows[1]["mcap"] is None, "拿不到市值就是 NULL,绝不拿别的数去凑"
+
+
+def test_转入告警去重台账与跟单台账互不吃行(conn):
+    """
+    ⚠️ 两张表的主键都是 (network_id, token_address),复用**一张**的话两类信号会互相吃掉:
+       跟单先占了行,转入告警就永远发不出;反过来转入告警占了行,
+       这个币的跟单信号会被当成"已经跟过"而静默跳过 —— 而后者是要花钱的那一侧。
+    """
+    store.record_copy_signal(conn, network_id="solana", token_address=_CA_FIH2,
+                             token_symbol="fih", buyers=3, entry_mcap=1.0,
+                             age_sec=None, amount_usd=10.0, status="paper")
+    assert store.record_transfer_in_signal(
+        conn, network_id="solana", token_address=_CA_FIH2, token_symbol="fih",
+        receivers=3, total_usd=4252.5) is True, "跟单台账占了行不该挡住转入告警"
+
+    # 反向:转入告警占了行,跟单照样能记
+    conn.execute("DELETE FROM copytrade_signals")
+    assert store.record_copy_signal(
+        conn, network_id="solana", token_address=_CA_FIH2, token_symbol="fih",
+        buyers=3, entry_mcap=1.0, age_sec=None, amount_usd=10.0, status="paper") is True
+
+
+def test_同一个币只记一次转入告警(conn):
+    """靠主键冲突去重,不是先 SELECT 再 INSERT —— 后者在两个 tick 撞上时会推两条"""
+    kw = {"network_id": "solana", "token_address": _CA_FIH2, "token_symbol": "fih",
+          "receivers": 3, "total_usd": 4252.5}
+    assert store.record_transfer_in_signal(conn, **kw) is True
+    assert store.record_transfer_in_signal(conn, **kw) is False
+    assert conn.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1

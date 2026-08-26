@@ -91,6 +91,8 @@ class FakeClient:
         self.leaderboard = leaderboard if leaderboard is not None else []
         self.leaderboard_boom = leaderboard_boom
         self.leaderboard_calls = 0
+        # 转账采集是降频的(20 轮一次),要能数出"到底哪几轮真的打了请求"
+        self.transfer_calls: list[str] = []
 
     def get_activity_feed(self, limit: int = 100) -> list:
         self.feed_calls += 1
@@ -136,6 +138,10 @@ class FakeClient:
 
     def get_trades(self, user_id: str):
         return self.fetch_snapshot(user_id).trades
+
+    def get_transfers(self, user_id: str, limit: int = 25):
+        self.transfer_calls.append(user_id)
+        return self.fetch_snapshot(user_id).transfers
 
 
 @pytest.fixture
@@ -1941,3 +1947,361 @@ def test_清理按配置的保留天数生效不写死(db, monkeypatch):
         )
     finally:
         get_settings.cache_clear()
+
+
+# ============================================================
+# 转账(TRANSFER_IN / TRANSFER_OUT)—— 取数、归一化、落库、告警
+# ============================================================
+# ⚠️ 下面这条是 2026-08-26 从 /v2/users/{uid}/transfers 抓下来的真实报文原件
+#    ($fih 分发给 PoorGoat_ 的那一笔),一个字段都没删改。
+#    手编简化 JSON 会把这里最容易错的三处一起测没:
+#      · symbol 藏在 tokenMetadata 里(顶层没有 symbol,也没有 "token" 这个键)
+#      · tokenAmount 被 JSON 数字精度毁了(8404 条里 6001 条是 0),真值在 humanAmount
+#      · 方向靠 type=DEPOSIT/WITHDRAWAL,不是 direction/side
+_REAL_DEPOSIT = {
+    "id": "1604366a-1ca6-47c1-b817-4fcc52b58584",
+    "toAddress": "7xYXu3gtFzbDa59fmCZnzQSo81frz9MNDBtVuJ8AfxTK",
+    "fromAddress": "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72",
+    "isNativeToken": False,
+    "tokenAddress": "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump",
+    "networkId": 1399811149,
+    "humanAmount": 12000000,
+    "tokenAmount": 12000000000000,
+    "tokenAmountString": "12000000000000",
+    "usdAmount": 2439.09,
+    "type": "DEPOSIT",
+    "createdAt": "2026-08-26T00:37:40.579Z",
+    "fromTradeId": None,
+    "toTradeId": "7d4252d4-8ccd-44c3-926e-d8a7a8278ed2",
+    "isReferral": None,
+    "isCrossmint": False,
+    "tokenMetadata": {"imageLargeUrl": "https://x.png", "symbol": "fih"},
+}
+# 真实的 SOL 充值(gas)。tokenAddress 为 null、isNativeToken=true,
+# 而 tokenMetadata.symbol = "SOL" —— 380/8404 条是这个形态
+_REAL_NATIVE = {
+    "id": "9b988f1f-0000-0000-0000-000000000001",
+    "toAddress": "7xYXu3gtFzbDa59fmCZnzQSo81frz9MNDBtVuJ8AfxTK",
+    "fromAddress": "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72",
+    "isNativeToken": True,
+    "tokenAddress": None,
+    "networkId": 1399811149,
+    "humanAmount": 0.5,
+    "tokenAmount": 500000000,
+    "tokenAmountString": "500000000",
+    "usdAmount": 92.3,
+    "type": "DEPOSIT",
+    "createdAt": "2026-08-26T00:26:30.000Z",
+    "tokenMetadata": {"imageLargeUrl": "https://x.png", "symbol": "SOL"},
+}
+_REAL_WITHDRAWAL = dict(_REAL_DEPOSIT, id="w-1", type="WITHDRAWAL")
+_CA_FIH = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
+
+
+def _row(uid="uA", handle="PoorGoat_"):
+    """归一化只用到 user_id / handle / display_name 三个键"""
+    return {"user_id": uid, "handle": handle, "display_name": handle}
+
+
+def _capture_warnings():
+    """收集 loguru 的 WARNING 及以上;返回 (列表, 关闭函数)"""
+    from loguru import logger as _lg
+
+    out: list[str] = []
+    hid = _lg.add(lambda m: out.append(str(m)), level="WARNING")
+    return out, lambda: _lg.remove(hid)
+
+
+def test_真实转账报文归一化出正确的方向与字段():
+    """
+    真实报文逐字段。三条断言各盯一个曾经会静默失效的地方:
+      symbol=None    → 一条 memecoin 提醒最该显示的东西整个丢失,而且不报错
+      数量 = 0       → 「💰 数量 0 ≈ $2,439.09」,而 0 在本项目里是有意义的真实值
+      方向判不出     → 退化成 side_unknown,整条记录与"真·收到"无法区分
+    """
+    p = Poller(FakeClient(), FakeNotifier())
+    ev_in = p.normalize_transfers(_row(), [_REAL_DEPOSIT])[0]
+    assert ev_in.event_type == "TRANSFER_IN"
+    assert ev_in.side_unknown is False, "type=DEPOSIT 是显式方向,不该走降级"
+    assert ev_in.token_symbol == "fih", "symbol 在 tokenMetadata 里,不在顶层、也不在 token 下"
+    assert ev_in.token_amount == "12000000", \
+        "数量要取人类可读的 humanAmount(1200 万枚),不是 6 位小数的最小单位"
+    assert ev_in.network_id == "solana"
+    assert ev_in.token_address == _CA_FIH
+    assert ev_in.amount_usd == 2439.09
+    assert ev_in.event_ts == "2026-08-26T00:37:40+00:00"
+    assert ev_in.ts_fallback is False
+    assert ev_in.event_id == "TRANSFER_IN:1604366a-1ca6-47c1-b817-4fcc52b58584"
+
+    ev_out = p.normalize_transfers(_row(), [_REAL_WITHDRAWAL])[0]
+    assert ev_out.event_type == "TRANSFER_OUT", "WITHDRAWAL 必须判成转出"
+    assert ev_out.side_unknown is False
+
+
+def test_EVM转账的数量不能取被精度毁掉的tokenAmount():
+    """
+    真实 BSC 报文:tokenAmount 是 0(JSON 数字精度撑不下 18 位小数),
+    真值在 tokenAmountString / humanAmount。8404 条里 6001 条是这个形态 ——
+    取错字段的话七成以上的转账都会显示成「数量 0」。
+    """
+    evm = {
+        "id": "9e0574eb-48af-5a1e-be09-3325f0575397",
+        "isNativeToken": False,
+        "tokenAddress": "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1",
+        "networkId": 56,
+        "humanAmount": 0.299361,
+        "tokenAmount": 0,
+        "tokenAmountString": "299361000000000000",
+        "usdAmount": 41.1302,
+        "type": "DEPOSIT",
+        "createdAt": "2026-08-26T01:02:22.344Z",
+        "tokenMetadata": {"symbol": "Broccoli"},
+    }
+    ev = Poller(FakeClient(), FakeNotifier()).normalize_transfers(_row(), [evm])[0]
+    assert ev.token_amount == "0.299361", f"取到的是 {ev.token_amount!r}"
+
+
+def test_原生币转账被显式跳过():
+    """
+    SOL/ETH/BNB 充值是给 gas 充钱,不是"有人给他分筹码",而且 tokenAddress 是 null、
+    聚合键都构造不出来。
+
+    ⚠️ 判据必须是 isNativeToken 这个**显式字段**,不能靠"取不到代币标识所以被丢掉"
+       这个副作用 —— tokenMetadata.symbol 是有值的("SOL"),symbol 取值一修好,
+       那道兜底门就再也拦不住它们。
+    """
+    p = Poller(FakeClient(), FakeNotifier())
+    assert p.normalize_transfers(_row(), [_REAL_NATIVE]) == []
+    # 同一批里的非原生币不受影响
+    got = p.normalize_transfers(_row(), [_REAL_NATIVE, _REAL_DEPOSIT])
+    assert [e.token_symbol for e in got] == ["fih"]
+
+
+def test_名单handle索引必须与比对侧同一套归一化(db):
+    """
+    ⚠️ 名单里绝大多数 handle 含大写(PoorGoat_ / CryptoTalkMan / 0xAvast…)。
+       建索引时不小写、比对时 .lower(),这个 in 判断对他们**恒为 False** ——
+       「名单内转账」标记永远不出现,不报错、日志里也看不出来。
+    """
+    _add_ready("uA", "PoorGoat_")
+    p = Poller(FakeClient(), FakeNotifier())
+    with store.get_conn() as c:
+        p._refresh_watched_index(store.list_active_users(c))
+    # 索引里必须已经是归一化形态,而不是原样的 PoorGoat_
+    assert "poorgoat_" in p._watched_handles
+    # 端到端:对手方带 @ 和不同大小写,仍要认得出是名单内的人
+    raw = dict(_REAL_DEPOSIT, fromUser={"userHandle": "@PoorGoat_"})
+    ev = p.normalize_transfers(_row("uB", "bob"), [raw])[0]
+    assert ev.counterparty_is_watched is True
+
+
+def test_转账采集与既有降频任务永不同轮触发():
+    """
+    钉死 _TRANSFERS_TICK_PHASE 的相位**性质**,而不是那个数字本身。
+
+    四个降频任务里有三个会真的打网络请求,叠在同一轮上就是单轮耗时翻倍 ——
+    而日志里已经出现过「单轮耗时 17s > 轮询间隔 15s」。
+    判断时点:活动流与转账在 _tick_no 自增**之前**判,盈亏与价格采样在自增**之后**判。
+    """
+    from src.poller import _TRANSFERS_EVERY_N_TICKS, _TRANSFERS_TICK_PHASE
+
+    sample_n = 60          # fomo_price_history_sample_ticks 的默认值
+    hits = 0
+    for t in range(6000):
+        if t % _TRANSFERS_EVERY_N_TICKS != _TRANSFERS_TICK_PHASE:
+            continue
+        hits += 1
+        assert t % _FEED_EVERY_N_TICKS != 0, f"tick {t}:转账与活动流撞在同一轮"
+        assert (t + 1) % _PNL_EVERY_N_TICKS != 0, f"tick {t}:转账与名单盈亏撞在同一轮"
+        assert (t + 1) % sample_n != sample_n // 2, f"tick {t}:转账与价格采样撞在同一轮"
+    assert hits > 0, "样本里一次都没命中,这条测试等于没测"
+
+
+def test_转账降频_绝大多数轮次一个请求都不打(db):
+    """
+    转账实测 13.1 条/人/天,只比买卖稀疏 1.8 倍 —— 与 swaps 同频要每轮多打 91 个请求,
+    是现有负载的量级性增加,必然撞上已知的并发拐点。
+    """
+    from src.poller import _TRANSFERS_EVERY_N_TICKS, _TRANSFERS_TICK_PHASE
+
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[], transfers=[], balances=[])})
+    p = Poller(client, FakeNotifier())
+    users = [{"user_id": "uA", "handle": "alice", "display_name": "alice"}]
+    hits = []
+    for _ in range(_TRANSFERS_EVERY_N_TICKS * 2):
+        before = len(client.transfer_calls)
+        p._fetch_snapshots(users)
+        hits.append(len(client.transfer_calls) > before)
+    assert sum(hits) == 2, f"{_TRANSFERS_EVERY_N_TICKS * 2} 轮里应该只命中 2 次,实际 {sum(hits)}"
+    assert hits.index(True) == _TRANSFERS_TICK_PHASE, "第一次命中的轮次应当就是配置的相位"
+
+
+def test_没轮到拉转账的那些轮次不刷警告(db):
+    """
+    ⚠️ snap.transfers is None 有两种来源:排到了却拿回 None(真失败,要 WARN)、
+       和"这一轮压根没轮到转账"(正常)。不分开的话,20 轮里有 19 轮会对每个人
+       各刷一条 WARNING —— 稳态下就是每分钟几十行噪音,把真正要紧的 ERROR 淹掉。
+    """
+    _add_ready("uA", "alice")
+    p = Poller(FakeClient(), FakeNotifier())
+    users = [{"user_id": "uA", "handle": "alice", "display_name": "alice"}]
+    snaps = {"uA": UserSnapshot("uA", swaps=[], transfers=None, balances=[])}
+    p._swaps_attempted = {"uA"}
+
+    p._transfers_attempted = set()          # 这一轮没轮到
+    warned, close = _capture_warnings()
+    with store.get_conn() as c:
+        try:
+            p._collect_events(c, users, snaps)
+        finally:
+            close()
+    assert not [w for w in warned if "transfers" in w], f"不该有警告,实际:{warned}"
+
+    # 反向:排到了却拿回 None,必须 WARN —— 否则真的拉不到数据也没人知道
+    p._transfers_attempted = {"uA"}
+    warned, close = _capture_warnings()
+    with store.get_conn() as c:
+        try:
+            p._collect_events(c, users, snaps)
+        finally:
+            close()
+    assert [w for w in warned if "transfers" in w], "真失败必须留痕"
+
+
+def test_转账落库但绝不逐条推送(db):
+    """
+    实测名单 91 人的非稳定币转入 13.1 条/人/天 ≈ 1200 条/天,绝大多数是几美元的空投灰尘。
+    逐条推等于把真正要看的买卖推送整个淹掉。
+
+    ⚠️ 而且必须当场 mark_sent:只是"跳过发送"的话 sent 永远是 0,
+       补发队列会每 20 秒把它们捞出来重试一次、连捞 10 分钟。
+    """
+    _add_ready("uA", "PoorGoat_")
+    p = Poller(FakeClient(), FakeNotifier())
+    evs = p.normalize_transfers(_row(), [_REAL_DEPOSIT, _REAL_WITHDRAWAL])
+    with store.get_conn() as c:
+        new_events = p._persist(c, evs)
+        rows = c.execute(
+            "SELECT event_type, sent FROM fomo_events ORDER BY event_type").fetchall()
+    assert new_events == [], "转账不该进入逐条推送的队列"
+    assert len(p._new_transfers) == 2, "但要交给转入告警去聚合"
+    assert [r["event_type"] for r in rows] == ["TRANSFER_IN", "TRANSFER_OUT"], "两条都必须落库"
+    assert [r["sent"] for r in rows] == [1, 1], "sent 必须当场置 1,否则补发队列会反复捞"
+
+
+def test_转账不改buy_count(db):
+    """
+    B-8:空投/领奖/内部划转绝不能造出假买入 —— 徽章会打在一笔没花钱的仓位上,
+    功能 A/B 同时失真。这条防线的落点是 store.should_count(只认 BUY)。
+    """
+    _add_ready("uA", "PoorGoat_")
+    p = Poller(FakeClient(), FakeNotifier())
+    with store.get_conn() as c:
+        p._persist(c, p.normalize_transfers(_row(), [_REAL_DEPOSIT]))
+        n = c.execute("SELECT COUNT(*) n FROM user_token_stats").fetchone()["n"]
+    assert n == 0
+
+
+def test_收到时市值只在事件足够新时才补():
+    """
+    报文里没有 marketCap,只能拿本轮 balances 索引里的现价市值补。
+    而首轮采集会一次性吃进最多 25 条、跨度可达十几小时的历史转账 ——
+    给它们贴上"现在的市值",就是在断言我们并不知道的事(消息里那一格写的正是「收到时」)。
+    """
+    p = Poller(FakeClient(), FakeNotifier())
+    p._token_meta[("solana", _CA_FIH)] = {"symbol": "fih", "market_cap": 198_200.0}
+
+    old = p.normalize_transfers(_row(), [_REAL_DEPOSIT])[0]      # createdAt 是固定的历史时刻
+    assert old.market_cap is None, "十几个小时前的转账不该被贴上现在的市值"
+
+    fresh_raw = dict(_REAL_DEPOSIT, id="fresh-1",
+                     createdAt=datetime.now(UTC).isoformat().replace("+00:00", "Z"))
+    fresh = p.normalize_transfers(_row(), [fresh_raw])[0]
+    assert fresh.market_cap == 198_200.0, "刚发生的转账,现价市值就是它收到时的市值"
+
+
+def _seed_receivers(usd_list, *, symbol="fih"):
+    """造 N 个名单成员各收到一笔 $fih 的库存,返回 Poller(_new_transfers 已就位)"""
+    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    p = Poller(FakeClient(), FakeNotifier())
+    evs = []
+    for i, usd in enumerate(usd_list):
+        _add_ready(f"u{i}", f"Holder{i}")
+        raw = dict(_REAL_DEPOSIT, id=f"tx-{i}", usdAmount=usd, createdAt=ts,
+                   tokenMetadata={"symbol": symbol})
+        evs.extend(p.normalize_transfers(_row(f"u{i}", f"Holder{i}"), [raw]))
+    with store.get_conn() as c:
+        p._persist(c, evs)
+    p._new_transfers = evs
+    p._catchup_since = None
+    return p, evs
+
+
+def test_三个人收到同一个币就告警_两个人不告警(db):
+    """用户要的那件事本身:同一个合约地址有 3 个以上他关注的人「收到」→ 推一条提醒。"""
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1
+    msg = p.notifier.sent[0]
+    assert "收到" in msg and "不是买入" in msg
+    assert "Holder0" in msg and "Holder1" in msg and "Holder2" in msg
+    assert _CA_FIH in msg
+
+
+def test_人数不够阈值时不告警(db):
+    p, _ = _seed_receivers([901.37, 912.05])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert p.notifier.sent == []
+
+
+def test_金额门槛之下的空投灰尘不算收到(db):
+    """
+    实测:1 小时窗口 ≥3 人的 42 次命中里,有 39 次单人到账不足 $100 —— 全是空投灰尘。
+    不设门槛的话这个功能一天炸 138.8 次,用户会直接静音。
+    """
+    p, _ = _seed_receivers([3.0, 4.0, 5.0, 6.0])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert p.notifier.sent == [], "四个人都收到了,但全是灰尘,不该打扰用户"
+
+
+def test_同一个币只告警一次(db):
+    """分发是一次性事件。每 5 分钟提醒一遍等于让用户静音。"""
+    p, evs = _seed_receivers([901.37, 912.05, 2439.09])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+        p._new_transfers = evs
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1
+
+
+def test_停机补数轮整段跳过转入告警(db):
+    """
+    积压的转账不是"刚刚发生的事",而消息里写的是"最近 N 小时内" —— 两者对不上。
+    与 _check_copytrade 同一道守卫。
+    """
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    p._catchup_since = "2026-08-25T00:00:00+00:00"
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert p.notifier.sent == []
+
+
+def test_转入告警绝不接跟单执行器(db):
+    """
+    ⚠️⚠️ 安全边界。「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义,
+       拿它去触发花钱的操作方向就是错的。三条可观测后果一起钉死:
+         · 不写 copytrade_signals(否则这个币的真跟单信号会被当成"已经跟过"而静默跳过)
+         · 不改 user_token_stats(否则共识数会把白拿的人算成买家)
+         · 不动跟单开关
+    """
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+        assert c.execute("SELECT COUNT(*) n FROM copytrade_signals").fetchone()["n"] == 0
+        assert c.execute("SELECT COUNT(*) n FROM user_token_stats").fetchone()["n"] == 0
+        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1
+        assert store.load_copy_config(c).enabled is False

@@ -410,3 +410,184 @@ def test_有币龄就出行没有就整行消失():
     ev = make_event(event_type=EVENT_BUY, token_created_at=int(_t.time()) - 86400 * 5)
     assert "🕐 币龄 5D" in render(ev)
     assert "币龄" not in render(make_event(event_type=EVENT_BUY))
+
+
+# ============================================================
+# 转入告警:N 个名单成员「收到」了同一个币
+# ============================================================
+# ⚠️ 阈值/预算一律写死字面量,不从被测模块 import ——
+#    从 formatter 里 import 预算再拿它去断言,等于用被测代码给自己打分。
+_TG_HARD_LIMIT = 4096          # Telegram 单条消息硬上限(与 notifier 的实现无关的外部事实)
+_SIG_CA = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
+
+render_transfer_in_signal = formatter.render_transfer_in_signal
+
+
+def _sig(**kw):
+    base = {
+        "network_id": "solana",
+        "token_address": _SIG_CA,
+        "token_symbol": "fih",
+        "receiver_count": 3,
+        "receivers": [
+            {"who": "unipcs", "usd": 901.37, "mcap": 198_200.0, "hits": 1},
+            {"who": "Quanterty", "usd": 912.05, "mcap": 201_400.0, "hits": 1},
+            {"who": "PoorGoat_", "usd": 2439.09, "mcap": 203_000.0, "hits": 1},
+        ],
+        "window_hours": 24,
+        "buyers": ["CryptoTalkMan"],
+    }
+    base.update(kw)
+    return render_transfer_in_signal(**base)
+
+
+def _tags(msg: str) -> list[tuple[str, str]]:
+    """按出现顺序抽出所有标签 —— (是否闭标签, 标签名)"""
+    import re
+
+    return re.findall(r"<(/?)([a-zA-Z]+)[^<>]*>", msg)
+
+
+def _html_ok(msg: str) -> bool:
+    """标签是否全部配对闭合 —— 未闭合标签让 TG 整条 400,用户什么都收不到"""
+    stack: list[str] = []
+    for slash, name in _tags(msg):
+        if slash:
+            if not stack or stack.pop() != name:
+                return False
+        else:
+            stack.append(name)
+    return not stack
+
+
+def test_转入告警一眼就能看出不是买入():
+    """
+    这条消息的第一职责:让人扫一眼**不会**读成"三个人在抢这个币"。
+    「收到」= 从外部钱包转进来、没花钱,语义上多半是项目方/内部人在分发筹码,
+    与"他自己看好所以掏钱买"是相反的信号 —— 认错就是把相反的含义读成同一件事。
+    """
+    msg = _sig()
+    head = msg.split("\n")[0]
+    assert head.startswith("🚨"), "标题必须有醒目的行首锚点,且与买卖那六个都不重样"
+    assert "收到" in head
+    assert "买入" not in head or "不是买入" in msg
+    assert "不是买入" in msg and "没花" in msg, "必须显式否定一次,宁可啰嗦"
+    # 行首锚点全局唯一:别撞上买/卖/观点/转账/跟单那几个
+    assert head[0] not in "🌱🟢🔴💭📥📤🧪🛒"
+
+
+def test_转入告警包含用户要的四项事实():
+    """谁收到的 / 各自多少 / 什么市值 / 名单里有没有人真金白银买过"""
+    msg = _sig()
+    for who in ("unipcs", "Quanterty", "PoorGoat_"):
+        assert who in msg
+    assert "$901.37" in msg and "$2,439.09" in msg
+    assert "$198.20K" in msg, "收到时的市值"
+    assert "CryptoTalkMan" in msg and "真金白银" in msg
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "CA 必须独占最后一行、纯 code"
+
+
+def test_没人真金白银买过与查不出来必须分开():
+    """
+    ⚠️ [] 与 None 语义完全不同:
+       [] = 查过了、确实没人买 —— 这是有价值的信息(纯分发,没人跟进);
+       None = 查不出来 —— 那一行必须整行消失,绝不能假装"没人买过"。
+    """
+    assert "还没有人" in _sig(buyers=[])
+    none_msg = _sig(buyers=None)
+    assert "还没有人" not in none_msg and "真金白银" not in none_msg
+
+
+def test_缺失字段整格消失而不是打0():
+    """铁律 2:缺失一律整格消失,绝不打 N/A / -- / 0"""
+    msg = _sig(receivers=[{"who": "unipcs"}, {"who": "Quanterty"}, {"who": "PoorGoat_"}],
+               token_symbol=None)
+    assert "N/A" not in msg and "--" not in msg
+    assert "$0" not in msg and "💎" not in msg
+    assert "$None" not in msg and "None" not in msg
+    assert "unipcs" in msg
+
+
+def test_金额为0是真实值不该被吞掉():
+    """⚠️ 判空一律 is None:0 是有意义的真实值,用真值判断会把它连同 None 一起吞掉"""
+    msg = _sig(receivers=[{"who": "unipcs", "usd": 0.0}], receiver_count=1)
+    assert "$0.00" in msg
+
+
+def test_展示不下的收到者要如实说明():
+    msg = _sig(receiver_count=41,
+               receivers=[{"who": f"Holder{i}", "usd": 900.0} for i in range(10)])
+    assert "还有 31 人未显示" in msg
+
+
+def test_恶意handle不会撑破消息也不会切碎实体():
+    """
+    ⚠️ handle 与 ticker 由陌生人决定,长度不受任何天然约束。
+       而 _esc 会把 ' 撑成 6 个字符 —— 一个 3000 字符的 handle 就能把消息顶破预算,
+       notifier 超限时做的是**盲切**,切点落在 &#x27; 中间就是残缺实体 → 整条 400
+       → 用户什么都收不到,只在日志里留一行。攻击者能自由控制长度,也就能自由挑切点。
+    """
+    evil = "'" * 3000 + "<script>x</script>"
+    msg = _sig(
+        token_symbol=evil,
+        receivers=[{"who": evil, "usd": 900.0 + i, "mcap": 1e5} for i in range(10)],
+        receiver_count=10,
+        buyers=[evil] * 6,
+    )
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符,会被 notifier 盲切"
+    assert _html_ok(msg), "标签必须全部配对闭合"
+    assert "<script>" not in msg, "陌生人写的标签必须被转义成文本"
+    # 每一个 & 都必须是一个**完整**实体的开头。残缺实体("&#x2" 这种)照样让整条 400
+    import re
+    assert re.search(r"&(?!(amp|lt|gt|quot|#x27|#39);)", msg) is None, "出现了残缺实体"
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "锚点必须活到最后且完整闭合"
+
+
+def test_收到者多到装不下时按整行砍且锚点必须活到最后():
+    """
+    ⚠️ 出口不变式是**本函数的职责**,不是调用方的:poller 现在只传 10 行,
+       但"传多少行"是调用方的选择,而"消息发不发得出去"必须由渲染方自己保证。
+       这里直接喂 60 个收到者(每个 handle 还都是最坏形态),模拟哪天有人把
+       上限调大、或者换了个调用方忘了限量。
+
+    ⚠️ 只能按**整行边界**砍。切进行内就会切碎 HTML 实体 → 整条 400 → 用户什么都收不到,
+       而这活儿绝不能留给 notifier.send 去盲切,它切的是字节。
+    """
+    evil = "'" * 40
+    msg = _sig(
+        receiver_count=60,
+        receivers=[{"who": f"{evil}{i}", "usd": 900.0 + i, "mcap": 1e5} for i in range(60)],
+        buyers=[evil] * 6,
+    )
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符"
+    assert _html_ok(msg)
+    lines = msg.split("\n")
+    assert lines[-1] == f"<code>{_SIG_CA}</code>", "锚点必须是最后一行且完整闭合"
+    assert len(lines) < 63, "装不下的行必须真的被砍掉,而不是原样拼出去"
+    import re
+    assert re.search(r"&(?!(amp|lt|gt|quot|#x27|#39);)", msg) is None, "出现了残缺实体"
+
+
+def test_超长CA也要收口而不是把消息撑破():
+    """
+    ⚠️ normalize_token_address 对非 0x/42 位的输入**原样透传**、不做长度校验。
+       而 CA 是"砍无可砍时也要贴上去"的那一行 —— 不先收口的话它就是一颗炸弹。
+    """
+    msg = _sig(token_address="Z" * 9000)
+    assert len(msg) <= _TG_HARD_LIMIT
+    assert _html_ok(msg)
+    assert msg.split("\n")[-1].startswith("<code>")
+    assert msg.split("\n")[-1].endswith("</code>")
+
+
+def test_未收录的链不出链接而不是拼一个404():
+    """错的链接比没有链接更糟(§10.3)。GMGN 不支持 Monad,那个链接就该整个不出。"""
+    msg = _sig(network_id="monad", token_address="0x" + "a" * 40)
+    assert "gmgn.ai" not in msg
+    assert "fomo.family" in msg
+
+
+def test_没有链名时不出链接段():
+    msg = _sig(network_id=None)
+    assert "http" not in msg
+    assert "🧬" not in msg

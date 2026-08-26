@@ -48,10 +48,14 @@ EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
 EP_LEADERBOARD = "/v2/leaderboard/{period}"
 # ⚠️ 服务端硬上限 100,传 201 会直接 400 —— 实测出来的,不要改大
 _FOLLOWING_PAGE = 100
-# ⚠️ 不提供转账查询。实测 /v2/transfers/with/{uid} 是「**我**与该用户之间的转账」——
-#    对自己调会返回 400 "Cannot fetch transfers with self",
-#    拿不到"某人与第三方之间的转账"。FOMO 没有别的转账查询入口,
-#    因此转入/转出监控在本平台上做不到(已与用户确认后砍掉)。
+# 某人的**全部**转账流水(与任意第三方之间的,不限于"我与他")。
+# ⚠️ 这条注释更正了一个长期的错误结论。此前记的是"FOMO 不提供转账查询" ——
+#    那句话只对 /v2/transfers/with/{uid} 成立:它的语义确实是「**我**与该用户之间的转账」
+#    (对自己调返回 400 "Cannot fetch transfers with self"),拿不到别人与第三方的转账。
+#    但 /v2/users/{uid}/transfers 是**另一个端点**,给的正是该用户与任意地址之间的全部
+#    充提流水。2026-08-26 实测 91 人 × 100 条全部 200,字段见 poller._transfer_to_event。
+#    这个区别很要命:整整一类信号(项目方/内部人把筹码分给名单里的人)曾经因此完全看不见。
+EP_TRANSFERS = "/v2/users/{uid}/transfers"
 # ⚠️ thesis 只能**按代币**查。实测 /feed/user/thesis → 404、/v2/users/{uid}/thesis → 不存在,
 #    FOMO 根本没有"按用户查观点"的端点。所以观点的采集方式是:
 #    遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象(见 poller._collect_thesis)。
@@ -74,6 +78,11 @@ SUPPORTED_CHAINS = "1,56,143,4663,8453,1399811149"
 # TODO(probe #5): 分页参数名(limit/offset/cursor/before)与单页上限全是猜的
 _PAGE_SIZE = 50
 _MAX_PAGES = 20          # 设计文档 §8.3 的内部硬上限
+# transfers 单页条数。⚠️ 稳态下每轮只取第一页、不翻页,所以这个数字的意义是
+#    "一次要覆盖多久的余量"。实测名单中位数 1.67 条/人/小时,而采集降频到 5 分钟一轮
+#    (poller._TRANSFERS_EVERY_N_TICKS),25 条相当于约 15 小时余量 —— 漏采只可能发生在
+#    停机之后,而那由 _catchup_since 兜住。默认 100 条约 70KB,25 条约 1/4,白省的流量。
+_TRANSFERS_PAGE = 25
 # ⚠️ 超时不是"越宽容越好":它发生在线程池的一个 worker 里,一个卡死的请求会占住
 #    整整一个并发名额。实测正常响应 p50 0.3-1.2s,25s 的余量只会把单轮拖到分钟级。
 _TIMEOUT_SEC = 12.0
@@ -209,6 +218,8 @@ class FomoClient(Protocol):
     def resolve_handle(self, handle: str) -> tuple[str, str, str]: ...
     def get_current_user(self) -> dict: ...
     def get_swaps(self, user_id: str, limit: int = 50) -> list[dict]: ...
+    def get_transfers(self, user_id: str, limit: int = _TRANSFERS_PAGE) -> list[dict]: ...
+    def iter_transfers(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
@@ -508,6 +519,82 @@ class _BaseFomoClient:
         # TODO(probe #1/#2/#3/#4): networkId 是否存在、唯一 id 字段名、时间单位、买卖方向表示
         return _as_list(self._get(EP_SWAPS.format(uid=quote(user_id, safe="")), {"limit": limit}))
 
+    def get_transfers(self, user_id: str, limit: int = _TRANSFERS_PAGE) -> list[dict]:
+        """
+        某人的充提流水(与任意第三方之间的转账),按 createdAt **降序**。
+
+        实测(2026-08-26)每条形如:
+          {"id": uuid, "type": "DEPOSIT" | "WITHDRAWAL",
+           "fromAddress": …, "toAddress": …, "isNativeToken": bool,
+           "tokenAddress": …(原生币为 null), "networkId": 1399811149,
+           "humanAmount": 12000000, "tokenAmountString": "12000000000000",
+           "usdAmount": 2439.09, "createdAt": "2026-08-26T00:37:40.579Z",
+           "tokenMetadata": {"symbol": "fih", "imageLargeUrl": …}}
+
+        ⚠️ 报文里**没有** marketCap / txHash / 对手方的 userId ——
+           市值只能从本 tick 的 balances 索引补,对手方只有钱包地址(见 poller)。
+        ⚠️ 这里**不包含** FOMO 上买卖产生的腿。铁证:CryptoTalkMan 在 FOMO 上买过两笔
+           $fih,而他这个币的 transfers 返回 0 条 —— 所以"同一笔交易被推两遍"不会发生。
+        """
+        path = EP_TRANSFERS.format(uid=quote(user_id, safe=""))
+        return _as_list(self._get(path, {"limit": max(1, int(limit))}))
+
+    def iter_transfers(self, user_id: str, max_items: int) -> Iterator[dict]:
+        """
+        分页迭代转账流水(冷启动补数用)。稳态采集只调 get_transfers 取第一页。
+
+        ⚠️ 游标是 **lastTransferId**(上一页最后一条的 id),不是 offset ——
+           与 swaps 的 lastSwapIdV2 同一套形式。实测两页 100+100 条 id 重叠 0 条、
+           时间严格更老。这个 API 对不认识的参数一律**静默忽略**,所以传错参数名
+           不会报错、只会一直返回第一页(swaps 上踩过这个坑,见 iter_swap_buys)。
+        ⚠️ 保留"某页无新条目就停"的兜底:万一参数名哪天又变了,不停就是无限循环。
+        """
+        uid = quote(user_id, safe="")
+        path = EP_TRANSFERS.format(uid=uid)
+        seen: set[str] = set()
+        yielded = 0
+        last_id: str | None = None
+
+        for page in range(_MAX_PAGES):
+            if yielded >= max_items:
+                return
+            params: dict = {"limit": _PAGE_SIZE}
+            if last_id:
+                params["lastTransferId"] = last_id
+            payload = self._get(path, params)
+            items = _as_list(payload)
+            if not items:
+                return
+
+            fresh = 0
+            for it in items:
+                key = _item_identity(it)
+                if key in seen:
+                    continue
+                seen.add(key)
+                fresh += 1
+                yield it
+                yielded += 1
+                if yielded >= max_items:
+                    return
+
+            if fresh == 0:
+                logger.warning(
+                    "transfers 第 {} 页无新数据(分页参数可能又变了),停止翻页 | user={}",
+                    page + 1, user_id,
+                )
+                return
+            ro = _unwrap(payload)
+            if isinstance(ro, dict) and ro.get("hasNextPage") is False:
+                return
+            if len(items) < _PAGE_SIZE:
+                return  # 不满一页 = 已到底
+            nid = _pick_id(items[-1])
+            if not nid:
+                logger.warning("transfers 末条没有可用作游标的 id,停止翻页 | user={}", user_id)
+                return
+            last_id = nid
+
     def get_balances(self, user_id: str) -> list[dict]:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
 
@@ -737,8 +824,9 @@ class _BaseFomoClient:
         按用户一次拉齐 swaps + balances。**每一类单独 try/except**,失败的置 None 并 WARN。
 
         ⚠️ 只拉这两类:
-          - transfers 已砍掉 —— /v2/transfers/with/{uid} 的语义是「我与该用户之间的转账」
-            (对自己调返回 400 "Cannot fetch transfers with self"),拿不到别人与第三方的转账。
+          - transfers **不在这里**:它是低频采集(约 5 分钟一轮,见
+            poller._TRANSFERS_EVERY_N_TICKS),与"每轮全员拉"的这两类节奏完全不同,
+            塞进来只会让它跟着涨到每轮 91 个请求。取数入口是 get_transfers。
           - thesis 没有按用户查的端点,改由 poller._collect_thesis 按代币采集后过滤。
         ⚠️ 绝不能让一类失败拖垮另一类:balances 挂了只是共识副指标降级,
            swaps 照常推送。

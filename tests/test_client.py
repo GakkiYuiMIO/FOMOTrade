@@ -75,3 +75,101 @@ def test_429退避仍然夹上限():
     """畸形/极端的 retry-after 不该把整轮卡死"""
     assert C._retry_after({"retry-after": "99999"}) <= 60.0 * (1 + C._JITTER)
     assert C._retry_after({"retry-after": "garbage"}) > 0
+
+
+# ============================================================
+# transfers:/v2/users/{uid}/transfers
+# ============================================================
+# ⚠️ 下面这份报文是 2026-08-26 从真实接口抓下来的原件($fih 分发给 PoorGoat_ 的那一笔),
+#    一个字段都没删改。测试这一层的意义就在于"我们对真实结构的假设"能不能被守住 ——
+#    换成手编的简化 JSON,恰恰把最容易出错的那部分(信封层级、tokenMetadata 嵌套)
+#    测没了。
+_REAL_TRANSFER_ENVELOPE = {
+    "success": True,
+    "message": "Transfers found",
+    "responseObject": {
+        "transfers": [{
+            "id": "1604366a-1ca6-47c1-b817-4fcc52b58584",
+            "toAddress": "7xYXu3gtFzbDa59fmCZnzQSo81frz9MNDBtVuJ8AfxTK",
+            "fromAddress": "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72",
+            "isNativeToken": False,
+            "tokenAddress": "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump",
+            "networkId": 1399811149,
+            "humanAmount": 12000000,
+            "tokenAmount": 12000000000000,
+            "tokenAmountString": "12000000000000",
+            "usdAmount": 2439.09,
+            "type": "DEPOSIT",
+            "createdAt": "2026-08-26T00:37:40.579Z",
+            "fromTradeId": None,
+            "toTradeId": "7d4252d4-8ccd-44c3-926e-d8a7a8278ed2",
+            "isReferral": None,
+            "isCrossmint": False,
+            "tokenMetadata": {"imageLargeUrl": "https://…png", "symbol": "fih"},
+        }],
+        "hasNextPage": False,
+    },
+    "statusCode": 200,
+}
+
+
+def _recording_client(pages):
+    """把 _get 换掉:记录每次请求的 (path, params),按顺序吐 pages 里的响应"""
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self.seen = []
+            self._i = 0
+
+        def _get(self, path, params=None):
+            self.seen.append((path, dict(params or {})))
+            page = pages[min(self._i, len(pages) - 1)]
+            self._i += 1
+            return page
+
+    return Fake()
+
+
+def test_transfers_真实信封能解出条目():
+    """
+    ⚠️ 真实响应是 {"responseObject": {"transfers": [...], "hasNextPage": …}} 双层信封。
+       解不开的话 get_transfers 恒返回 0 条 —— 而这种失效**不报错**:
+       看起来"连得上、没异常、就是没数据",与"这个人确实没转账"长得一模一样。
+    """
+    c = _recording_client([_REAL_TRANSFER_ENVELOPE])
+    items = c.get_transfers("uid-1")
+    assert len(items) == 1
+    assert items[0]["id"] == "1604366a-1ca6-47c1-b817-4fcc52b58584"
+    path, params = c.seen[0]
+    assert path == "/v2/users/uid-1/transfers", "端点写错会 404,而 404 会被降级吞掉"
+    assert params["limit"] == 25, "默认单页条数变了就会改变漏采余量,见 _TRANSFERS_PAGE"
+
+
+def test_transfers_翻页游标是lastTransferId():
+    """
+    ⚠️ 这个 API 对**不认识的参数一律静默忽略**(swaps 上用 offset 踩过一次):
+       游标参数名写错不会报错,只会一直返回第一页 → 翻页变成无限重复第一页。
+       所以这条测试盯的不是"能不能翻页",而是"第二页请求里到底带了什么参数"。
+    """
+    full = {"responseObject": {
+        "transfers": [{"id": f"id-{i}"} for i in range(C._PAGE_SIZE)],
+        "hasNextPage": True}}
+    tail = {"responseObject": {"transfers": [{"id": "id-last"}], "hasNextPage": False}}
+    c = _recording_client([full, tail])
+    got = list(c.iter_transfers("uid-1", max_items=999))
+    assert len(got) == C._PAGE_SIZE + 1
+    assert "lastTransferId" not in c.seen[0][1], "第一页不该带游标"
+    assert c.seen[1][1]["lastTransferId"] == f"id-{C._PAGE_SIZE - 1}", \
+        "第二页的游标必须是上一页**最后一条**的 id"
+
+
+def test_transfers_同一页反复返回时必须停手():
+    """
+    兜底:万一哪天参数名又变了,服务端会一直吐第一页。不停就是无限循环 + 无限重复数据。
+    """
+    same = {"responseObject": {
+        "transfers": [{"id": f"id-{i}"} for i in range(C._PAGE_SIZE)],
+        "hasNextPage": True}}
+    c = _recording_client([same])
+    got = list(c.iter_transfers("uid-1", max_items=10_000))
+    assert len(got) == C._PAGE_SIZE, "重复页必须被识别出来并停手,而不是一路翻到 _MAX_PAGES"
