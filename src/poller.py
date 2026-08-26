@@ -134,7 +134,12 @@ _K_TRANSFER_DIR = ("direction", "type", "side", "transferType", "flow", "action"
 _K_TRANSFER_AMOUNT = ("humanAmount", "uiAmount", "tokenAmountString", "tokenAmount", "amount")
 _K_FROM_UID = ("fromUserId", "senderId", "fromId", "sourceUserId", "from_user_id")
 _K_TO_UID = ("toUserId", "receiverId", "toId", "targetUserId", "to_user_id")
-_K_COUNTERPARTY = ("counterparty", "counterpartyUser", "otherUser", "peer", "fromUser", "toUser", "user")
+# 对手方**钱包地址**。⚠️ 顶层就有 fromAddress / toAddress;而 userId 在 8404 条真实
+#    转账里出现 **0** 次 —— 这就是为什么"谁在发"只能按地址说、不能按人说,
+#    也是转入告警里唯一可证的那条证据(见 store.transfer_senders)。
+_K_FROM_ADDR = ("fromAddress", "from_address", "senderAddress")
+_K_TO_ADDR = ("toAddress", "to_address", "receiverAddress")
+_K_COUNTERPARTY =("counterparty", "counterpartyUser", "otherUser", "peer", "fromUser", "toUser", "user")
 _K_HANDLE = ("userHandle", "handle", "username", "displayName", "name")
 
 # TODO(probe #12): thesis 是否同时返回 tokenAddress **和** networkId。
@@ -201,27 +206,34 @@ _FEED_EVERY_N_TICKS = 6
 #    tests/test_poller.py::test_名单盈亏与活动流永不同轮触发:谁把其中一次
 #    判断挪到自增的另一侧,这条回归测试会变红。
 _PNL_EVERY_N_TICKS = 20
-# ---- 转账采集的降频(见 _fetch_snapshots / _collect_events)----
-# 20 轮 × 15s = 5 分钟跑一次全名单。
-# ⚠️ **绝不能跟 swaps 同频**。转账并不像原先设想的那样稀疏:实测非稳定币转入
-#    13.1 条/人/天,而库里近 24h 的买卖是 23.2 条/人/天 —— 只差 1.8 倍,不是一个数量级。
-#    同频要每轮多打 91 个请求,是现有负载的量级性增加,必然撞上 12+8=20 那个已知的
-#    并发拐点(见 _THESIS_WORKERS)。降到 20 轮后平均每轮只多 91/20 ≈ 4.6 个请求。
-# ⚠️ 这个信号**本质是慢信号**:筹码先被分下去、名单里的人隔几小时才跟进买入
-#    ($fih 的真实间隔以小时计),5 分钟延迟对可操作性零损失。
-# ⚠️ 不翻页:实测名单中位数 1.67 条/人/小时,单页 25 条 ≈ 15 小时余量,
-#    5 分钟内单人期望新增 0.14 条 —— 漏采在数学上不可能,除非停机(那有 catchup 兜底)。
-_TRANSFERS_EVERY_N_TICKS = 20
-# 命中相位。⚠️ 取 7 而不是常见的 0,是**刻意错开**,不是随手填的:
-#    本判断与 _poll_feed 一样在 _tick_no 自增**之前**执行,于是
-#      活动流    命中 t ≡ 0  (mod 6)  → t 必为偶数
-#      转账      命中 t ≡ 7  (mod 20) → t 必为奇数        ⇒ 二者永不同轮
-#      名单盈亏  在自增**之后**判,等价于命中 t ≡ 19 (mod 20) ⇒ 与 7 (mod 20) 永不同余
-#      价格采样  同样自增后判,等价于命中 t ≡ 29 (mod 60);7 (mod 20) 只落在 {7,27,47}
-#    四者两两都不会叠到同一轮上 —— 叠上就是一轮里挤进两批网络请求,单轮耗时直接翻倍,
-#    而日志里已经出现过「单轮耗时 17s > 轮询间隔 15s」。
-#    见 tests/test_poller.py::test_转账采集与既有降频任务永不同轮触发。
-_TRANSFERS_TICK_PHASE = 7
+# ---- 转账采集的**轮转**(见 _fetch_snapshots / _rotate_transfers)----
+# 跑完全名单一圈要多少轮。20 轮 × 15s = 5 分钟,与改造前的采集周期完全相同。
+#
+# ⚠️⚠️ 改造前是「每 20 轮把全名单一次打完」,这是个**峰值**问题,不是均值问题:
+#    实测(91 人 · fomo_fetch_workers=12 · 轮询 15s · 60 轮模拟)
+#      非转账轮   99 ~ 109 个请求
+#      转账轮     190 个(91 swaps + 8 balances + 91 transfers)  ← 峰值 1.74x
+#      190 / 12 = 15.8 波 × p50 0.3~1.2s/请求 = 单轮 4.8 ~ 19.0s
+#    上界 19.0s **超过 15s 轮询间隔**,而用户的生产日志里已经有
+#    「单轮耗时 17s > 轮询间隔 15s —— tick 会连轴转」这条警告 ——
+#    也就是说这个功能会让一个已经超预算的 tick 更糟。均值(每轮多 4.6 个请求)
+#    看着无害,但请求并不是按均值发出去的。
+#
+# ⚠️ 所以改成与 _BALANCE_ROTATE_PER_TICK 同一套做法:**每轮只拉一小批**,
+#    批量 = ceil(名单人数 / 本常量),91 人 → 每轮 5 个,峰值回到 104 ≈ 平常轮。
+#    批量随名单规模自动伸缩,而"一圈多久"这个真正要守的量恒定在 5 分钟。
+# ⚠️ 覆盖延迟(必须重算,分摊换来的就是它):
+#      每人被轮到一次的间隔 = ceil(91 / 5) = 19 轮 × 15s = 285s ≈ 4.75 分钟
+#      单人期望新增转账 = 1.67 条/小时(实测中位数)× 285/3600 = 0.13 条
+#      单页 limit 25 条 → 25 / 1.67 ≈ 15.0 小时余量,是覆盖间隔的 189 倍
+#    漏采要求单人在 285s 内新增 >25 条,即 315 条/小时 —— 比实测中位数高 189 倍。
+#    停机导致的积压由 catchup 兜底,不靠这里。
+# ⚠️ 这个信号**本质是慢信号**:筹码先分下去、名单里的人隔几小时才跟进买入
+#    ($fih 的真实间隔以小时计),4.75 分钟的覆盖延迟对可操作性零损失。
+# ⚠️ 轮转之后**不再有"转账轮"**,因此也不再需要与活动流/盈亏/价格采样错开相位
+#    (原 _TRANSFERS_TICK_PHASE 已删除):那个相位存在的唯一理由就是别让 91 个
+#    请求和另一批撞在同一轮,现在每轮就 5 个,撞不撞已经无所谓了。
+_TRANSFERS_CYCLE_TICKS = 20
 # 一笔转账"多新"才敢把本轮观测到的市值当作它**收到时**的市值(秒)。
 # 900s = 3 倍采集周期,稳态下每一笔都轻松达标;真正被这道门拦住的是首轮/停机后
 # 一次性吃进来的那批历史转账(单页 25 条最远能到十几小时前)。见 _transfer_to_event。
@@ -234,6 +246,10 @@ _TRANSFER_BUYER_LOOKBACK_DAYS = 3650
 # 告警消息里最多展开几个收到者 / 几个买家
 _TRANSFER_RECEIVER_ROWS = 10
 _TRANSFER_BUYER_ROWS = 6
+# 等待重试的转入告警最多攒多少个。⚠️ 必须有上限:TG 长时间不可达时,
+#    每个够门槛的币都会往里塞一个,不封顶就是一条只增不减的内存泄漏,
+#    而且恢复那一刻会把攒下的全部一次喷出去。满了就丢最早那个(它也最过期)。
+_TRANSFER_RETRY_MAX = 32
 # 价格历史清理的降频。这是纯本地维护动作(无网络请求),但一次性删太多行会
 # 长时间占住写锁,所以也不能太频繁跑。约 4 小时一次:15s × 961 ≈ 4.0 小时。
 # ⚠️ 961 = 31² 特意选的,与 _FEED_EVERY_N_TICKS(6)、_PNL_EVERY_N_TICKS(20)
@@ -317,6 +333,19 @@ def _f(v) -> float | None:
 def _i(v) -> int | None:
     f = _f(v)
     return int(f) if f is not None else None
+
+
+def _first_not_none(*vals):
+    """
+    多来源取值:第一个**不是 None** 的那个。
+
+    ⚠️ 存在的理由就是不能写 `a or b`:0 / 0.0 / "" 在本项目里都是有意义的真实值,
+       真值判断会把它们当成"没取到"而落到下一个来源,把"确实是 0"变成"不知道"。
+    """
+    for v in vals:
+        if v is not None:
+            return v
+    return None
 
 
 def _pick_str(d, *keys) -> str | None:
@@ -643,6 +672,7 @@ class Poller:
         self._bal_dirty: set[str] = set()
         self._bal_rr = 0                            # balances 轮转刷新的游标
         self._warm_rr = 0                           # 冷启动预热的轮转游标
+        self._tx_rr = 0                             # transfers 轮转采集的游标(见 _rotate_transfers)
         self._feed_seen: set[str] = set()           # 上次活动流里见过的条目 id
         self._feed_thesis: list[dict] = []          # 活动流里捡到的观点,交给 _collect_thesis
         self._tick_no = 0                           # 轮次计数,用来给活动流降频(见 _poll_feed)
@@ -657,6 +687,11 @@ class Poller:
         # 本轮新落库的转入/转出事件。⚠️ 它们**不进 new_events**(不逐条推送,
         # 见 _persist),只喂给 _check_transfer_in 判"有几个人收到了同一个币"
         self._new_transfers: list[FomoEvent] = []
+        # 渲染/推送失败、台账已退回、等下一轮重试的转入告警。{(net, ca): symbol}
+        # ⚠️ 光把台账退回是不够的:_check_transfer_in 只扫**本轮有新转账**的币,
+        #    而推送失败之后这个币多半不会马上再来一笔转账 —— 没有这个集合,
+        #    "退回"就等于"要等下一笔转账才补发"。见 store.drop_transfer_in_signal。
+        self._transfer_retry: dict[tuple[str, str], str | None] = {}
         # 观点网络采集的后台线程。跨 tick 复用,懒建(见 _start_thesis)
         self._thesis_pool: ThreadPoolExecutor | None = None
         # 无人值守买入的执行队列。懒建 —— 没开自动的人不该多一条线程
@@ -849,9 +884,10 @@ class Poller:
                在我们眼里是旧的。这是既有的轮转慢刷本来就有的偏差(约 9 轮扫一圈),
                不为转账单开一条刷新路径:多打 91 个 balances 换一个只影响副指标的数字,
                不划算(主推送与共识分子都不依赖它)。
-          - transfers:全名单每 _TRANSFERS_EVERY_N_TICKS 轮拉一次(约 5 分钟)。
-            与 swaps 同频要每轮多打 91 个请求,必然撞限流;而这是个慢信号,
-            延迟 5 分钟零损失。详见 _TRANSFERS_EVERY_N_TICKS 的说明。
+          - transfers:**每轮轮转一小批**,一圈 _TRANSFERS_CYCLE_TICKS 轮(约 5 分钟)。
+            与 swaps 同频要每轮多打 91 个请求,必然撞限流;而"某一轮打完全名单"
+            会把那一轮顶到 190 个请求(峰值 1.74x,理论耗时上界超过轮询间隔)。
+            这是个慢信号,4.75 分钟的覆盖延迟零损失。详见 _TRANSFERS_CYCLE_TICKS。
 
         ⚠️ 返回值形态与改造前**完全一致**:每个人的 balances 都有值(本轮没拉的读缓存),
            所以 count_holders / _build_token_index 一行都不用改。缓存只在本函数内部生效,
@@ -864,10 +900,6 @@ class Poller:
         # ⚠️ 计数器在**调用之后**才加:否则第一轮算出的是 1 % N != 0,
         #    活动流在启动那一轮反而被跳过,而那正是最该捞一次的时候。
         self._poll_feed(uids)
-        # 转账采集的降频判断必须与 _poll_feed 一样落在自增**之前** ——
-        # _TRANSFERS_TICK_PHASE 的"永不同轮"分析就是按这个时点做的,
-        # 挪到自增之后会让它与名单盈亏(自增后判)撞在同一轮。
-        tx_due = self._tick_no % _TRANSFERS_EVERY_N_TICKS == _TRANSFERS_TICK_PHASE
         self._tick_no += 1
         # ⚠️ playwright 实现必须串行:它按线程私有创建整套浏览器,而线程池每 tick 建新线程,
         #    线程退出时浏览器不回收 —— 实测每 tick 泄漏 6 套 chromium,进程数单调递增到卡死。
@@ -955,7 +987,10 @@ class Poller:
         need_trd: list[str] = []
         # ⚠️ 转账**复用同一个池子**,绝不另开线程池:峰值并发 = 本池 + _THESIS_WORKERS,
         #    实测 12+8=20 就已经会撞限流。再开一个 N 就是必 429。
-        need_tx = uids if tx_due else []
+        # ⚠️ 而且是**每轮一小批**、不是"某一轮把 91 个一次打完":后者让转账轮的请求数
+        #    冲到 190(峰值 1.74x、单轮理论耗时上界 19.0s > 15s 轮询间隔),
+        #    详见 _TRANSFERS_CYCLE_TICKS 那段实测与算式。
+        need_tx = self._rotate_transfers(uids)
         self._transfers_attempted = set(need_tx)
         res = run([("swaps", u) for u in need_swaps]
                   + [("balances", u) for u in need_bal]
@@ -1182,6 +1217,27 @@ class Poller:
         now = time.monotonic()
         for k in [k for k, exp in self._thesis_priority.items() if exp <= now]:
             del self._thesis_priority[k]
+
+    def _rotate_transfers(self, uids: list[str]) -> list[str]:
+        """
+        轮转拉一小批人的 transfers。返回本轮该拉的 user_id(可能为空:名单为空时)。
+
+        批量 = ceil(名单人数 / _TRANSFERS_CYCLE_TICKS),于是:
+          · 每轮的请求数只有 ⌈91/20⌉ = 5 个,转账不再制造 190 个请求的峰值轮;
+          · 一圈仍然是 ⌈91/5⌉ = 19 轮 ≈ 4.75 分钟,采集周期与改造前持平。
+        批量随名单规模自动伸缩 —— 要守住的是"一圈多久",不是"每轮几个"。
+
+        ⚠️ 至少 1 个:名单人数少于周期数时 ceil 会算出 0,那样转账**一条都采不到**,
+           而且悄无声息(小名单反而彻底失效,是最容易漏测的那种边界)。
+        ⚠️ 游标走在**完整名单**上并按 len(uids) 取模 —— 与 _rotate_balances 同一条理由:
+           在长度会变的列表上取模不构成扫描,会有人长期轮不到。
+        """
+        if not uids:
+            return []
+        n = min(max(1, math.ceil(len(uids) / _TRANSFERS_CYCLE_TICKS)), len(uids))
+        start = self._tx_rr % len(uids)
+        self._tx_rr = (start + n) % len(uids)
+        return [uids[(start + i) % len(uids)] for i in range(n)]
 
     def _rotate_balances(self, uids: list[str], hot: set[str]) -> set[str]:
         """
@@ -1780,22 +1836,42 @@ class Poller:
         """
         转入告警:本轮有人**收到**的币,够不够"N 个名单成员收到过"的门槛。
 
-        「收到」= 从外部钱包转进来,不是在 FOMO 上买的。同一个合约地址短时间内被好几个
-        名单成员收到,语义上多半是项目方/内部人在分发筹码 —— 真实案例($fih):
-        00:32~00:37 五分半钟内,同一个发送方把币发给了名单里的三个人;而名单里另一个人
+        「收到」= 从外部钱包转进来,不是在 FOMO 上买的。真实案例($fih):00:32~00:37
+        五分半钟内,**同一个 fromAddress** 把币发给了名单里的三个人;而名单里另一个人
         是在**两倍市值**上真金白银买进的。前半段以前我们完全无感。
 
+        ⚠️ 报文里只有 fromAddress/toAddress、**没有 userId**,所以"项目方在分发"与
+           "本人把别处买的币充进来"在数据上完全一样 —— 消息里绝不替用户断言是哪一种,
+           只把可证的事实(几个人、多长时间内、是不是同一个发货地址)摆出来。
+           详见 store.transfer_senders 与 formatter.render_transfer_in_signal。
         ⚠️⚠️ **这个信号绝不接入跟单执行器,一行都不能接。**
            「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义,拿它去触发花钱的
            操作方向就是错的。所以这里:不读 CopyConfig、不写 copytrade_signals、
            不碰 store.should_count(那道防线只认 EVENT_BUY,别去动它)。
-        ⚠️ 只看**本轮新收到**的币,不做全表扫描 —— 与 _check_copytrade 同一个理由:
-           全表扫会在阈值放宽的那一刻把历史上所有够格的币一次性全喷出来。
+        ⚠️ 只看**本轮新收到**的币(外加上一轮推送失败的重试项),不做全表扫描 ——
+           与 _check_copytrade 同一个理由:全表扫会在阈值放宽的那一刻,
+           把历史上所有够格的币一次性全喷出来。
         ⚠️ **停机补数那一轮整段跳过**:那时的 new_transfers 是整段积压而不是"刚刚发生的
            事",而消息里写的是"最近 N 小时内",两者对不上。
         """
         transfers = [e for e in self._new_transfers if e.event_type == EVENT_TRANSFER_IN]
-        if not transfers:
+
+        # 本轮新收到的币,去重到 (链, CA) —— 这只是"这轮该查哪些币"的候选集。
+        # ⚠️ 真正的判定**全部**在 store.count_recent_receivers 里(它排除 no_side、
+        #    排除计价币、按金额与时间窗过滤)。这里的 side_unknown / is_quote 两个条件
+        #    与那边**语义等价**,是纯粹的省查询预过滤:本函数排在 _persist 之后,
+        #    这批事件早已在库里,那条 SQL 看得见它们。所以别指望它是"第二道防线" ——
+        #    真要动过滤规则,动的是 count_recent_receivers,不是这里。
+        #    (对应的变异测试是等价变异,已在交付说明里如实标注。)
+        pending: dict[tuple[str, str], str | None] = dict(self._transfer_retry)
+        for e in transfers:
+            if not e.token_key or e.side_unknown or e.is_quote:
+                continue
+            # ⚠️ 已有 symbol 的不许被 None 覆盖:重试项带着上一轮查到的 symbol,
+            #    而本轮这笔转账可能压根没解析出 symbol,覆盖过去消息标题就秃了
+            if e.token_symbol is not None or e.token_key not in pending:
+                pending[e.token_key] = e.token_symbol
+        if not pending:
             return
         if self._catchup_since:
             logger.info("停机补数轮,转入告警整段跳过(积压信号已过期)")
@@ -1809,38 +1885,55 @@ class Poller:
         # 「名单里有没有人真金白银买过」不设时间窗(见 _TRANSFER_BUYER_LOOKBACK_DAYS)
         buy_since = iso_minutes_ago(_TRANSFER_BUYER_LOOKBACK_DAYS * 24 * 60)
 
-        # 本轮新收到的币,去重到 (链, CA) —— 这只是"这轮该查哪些币"的候选集。
-        # ⚠️ 真正的判定**全部**在 store.count_recent_receivers 里(它排除 no_side、
-        #    排除计价币、按金额与时间窗过滤)。这里的 side_unknown / is_quote 两个条件
-        #    与那边**语义等价**,是纯粹的省查询预过滤:本函数排在 _persist 之后,
-        #    这批事件早已在库里,那条 SQL 看得见它们。所以别指望它是"第二道防线" ——
-        #    真要动过滤规则,动的是 count_recent_receivers,不是这里。
-        #    (对应的变异测试是等价变异,已在交付说明里如实标注。)
-        keys = {
-            e.token_key for e in transfers
-            if e.token_key and not e.side_unknown and not e.is_quote
-        }
-        for net, ca in sorted(keys):
+        for net, ca in sorted(pending):
+            sym = pending[(net, ca)]
             try:
                 n = store.count_recent_receivers(conn, net, ca, since, min_usd)
                 if n < need:
+                    # 重试项也可能因为窗口滑过去而不再够格 —— 那就让它彻底出队,
+                    # 否则它会在内存里赖到进程重启
+                    self._transfer_retry.pop((net, ca), None)
                     continue
                 rows = store.transfer_receivers(conn, net, ca, since, min_usd,
                                                 limit=_TRANSFER_RECEIVER_ROWS)
                 recv = [
-                    {"who": r["who"], "usd": r["usd"], "mcap": r["mcap"], "hits": r["hits"]}
+                    {"who": r["who"], "usd": r["usd"], "mcap": r["mcap"],
+                     "hits": r["hits"], "ts": r["ts"]}
                     for r in rows
                 ]
-                total = sum(r["usd"] for r in rows if r["usd"] is not None) or None
-                sym = next((e.token_symbol for e in transfers
-                            if e.token_key == (net, ca) and e.token_symbol), None)
+                # ⚠️ 判空一律 is None(模块铁律)。这里曾经写成 `sum(...) or None` ——
+                #    而配置允许 min_usd=0(config 里的约束是 ge=0),几个人到账都恰好
+                #    $0.00 时 sum 得 0.0 会被 `or` 吞成 None,「合计」整段消失,
+                #    也就是把"确实是 0"渲染成"不知道"。0 是有意义的真实值。
+                priced = [r["usd"] for r in rows if r["usd"] is not None]
+                total = sum(priced) if priced else None
+                # 发货地址聚类 —— 这条告警里唯一可证的证据(见 store.transfer_senders)。
+                # ⚠️ 它只进文案,**绝不进判定**:地址各不相同照样告警。
+                try:
+                    senders = store.transfer_senders(conn, net, ca, since, min_usd)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("转入告警:发货地址聚类失败,该行不显示 | {} {} | {}", net, ca, e)
+                    senders = None
                 # 主键去重:同一个币这辈子只告警一次。**必须在渲染/发送之前**记账 ——
                 # 两个 tick 撞上时靠 INSERT OR IGNORE 的 rowcount 决出唯一的赢家。
                 if not store.record_transfer_in_signal(
                     conn, network_id=net, token_address=ca, token_symbol=sym,
                     receivers=n, total_usd=total,
                 ):
+                    self._transfer_retry.pop((net, ca), None)
                     continue
+            except Exception as e:  # noqa: BLE001
+                # 一个币出问题不该拖垮别的币
+                logger.error("转入告警判定失败,跳过该币 | {} {} | {}", net, ca, e)
+                continue
+
+            # ⚠️⚠️ 台账已经占位了。从这里往下**任何**失败都必须把它退回去:
+            #    主键 (network_id, token_address) 的语义是"这个币这辈子只告警一次",
+            #    而渲染异常 / TG 400 / 网络抖动恰恰是最常见的失败 ——
+            #    不退回就是"推送失败 = 该币的告警永久丢失",日志里只留一行 error。
+            #    退回 + 进重试队列,下一轮重走一遍(事件还在库里、还在窗口内)。
+            delivered = False
+            try:
                 # ⚠️ 名单里"真金白银买过"的人 —— 用买入侧那套严格谓词(token_buyers 自带
                 #    COUNTABLE_REASONS + active + stats_ready),这里问的正是"谁掏了钱"。
                 #    查不出来就传 None,让那一行整行消失,绝不假装"没人买过"。
@@ -1856,22 +1949,38 @@ class Poller:
                 text = render_transfer_in_signal(
                     network_id=net, token_address=ca, token_symbol=sym,
                     receiver_count=n, receivers=recv,
-                    window_hours=window_h, buyers=buyers,
+                    window_hours=window_h, buyers=buyers, senders=senders,
                 )
+                logger.info("转入告警 | {} 人收到 ${} | {} {}", n, sym or "?", net, ca)
+                if dry_run:
+                    logger.info("[dry-run] {}", text.replace("\n", " ⏎ "))
+                    delivered = True
+                else:
+                    self._throttle_send()
+                    # ⚠️ 返回值必须看。notifier.send 在 TG 返回 400/403 时是**返回 False**
+                    #    而不是抛异常 —— 只 try/except 的话这一整类失败静默通过
+                    delivered = bool(self.notifier.send(text))
+                    if not delivered:
+                        logger.error("转入告警推送被拒,台账退回、下轮重试 | {} {}", net, ca)
             except Exception as e:  # noqa: BLE001
-                # 一个币出问题不该拖垮别的币
-                logger.error("转入告警渲染失败,跳过该币 | {} {} | {}", net, ca, e)
-                continue
+                logger.error("转入告警渲染/推送失败,台账退回、下轮重试 | {} {} | {}", net, ca, e)
+            if delivered:
+                self._transfer_retry.pop((net, ca), None)
+            else:
+                store.drop_transfer_in_signal(conn, net, ca)
+                self._queue_transfer_retry(net, ca, sym)
 
-            logger.info("转入告警 | {} 人收到 ${} | {} {}", n, sym or "?", net, ca)
-            if dry_run:
-                logger.info("[dry-run] {}", text.replace("\n", " ⏎ "))
-                continue
-            self._throttle_send()
-            try:
-                self.notifier.send(text)
-            except Exception as e:  # noqa: BLE001
-                logger.error("转入告警推送异常 | {} {} | {}", net, ca, e)
+    def _queue_transfer_retry(self, net: str, ca: str, sym: str | None) -> None:
+        """
+        把一个推送失败的币排进下一轮重试。⚠️ 封顶,理由见 _TRANSFER_RETRY_MAX。
+        """
+        if (net, ca) not in self._transfer_retry and len(self._transfer_retry) >= _TRANSFER_RETRY_MAX:
+            # dict 保插入序,最早那个也最过期,丢它
+            oldest = next(iter(self._transfer_retry))
+            self._transfer_retry.pop(oldest)
+            logger.warning("转入告警重试队列已满({}),丢弃最早的一个 | {} {}",
+                           _TRANSFER_RETRY_MAX, oldest[0], oldest[1])
+        self._transfer_retry[(net, ca)] = sym
 
     def _check_copytrade(self, conn, new_events: list[FomoEvent], dry_run: bool) -> None:
         """
@@ -2607,6 +2716,14 @@ class Poller:
             (cp_id and cp_id in self._watched_ids)
             or (cp_norm and cp_norm in self._watched_handles)
         )
+        # 对手方钱包地址:收到就是发货方(fromAddress),转出就是收货方(toAddress)。
+        # ⚠️ 归一化复用 normalize_token_address —— 它的判据是"0x 开头 + 42 位"这个
+        #    **编码形态**,钱包地址与代币地址在这一点上完全同构(EVM 大小写不敏感要
+        #    lower,Solana base58 大小写敏感绝不能动)。不归一化的话同一个发货地址
+        #    会因为大小写裂成两个,聚类当场失效且一声不吭。
+        cp_addr = normalize_token_address(
+            _pick_str(raw, *(_K_FROM_ADDR if direction == EVENT_TRANSFER_IN else _K_TO_ADDR))
+        )
         # symbol / 市值从本 tick 的 balances 索引补 —— 与 _make_swap_event 同一套做法。
         # ⚠️ 报文里**没有 marketCap**,不补的话「在什么市值收到的」这行永远不出现。
         #    索引里没有(名单里还没人持有这个币)就保持 None,对应行整行消失。
@@ -2633,7 +2750,13 @@ class Poller:
             network_id=net,
             token_address=ca,
             token_symbol=_clean_symbol(sym) or meta.get("symbol"),
-            amount_usd=_f(pick(raw, *_K_AMOUNT_USD)) or _f(pick(src, *_K_AMOUNT_USD)),
+            # ⚠️ 顶层没有才去嵌套里取,判据是 **is None** 不是真值 ——
+            #    写成 `A or B` 时,一笔真实金额为 $0.00 的转账会被当成"顶层没给",
+            #    落到 B(嵌套里没有这个键)= None,于是"确实是 0"变成了"不知道多少"。
+            #    而 count_recent_receivers 的门槛是 `amount_usd >= ?`,NULL 恒不成立 ——
+            #    也就是说 min_usd=0 这个合法配置下,$0.00 的到账会**整条消失**。
+            amount_usd=_first_not_none(_f(pick(raw, *_K_AMOUNT_USD)),
+                                       _f(pick(src, *_K_AMOUNT_USD))),
             token_amount=amount,
             # ⚠️ 刻意**不**从 meta 兜底 price_usd(_make_swap_event 是兜的)。
             #    meta 里的是"本轮观测到的现价",对一笔可能几小时前发生的转账来说
@@ -2649,6 +2772,7 @@ class Poller:
             token_created_at=meta.get("created_at"),
             counterparty_handle=cp_handle,
             counterparty_is_watched=cp_watched,
+            counterparty_address=cp_addr,
         )
 
     # --------------------------------------------------------

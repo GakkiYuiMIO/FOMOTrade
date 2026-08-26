@@ -361,6 +361,12 @@ class FomoEvent:
     thesis_text: str | None = None
     counterparty_handle: str | None = None
     counterparty_is_watched: bool = False
+    # 对手方**钱包地址**(转入取 fromAddress、转出取 toAddress)。
+    # ⚠️ 这是转入告警里唯一可证的硬证据,所以必须落库:报文里**没有 userId**
+    #    (8404 条真实转账里 userId 键出现 0 次),"是不是同一个人在发"永远无从判断;
+    #    而"是不是同一个钱包在发"是地址比对,确定性的。
+    #    $fih 真实案例:5 分 23 秒内同一个 fromAddress 发给名单里三个人。
+    counterparty_address: str | None = None
     # 代币合约创建时间(unix 秒)→ 消息里的「币龄」。
     # ⚠️ 落库:补发的消息也要能显示它,而 formatter 是纯函数、不查库(§10.4 铁律 7)
     token_created_at: int | None = None
@@ -412,6 +418,9 @@ class FomoEvent:
             "ingested_at": self.ingested_at,
             "badge": self.badge,
             "badge_reason": self.badge_reason,
+            # 发货地址。⚠️ 与 market_cap 同理:事后无法从别处补回来,
+            #    而"同一个地址发给了几个人"正是转入告警里唯一站得住的证据
+            "counterparty_address": self.counterparty_address,
             "raw_json": self.raw_json,
         }
 

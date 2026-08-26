@@ -155,3 +155,43 @@ refresh token 也没被轮换。但**这是该问用户的决定，不是它该�
 - 这条同样适用于我自己执行命令时——我这一整轮都在用
   `.venv/Scripts/python.exe -m pytest`，没有 `-X utf8`。
   测试没炸是因为 pytest 自己处理了编码，不是因为我做对了
+
+---
+
+## 8. `monkeypatch.undo()` 会连别人的补丁一起撤 —— 差点写进生产库
+
+**发生了什么**（2026-08-26）
+新写的一条用例这么打桩:
+
+```python
+def test_渲染失败时台账同样要退回(db, monkeypatch):
+    monkeypatch.setattr(pmod, "render_transfer_in_signal", _boom)
+    ...                       # 前半段:验证渲染炸了台账要退回
+    monkeypatch.undo()        # ← 这里
+    ...                       # 后半段:验证修好之后能补发
+```
+
+后半段死活跑不通。根因是 `monkeypatch` 是**函数级共享**的一个实例,
+而 `db` 夹具用的也是它:
+
+```python
+def db(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "t.db")
+```
+
+`undo()` 撤的是**这条用例的全部补丁**,包括 `DB_PATH`。
+于是后半段的 `store.get_conn()` 连的是 `data/fomo.db` ——
+用户当时**正跑着监控**(进程 13:01 启动、库文件每分钟在长)。
+
+**没造成损坏**:那半段只走到 `count_recent_receivers`(纯 SELECT),
+生产库里近 24h 没有够 3 人的币,`n < need` 直接 continue,
+一条 INSERT/UPDATE/DELETE 都没执行 —— 断言失败信息是「发了 0 条」而不是「发了 1 条」,
+正好反过来证明了没走到任何写语句。但这是运气,不是设计。
+
+**怎么做**
+- 用例自己要撤的桩,**自己开一份** `pytest.MonkeyPatch()`,别用共享夹具再 `undo()`
+- `db` 这类"把全局指针挪走"的夹具也要自己开一份,免得被用例的 `undo()` 掀掉
+- 更根本的:在 `conftest.py` 加一条**会话级 autouse** 兜底,把 `store.DB_PATH`
+  整场挪出 `data/`。靠"每条用例记得加 db 夹具"是守不住的,地板要铺在会话级
+- 顺带记住:`get_conn()` 是**读写**打开(它发 `PRAGMA journal_mode = WAL`),
+  "只是读一下"在 sqlite 这里不成立

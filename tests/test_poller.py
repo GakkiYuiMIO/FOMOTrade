@@ -145,11 +145,24 @@ class FakeClient:
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """把 store.DB_PATH 指到临时文件 —— Poller 内部走 get_conn(),必须有真实文件"""
-    monkeypatch.setattr(store, "DB_PATH", tmp_path / "t.db")
+def db(tmp_path):
+    """
+    把 store.DB_PATH 指到临时文件 —— Poller 内部走 get_conn(),必须有真实文件。
+
+    ⚠️⚠️ 这里**刻意不复用 monkeypatch 夹具**,而是自己开一个 MonkeyPatch:
+       monkeypatch 是函数级共享的,用例里任何一句 `monkeypatch.undo()` 都会把
+       DB_PATH 一起还原成 data/fomo.db —— 于是那一刻起,测试打的是**生产库**。
+       这不是假想:2026-08-26 就这么发生过一次(一条用例用 undo() 还原
+       render 的桩,后半段直接连上了正在运行的生产库)。
+       自己开一份就与用例的 undo() 彻底隔离。
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(store, "DB_PATH", tmp_path / "t.db")
     store.init_db()
-    return store.DB_PATH
+    try:
+        yield store.DB_PATH
+    finally:
+        mp.undo()
 
 
 def _add_ready(user_id: str, handle: str) -> None:
@@ -2095,46 +2108,76 @@ def test_名单handle索引必须与比对侧同一套归一化(db):
     assert ev.counterparty_is_watched is True
 
 
-def test_转账采集与既有降频任务永不同轮触发():
+def _many_users(n: int) -> list[dict]:
+    """造 n 个已就绪用户,返回 _fetch_snapshots 要的 users 列表"""
+    users = []
+    for i in range(n):
+        uid = f"u{i:03d}"
+        _add_ready(uid, f"h{i:03d}")
+        users.append({"user_id": uid, "handle": f"h{i:03d}", "display_name": f"h{i:03d}"})
+    return users
+
+
+def test_转账采集的单轮峰值必须与平常轮持平(db):
     """
-    钉死 _TRANSFERS_TICK_PHASE 的相位**性质**,而不是那个数字本身。
+    ⚠️⚠️ 这是个**峰值**问题,不是均值问题 —— 上一版实现"每 20 轮把 91 个人一次打完",
+       均值只有每轮 4.6 个请求,看着无害;实际是:
+         非转账轮 99~109 个请求 / 转账轮 190 个(91 swaps + 8 balances + 91 transfers)
+         峰值 1.74x;190/12 线程 = 15.8 波 × p50 0.3~1.2s = 单轮 4.8~19.0s
+       上界超过 15s 轮询间隔,而用户的生产日志里已经有
+       「单轮耗时 17s > 轮询间隔 15s —— tick 会连轴转」。
 
-    四个降频任务里有三个会真的打网络请求,叠在同一轮上就是单轮耗时翻倍 ——
-    而日志里已经出现过「单轮耗时 17s > 轮询间隔 15s」。
-    判断时点:活动流与转账在 _tick_no 自增**之前**判,盈亏与价格采样在自增**之后**判。
+    所以这里断言的是**任何一轮**的转账请求数都不超过 ⌈人数/周期⌉,
+    也就是"再也不存在把全名单一次打完的那一轮"。
+    ⚠️ 门槛写死字面量(91 人 · 20 轮 → 5),不从被测模块 import 常量 ——
+       从 poller 里 import 周期再拿它算门槛,等于用被测代码给自己打分。
     """
-    from src.poller import _TRANSFERS_EVERY_N_TICKS, _TRANSFERS_TICK_PHASE
-
-    sample_n = 60          # fomo_price_history_sample_ticks 的默认值
-    hits = 0
-    for t in range(6000):
-        if t % _TRANSFERS_EVERY_N_TICKS != _TRANSFERS_TICK_PHASE:
-            continue
-        hits += 1
-        assert t % _FEED_EVERY_N_TICKS != 0, f"tick {t}:转账与活动流撞在同一轮"
-        assert (t + 1) % _PNL_EVERY_N_TICKS != 0, f"tick {t}:转账与名单盈亏撞在同一轮"
-        assert (t + 1) % sample_n != sample_n // 2, f"tick {t}:转账与价格采样撞在同一轮"
-    assert hits > 0, "样本里一次都没命中,这条测试等于没测"
-
-
-def test_转账降频_绝大多数轮次一个请求都不打(db):
-    """
-    转账实测 13.1 条/人/天,只比买卖稀疏 1.8 倍 —— 与 swaps 同频要每轮多打 91 个请求,
-    是现有负载的量级性增加,必然撞上已知的并发拐点。
-    """
-    from src.poller import _TRANSFERS_EVERY_N_TICKS, _TRANSFERS_TICK_PHASE
-
-    _add_ready("uA", "alice")
-    client = FakeClient({"uA": UserSnapshot("uA", swaps=[], transfers=[], balances=[])})
+    users = _many_users(91)
+    client = FakeClient()
     p = Poller(client, FakeNotifier())
-    users = [{"user_id": "uA", "handle": "alice", "display_name": "alice"}]
-    hits = []
-    for _ in range(_TRANSFERS_EVERY_N_TICKS * 2):
+    peaks = []
+    for _ in range(60):
         before = len(client.transfer_calls)
         p._fetch_snapshots(users)
-        hits.append(len(client.transfer_calls) > before)
-    assert sum(hits) == 2, f"{_TRANSFERS_EVERY_N_TICKS * 2} 轮里应该只命中 2 次,实际 {sum(hits)}"
-    assert hits.index(True) == _TRANSFERS_TICK_PHASE, "第一次命中的轮次应当就是配置的相位"
+        peaks.append(len(client.transfer_calls) - before)
+    assert max(peaks) <= 5, f"单轮转账请求峰值 {max(peaks)},超过 ⌈91/20⌉ = 5"
+    assert max(peaks) >= 1, "一轮都没拉过转账,这条测试等于没测"
+    assert 91 not in peaks, "又出现了『一轮打完全名单』的峰值轮"
+
+
+def test_转账轮转必须在一个周期内覆盖到每一个人(db):
+    """
+    分摊的代价是覆盖延迟,所以延迟必须**可证**:91 人 · 每轮 5 个 → ⌈91/5⌉ = 19 轮
+    (× 15s = 285s ≈ 4.75 分钟)必须每个人都被轮到至少一次,一个都不能漏。
+
+    ⚠️ 漏采分析(为什么 4.75 分钟够):单人转账实测中位数 1.67 条/小时,
+       285s 内期望新增 0.13 条,而单页 limit 25 条 ≈ 15.0 小时余量。
+       要漏采得单人在 285s 内新增 >25 条 = 315 条/小时,比实测高 189 倍。
+    ⚠️ 必须断言"**每个人**都被覆盖到",不能只断言总请求数 —— 游标写错(比如在
+       每轮长度都在变的池子上取模)时总数照样对,但有人永远排不上队。
+    """
+    users = _many_users(91)
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+    for _ in range(19):
+        p._fetch_snapshots(users)
+    missed = {u["user_id"] for u in users} - set(client.transfer_calls)
+    assert missed == set(), f"19 轮里有 {len(missed)} 个人一次都没被轮到:{sorted(missed)[:5]}"
+
+
+def test_名单比周期还短时也必须真的采到转账(db):
+    """
+    ⚠️ ⌈人数/周期⌉ 在人数 < 周期时会算出 0(3/20 → 0.15 → ceil=1,但 3//20 = 0)——
+       批量取整取错方向的话小名单**一条转账都采不到**,而且悄无声息。
+       所以下限必须是 1:3 个人 → 每轮 1 个 → 3 轮覆盖一圈。
+    """
+    users = _many_users(3)
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+    for _ in range(3):
+        p._fetch_snapshots(users)
+    assert set(client.transfer_calls) == {"u000", "u001", "u002"}, \
+        f"3 轮该把 3 个人都轮一遍,实际 {client.transfer_calls}"
 
 
 def test_没轮到拉转账的那些轮次不刷警告(db):
@@ -2221,15 +2264,24 @@ def test_收到时市值只在事件足够新时才补():
     assert fresh.market_cap == 198_200.0, "刚发生的转账,现价市值就是它收到时的市值"
 
 
-def _seed_receivers(usd_list, *, symbol="fih"):
-    """造 N 个名单成员各收到一笔 $fih 的库存,返回 Poller(_new_transfers 已就位)"""
-    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+def _seed_receivers(usd_list, *, symbol="fih", ages_min=None, from_addrs=None):
+    """
+    造 N 个名单成员各收到一笔 $fih 的库存,返回 Poller(_new_transfers 已就位)。
+
+    ages_min   每个人是"多少分钟前"收到的(默认全是刚刚)。用来测时间窗。
+    from_addrs 每个人的发货地址(默认全都是真实报文里那个 —— $fih 的真实形态就是
+               同一个地址发给三个人)。用来测聚类的两种表述。
+    """
     p = Poller(FakeClient(), FakeNotifier())
     evs = []
     for i, usd in enumerate(usd_list):
         _add_ready(f"u{i}", f"Holder{i}")
+        mins = 0 if ages_min is None else ages_min[i]
+        ts = (datetime.now(UTC) - timedelta(minutes=mins)).isoformat().replace("+00:00", "Z")
         raw = dict(_REAL_DEPOSIT, id=f"tx-{i}", usdAmount=usd, createdAt=ts,
                    tokenMetadata={"symbol": symbol})
+        if from_addrs is not None:
+            raw["fromAddress"] = from_addrs[i]
         evs.extend(p.normalize_transfers(_row(f"u{i}", f"Holder{i}"), [raw]))
     with store.get_conn() as c:
         p._persist(c, evs)
@@ -2245,9 +2297,12 @@ def test_三个人收到同一个币就告警_两个人不告警(db):
         p._check_transfer_in(c, dry_run=False)
     assert len(p.notifier.sent) == 1
     msg = p.notifier.sent[0]
-    assert "收到" in msg and "不是买入" in msg
+    assert "收到" in msg and "不是在 FOMO 上买的" in msg
     assert "Holder0" in msg and "Holder1" in msg and "Holder2" in msg
     assert _CA_FIH in msg
+    # ⚠️ 意图断言不许回来:报文里没有 userId,「一分钱没花」区分不了
+    #    "项目方分发"和"本人从别处充值"(后者其实就是买入)
+    assert "一分钱没花" not in msg and "没花" not in msg
 
 
 def test_人数不够阈值时不告警(db):
@@ -2290,34 +2345,72 @@ def test_停机补数轮整段跳过转入告警(db):
     assert p.notifier.sent == []
 
 
-def test_转入告警绝不接跟单执行器(db):
+def test_跟单开着的时候转账也绝不会下单(db):
     """
-    ⚠️⚠️ 安全边界。「有人收到了免费筹码」与「有人自己掏钱买入」是相反的含义,
-       拿它去触发花钱的操作方向就是错的。三条可观测后果一起钉死:
-         · 不写 copytrade_signals(否则这个币的真跟单信号会被当成"已经跟过"而静默跳过)
-         · 不改 user_token_stats(否则共识数会把白拿的人算成买家)
-         · 不动跟单开关
+    ⚠️⚠️ 安全边界。「收到免费筹码」与「自己掏钱买入」是相反的含义,拿它去触发花钱的
+       操作方向就是错的。
+
+    ⚠️ 这条测试上一版是**无效的**:它整场跑在跟单**关闭**的状态下,而且只调
+       _check_transfer_in、从不调 _check_copytrade —— 跟单关着时 _check_copytrade
+       第一行就 return,所以它证明的其实是"关着的功能没运行",
+       而要守的命题是"**开着**的时候转账也不会下单"。
+
+    这一版:跟单**启用**(min_buyers=1,门槛低到只要有一笔买入就会下单)、
+    跑**完整 tick**、同一轮里既有转账又有一笔真买入作**阳性对照** ——
+    对照那个币必须生成跟单信号(证明执行器确实是活的、这一轮真的走到了判定),
+    而被转账的那个币必须一条信号都没有。
     """
-    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    _enable_copy(min_buyers=1)
+    _stale_tick(0.01)                 # 别落进停机补数轮,那会整段跳过跟单
+
+    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    snaps = {}
+    for i in range(3):
+        _add_ready(f"u{i}", f"Holder{i}")
+        raw = dict(_REAL_DEPOSIT, id=f"boundary-tx-{i}", usdAmount=900.0 + i, createdAt=ts)
+        # 只有 u0 额外真买了**另一个**币(CA_TOAD),作阳性对照
+        swaps = [_swap("buy-control")] if i == 0 else []
+        # ⚠️ 必须把被转账那个币的 balances(含 marketCap)也喂进来。
+        #    否则它拿不到入场市值,decide 会以 SKIP_NO_MCAP 跳过 ——
+        #    那样这条测试守住的就成了"碰巧没市值",而不是"边界成立"。
+        #    (仓库里已经有过一模一样的教训:别拿巧合当防线。)
+        snaps[f"u{i}"] = UserSnapshot(f"u{i}", swaps=swaps, transfers=[raw],
+                                      balances=[_bal(_CA_FIH, mcap=368_000.0)])
+    p = Poller(FakeClient(snaps), FakeNotifier())
+    for _ in range(3):                # 3 个人 → 轮转 3 轮才凑齐转账
+        p.tick()
+
     with store.get_conn() as c:
-        p._check_transfer_in(c, dry_run=False)
-        assert c.execute("SELECT COUNT(*) n FROM copytrade_signals").fetchone()["n"] == 0
-        assert c.execute("SELECT COUNT(*) n FROM user_token_stats").fetchone()["n"] == 0
-        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1
-        assert store.load_copy_config(c).enabled is False
+        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1, \
+            "前提不成立:转入告警本身没触发,那这条测试什么都没证明"
+        assert store.load_copy_config(c).enabled is True, "前提不成立:跟单没真的开着"
+        sigs = [dict(r) for r in c.execute(
+            "SELECT token_address, status FROM copytrade_signals")]
+        # 阳性对照:执行器是活的,一笔真买入就足以生成信号
+        assert [s["token_address"] for s in sigs] == [CA_TOAD], \
+            f"阳性对照没生成跟单信号,判定这一轮压根没跑到:{sigs}"
+        # 真正要守的:被转账的那个币,一条跟单信号都不许有
+        assert _CA_FIH not in [s["token_address"] for s in sigs], \
+            "转账把币送进了跟单执行器 —— 安全边界破了"
+        # 白拿的筹码也不许被算成买入(共识分子的地基)
+        stats = [dict(r) for r in c.execute(
+            "SELECT token_address, buy_count FROM user_token_stats")]
+        assert all(s["token_address"] != _CA_FIH for s in stats), \
+            f"转账改了 user_token_stats,共识数会把白拿的人算成买家:{stats}"
 
 
 def test_整条tick真的把转账采进来并在够人数时告警(db):
     """
-    整条链路的集成证明:tick() → _fetch_snapshots(降频命中那一轮才拉)→ 归一化 →
+    整条链路的集成证明:tick() → _fetch_snapshots(轮转到谁就拉谁)→ 归一化 →
     游标过滤 → 落库 → 转入告警。
 
     ⚠️ 这条测试存在的理由:normalize_transfers / _transfer_to_event 在此之前是
        **零调用者的孤儿代码** —— 它们各自的单测全绿,而线上一条转账都采不到。
        只测归一化函数是测不出"没人调它"的。
+    ⚠️ 转账改成轮转采集之后,3 个人要 3 轮才轮完一圈 —— 也就是说这条链路只有在
+       "最后一个人也被轮到"的那一轮才凑得齐 3 个收到者。这正是分摊换来的覆盖延迟,
+       这里顺便把它钉住。
     """
-    from src.poller import _TRANSFERS_TICK_PHASE
-
     ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     snaps = {}
     for i in range(3):
@@ -2328,14 +2421,14 @@ def test_整条tick真的把转账采进来并在够人数时告警(db):
     notifier = FakeNotifier()
     p = Poller(client, notifier)
 
-    # 降频相位之前的每一轮:一个转账请求都不该打,库里也不该有转账
-    for _ in range(_TRANSFERS_TICK_PHASE):
-        p.tick()
-    assert client.transfer_calls == [], "还没到相位就去拉转账 = 白白多打 91 个请求/轮"
-    with store.get_conn() as c:
-        assert c.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 0
+    # 前两轮:各轮到一个人,只有 2 个人收到 —— 不够 3 人门槛,不该推
+    p.tick()
+    p.tick()
+    assert len(client.transfer_calls) == 2, \
+        f"每轮该只拉 1 个人(3 人 / 20 轮向上取整),实际 {client.transfer_calls}"
+    assert notifier.sent == [], "才 2 个人收到就推,等于门槛没生效"
 
-    # 命中相位的那一轮:采进来、落库、够 3 人 → 推一条告警
+    # 第三轮:最后一个人也被轮到,凑够 3 人 → 推一条告警
     p.tick()
     assert sorted(client.transfer_calls) == ["u0", "u1", "u2"]
     with store.get_conn() as c:
@@ -2344,4 +2437,282 @@ def test_整条tick真的把转账采进来并在够人数时告警(db):
     assert [r["event_type"] for r in rows] == ["TRANSFER_IN"] * 3, "转账必须真的落库"
     assert all(r["sent"] == 1 for r in rows), "转账不逐条推送,但要当场标记已发"
     assert len(notifier.sent) == 1, f"应当只推那一条聚合告警,实际 {len(notifier.sent)} 条"
-    assert "🚨" in notifier.sent[0] and "不是买入" in notifier.sent[0]
+    assert "🚨" in notifier.sent[0] and "不是在 FOMO 上买的" in notifier.sent[0]
+
+
+# ---- 时间窗:配置必须真的生效,而且不许被写死的数字架空 ----------------------
+def _env(monkeypatch, **kw) -> None:
+    """
+    改环境变量并清缓存。⚠️ 必须在**构造 Poller 之前**调用 ——
+    Poller.__init__ 里就把 get_settings() 的结果抓走了。
+    (teardown 由 conftest 的 _no_send_throttle 统一 cache_clear)
+    """
+    from src.config import get_settings
+
+    for k, v in kw.items():
+        monkeypatch.setenv(k, str(v))
+    get_settings.cache_clear()
+
+
+def test_转入告警的默认阈值(monkeypatch):
+    """
+    ⚠️ 三个默认值一律**写死字面量**,不从 config import 再断言 ——
+       从被测模块 import 默认值给自己打分,改成 1 小时或 720 小时都照样绿,
+       而"最近多久内"正是这条告警的全部语义:
+         1 小时   → 分发通常横跨几小时,真信号大面积漏掉
+         720 小时 → 一个月内碰巧各自收到过的人被凑成"同时收到",全是假信号
+    ⚠️ 用 _env_file=None 构造:否则会去读仓库根目录的 .env,
+       断言就变成了"这台机器的配置是多少",而不是"代码的默认值是多少"。
+    """
+    from src.config import FomoSettings
+
+    for k in ("FOMO_TRANSFER_ALERT_WINDOW_HOURS", "FOMO_TRANSFER_ALERT_RECEIVERS",
+              "FOMO_TRANSFER_ALERT_MIN_USD"):
+        monkeypatch.delenv(k, raising=False)
+    s = FomoSettings(_env_file=None)
+    assert s.fomo_transfer_alert_window_hours == 24
+    assert s.fomo_transfer_alert_receivers == 3
+    assert s.fomo_transfer_alert_min_usd == 500.0
+
+
+def test_窗口之外的到账不算数_窗口是配置说了算(db, monkeypatch):
+    """
+    ⚠️⚠️ 这条守的是"时间窗真的存在,而且真的取自配置"。此前**四种**变异全绿:
+         config 默认 24 → 1 / 24 → 720 / poller 里写死 720 小时 / since = ""(窗口取消)
+       原因是从来没有一条用例让某个到账**落在窗口之外**。
+
+    这里窗口配成 2 小时,三个人分别在 10 分钟前、20 分钟前、5 小时前收到 ——
+    窗口内只有 2 个人,不够 3 人门槛,一条都不该推。
+    只要窗口被写死成更大的数(720)、或者被取消(since=""),第三个人就会被算进来。
+    """
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_WINDOW_HOURS=2)
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09], ages_min=[10, 20, 300])
+    assert p.settings.fomo_transfer_alert_window_hours == 2, "配置没吃到,测试前提不成立"
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert p.notifier.sent == [], \
+        "5 小时前那笔落在 2 小时窗口之外,却被算进了人数 —— 窗口没生效"
+
+
+def test_窗口配多大就认多大_不许被写死成更小的数(db, monkeypatch):
+    """
+    上一条的反向对照。窗口配成 720 小时,三笔都在 100 小时前 ——
+    必须照样告警。窗口要是被写死成 1 或 24 小时,这里就一条都推不出来。
+    ⚠️ 两条方向缺一不可:只测"窗口外不算"挡不住 since 被写死成 1 小时,
+       只测"窗口内算"挡不住 since 被取消。
+    """
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_WINDOW_HOURS=720)
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09],
+                           ages_min=[60 * 100, 60 * 100 + 1, 60 * 100 + 2])
+    assert p.settings.fomo_transfer_alert_window_hours == 720, "配置没吃到,测试前提不成立"
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1, "窗口配到 720 小时,100 小时前的到账必须还算数"
+    assert "最近 720 小时内" in p.notifier.sent[0], "消息里写的窗口也必须是配置值"
+
+
+# ---- 「名单里有没有人真金白银买过」的回看窗口 --------------------------------
+def _seed_old_buy(uid, handle, *, days_ago, ca=_CA_FIH, usd=3000.0):
+    """给某人补一笔 days_ago 天前的真买入(走买入侧的严格谓词:ready + 可计数 reason)"""
+    from tests.conftest import make_event
+
+    _add_ready(uid, handle)
+    ts = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    ev = make_event(event_type=EVENT_BUY, event_id=f"BUY:{uid}-old",
+                    user_id=uid, handle=handle, network_id="solana",
+                    token_address=ca, token_symbol="fih", event_ts=ts,
+                    amount_usd=usd, market_cap=368_000.0)
+    ev.badge_reason = "local_stats"
+    with store.get_conn() as c:
+        store.insert_event(c, ev)
+        c.execute("UPDATE fomo_events SET user_handle = ? WHERE event_id = ?",
+                  (handle, ev.event_id))
+
+
+def test_一个月前买过的人也必须算进真金白银买过(db):
+    """
+    ⚠️⚠️ 这条守的是 _TRANSFER_BUYER_LOOKBACK_DAYS,而它此前**没有任何测试**:
+       把 3650 天改成 0 全套测试照样绿。
+
+    后果不是"少一行",是**印反话**:回看窗口塌成 0 天 → token_buyers 返回 []
+    → 而 [] 与 None 语义不同,[] 会渲染成「名单里还没有人真金白银买过这个币」。
+    $fih 的真实情况恰恰相反 —— CryptoTalkMan 在 $36.8 万市值上买了两笔。
+    在一条"有人在分发筹码"的告警里印出"没人买过",与刚在 /ca 修掉的假事实同级。
+
+    ⚠️ 这个问题问的是"名单认不认识这个币",不是"最近有没有人买" ——
+       一个月前有人重仓过、现在有人在给别人发筹码,恰恰是最该看见的对照。
+    """
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    _seed_old_buy("uBuyer", "CryptoTalkMan", days_ago=30)
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1
+    msg = p.notifier.sent[0]
+    assert "CryptoTalkMan" in msg and "真金白银" in msg, \
+        f"一个月前的真买入被回看窗口挡掉了:{msg}"
+    assert "还没有人" not in msg, \
+        "把『有人买过』印成『还没有人买过』—— 这是印反话,不是少一行"
+
+
+def test_确实没人买过时才允许说没人买过(db):
+    """上一条的对照组:没有任何买入记录时,[] 这条信息本身是有价值的,要显示。"""
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert "还没有人" in p.notifier.sent[0]
+
+
+# ---- 发货地址聚类:唯一可证的那条证据 ----------------------------------------
+def test_同一个发货地址发给多人时告警里要点出来(db):
+    """
+    $fih 的真实形态,端到端:5 分多钟内同一个 fromAddress 发给名单里三个人。
+    ⚠️ 这条链路整条都得通 —— fromAddress 要从报文里解析出来、要落库、
+       要能被聚类查出来、最后要出现在消息里。断在任何一环这句话都不会出现。
+    """
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09], ages_min=[5, 3, 0])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    msg = p.notifier.sent[0]
+    assert "同一个发货地址" in msg
+    assert "8FtY7n…cZx72" in msg, f"发货地址没出现在消息里:{msg}"
+    assert "前后 5 分" in msg, "多长时间内发完必须写出来,「几分钟内」和「20 小时里」是两回事"
+
+
+def test_发货地址各不相同时照样告警但不许声称有聚类(db):
+    """
+    ⚠️ 聚类是**加强证据,不是触发条件**。三个地址各不相同时:
+       仍然是"3 个人同时收到同一个币",仍然该告警;
+       但一个字都不能暗示有共同发货方 —— 而"各不相同"本身也是要说出来的信息。
+    """
+    p, _ = _seed_receivers(
+        [901.37, 912.05, 2439.09],
+        from_addrs=["3nQmLpZq7Rt2Vx9Kd8Hs1Wf4Yc6Ub5Ne0Ja7Mg2Pk3S",
+                    "9zTbCwEr4Yu6Io8Pa1Sd3Fg5Hj7Kl9Zx2Cv4Bn6Mq8W",
+                    "5aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890AbCdEf"])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1, "没有聚类不是不告警的理由"
+    msg = p.notifier.sent[0]
+    assert "同一个发货地址" not in msg
+    assert "各不相同" in msg
+
+
+# ---- 推送失败:台账必须退回,而且真的会重试 ----------------------------------
+def test_推送失败时台账退回并在下一轮重试(db):
+    """
+    ⚠️⚠️ record_transfer_in_signal 排在渲染/推送**之前**(两个 tick 撞上时靠主键
+       决出唯一赢家),而它的主键语义是"这个币这辈子只告警一次" ——
+       于是一次 TG 400 就等于**这个币的告警永久丢失**,日志里只留一行 error。
+
+    ⚠️ notifier.send 在 TG 返回 400/403 时是**返回 False** 而不是抛异常,
+       所以光 try/except 是接不住的:返回值必须看。
+    ⚠️ 光把台账退回还不够:_check_transfer_in 只扫"本轮有新转账"的币,
+       而失败之后这个币多半不会马上再来一笔转账 —— 所以第二轮这里**故意不喂新转账**,
+       重试必须靠 poller 自己记着的重试队列。
+    """
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    p.notifier.ok = False                      # TG 拒收(返回 False,不抛异常)
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+        assert len(p.notifier.sent) == 1, "第一轮该尝试发一次"
+        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 0, \
+            "推送没成功,台账不能留着 —— 留着就是这个币永不再告警"
+
+    # 第二轮:TG 恢复,而且**没有任何新转账**。必须靠重试队列把它重新发出去
+    p.notifier.ok = True
+    p._new_transfers = []
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 2, "TG 恢复后必须补发,而不是等下一笔转账"
+    assert "🚨" in p.notifier.sent[1]
+    with store.get_conn() as c:
+        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1
+
+    # 第三轮:已经发成功了,不许再发第三遍
+    p._new_transfers = []
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 2, "补发成功后重试项必须出队,否则会每轮重复推送"
+
+
+def test_推送抛异常时台账同样要退回(db):
+    """返回 False 与抛异常是两条不同的失败路径,两条都会让这个币永久丢告警"""
+
+    class _Boom:
+        sent: list = []
+
+        def send(self, text, **kw):
+            raise RuntimeError("网络断了")
+
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    p.notifier = _Boom()
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+        assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 0
+
+    p.notifier = FakeNotifier()
+    p._new_transfers = []
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1, "异常之后必须还能补发出来"
+
+
+def test_渲染失败时台账同样要退回(db):
+    """
+    渲染阶段抛异常与推送失败同理 —— 台账已经占位了,不退回就是永久丢。
+
+    ⚠️ 打桩/还原**必须自己开一份 MonkeyPatch**,绝不能用 monkeypatch 夹具再 undo():
+       那个夹具是函数级共享的,undo() 会把 db 夹具的 DB_PATH 补丁一起还原,
+       后半段就打到 data/fomo.db(用户正在跑的生产库)上去了 —— 已经踩过一次。
+    """
+    import src.poller as pmod
+
+    def _boom(**kw):
+        raise ValueError("模板炸了")
+
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    mp = pytest.MonkeyPatch()
+    mp.setattr(pmod, "render_transfer_in_signal", _boom)
+    try:
+        with store.get_conn() as c:
+            p._check_transfer_in(c, dry_run=False)
+            assert p.notifier.sent == []
+            assert c.execute(
+                "SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 0
+    finally:
+        mp.undo()
+
+    p._new_transfers = []
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1, "渲染修好之后必须还能补发出来"
+
+
+# ---- 0 是有意义的真实值 -------------------------------------------------------
+def test_到账金额都是0时合计是0而不是不知道(db, monkeypatch):
+    """
+    ⚠️ 铁律:判空一律 is None。`total = sum(...) or None` 在配置允许的 min_usd=0 下
+       (config 里的约束就是 ge=0)会把"三个人各收到 $0.00"这件**确定的事实**
+       吞成 None。0 与"拿不到"在本项目里是两件事。
+
+    ⚠️ 这一句 total 的**唯一去处是台账**(transfer_in_signals.total_usd),
+       消息里那行合计是 formatter 自己按 receivers 重算的 —— 所以断言必须落在
+       台账那一列上。只断言消息的话,这个变异是抓不住的(第一版就这么空转了一次)。
+       台账那一列是事后回溯"这次分发一共发了多少钱"的唯一记录,
+       写成 NULL = 永久丢失,而且看起来像"当时查不到金额"。
+    ⚠️ 顺带守住 _transfer_to_event 里同一条铁律:amount_usd 用 `A or B` 取多来源时,
+       $0.00 会被当成"顶层没给"而落到 None —— 那样这三个人连"收到"都算不上。
+    """
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_MIN_USD=0)
+    p, _ = _seed_receivers([0.0, 0.0, 0.0])
+    assert p.settings.fomo_transfer_alert_min_usd == 0, "配置没吃到,测试前提不成立"
+    assert [e.amount_usd for e in p._new_transfers] == [0.0, 0.0, 0.0], \
+        "$0.00 在解析阶段就被真值判断吞成 None 了"
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+        row = c.execute("SELECT total_usd FROM transfer_in_signals").fetchone()
+    assert len(p.notifier.sent) == 1
+    assert row["total_usd"] == 0.0, \
+        f"台账里的合计被 `or None` 吞成了 {row['total_usd']!r} —— 『确实是 0』变成了『不知道』"
+    assert "合计 $0.00" in p.notifier.sent[0], \
+        f"消息里的合计也不该消失:{p.notifier.sent[0]}"

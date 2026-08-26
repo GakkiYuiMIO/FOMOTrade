@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS fomo_events (
     -- 代币合约创建时间(unix 秒)→ 消息里的「币龄」。落库是为了让补发的消息也能显示它
     -- (formatter 是纯函数、不查库),而且它是恒定值,不像市值那样会过期
     token_created_at INTEGER,
+    -- 转账的对手方钱包地址(转入 = fromAddress,转出 = toAddress)。
+    -- 【转入告警】"同一个发货地址发给了几个人"是这条告警里唯一**可证**的证据:
+    --   报文里没有 userId,「项目方在分发」与「本人从别处充值」在数据上完全一样,
+    --   只有地址聚类能把两者分开一点。买卖事件没有这个字段,恒为 NULL。
+    counterparty_address TEXT,
     sent          INTEGER NOT NULL DEFAULT 0,  -- 0=未发出;每 tick 末尾补发 10 分钟内未发出项
     raw_json      TEXT NOT NULL       -- 原始报文全量留存,便于日后离线回填
 );
@@ -303,7 +308,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(fomo_events)").fetchall()}
     for col, ddl in (("user_handle", "TEXT"), ("market_cap", "REAL"),
-                     ("token_created_at", "INTEGER")):
+                     ("token_created_at", "INTEGER"),
+                     ("counterparty_address", "TEXT")):
         if cols and col not in cols:
             conn.execute(f"ALTER TABLE fomo_events ADD COLUMN {col} {ddl}")  # noqa: S608
             logger.info("迁移:fomo_events 补列 {}", col)
@@ -656,11 +662,11 @@ def insert_event(conn, ev: FomoEvent) -> bool:
         INSERT OR IGNORE INTO fomo_events
             (event_id, event_type, user_id, handle, user_handle, network_id, token_address,
              token_symbol, amount_usd, token_amount, price_usd, market_cap, token_created_at,
-             tx_hash, event_ts, ingested_at, badge, badge_reason, raw_json)
+             tx_hash, event_ts, ingested_at, badge, badge_reason, counterparty_address, raw_json)
         VALUES (:event_id, :event_type, :user_id, :handle, :user_handle, :network_id,
                 :token_address, :token_symbol, :amount_usd, :token_amount, :price_usd,
                 :market_cap, :token_created_at, :tx_hash, :event_ts, :ingested_at,
-                :badge, :badge_reason, :raw_json)
+                :badge, :badge_reason, :counterparty_address, :raw_json)
         """,
         r,
     )
@@ -1496,22 +1502,15 @@ def set_copy_status(conn, network_id: str, token_address: str, status: str,
 #    拿它去触发花钱的操作方向就是错的。这几个函数只服务于一条推送。
 #    这条边界的落点是 should_count(只认 EVENT_BUY)——**别去动它**。
 
-# 单人到账金额下限的兜底默认值。真正的取值来自配置
-# (fomo_transfer_alert_min_usd),这里只是给不传参的调用方一个安全值。
-# ⚠️ 这道门槛不是可有可无的调味料,它是这个功能能不能上线的分水岭。
-#    用 91 人 × 8404 条真实 transfers 离线重放(全员完整覆盖的 11.9 小时窗口):
-#      24h 窗口 · ≥3 人 · 不设金额门槛  → 命中 69 个币 = 138.8 次/天  ← 用户会直接静音
-#      24h 窗口 · ≥3 人 · 每人 ≥$100    → 命中  5 个币 =  10.1 次/天
-#      24h 窗口 · ≥3 人 · 每人 ≥$500    → 命中  3 个币 =   6.0 次/天  ← 取这个
-#      24h 窗口 · ≥3 人 · 每人 ≥$1000   → 命中  2 个币 =   4.0 次/天  ← $fih 丢了
-#    噪音的真面目是空投灰尘(1 小时窗口 42 次命中里 39 次单人到账不足 $100)和
-#    平台级批量发放(美股代币化 NVDAB/SPYB/TSLAB,单个币能有 41 个名单成员收到)。
-#    $500 与 $300 命中数相同($fih 最低那笔 $901.37 仍安然通过),取 $500 更抗噪。
-TRANSFER_MIN_USD = 500.0
+# ⚠️ 金额门槛(min_usd)**没有默认值,必须由调用方传**。
+#    这里曾经放过一个 TRANSFER_MIN_USD = 500.0 的"兜底默认值",而生产路径永远传
+#    settings.fomo_transfer_alert_min_usd —— 于是同一个阈值有两份写法,改了配置
+#    这边不动、看代码的人还以为 500 生效着。唯一真源是 config.fomo_transfer_alert_min_usd,
+#    这条注释是它在本模块留下的全部痕迹(阈值取值的实测依据见 config 里那段说明)。
 
 
 def count_recent_receivers(conn, network_id: str, token_address: str, since_iso: str,
-                           min_usd: float = TRANSFER_MIN_USD) -> int:
+                           min_usd: float) -> int:
     """
     窗口内**收到**这个币的名单成员数(去重到人)。转入告警的分子。
 
@@ -1562,8 +1561,7 @@ def count_recent_receivers(conn, network_id: str, token_address: str, since_iso:
 
 
 def transfer_receivers(conn, network_id: str, token_address: str, since_iso: str,
-                       min_usd: float = TRANSFER_MIN_USD,
-                       limit: int = 12) -> list[sqlite3.Row]:
+                       min_usd: float, limit: int = 12) -> list[sqlite3.Row]:
     """
     窗口内收到这个币的人都是谁、各自收到多少、在什么市值收到的(按时间正序 —— 谁先拿到的排前面)。
 
@@ -1612,6 +1610,85 @@ def transfer_receivers(conn, network_id: str, token_address: str, since_iso: str
     ).fetchall()
 
 
+def transfer_senders(conn, network_id: str, token_address: str, since_iso: str,
+                     min_usd: float) -> dict:
+    """
+    这些币**是从哪些钱包发过来的** —— 转入告警里唯一站得住的那条证据。
+
+    返回 {"known": 查得到发货地址的人数, "distinct": 这些地址去重后几个,
+          "top": {"address", "receivers", "first_ts", "last_ts"} | None}
+    top 只在某个地址发给了 **≥2 个人** 时才有值。
+
+    ⚠️ 为什么需要它:报文里只有 fromAddress / toAddress,**没有 userId**
+       (8404 条真实转账里 userId 键出现 0 次)。所以下面这两件事在数据上一模一样:
+         (a) 项目方/内部人在给一群人分发筹码   ← 用户关心的
+         (b) 这个人把自己在别处买的币充进 FOMO ← 与买入同义,方向相反
+       消息里绝不能替用户断言是哪一种。但"同一个钱包在 5 分钟内发给了三个不同的人"
+       是**可证的事实**,而且它把概率明显推向 (a) —— 这才是该写进消息里的东西。
+    ⚠️ 谓词必须与 count_recent_receivers 逐条一致,再加一条"地址非空":
+       地址缺失的行不能算进 known,否则"各不相同"这句话会建立在没查到的数据上。
+    ⚠️ 聚类是**加强证据,不是触发条件**:地址各不相同照样告警(仍然是 N 个人同时
+       收到同一个币),只是消息里不能声称有共同发货方。判定仍然只看
+       count_recent_receivers,这个函数一行都不参与。
+    """
+    empty = {"known": 0, "distinct": 0, "top": None}
+    if is_quote_token(network_id, token_address):
+        return empty
+    rows = conn.execute(
+        """
+        WITH scoped AS (
+            SELECT e.user_id, e.counterparty_address AS addr, e.event_ts
+            FROM fomo_events e
+            JOIN watch_users w ON w.user_id = e.user_id AND w.active = 1
+            WHERE e.event_type = ?
+              AND e.network_id = ? AND e.token_address = ?
+              AND e.event_ts >= ?
+              AND COALESCE(e.badge_reason, '') <> ?
+              AND e.amount_usd >= ?
+              AND e.counterparty_address IS NOT NULL
+              AND TRIM(e.counterparty_address) <> ''
+        ),
+        -- ⚠️ 先塌到"每个地址 × 每个人最早那一笔":同一个人被同一个地址连发五笔时,
+        --    时间跨度该按**人**算,否则"5 分 23 秒内发给 3 个人"会被自己的补发拉长
+        per_user AS (
+            SELECT addr, user_id, MIN(event_ts) AS ts FROM scoped GROUP BY addr, user_id
+        )
+        SELECT addr, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts
+        FROM per_user GROUP BY addr
+        ORDER BY n DESC, first_ts ASC
+        """,
+        (EVENT_TRANSFER_IN, network_id, token_address, since_iso,
+         REASON_NO_SIDE, float(min_usd)),
+    ).fetchall()
+    if not rows:
+        return empty
+    # known 要**去重到人**:一个人从两个地址各收一笔时,他只是一个人
+    known = len({r["user_id"] for r in conn.execute(
+        """
+        SELECT DISTINCT e.user_id
+        FROM fomo_events e
+        JOIN watch_users w ON w.user_id = e.user_id AND w.active = 1
+        WHERE e.event_type = ?
+          AND e.network_id = ? AND e.token_address = ?
+          AND e.event_ts >= ?
+          AND COALESCE(e.badge_reason, '') <> ?
+          AND e.amount_usd >= ?
+          AND e.counterparty_address IS NOT NULL
+          AND TRIM(e.counterparty_address) <> ''
+        """,
+        (EVENT_TRANSFER_IN, network_id, token_address, since_iso,
+         REASON_NO_SIDE, float(min_usd)),
+    )})
+    top = rows[0]
+    return {
+        "known": known,
+        "distinct": len(rows),
+        "top": ({"address": top["addr"], "receivers": int(top["n"]),
+                 "first_ts": top["first_ts"], "last_ts": top["last_ts"]}
+                if int(top["n"]) >= 2 else None),
+    }
+
+
 def record_transfer_in_signal(conn, *, network_id: str, token_address: str,
                               token_symbol: str | None, receivers: int,
                               total_usd: float | None) -> bool:
@@ -1630,6 +1707,26 @@ def record_transfer_in_signal(conn, *, network_id: str, token_address: str,
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (network_id, token_address, token_symbol, now_iso(), int(receivers), total_usd),
+        )
+    return cur.rowcount == 1
+
+
+def drop_transfer_in_signal(conn, network_id: str, token_address: str) -> bool:
+    """
+    把一行转入告警台账**退回去**。返回 True 表示确实删掉了一行。
+
+    ⚠️ 存在的唯一理由:record_transfer_in_signal 必须排在渲染/推送**之前**
+       (两个 tick 撞上时靠主键决出唯一赢家),可主键 (network_id, token_address)
+       的语义是"这个币这辈子只告警一次" —— 于是一次 TG 400 或网络抖动就等于
+       **这个币的告警永久丢失**,而且日志里只有一行 error。
+       所以推送没成功时要把占位退掉,让下一轮重新走一遍。
+    ⚠️ 退回之后重试靠 poller._transfer_retry 兜着(本轮没有新转账的币不会再被扫到),
+       两者缺一不可:只退台账不重试 = 要等这个币下一笔转账才补发。
+    """
+    with tx(conn):
+        cur = conn.execute(
+            "DELETE FROM transfer_in_signals WHERE network_id = ? AND token_address = ?",
+            (network_id, token_address),
         )
     return cur.rowcount == 1
 

@@ -1622,3 +1622,44 @@ def test_在持路径上尘埃已实现不印成假的打平(monkeypatch, tmp_pa
         "@dustloss · $200.00 · 未实现 +$25.00 (+14.0%) · 已实现 亏不足 $0.01 (-0.5%)"
     assert "+$0.00" not in out, "尘埃被印成 +$0.00 就是凭空断言「卖过、刚好打平」"
     assert "-$0.00" not in out, "带负号的零是纯粹的浮点垃圾"
+
+
+# ============================================================
+# /status 的「今日事件」口径
+# ============================================================
+def test_status的今日事件不把转账算进去(monkeypatch, tmp_path):
+    """
+    ⚠️ 与网页版看板同一口径(web.queries.dashboard)。这个数字回答的是
+       "名单今天动了多少次",而转账是 2026-08 才加的采集,实测非稳定币转入
+       13.1 条/人/天 —— 算进来会让它虚增约 10 倍。
+       同一个数字悄悄换了含义,比数字算错了更难被发现。
+    """
+    from src.models import (
+        EVENT_TRANSFER_IN,
+        EVENT_TRANSFER_OUT,
+        FomoEvent,
+        dump_raw,
+        now_iso,
+    )
+
+    b, store_ = _bot(monkeypatch, tmp_path, client=None)
+    today = now_iso()
+    with store_.get_conn() as c:
+        store_.add_watch_user(c, "u1", "alice", "alice")
+        store_.mark_stats_ready(c, "u1")
+        ev = FomoEvent(event_id="BUY:1", event_type=EVENT_BUY, user_id="u1",
+                       event_ts=today, raw_json=dump_raw({}), handle="alice",
+                       network_id="solana", token_address=CA_SOL, token_symbol="X",
+                       amount_usd=2500.0)
+        ev.badge_reason = REASON_LOCAL_STATS
+        store_.insert_event(c, ev)
+        for i, kind in enumerate([EVENT_TRANSFER_IN] * 5 + [EVENT_TRANSFER_OUT] * 3):
+            store_.insert_event(c, FomoEvent(
+                event_id=f"{kind}:{i}", event_type=kind, user_id="u1", event_ts=today,
+                raw_json=dump_raw({}), handle="alice", network_id="solana",
+                token_address=CA_SOL, token_symbol="X", amount_usd=900.0))
+        assert c.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 9, \
+            "前提不成立:九条事件没都落库"
+
+    out = b._cmd_status()
+    assert "📨 今日事件 1 条" in out, f"转账把今日事件灌水了:{out}"

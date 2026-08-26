@@ -24,6 +24,7 @@ import html
 import math
 import re
 import time
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, localcontext
 
 from loguru import logger
@@ -757,6 +758,13 @@ _SIG_SYMBOL_CHARS = 16
 # CA 也要收口:normalize_token_address 对非 0x/42 位的输入原样透传、不做长度校验,
 # 而 CA 是"砍无可砍时也要贴上去"的那一行。Solana 44 位 / EVM 42 位,128 绰绰有余。
 _SIG_CA_CHARS = 128
+# 发货地址在消息里的显示形态:头 6 位 + 尾 5 位。⚠️ 截短只是为了好读,
+# 判定用的永远是完整地址(在 store 里比对);而且地址同样是陌生人可控内容,
+# 截短之后仍然要走 _clip(叠平空白 → 限长 → 转义)。
+_SIG_ADDR_HEAD = 6
+_SIG_ADDR_TAIL = 5
+EMOJI_SENDER = "📮"          # 发货地址(转入告警专用)
+EMOJI_CLOCK = "⏱"           # 到账时刻
 
 
 def _clip(s, limit: int) -> str:
@@ -792,6 +800,94 @@ def _fit_signal(lines: list[str], anchor: str) -> str:
     return "\n".join([*kept, anchor])
 
 
+def _short_addr(addr) -> str | None:
+    """钱包地址 → `8FtY7n…cZx72`(已转义)。空/非字符串返回 None,让那一格消失。"""
+    flat = " ".join(str(addr or "").split())
+    if not flat:
+        return None
+    if len(flat) > _SIG_ADDR_HEAD + _SIG_ADDR_TAIL + 1:
+        flat = f"{flat[:_SIG_ADDR_HEAD]}…{flat[-_SIG_ADDR_TAIL:]}"
+    return _esc(flat)
+
+
+def _parse_ts(ts) -> float | None:
+    """ISO 时间串 → unix 秒。解析不出来返回 None(对应那一格整格消失,绝不拿 0 冒充)。"""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def _fmt_span(sec) -> str | None:
+    """
+    一段时长 → 「23 秒」「5 分 23 秒」「2 小时 11 分」「1 天 4 小时」。
+
+    ⚠️ 这一格是这条告警里信息量最大的东西之一:「5 分钟内到齐」和「散在 20 小时里」
+       是完全不同的信号,前者几乎不可能是三个人各自去买了充进来。
+    ⚠️ 负数/NaN 一律 None —— 宁可不显示,也不能出现「-3 分钟内」。
+    """
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(s) or s < 0:
+        return None
+    s = int(s)
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return f"{m} 分 {r} 秒" if r else f"{m} 分"
+    if s < 86400:
+        h, r = divmod(s, 3600)
+        m = r // 60
+        return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+    d, r = divmod(s, 86400)
+    h = r // 3600
+    return f"{d} 天 {h} 小时" if h else f"{d} 天"
+
+
+def _sender_line(senders: dict | None) -> str | None:
+    """
+    发货地址那一行 —— 整条告警里**唯一可证**的证据。
+
+    ⚠️ 为什么必须有这一行:报文里只有 fromAddress/toAddress,**没有 userId**
+       (8404 条真实转账里 userId 键出现 0 次)。所以这两件事在数据上一模一样:
+         (a) 项目方/内部人在给一群人分发筹码
+         (b) 这个人把自己在别处买的币充进 FOMO —— 那其实**就是买入**
+       "他们一分钱没花"这种话是在断言别人的意图,数据证不了。
+       而"同一个钱包 5 分 23 秒内发给了名单里三个人"是地址比对出来的事实,
+       它不能证明 (a),但把天平明显压向 (a),而且经得起追问。
+    ⚠️ 三种情况必须分开说,一句都不能串:
+         有聚类   → 点名几个人、多长时间、哪个地址
+         无聚类   → 只说"地址各不相同",绝不因此就不告警(聚类是加强证据,不是触发条件)
+         查不到   → 整行消失(老库没有这一列、或上游没给地址),绝不说"没有共同发货方"
+    """
+    if not senders or not senders.get("known"):
+        return None
+    top = senders.get("top") or {}
+    n = top.get("receivers") or 0
+    if n >= 2:
+        addr = _short_addr(top.get("address"))
+        if addr is None:
+            return None
+        line = f"{EMOJI_SENDER} 其中 <b>{n} 人</b>的币来自<b>同一个发货地址</b>{SEP}{addr}"
+        first, last = _parse_ts(top.get("first_ts")), _parse_ts(top.get("last_ts"))
+        span = _fmt_span(last - first) if (first is not None and last is not None) else None
+        if span is not None:
+            line += f"{SEP}前后 {span}"
+        return line
+    known = senders["known"]
+    if known >= 2 and senders.get("distinct") == known:
+        return f"{EMOJI_SENDER} 这 {known} 人的发货地址{SEP}<b>各不相同</b>"
+    return None
+
+
 def render_transfer_in_signal(
     *,
     network_id: str | None,
@@ -801,22 +897,34 @@ def render_transfer_in_signal(
     receivers: list[dict],
     window_hours: int,
     buyers: list[str] | None = None,
+    senders: dict | None = None,
+    now: float | None = None,
 ) -> str:
     """
     「同一个币被 N 个名单成员『收到』」的告警。
 
     参数:
         receiver_count  窗口内合格收到者总人数(可能大于 len(receivers),下面会写"还有 N 人")
-        receivers       [{"who": handle, "usd": 到账美元, "mcap": 收到时市值, "hits": 笔数}, …]
+        receivers       [{"who": handle, "usd": 到账美元, "mcap": 收到时市值,
+                          "hits": 笔数, "ts": 最早到账时刻 ISO}, …]
                         缺哪个键就少哪一格(铁律 2:缺失整格消失,绝不打 0 / N/A)
         buyers          名单里**真金白银买过**这个币的人。
                         ⚠️ None 与 [] 语义不同:None = 查不出来(那一行整行消失),
                            [] = 查过了、确实没人买过 —— 后者是有价值的信息,要显示。
+        senders         发货地址聚类,见 store.transfer_senders / 本模块 _sender_line。
+                        None = 查不到地址 → 那一行整行消失。
+        now             渲染时刻(unix 秒),只用来算"多久之前到账"。默认取当前时间。
 
-    ⚠️ 这条消息的第一职责是**让人一眼看出这不是买入**。「收到」= 从外部钱包转进来、
-       没花钱,语义上多半是项目方/内部人在分发筹码,与"他自己看好所以掏钱买"是相反的
-       信号。所以标题里带「没花钱」、正文第二行再显式否定一次 —— 宁可啰嗦,
-       也不能让人扫一眼当成"三个人在抢这个币"。
+    ⚠️ 这条消息的第一职责是**让人一眼看出这不是在 FOMO 上买的**:「收到」= 从外部钱包
+       转进来,与"他自己在 FOMO 上掏钱买"是两回事,不能扫一眼读成"三个人在抢这个币"。
+    ⚠️⚠️ 但**到此为止**,再往前一步就是编。这里曾经写着「他们一分钱没花」——
+       那句话数据证不了:报文里只有 fromAddress/toAddress,**没有 userId**
+       (8404 条真实转账里 userId 键出现 0 次),所以下面两件事完全无法区分:
+         (a) 项目方/内部人在分发筹码        ← 用户关心的
+         (b) 本人把在 Jupiter/OKX 买的币充进 FOMO ← 这恰恰**是**花了钱的买入
+       说"一分钱没花"就是在替别人断言意图,与刚在 /ca 修掉的那类假事实同级。
+       现在只说数据能证明的:不是在 FOMO 上买的、几个人、什么时候到的、
+       是不是同一个发货地址(见 _sender_line —— 那才是真正有力的那条证据)。
     ⚠️ 本函数是纯函数,不查库(铁律 7)。所有事实由 poller 取好传进来。
     """
     sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
@@ -828,7 +936,7 @@ def render_transfer_in_signal(
         title += f"{SEP}<b>${sym}</b>"
     lines = [
         title,
-        f"{EMOJI_TRANSFER_IN} <b>不是买入</b> —— 是从外部钱包转进来的,他们一分钱没花",
+        f"{EMOJI_TRANSFER_IN} <b>不是在 FOMO 上买的</b> —— 币是从外部钱包转进来的",
     ]
 
     # ⚠️ 判空一律 is None(模块铁律):一个人也没报出金额时 total 是 None、那一段消失;
@@ -853,10 +961,22 @@ def render_transfer_in_signal(
         hits = r.get("hits")
         if hits is not None and hits > 1:
             cells.append(f"{EMOJI_TRADE_COUNT} {hits} 笔")
+        # 各自什么时候到的账。⚠️「5 分钟内到齐」和「散落在 20 小时里」是完全不同的信号,
+        #    只报人数等于把这个差别抹平。取不到时间就整格消失,不拿"刚刚"凑数。
+        got_at = _parse_ts(r.get("ts"))
+        ago = None if got_at is None else _fmt_span(
+            (time.time() if now is None else now) - got_at)
+        if ago is not None:
+            cells.append(f"{EMOJI_CLOCK} {ago}前")
         lines.append(SEP.join(cells))
     omitted = receiver_count - len(receivers)
     if omitted > 0:
         lines.append(f"…还有 {omitted} 人未显示")
+
+    # 发货地址聚类 —— 这条告警里唯一可证的硬证据,见 _sender_line 的说明
+    sender_line = _sender_line(senders)
+    if sender_line is not None:
+        lines.append(sender_line)
 
     # 有没有人真金白银买过 —— 有对比才有判断力
     if buyers is not None:

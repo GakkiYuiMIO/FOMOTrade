@@ -1326,18 +1326,24 @@ _CA_FIH2 = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
 _WIN = "2026-08-01T00:00:00+00:00"
 
 
-def _recv(conn, uid, handle, *, usd=1000.0, ca=_CA_FIH2, net="solana",
-          ts=TS_MID, reason="not_buy", active=True, ready=True, mcap=None):
-    """写一条『某人收到了这个币』的库存。reason 默认取 judge_badge 对真·收到转入给出的值"""
+def _ev_of(conn, uid, handle, *, kind, usd=1000.0, ca=_CA_FIH2, net="solana",
+           ts=TS_MID, reason="not_buy", active=True, ready=True, mcap=None,
+           addr=None, tag=""):
+    """
+    写一条『某人对这个币做了 kind』的库存。
+    kind 是 BUY / SELL / TRANSFER_IN / TRANSFER_OUT 之一 —— 这几类必须能同库共存,
+    「收到」的口径才可能被真的检验(见 test_买入卖出转出绝不能被算成收到)。
+    """
     store.add_watch_user(conn, uid, handle, handle)
     if ready:
         store.mark_stats_ready(conn, uid)
     if not active:
         conn.execute("UPDATE watch_users SET active = 0 WHERE user_id = ?", (uid,))
     ev = make_event(
-        event_type=EVENT_TRANSFER_IN, event_id=f"TRANSFER_IN:{uid}-{ca[:6]}-{usd}",
+        event_type=kind, event_id=f"{kind}:{uid}-{ca[:6]}-{usd}{tag}",
         user_id=uid, handle=handle, network_id=net, token_address=ca,
         token_symbol="fih", event_ts=ts, amount_usd=usd, market_cap=mcap,
+        counterparty_address=addr,
     )
     ev.badge_reason = reason
     store.insert_event(conn, ev)
@@ -1346,10 +1352,46 @@ def _recv(conn, uid, handle, *, usd=1000.0, ca=_CA_FIH2, net="solana",
     return ev
 
 
+def _recv(conn, uid, handle, **kw):
+    """写一条『某人收到了这个币』的库存。reason 默认取 judge_badge 对真·收到转入给出的值"""
+    return _ev_of(conn, uid, handle, kind=EVENT_TRANSFER_IN, **kw)
+
+
 def test_收到计数_三个人各收到一笔(conn):
     for i in range(3):
         _recv(conn, f"u{i}", f"Holder{i}")
     assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 3
+
+
+def test_买入卖出转出绝不能被算成收到(conn):
+    """
+    ⚠️⚠️ 这条守的是整个功能的**立身之本**:「收到」与「买入」是相反的含义,
+       分不开的话这条告警就是在把"三个人在抢这个币"和"有人在给三个人发币"混成一句话。
+
+    ⚠️ 在这条测试之前,没有任何一条用例在**同一个币、同一个时间窗**里同时放过
+       TRANSFER_IN 和 BUY/SELL/TRANSFER_OUT —— 于是 `WHERE e.event_type = ?`
+       那一句从来没被真正执行过:把它改成 `WHERE (e.event_type = ? OR 1=1)`
+       整套测试照样全绿。这里把六个人六种事件摆在同一个窗口里,
+       口径一松就会从 3 变成 6。
+
+    ⚠️ 六个人必须是**不同的人**:COUNT(DISTINCT user_id) 会把"同一个人又买又收"
+       吸收掉,那样过滤松了也看不出来。
+    """
+    for i in range(3):
+        _recv(conn, f"r{i}", f"Recv{i}", usd=1000.0 + i)
+    # 同一个币、同一个窗口、金额同样够门槛、badge_reason 也都在允许范围内 ——
+    # 唯一的区别就是 event_type
+    _ev_of(conn, "b1", "Buyer1", kind="BUY", usd=5000.0, reason="local_stats")
+    _ev_of(conn, "s1", "Seller1", kind="SELL", usd=5000.0, reason="not_buy")
+    _ev_of(conn, "o1", "Sender1", kind="TRANSFER_OUT", usd=5000.0, reason="not_buy")
+
+    assert conn.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 6, \
+        "前提不成立:六条事件没有都落进库,这条测试挡不住任何东西"
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 3, \
+        "只有 TRANSFER_IN 算『收到』;买入/卖出/转出混进来就是把相反的含义算成同一件事"
+    rows = store.transfer_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert {r["who"] for r in rows} == {"Recv0", "Recv1", "Recv2"}, \
+        f"明细里混进了非收到者:{[r['who'] for r in rows]}"
 
 
 def test_收到计数不得复用买入侧的可计数过滤(conn):
@@ -1468,6 +1510,102 @@ def test_收到者明细与计数口径完全一致(conn):
     assert rows[1]["mcap"] is None, "拿不到市值就是 NULL,绝不拿别的数去凑"
 
 
+# ---- 发货地址聚类:这条告警里唯一可证的证据 ------------------------------
+_ADDR_A = "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72"   # $fih 真实报文里的发货地址
+_ADDR_B = "3nQmLpZq7Rt2Vx9Kd8Hs1Wf4Yc6Ub5Ne0Ja7Mg2Pk3S"
+_ADDR_C = "9zTbCwEr4Yu6Io8Pa1Sd3Fg5Hj7Kl9Zx2Cv4Bn6Mq8W"
+
+
+def test_同一个发货地址发给多人时要能查出来(conn):
+    """
+    $fih 的真实形态:5 分 23 秒内同一个 fromAddress 发给名单里三个人
+    (00:32:17 / 00:35:11 / 00:37:40)。这是数据能证明的事实,
+    而「他们一分钱没花」不是 —— 报文里根本没有 userId,区分不了
+    "项目方在分发"和"本人把别处买的币充进来"。
+    """
+    _recv(conn, "u0", "unipcs", usd=901.37, addr=_ADDR_A, ts="2026-08-26T00:32:17+00:00")
+    _recv(conn, "u1", "Quanterty", usd=912.05, addr=_ADDR_A, ts="2026-08-26T00:35:11+00:00")
+    _recv(conn, "u2", "PoorGoat_", usd=2439.09, addr=_ADDR_A, ts="2026-08-26T00:37:40+00:00")
+    got = store.transfer_senders(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert got["known"] == 3
+    assert got["distinct"] == 1
+    assert got["top"]["address"] == _ADDR_A
+    assert got["top"]["receivers"] == 3
+    assert got["top"]["first_ts"] == "2026-08-26T00:32:17+00:00"
+    assert got["top"]["last_ts"] == "2026-08-26T00:37:40+00:00"
+
+
+def test_地址各不相同时不许报出聚类(conn):
+    """聚类是加强证据,不是触发条件 —— 但没有聚类时绝不能编一个出来"""
+    _recv(conn, "u0", "Holder0", addr=_ADDR_A)
+    _recv(conn, "u1", "Holder1", addr=_ADDR_B)
+    _recv(conn, "u2", "Holder2", addr=_ADDR_C)
+    got = store.transfer_senders(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert got == {"known": 3, "distinct": 3, "top": None}
+
+
+def test_同一个人被连发多笔不构成聚类也不拉长时间跨度(conn):
+    """
+    ⚠️ 一个人被同一个地址连发五笔,那是**一个人**,不是"发给了五个人";
+       而且时间跨度必须按人算 —— 按笔算的话他自己的补发就能把
+       「5 分 23 秒内发给 3 个人」拉成「4 小时内」,把最有力的那句话稀释掉。
+    """
+    _recv(conn, "u0", "Holder0", addr=_ADDR_A, ts="2026-08-26T00:32:17+00:00", usd=901.0)
+    _recv(conn, "u0", "Holder0", addr=_ADDR_A, ts="2026-08-26T04:00:00+00:00", usd=902.0,
+          tag="-late")
+    _recv(conn, "u1", "Holder1", addr=_ADDR_A, ts="2026-08-26T00:37:40+00:00", usd=903.0)
+    got = store.transfer_senders(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert got["known"] == 2, "两个人就是两个人,连发五笔也还是两个人"
+    assert got["top"]["receivers"] == 2
+    assert got["top"]["last_ts"] == "2026-08-26T00:37:40+00:00", \
+        "时间跨度按『每人最早一笔』算,不能被同一个人的补发拉长"
+
+
+def test_地址聚类的谓词必须与收到计数逐条一致(conn):
+    """
+    金额不够 / 方向不明 / 已移出名单 —— 这三种行在收到计数里被排除,
+    在聚类里也必须被排除。否则消息里会写着"其中 5 人来自同一个地址",
+    而上面只列得出 3 个名字。
+    """
+    _recv(conn, "u0", "Holder0", addr=_ADDR_A)
+    _recv(conn, "u1", "Holder1", addr=_ADDR_A)
+    _recv(conn, "u2", "Dust", addr=_ADDR_A, usd=1.0)                  # 灰尘
+    _recv(conn, "u3", "Unknown", addr=_ADDR_A, reason="no_side")      # 方向不明
+    _recv(conn, "u4", "Gone", addr=_ADDR_A, active=False)             # 已移出名单
+    got = store.transfer_senders(conn, "solana", _CA_FIH2, _WIN, 500.0)
+    assert got["known"] == 2
+    assert got["top"]["receivers"] == 2
+    assert store.count_recent_receivers(conn, "solana", _CA_FIH2, _WIN, 500.0) == 2
+
+
+def test_没有发货地址的行不算进已知(conn):
+    """
+    ⚠️ 老库(counterparty_address 这一列刚补上)与上游没给地址的记录,地址都是 NULL。
+       把它们算进 known 会让消息说出「这 3 人的发货地址各不相同」——
+       而事实是我们**根本不知道**。把"不知道"说成"知道是否定的",与印反话同级。
+    """
+    _recv(conn, "u0", "Holder0")            # addr 默认 None
+    _recv(conn, "u1", "Holder1")
+    _recv(conn, "u2", "Holder2")
+    assert store.transfer_senders(conn, "solana", _CA_FIH2, _WIN, 500.0) == \
+        {"known": 0, "distinct": 0, "top": None}
+
+
+def test_金额门槛没有默认值必须由调用方传(conn):
+    """
+    ⚠️ store 里曾经有一个 TRANSFER_MIN_USD = 500.0 的"兜底默认值",而生产路径永远传
+       settings.fomo_transfer_alert_min_usd —— 同一个阈值两份写法,改了配置这边不动,
+       读代码的人还以为 500 生效着。唯一真源只能有一个,所以这里的 min_usd 必须是必传的。
+    """
+    import pytest as _pytest
+
+    assert not hasattr(store, "TRANSFER_MIN_USD"), \
+        "阈值的第二份定义又回来了 —— 唯一真源是 config.fomo_transfer_alert_min_usd"
+    for fn in (store.count_recent_receivers, store.transfer_receivers, store.transfer_senders):
+        with _pytest.raises(TypeError):
+            fn(conn, "solana", _CA_FIH2, _WIN)
+
+
 def test_转入告警去重台账与跟单台账互不吃行(conn):
     """
     ⚠️ 两张表的主键都是 (network_id, token_address),复用**一张**的话两类信号会互相吃掉:
@@ -1495,3 +1633,19 @@ def test_同一个币只记一次转入告警(conn):
     assert store.record_transfer_in_signal(conn, **kw) is True
     assert store.record_transfer_in_signal(conn, **kw) is False
     assert conn.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1
+
+
+def test_台账能退回去以便重推(conn):
+    """
+    ⚠️ 主键的语义是"这个币这辈子只告警一次",可它是在**推送之前**写的 ——
+       一次 TG 400 就等于这个币的告警永久丢失。所以必须能退回去。
+    """
+    kw = {"network_id": "solana", "token_address": _CA_FIH2, "token_symbol": "fih",
+          "receivers": 3, "total_usd": 4252.5}
+    assert store.record_transfer_in_signal(conn, **kw) is True
+    assert store.drop_transfer_in_signal(conn, "solana", _CA_FIH2) is True
+    assert conn.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 0
+    # 退回之后必须能重新占位,否则"退回"只是把行删了、告警照样发不出
+    assert store.record_transfer_in_signal(conn, **kw) is True
+    # 退一个不存在的行不该报错,也不该谎报成功
+    assert store.drop_transfer_in_signal(conn, "solana", "不存在的CA") is False

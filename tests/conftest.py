@@ -17,6 +17,26 @@ from src.config import get_settings
 from src.models import EVENT_BUY, FomoEvent, dump_raw
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _never_touch_production_db(tmp_path_factory):
+    """
+    整场测试的**兜底防线**:把 store.DB_PATH 从 data/fomo.db 挪开。
+
+    ⚠️⚠️ 为什么需要它:store.DB_PATH 是模块级全局,而 get_conn() 是**读写**打开
+       (它会发 PRAGMA journal_mode = WAL)。任何一条走了 get_conn() 却没用 db 夹具的
+       用例,都会直接连上用户**正在运行**的生产库。
+       这不是假想 —— 2026-08-26 真的发生过一次:一条用例用 monkeypatch.undo()
+       还原自己打的桩,把 db 夹具的 DB_PATH 补丁**一并**还原了(monkeypatch 是
+       函数级共享的),后半段就打在了生产库上。
+       靠"每条用例记得加 db 夹具"守不住,这里在会话级把地板铺死。
+    ⚠️ 只挪路径、不建库:需要真实文件的用例仍然要用 db 夹具(它负责 init_db)。
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(store, "DB_PATH", tmp_path_factory.mktemp("nodb") / "never_used.db")
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _clear_stop_flag():
     """

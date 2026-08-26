@@ -11,6 +11,8 @@ formatter.py 的单测 —— Telegram HTML 消息渲染(设计文档 §10)。
 # 测试函数名刻意用中文:pytest -v 的输出就是一份可读的验收清单。ruff 的 N802 只认 ASCII 小写。
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.models import (
@@ -419,6 +421,11 @@ def test_有币龄就出行没有就整行消失():
 #    从 formatter 里 import 预算再拿它去断言,等于用被测代码给自己打分。
 _TG_HARD_LIMIT = 4096          # Telegram 单条消息硬上限(与 notifier 的实现无关的外部事实)
 _SIG_CA = "547tWxWhym8U7Y7DvhGJktpkcs5eHeywvSYnhwvdpump"
+# $fih 真实案例里三笔到账的发货地址(报文原件里那个)
+_SIG_SENDER = "8FtY7n1ad4LvXqyw8FojCjc7aPLVyTgXXyMJPL2cZx72"
+# 渲染时刻:最后一笔到账(00:37:40)之后整整 1 小时。写死时刻是为了让
+# "多久之前到账"这一格可断言 —— 用 time.time() 的话断言只能写成模糊匹配。
+_NOW_FIH = datetime(2026, 8, 26, 1, 37, 40, tzinfo=UTC).timestamp()
 
 render_transfer_in_signal = formatter.render_transfer_in_signal
 
@@ -429,13 +436,19 @@ def _sig(**kw):
         "token_address": _SIG_CA,
         "token_symbol": "fih",
         "receiver_count": 3,
+        # 时间取真实的 $fih 案例:00:32:17 / 00:35:11 / 00:37:40(前后 5 分 23 秒)
         "receivers": [
-            {"who": "unipcs", "usd": 901.37, "mcap": 198_200.0, "hits": 1},
-            {"who": "Quanterty", "usd": 912.05, "mcap": 201_400.0, "hits": 1},
-            {"who": "PoorGoat_", "usd": 2439.09, "mcap": 203_000.0, "hits": 1},
+            {"who": "unipcs", "usd": 901.37, "mcap": 198_200.0, "hits": 1,
+             "ts": "2026-08-26T00:32:17+00:00"},
+            {"who": "Quanterty", "usd": 912.05, "mcap": 201_400.0, "hits": 1,
+             "ts": "2026-08-26T00:35:11+00:00"},
+            {"who": "PoorGoat_", "usd": 2439.09, "mcap": 203_000.0, "hits": 1,
+             "ts": "2026-08-26T00:37:40+00:00"},
         ],
         "window_hours": 24,
         "buyers": ["CryptoTalkMan"],
+        # 渲染时刻写死,否则"多久之前到账"那一格会随着测试运行的日期漂
+        "now": _NOW_FIH,
     }
     base.update(kw)
     return render_transfer_in_signal(**base)
@@ -460,20 +473,35 @@ def _html_ok(msg: str) -> bool:
     return not stack
 
 
-def test_转入告警一眼就能看出不是买入():
+def test_转入告警一眼就能看出不是在FOMO上买的():
     """
     这条消息的第一职责:让人扫一眼**不会**读成"三个人在抢这个币"。
-    「收到」= 从外部钱包转进来、没花钱,语义上多半是项目方/内部人在分发筹码,
-    与"他自己看好所以掏钱买"是相反的信号 —— 认错就是把相反的含义读成同一件事。
+    「收到」= 从外部钱包转进来,与"他自己在 FOMO 上掏钱买"是两回事。
     """
     msg = _sig()
     head = msg.split("\n")[0]
     assert head.startswith("🚨"), "标题必须有醒目的行首锚点,且与买卖那六个都不重样"
     assert "收到" in head
-    assert "买入" not in head or "不是买入" in msg
-    assert "不是买入" in msg and "没花" in msg, "必须显式否定一次,宁可啰嗦"
+    assert "不是在 FOMO 上买的" in msg, "必须显式否定一次,宁可啰嗦"
     # 行首锚点全局唯一:别撞上买/卖/观点/转账/跟单那几个
     assert head[0] not in "🌱🟢🔴💭📥📤🧪🛒"
+
+
+def test_绝不断言收到者的意图():
+    """
+    ⚠️⚠️ 这条消息曾经写着「他们一分钱没花」。数据证不了这句话:
+       报文里只有 fromAddress/toAddress、**没有 userId**(8404 条真实转账里
+       userId 键出现 0 次),所以下面两件事在数据上一模一样 ——
+         (a) 项目方/内部人在分发筹码
+         (b) 本人把在 Jupiter/OKX 买的币充进 FOMO ← 这**恰恰是**花了钱的买入
+       说"没花钱"就是在替别人断言意图,与刚在 /ca 修掉的假事实同级。
+
+    ⚠️ 断言的是"这些说法**不出现**",不是"文案长什么样" —— 换个措辞不该让它变红,
+       但只要有人把任何一句意图断言塞回来就必须红。
+    """
+    msg = _sig()
+    for claim in ("没花", "一分钱", "免费", "白拿", "空投", "项目方", "内部人"):
+        assert claim not in msg, f"消息里出现了数据证明不了的断言:{claim}"
 
 
 def test_转入告警包含用户要的四项事实():
@@ -485,6 +513,70 @@ def test_转入告警包含用户要的四项事实():
     assert "$198.20K" in msg, "收到时的市值"
     assert "CryptoTalkMan" in msg and "真金白银" in msg
     assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "CA 必须独占最后一行、纯 code"
+
+
+def test_同一个发货地址发给多人时必须明确点出来():
+    """
+    ⚠️ 这是整条告警里**唯一可证**的证据,比"他们一分钱没花"有力得多:
+       $fih 真实案例 —— 5 分 23 秒内,同一个 fromAddress 发给名单里三个人。
+       三个人各自去别处买了同一个币、又在 5 分钟内先后充进 FOMO,可能;
+       但同一个钱包在 5 分钟内给这三个人发货,是另一回事。
+    ⚠️ 三项都要出现:几个人 / 同一个地址(截短显示)/ 多长时间窗内。
+       少任何一项这句话都会退化成模糊印象。
+    """
+    msg = _sig(senders={
+        "known": 3, "distinct": 1,
+        "top": {"address": _SIG_SENDER, "receivers": 3,
+                "first_ts": "2026-08-26T00:32:17+00:00",
+                "last_ts": "2026-08-26T00:37:40+00:00"},
+    })
+    assert "同一个发货地址" in msg
+    assert "3 人" in msg
+    assert "8FtY7n…cZx72" in msg, "地址要截短显示(头 6 尾 5)"
+    assert _SIG_SENDER not in msg, "整串 44 位地址塞进消息只会挤掉真正要看的行"
+    assert "5 分 23 秒" in msg, "时间窗必须精确到可核对,「几分钟内」不算"
+
+
+def test_发货地址各不相同时不许声称有聚类():
+    """
+    ⚠️ 聚类是**加强证据,不是触发条件**:地址各不相同照样是"N 个人同时收到同一个币",
+       照样该告警 —— 但文案里一个字都不能暗示有共同发货方。
+       而"三个人来自三个不同地址"本身也是有价值的信息(它把天平推向另一边),要说出来。
+    """
+    msg = _sig(senders={"known": 3, "distinct": 3, "top": None})
+    assert "同一个发货地址" not in msg
+    assert "各不相同" in msg
+    assert "3 人「收到」同一个币" in msg, "没聚类不代表不告警"
+
+
+def test_查不到发货地址时那一行整行消失():
+    """
+    ⚠️ 铁律 2:查不出来就整行消失,绝不打 N/A。
+       尤其不能因为"没查到聚类"就写成「各不相同」—— 那是把"不知道"说成"知道是否定的",
+       和印反话同级(老库没有 counterparty_address 这一列时正是这个场景)。
+    """
+    for blind in (None, {"known": 0, "distinct": 0, "top": None}):
+        msg = _sig(senders=blind)
+        assert "发货地址" not in msg
+        assert "各不相同" not in msg
+        assert "N/A" not in msg
+
+
+def test_各自到账的时间必须出现():
+    """
+    ⚠️「5 分钟内到齐」和「散落在 20 小时里」是完全不同的信号,只报人数等于把这个差别抹平。
+       这里三笔分别在渲染时刻之前 65 分 23 秒 / 62 分 29 秒 / 60 分 0 秒到账。
+    """
+    msg = _sig()
+    assert "1 小时 5 分前" in msg, "unipcs 那笔:00:32:17,距渲染时刻 1 小时 5 分"
+    assert "1 小时 0 分前" in msg or "1 小时前" in msg, "PoorGoat_ 那笔:整整 1 小时"
+
+
+def test_到账时间取不到就整格消失而不是写刚刚():
+    msg = _sig(receivers=[{"who": "unipcs", "usd": 901.37},
+                          {"who": "Quanterty", "usd": 912.05, "ts": "看不懂的时间"}])
+    assert "前" not in msg.split("\n")[3], f"实际渲染:{msg.split(chr(10))[3]}"
+    assert "刚刚" not in msg and "N/A" not in msg
 
 
 def test_没人真金白银买过与查不出来必须分开():
