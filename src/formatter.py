@@ -792,7 +792,7 @@ def _clip(s, limit: int) -> str:
     return _esc(flat)
 
 
-def _fit_signal(lines: list[str], anchor: str) -> str:
+def _fit_signal(lines: list[str], anchor: str | None) -> str:
     """
     整条信号消息的出口:按**整行边界**砍到预算内,锚点最后贴。
 
@@ -803,11 +803,14 @@ def _fit_signal(lines: list[str], anchor: str) -> str:
     ⚠️ 只按整行砍,绝不切进行内 —— 切在实体中间就是残缺实体、整条 400。
     ⚠️ 锚点最后贴,且它自己已经过 _clip 收口(≤ _SIG_CA_CHARS 转义后)——
        所以"砍到一行不剩 + 贴上锚点"这个最坏情况仍然在预算内。
+    ⚠️ anchor 允许为 None:上游拿不到 CA 时(币安 Alpha 名单理论上可能缺 contractAddress),
+       宁可少这一行也不能贴一个空的 <code></code> —— 那是个点了复制不出东西的假区域。
     """
     kept = [ln for ln in lines if ln]
-    while kept and len("\n".join([*kept, anchor])) > TRANSFER_MSG_BUDGET:
+    tail = [anchor] if anchor else []
+    while kept and len("\n".join([*kept, *tail])) > TRANSFER_MSG_BUDGET:
         kept.pop()
-    return "\n".join([*kept, anchor])
+    return "\n".join([*kept, *tail])
 
 
 def _sig_size(lines: list[str]) -> int:
@@ -1067,3 +1070,156 @@ def render_transfer_in_signal(
         lines.append(f"…还有 {omitted} 人未显示")
     lines.extend(tail_lines)
     return _fit_signal(lines, anchor)
+
+
+# ============================================================
+# 币安 Alpha 新上架
+# ============================================================
+# 行首锚点。⚠️ 全局唯一(铁律 1):与买卖那六个、跟单的 🧪/🛒、分发预警的 🚨 都不重样。
+#    这条消息说的是"币安上了个新币",与"名单里谁买了"没有任何关系 ——
+#    在聊天列表预览里必须一眼分得开,认错锚点就是把两类完全不同的事读成一件。
+EMOJI_ALPHA = "🆕"
+EMOJI_SECTOR = "🏷"          # 板块标注(Alpha 专用)
+LABEL_ALPHA = "币安 Alpha 新上架"
+# 板块名来自 .env(自己人写的),但仍然限长 —— 配置写错不该把消息顶破预算
+_ALPHA_SECTOR_CHARS = 24
+# name / symbol 来自链上,是**陌生人可控的任意字符串**:必须限长 + 转义,且只转一次
+_ALPHA_NAME_CHARS = 32
+# 汇总消息里最多列几个符号
+_ALPHA_BATCH_SYMBOLS = 30
+
+
+def _fmt_count(v) -> str | None:
+    """
+    人数/个数 → "48,872"。取不到返回 None(整行消失,铁律 2)。
+
+    ⚠️ 0 是有意义的真实值(刚上架确实可能一个持有人都没有),照常显示 ——
+       判空一律 is None,绝不用真值判断。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    try:
+        n = int(d)
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+    if n < 0:
+        return None                              # 负数持有人一眼是脏数据,宁可不显示
+    return f"{n:,}"
+
+
+def _alpha_listing_line(listing_time_ms, now: float | None = None) -> str | None:
+    """
+    🕐 上架 2026-08-26 10:00 UTC · 3H前
+
+    ⚠️ 绝对时刻必须有 —— "3H前"在一条隔夜才看到的消息里是错的,而绝对时刻永远对。
+    ⚠️ 名单里会出现**还没到上架时刻**的币(实测 DEBIT 在 10:00 前就已经在名单里),
+       这时 fmt_token_age 返回 None(它拒绝渲染负数币龄),改说「即将上架」——
+       那是这条消息此刻最重要的一句话,不能因为算不出"多久之前"就整格消失。
+    """
+    ms = listing_time_ms
+    if ms is None or isinstance(ms, bool):
+        return None
+    try:
+        secs = float(ms) / 1000.0
+        stamp = datetime.fromtimestamp(secs, UTC).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    line = f"{EMOJI_TOKEN_AGE} 上架 {stamp}"
+    ref = time.time() if now is None else now
+    if secs > ref:
+        return f"{line}{SEP}即将上架"
+    age = fmt_token_age(secs, now)
+    return f"{line}{SEP}{age}前" if age else line
+
+
+def render_alpha_listing(
+    *,
+    symbol: str | None,
+    listing_time_ms,
+    name: str | None = None,
+    network_id: str | None = None,
+    chain_name: str | None = None,
+    contract_address: str | None = None,
+    market_cap=None,
+    holders=None,
+    sector: str | None = None,
+    now: float | None = None,
+) -> str:
+    """
+    「币安 Alpha 上了个新币」的推送。
+
+    参数:
+        symbol / name    链上文本,**陌生人可控** —— 一律走 _clip(叠平空白→限长→转义)
+        network_id       已归一化的链标识(models.normalize_network 的输出),用来查展示名与链接
+        chain_name       币安给的原始链名,只在 network_id 查不到展示名时兜底
+        sector           板块标注,None = 没命中或板块拉取失败 → **那一行整行消失**,
+                         绝不打 "N/A" / "未知板块"(铁律 2)
+        now              渲染时刻(unix 秒),只用来算"多久之前上架"
+
+    ⚠️ 板块是币安运营编排的、随时可能改名下线的东西:它只是这条消息里的一行标注,
+       没有它这条消息照样成立。主干(名单新增)与标注(板块)的地位不对等,不要写成
+       "拿不到板块就不推"。
+    ⚠️ 本函数是纯函数,不查库、不发请求(铁律 7)。
+    """
+    sym = _clip((symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    title = f"{EMOJI_ALPHA} <b>{LABEL_ALPHA}</b>"
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+    # 全名与符号相同时不重复("牛来 · 牛来"只是噪音)。比对用**转义前**的原文
+    raw_name = " ".join(str(name or "").split())
+    raw_sym = " ".join(str(symbol or "").lstrip("$").split())
+    if raw_name and raw_name.casefold() != raw_sym.casefold():
+        title += f"{SEP}{_clip(raw_name, _ALPHA_NAME_CHARS)}"
+
+    lines = [title]
+    if sector is not None:
+        lines.append(f"{EMOJI_SECTOR} 板块{SEP}<b>{_clip(sector, _ALPHA_SECTOR_CHARS)}</b>")
+
+    mc = _fmt_usd_compact(market_cap)
+    if mc is not None:
+        lines.append(f"{EMOJI_MARKET_CAP} 市值 {mc}")
+    hold = _fmt_count(holders)
+    if hold is not None:
+        lines.append(f"{EMOJI_CONSENSUS} 持有人 {hold}")
+    ts_line = _alpha_listing_line(listing_time_ms, now)
+    if ts_line is not None:
+        lines.append(ts_line)
+
+    net = (network_id or "").strip()
+    # 链展示名:先查内部映射表,查不到才用币安给的原始链名(那是 API 文本,必须转义)
+    chain_disp = NETWORK_DISPLAY.get(net) or " ".join(str(chain_name or "").split()) or None
+    if chain_disp:
+        lines.append(f"{EMOJI_NETWORK} {_esc(chain_disp)}")
+    link = _links_line(_fake_ev(net, contract_address or ""))
+    if link:
+        lines.append(link)
+
+    ca = " ".join(str(contract_address or "").split())
+    # CA 独占最后一行、纯 <code>(铁律 6)。拿不到就没有这一行 —— 空的 <code></code>
+    # 是个点了复制不出东西的假区域,比没有更糟
+    anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
+    return _fit_signal(lines, anchor)
+
+
+def render_alpha_batch(items: list[tuple[str | None, int]]) -> str:
+    """
+    一轮新增太多时的汇总消息(见 binance_alpha.MAX_PUSH_PER_ROUND)。
+
+    ⚠️ 这条消息存在的唯一理由是**别把 Telegram 打爆**:上游若把一批老币的
+       listingTime 重写成今天,逐条推就是几百条,用户当场静音,这个功能就死了。
+       所以它必须自己说清楚"这不正常",而不是假装一切正常地报一个大数字。
+    ⚠️ items 里的符号同样是陌生人可控文本,一律 _clip。
+    """
+    n = len(items)
+    lines = [
+        f"{EMOJI_ALPHA} <b>{LABEL_ALPHA}</b>{SEP}<b>一次新增 {n} 个</b>",
+        f"{EMOJI_WARN} 数量异常(多半是上游重写了上架时间),已跳过逐条推送",
+    ]
+    syms = [f"${_clip((s or '').lstrip('$'), _SIG_SYMBOL_CHARS)}"
+            for s, _ in items[:_ALPHA_BATCH_SYMBOLS] if s]
+    if syms:
+        lines.append(SEP.join(syms))
+    if n > _ALPHA_BATCH_SYMBOLS:
+        lines.append(f"…还有 {n - _ALPHA_BATCH_SYMBOLS} 个未列出")
+    return _fit_signal(lines, None)

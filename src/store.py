@@ -198,6 +198,34 @@ CREATE TABLE IF NOT EXISTS transfer_in_signals (
 );
 CREATE INDEX IF NOT EXISTS idx_transfer_in_time ON transfer_in_signals(triggered_at);
 
+-- ============ 【币安 Alpha】已推送台账 ============
+-- 记住哪些 Alpha 代币已经推过。
+--
+-- ⚠️⚠️ 存在的理由是**单靠水位线会永久静默漏推**:实测一次真实响应,665 条名单里
+--    32 组代币共享同一个 listingTime,覆盖 100 个币(15%),最大一组 10 个。
+--    「进名单的时刻」与「listingTime」是脱钩的两件事 —— 名单里存在尚未到上架时刻的币
+--    (formatter 那个「即将上架」分支就是为它写的)就是证据。于是同一毫秒的几个币
+--    完全可能分两轮进名单:水位线被第一批顶到 T 之后,第二批不满足 `> T`,
+--    **一条日志都不留地永久丢失**。
+--    改用 `>=` 只是把静默漏推换成必然的重复推送(listingTime 等于水位线的那个币每轮重推),
+--    两害都不取:候选放宽到「水位线 - 宽限窗口」,重复的由这张表的主键挡住。
+--
+-- ⚠️ 主键与 copytrade_signals / transfer_in_signals 同一口径 (network_id, token_address),
+--    但**另起一张表** —— 共用主键会让几类信号互相吃掉彼此的行(见那两张表的注释)。
+-- ⚠️ listing_time_ms 必须存:清理任务靠它判「已经掉出宽限窗口、永远不会再成为候选」。
+-- ⚠️⚠️ 这张表与跟单执行器**没有任何关系**,永远不要让它参与下单判定:
+--    「币安上了个新币」与「名单里的人掏钱买了」是完全不同的含义。
+CREATE TABLE IF NOT EXISTS binance_alpha_pushed (
+    network_id      TEXT NOT NULL,
+    token_address   TEXT NOT NULL,
+    token_symbol    TEXT,
+    listing_time_ms INTEGER NOT NULL,   -- 币安给的上架时刻,候选窗口与清理都按它判
+    pushed_at       TEXT NOT NULL,      -- UTC ISO
+    PRIMARY KEY (network_id, token_address)
+);
+-- 专给清理任务用:prune 按 listing_time_ms 单列判过期,用不上以 network_id 打头的主键索引
+CREATE INDEX IF NOT EXISTS idx_alpha_pushed_listing ON binance_alpha_pushed(listing_time_ms);
+
 -- ============ 【买入榜】代币行情快照 ============
 -- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
 -- 存在的理由:/hot 要算"买入时市值 → 现在市值"的倍数,
@@ -1747,6 +1775,62 @@ def drop_transfer_in_signal(conn, network_id: str, token_address: str) -> bool:
             (network_id, token_address),
         )
     return cur.rowcount == 1
+
+
+# ============================================================
+# 【币安 Alpha】已推送台账
+# ============================================================
+# ⚠️ 这三个函数**都不自己开事务**,与 set_state 同一约定 ——
+#    调用方要把「记台账 + 前移水位线 + 清理」放进同一个 tx 里,
+#    拆成三个事务的话中途崩一次就会留下自相矛盾的状态(水位线前移了但台账没记 →
+#    那一批币掉进宽限窗口里被重推;台账记了但水位线没动 → 下一轮白算一遍)。
+def alpha_pushed_since(conn, after_ms: int) -> set[tuple[str, str]]:
+    """
+    台账里 listing_time_ms 严格大于阈值的那些键。
+
+    ⚠️ 刻意按时间捞整段、而不是拿候选键逐个 IN 查:候选键在异常轮次可能有几百个
+       (上游重写 listingTime 那种),拼一条几百个占位符的 SQL 只会更慢更脆;
+       而这张表被清理策略钉死在宽限窗口内,整段捞出来也就几十行。
+    """
+    rows = conn.execute(
+        "SELECT network_id, token_address FROM binance_alpha_pushed WHERE listing_time_ms > ?",
+        (int(after_ms),),
+    ).fetchall()
+    return {(r["network_id"], r["token_address"]) for r in rows}
+
+
+def record_alpha_pushed(conn, rows) -> None:
+    """
+    记若干行「这个币已经处理过」。rows: (network_id, token_address, symbol, listing_time_ms)。
+
+    ⚠️ INSERT OR IGNORE:重复键不是错误 —— 冷启动播种与后续推送本来就会撞上同一个币。
+    """
+    payload = [(net, ca, sym, int(ms), now_iso()) for net, ca, sym, ms in rows]
+    if not payload:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO binance_alpha_pushed
+            (network_id, token_address, token_symbol, listing_time_ms, pushed_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
+
+
+def prune_alpha_pushed(conn, upto_ms: int) -> int:
+    """
+    删掉 listing_time_ms **小于等于** 阈值的行,返回删除行数。
+
+    ⚠️ 阈值传的是候选窗口下界(水位线 - 宽限窗口):等于下界的那个币已经不满足
+       「严格大于下界」,永远不会再成为候选,留着它只是让表无限长大。
+    ⚠️ 不分批:这张表稳态只有几十行(每天上新个位数 × 宽限窗口),
+       与 token_price_history 那种百万行量级不是一回事,分批反而是过度设计。
+    """
+    cur = conn.execute(
+        "DELETE FROM binance_alpha_pushed WHERE listing_time_ms <= ?", (int(upto_ms),)
+    )
+    return cur.rowcount
 
 
 def list_buyers(conn, network_id: str, token_address: str) -> list[sqlite3.Row]:

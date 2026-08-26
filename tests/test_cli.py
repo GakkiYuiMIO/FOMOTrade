@@ -1,5 +1,7 @@
 """
-⚠️ 这个文件目前只钉一件事:main() 里 --web 必须跳过 store.init_db()。
+⚠️ 这个文件钉两件事:
+  1) main() 里 --web 必须跳过 store.init_db();
+  2) cmd_run 必须把币安 Alpha 巡检真的注册成调度器里的第二个 job。
 
 那是个读写连接(见 src/web/db.py 顶部注释),网页版整个安全设计的前提是
 "这个进程物理上写不进库" —— 如果 main() 在分发到 cmd_web() 之前就无条件建了库,
@@ -43,3 +45,86 @@ def test_其他命令仍会建库(monkeypatch):
     assert rc == 0
     init_db_mock.assert_called_once()
     cmd_dry_run_mock.assert_called_once()
+
+
+# ============================================================
+# cmd_run 有没有真的把 job 接进调度器
+# ============================================================
+# ⚠️⚠️ 仓库原先**没有任何测试**碰过 cmd_run。把 cmd_run 里的
+#    `if s.fomo_alpha_enabled:` 改成 `if False:`(= 整个币安 Alpha 功能压根不接进
+#    APScheduler)时,全部测试照样绿 —— 而用户端的表现是「一条推送都收不到」,
+#    日志里没有任何报错。所以这两条必须存在。
+class _FakeScheduler:
+    """记下注册了哪些 job。start() 立刻返回,让 cmd_run 走完 finally 那段清理。"""
+
+    def __init__(self, **kw) -> None:
+        self.jobs: list[dict] = []
+        self.running = False
+
+    def add_job(self, func, trigger, **kw) -> None:
+        self.jobs.append({"func": func, "trigger": trigger, **kw})
+
+    def start(self) -> None:
+        return None
+
+    def shutdown(self, wait: bool = True) -> None:
+        self.running = False
+
+
+def _stub_run(monkeypatch, settings):
+    """
+    把 cmd_run 的外部依赖全部换掉:不建 client、不连 TG、不开真调度器、不碰库。
+
+    ⚠️ build_client / CommandBot / Poller / BlockingScheduler / AlphaWatcher 都是在
+       cmd_run **函数体内**才 import 的,所以要打到各自的源模块上,而不是 cli 的命名空间。
+    """
+    sched = _FakeScheduler()
+    alpha_cls = Mock()
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "TelegramNotifier", Mock())
+    monkeypatch.setattr(cli, "request_stop", Mock())
+    monkeypatch.setattr(cli, "_reconcile_copytrade", Mock())
+    monkeypatch.setattr("apscheduler.schedulers.blocking.BlockingScheduler",
+                        lambda **kw: sched)
+    monkeypatch.setattr("src.client.build_client", Mock())
+    monkeypatch.setattr("src.poller.Poller", Mock())
+    monkeypatch.setattr("src.bot.CommandBot", Mock())
+    monkeypatch.setattr("src.binance_alpha.AlphaWatcher", alpha_cls)
+    return sched, alpha_cls
+
+
+def test_cmd_run把币安Alpha注册成独立的第二个job(monkeypatch):
+    """
+    开关打开时,巡检必须真的成为调度器里的一个 job。
+
+    ⚠️ 同时钉住「它是**第二个独立** job」而不是被塞进 fomo_tick:
+       tick 里抛 AuthError 会 sched.shutdown(),币安接口抖一下绝不该有权力
+       停掉整条 FOMO 推送链路。
+    """
+    from src.config import FomoSettings
+
+    s = FomoSettings(fomo_alpha_enabled=True, fomo_alpha_interval_sec=300)
+    sched, alpha_cls = _stub_run(monkeypatch, s)
+
+    assert cli.cmd_run() == 0
+
+    ids = [j["id"] for j in sched.jobs]
+    assert "fomo_tick" in ids, "对照:主轮询本来就该在"
+    assert "binance_alpha" in ids, "开关打开却没注册 = 用户一条推送都收不到,且日志无异常"
+    job = next(j for j in sched.jobs if j["id"] == "binance_alpha")
+    assert job["func"] is alpha_cls.return_value.run_once, \
+        "注册进去的必须是 AlphaWatcher.run_once —— 它是唯一契约上不抛异常的入口"
+    assert job["trigger"] == "interval"
+    assert job["seconds"] == 300
+    assert job["max_instances"] == 1, "两轮叠在一起会重复推送"
+
+
+def test_关掉开关就不注册币安Alpha的job(monkeypatch):
+    """对照组:证明上面那条钉的是开关真的生效,而不是无条件注册。"""
+    from src.config import FomoSettings
+
+    s = FomoSettings(fomo_alpha_enabled=False)
+    sched, _ = _stub_run(monkeypatch, s)
+
+    assert cli.cmd_run() == 0
+    assert [j["id"] for j in sched.jobs] == ["fomo_tick"]

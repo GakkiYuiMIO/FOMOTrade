@@ -122,6 +122,27 @@ class FomoSettings(BaseSettings):
         500.0, ge=0, description="单人到账金额下限(美元),低于此不计入『收到』人数"
     )
 
+    # ---------- 币安 Alpha 新上架推送 ----------
+    # ⚠️⚠️ 与转入告警同一条理由:**刻意不放进 CopyConfig**。
+    #    「币安上了个新币」和「名单里的人掏钱买了」是完全不同的含义,
+    #    放进那个对象里迟早会有人顺手把它接进执行器 —— 这个信号永远只推通知。
+    fomo_alpha_enabled: bool = Field(True, description="币安 Alpha 新上架推送总开关")
+    # 5 分钟。⚠️ 不能跟 FOMO 轮询用同一个节奏:Alpha 上新实测约 3~4 天一个
+    #    (近 7 天 2 个、近 30 天 8 个),27 秒一次纯粹是白打币安接口、白挨风控。
+    #    下限 60s 是防手滑写个 5 进去。
+    fomo_alpha_interval_sec: int = Field(
+        300, ge=60, description="币安 Alpha 巡检间隔(秒),上新是天级事件,不需要快"
+    )
+    # 要标注哪些板块,格式 `rankType:tabId:显示名`,多个用逗号分隔。
+    # 默认 60:61 = App 钱包页「市場焦點」里的「股票 Meme 幣」(实测 21 个成员)。
+    # ⚠️ 板块目录是币安运营编排的,没有任何文档,随时可能改名或下线 ——
+    #    所以它只是推送里的一行标注,拿不到就整行消失,绝不影响主干。
+    # ⚠️ 显示名里不能带逗号(那是条目分隔符);冒号可以,只切前两个。
+    fomo_alpha_sectors: str = Field(
+        "60:61:股票 Meme 幣",
+        description="板块标注配置,格式 rankType:tabId:显示名,逗号分隔;留空则不标注",
+    )
+
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")
 
@@ -154,6 +175,30 @@ class FomoSettings(BaseSettings):
     def admin_chat_id(self) -> str | None:
         """命令白名单 chat_id,未单独配置时等于推送目标"""
         return self.fomo_telegram_admin_chat_id or self.fomo_telegram_chat_id
+
+    @property
+    def alpha_sectors(self) -> list[tuple[int, int, str]]:
+        """
+        `FOMO_ALPHA_SECTORS` → [(rankType, tabId, 显示名), …]。
+
+        ⚠️ 写坏的条目**跳过、不抛** —— 板块标注是锦上添花,一个手滑的配置
+           绝不该让整个进程起不来(更不该让主干的上新推送跟着死)。
+           跳过的条目在启动日志里看不见,但它本来也只是少一行标注。
+        ⚠️ 显示名允许带冒号(只切前两个),但不能带逗号 —— 逗号是条目分隔符。
+        """
+        out: list[tuple[int, int, str]] = []
+        for chunk in (self.fomo_alpha_sectors or "").split(","):
+            parts = chunk.strip().split(":", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                rank_type, tab_id = int(parts[0].strip()), int(parts[1].strip())
+            except ValueError:
+                continue
+            label = parts[2].strip()
+            if label:
+                out.append((rank_type, tab_id, label))
+        return out
 
     @property
     def proxies(self) -> dict | None:
