@@ -2305,3 +2305,43 @@ def test_转入告警绝不接跟单执行器(db):
         assert c.execute("SELECT COUNT(*) n FROM user_token_stats").fetchone()["n"] == 0
         assert c.execute("SELECT COUNT(*) n FROM transfer_in_signals").fetchone()["n"] == 1
         assert store.load_copy_config(c).enabled is False
+
+
+def test_整条tick真的把转账采进来并在够人数时告警(db):
+    """
+    整条链路的集成证明:tick() → _fetch_snapshots(降频命中那一轮才拉)→ 归一化 →
+    游标过滤 → 落库 → 转入告警。
+
+    ⚠️ 这条测试存在的理由:normalize_transfers / _transfer_to_event 在此之前是
+       **零调用者的孤儿代码** —— 它们各自的单测全绿,而线上一条转账都采不到。
+       只测归一化函数是测不出"没人调它"的。
+    """
+    from src.poller import _TRANSFERS_TICK_PHASE
+
+    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    snaps = {}
+    for i in range(3):
+        _add_ready(f"u{i}", f"Holder{i}")
+        raw = dict(_REAL_DEPOSIT, id=f"tick-tx-{i}", usdAmount=900.0 + i, createdAt=ts)
+        snaps[f"u{i}"] = UserSnapshot(f"u{i}", swaps=[], transfers=[raw], balances=[])
+    client = FakeClient(snaps)
+    notifier = FakeNotifier()
+    p = Poller(client, notifier)
+
+    # 降频相位之前的每一轮:一个转账请求都不该打,库里也不该有转账
+    for _ in range(_TRANSFERS_TICK_PHASE):
+        p.tick()
+    assert client.transfer_calls == [], "还没到相位就去拉转账 = 白白多打 91 个请求/轮"
+    with store.get_conn() as c:
+        assert c.execute("SELECT COUNT(*) n FROM fomo_events").fetchone()["n"] == 0
+
+    # 命中相位的那一轮:采进来、落库、够 3 人 → 推一条告警
+    p.tick()
+    assert sorted(client.transfer_calls) == ["u0", "u1", "u2"]
+    with store.get_conn() as c:
+        rows = c.execute(
+            "SELECT event_type, sent FROM fomo_events ORDER BY event_ts").fetchall()
+    assert [r["event_type"] for r in rows] == ["TRANSFER_IN"] * 3, "转账必须真的落库"
+    assert all(r["sent"] == 1 for r in rows), "转账不逐条推送,但要当场标记已发"
+    assert len(notifier.sent) == 1, f"应当只推那一条聚合告警,实际 {len(notifier.sent)} 条"
+    assert "🚨" in notifier.sent[0] and "不是买入" in notifier.sent[0]
