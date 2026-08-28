@@ -1211,3 +1211,57 @@ BSC 只占 490/665。**作者自己提交的夹具里就有 2 行 CT_501**,反�
 「我想不出它怎么发生」不是「它不会发生」。上一节把同毫秒漏推判成
 「现实中打不着」,靠的是一个从没验证过的上游行为假设 —— 而反证就躺在同一个文件里。
 边界权衡写进注释之前,先去数一遍真实数据。
+
+---
+
+## /chips 持仓占比命令（2026-08-26 未完成，明天继续）
+
+分支 `feat/chips`，提交 `dd6f76b`（**WIP，未经验证，勿合并**）。
+main 停在 `e9db890`，工作区已切回 main，干净，702 passed。
+
+### 状态
+实现阶段完成：755 passed（基线 702 +53）、ruff 干净。
+**对抗验证阶段被中断，没跑。** 合并前必须补跑两路：
+1. **诚实性与口径** —— 精确 vs 下界必须可区分，措辞不许把下界说成真值
+2. **测试有效性与回归** —— 独立设计变异，重点查自指断言
+
+工作流脚本还在，可直接 resume：
+`workflows/scripts/chips-build-wf_5659bf7f-bfc.js`（runId `wf_5659bf7f-bfc`）
+resume 时实现 agent 走缓存不重跑，只跑两路验证。
+
+### 数据来源（已调研 + 人工复核，别重新探）
+**分子** `GET /hodlers/top?tokens=[{address,networkId}]&limit=100`
+- `responseObject[0]` = {totalHolders, topHolders[]}
+- topHolders[] 每项带 `user.id` / `humanAmount` / `value` / `sumSwapOpen` 等
+- ⚠️ **数量硬钳 100**，`limit=1000` 也是 100
+- ⚠️ **无分页**：offset/page/skip/cursor 实测全部被静默忽略（首条 tradeId 纹丝不动）
+- ⚠️ **持仓市值下限 ≈ $2**（从多币末位 value 落在 $2.20–$2.72 推断，**强推断非实锤**）
+
+**分母** `POST /public/proxy/filterTokens`，body 是字符串数组 `["<addr>:<networkId>"]`
+- → `responseObject[0].token.info.totalSupply`
+- ⚠️ **不需要 Bearer**（实测 200，不占用监控进程会话）
+- ⚠️ **但必须 curl_cffi + impersonate="chrome"**，裸 urllib 报 **HTTP 430**
+- 兜底：本地 `token_snapshot` 的 market_cap / price 可反推
+  （实测 marketCap/price ≈ totalSupply，差 0.02%），但要标注是推算值
+
+**名单侧**：从 `topHolders[].user.id` 匹配 `watch_users.user_id`（UUID，精确）
+- ⚠️ **不要按 handle 匹配**（大小写会坑，本项目已踩过）
+- ⚠️ **不用 balances**：poller 拉了但**从来没落库**（11 张表里没有持仓表，
+  `user_token_stats` 只有 buy_count/first_buy_at，答的是「谁买过」不是「现在持有多少」）。
+  现场拉 91 人 = 91 个请求，一条命令十几秒还抢会话，不可接受。
+- ⚠️ **两块同源是有意的**：口径一致才能直接比较。若名单侧用 balances（无上限）
+  而平台侧用 topHolders（有上限），会出现「名单占比 > 平台占比」这种看着像 bug 的输出。
+
+### 精确性边界（这个功能的核心诚实点）
+`len(topHolders) == totalHolders` 时**精确**，否则只是**下界**。
+实测：Whimsy 62/62=25.633%、Maliens 46/46=26.337%、FOREST 26/26=2.645%、
+LESTER 5/5=3.126% 全部精确；copycat 113 人只返 8 条 → 只能给下界。
+
+用户看过的第三方工具用的就是这个算式（47 人 / 3.5% 反推验证过），
+但它在 CATE 这种 79,891 人的币上只统计 98 个（覆盖 **0.12%**）
+**照样显示成「持仓占比」不加任何提示**。我们必须标出来。
+
+### 待用户拍板
+分母用**总供应量**（FDV 口径，与那个第三方工具一致，便于对照）。
+接口里也有 `circulatingSupply`；memecoin 一般全流通两者相等，
+但碰上有锁仓的币会差很多。用户尚未表态，保持现状。
