@@ -29,6 +29,10 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from src import store
+
+# total_supply_of 与 client 那边的响应形状是一体的:它知道 totalSupply 埋在 .token.info 里、
+# 也知道 0 / 负数要当"没拿到"处理。在 bot 里再解一遍等于把同一个契约抄成两份,迟早走岔。
+from src.client import total_supply_of
 from src.config import PROBE_DIR, get_settings
 from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
@@ -91,6 +95,7 @@ _COMMAND_MENU = [
     ("status", "运行状态"),
     ("who", "名单里谁买过这个币:/who <CA>"),
     ("ca", "查合约地址:/ca <地址> [链] — FOMO 用户怎么看这个币"),
+    ("chips", "筹码分布:/chips <地址> [链] — 平台与名单各持有多少"),
     ("copy", "跟单参数:/copy 查看 · /copy <项> <值> 修改"),
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
@@ -132,6 +137,7 @@ _HELP = (
     "/status — 运行状态\n"
     "/who &lt;CA&gt; [链] — 名单里谁买过这个币\n"
     "/ca &lt;地址&gt; [链] — 查这个合约地址:观点 + 名单买没买过\n"
+    "/chips &lt;地址&gt; [链] — 筹码分布:FOMO 平台与你的名单各持有多少占比\n"
     "/rebuild — 重建全部历史基线(回填逻辑改动后用)\n"
     "/help — 本说明"
 )
@@ -349,6 +355,22 @@ _CA_DUST_USD = 0.005
 # 金额大到这个量级就改用科学计数法。见 _ca_money ——
 # 千万亿美元比全球 M2 还大几个量级,真到了这儿它已经不是"钱"而是脏数据/攻击载荷了
 _CA_MONEY_SCI = 1e15
+
+# ============================================================
+# /chips <合约地址> —— 筹码分布:FOMO 全平台 + 本 bot 监控名单
+# ============================================================
+# ⚠️⚠️ 两块**共用同一份 topHolders**,这是有意的设计,不是图省事:
+#    名单侧若改用 balances(无上限)、平台侧用 topHolders(钳在 100 条),
+#    就会出现"名单占比 > 平台占比"这种看着像 bug 的输出 —— 分子口径不同,
+#    两个数根本不可比。同源之后两块永远同口径,可以直接相减、相比。
+# ⚠️ 顺带也是唯一可行的做法:poller 虽然在拉 balances,但**从来没落库**
+#    (11 张表里没有持仓表;user_token_stats 只有 buy_count / first_buy_at,
+#     答的是"谁买过"不是"现在持有多少")。现场拉 91 个人 = 91 个请求,
+#    一条命令十几秒还抢监控进程的会话,不可接受。
+# 名单区最多展开几个人,超出的由 _ca_assemble 收口成"还有 N 人未显示"
+MAX_CHIPS_MEMBER_ROWS = 10
+# 占比小到这个量级以下就不再报数字 —— 再往下全是量化噪声,写出来只是假精确
+_CHIPS_PCT_FLOOR = 0.0001
 
 
 class CommandBot:
@@ -592,6 +614,8 @@ class CommandBot:
             return self._cmd_who(arg)
         if cmd == "/ca":
             return self._cmd_ca(arg)
+        if cmd == "/chips":
+            return self._cmd_chips(arg)
         return f"❓ 未知命令 {_esc(cmd)},发 /help 看用法"
 
     # ============================================================
@@ -1381,29 +1405,9 @@ class CommandBot:
         """
         since = _iso_days_ago(CA_LOCAL_LOOKBACK_DAYS)
         with store.get_conn() as conn:
-            # ⚠️ 用 fomo_events 而不是 user_token_stats:后者只是前者按"算数的买入"
-            #    聚合出来的派生表,任何一行 user_token_stats 必然对应一行 fomo_events,
-            #    反过来不成立(SELL、非计数原因的 BUY 只落 fomo_events)。
-            #    这里要的是"本地是否见过这个地址"这个更宽的信号,token_snapshot
-            #    再补上"持有但没见过买入事件"(比如转入)的那一小撮。
-            local_nets = [
-                r["network_id"]
-                for r in conn.execute(
-                    "SELECT DISTINCT network_id FROM fomo_events WHERE token_address = ? "
-                    "UNION SELECT DISTINCT network_id FROM token_snapshot WHERE token_address = ?",
-                    (ca, ca),
-                ).fetchall()
-                if r["network_id"]
-            ]
+            local_nets = _local_token_nets(conn, ca)
 
-            symbol = None
-            srow = conn.execute(
-                "SELECT token_symbol FROM fomo_events "
-                "WHERE token_address = ? AND token_symbol IS NOT NULL LIMIT 1",
-                (ca,),
-            ).fetchone()
-            if srow:
-                symbol = srow["token_symbol"]
+            symbol = _local_token_symbol(conn, ca)
 
             blocks: list[str] = []
             for net in local_nets:
@@ -1508,6 +1512,192 @@ class CommandBot:
             return f"❌ FOMO 接口异常: {_esc(text[:150])}"
         logger.exception("get_token_thesis 未知异常 | {}", ca[:16])
         return f"❌ 查询失败: {_esc(text[:150])}"
+
+    # ============================================================
+    def _cmd_chips(self, arg: str) -> str:
+        """
+        /chips <合约地址> [链] —— 筹码分布:FOMO 全平台 + 本 bot 监控名单各持有多少。
+
+        ## 这条命令的核心是**诚实**,不是数字
+        持有人榜(/hodlers/top)被服务端钳在 100 条,且还有一道约 $2 的持仓市值下限,
+        所以我们手上这份名单**可能只是全部持有人的一小撮**。判据只有一条:
+        len(topHolders) == totalHolders 时统计是**精确**的,否则只是**下界**。
+        用户见过的第三方工具在 CATE 这种币上只统计 98/79891(覆盖 0.12%)却照样显示成
+        "持仓占比",不加任何提示 —— 我们必须标出来。两套文案在
+        _chips_platform_lines / _chips_watch_lines 里泾渭分明,并且有测试守住。
+
+        ## 三个数据源,失败互不牵连
+          分子 —— /hodlers/top,平台与名单**共用同一份**(见 MAX_CHIPS_MEMBER_ROWS 上面的说明)
+          分母 —— /public/proxy/filterTokens 的 totalSupply。**匿名请求**,不占用监控进程
+                  共用的登录态;拿不到就退到本地 token_snapshot 的 市值÷价格 推算,
+                  推算值必须显式标注(那是 FDV 反推,不是权威值)。
+          名单 —— 本地 watch_users,按 **user.id** 与 topHolders 匹配(见 _chips_match_members)
+
+        分母挂了不影响持有人数与持仓数量;分子挂了占比无从谈起,但链名、地址、
+        以及"为什么没拿到"照样给到用户手里。
+
+        ⚠️ 链解析沿用 /ca 的三级做法(用户指定 → 本地库已知 → 依次试),共用
+           _local_token_nets:同一个地址在两条命令下必须定到同一条链。
+        """
+        parts = (arg or "").split()
+        if not parts:
+            return "用法: /chips &lt;合约地址&gt; [链]  例: /chips 0xfc6e...5777 bsc"
+        ca = normalize_token_address(parts[0])
+        if not ca:
+            return "⚠️ 请给出代币合约地址"
+        forced_net = normalize_network(parts[1]) if len(parts) > 1 else None
+        # 与 /ca 同样的理由:地址是用户可控的无界字符串,锚点在这里一次性收口,
+        # 下面每条**不走 _ca_assemble** 的早退路径共用它
+        anchor = _ca_anchor(ca)
+
+        with store.get_conn() as conn:
+            local_nets = _local_token_nets(conn, ca)
+            local_symbol = _local_token_symbol(conn, ca)
+            members = _load_watch_members(conn)
+
+        if forced_net:
+            candidates = [forced_net]
+        elif local_nets:
+            candidates = local_nets                 # 本地已经见过,链是确定的,不猜
+        elif ca.startswith("0x"):
+            candidates = list(CA_EVM_GUESS_ORDER)
+        else:
+            candidates = ["solana"]
+
+        data, used_net, tried, err, unfinished = self._chips_fetch(ca, candidates)
+        net = used_net or forced_net or (local_nets[0] if local_nets else None)
+
+        # 一条链都没定下来 = 连分母都不知道该查哪条链,再往下走只会拼出一条什么都没说的消息。
+        # 措辞必须把"没这个币"和"猜错了链"的不确定性一起带出来(与 /ca 同一条理由)
+        if err is not None and net is None:
+            return "\n".join([_ca_fit_line(f"🔎 {anchor}"), err])
+        if net is None:
+            miss = [
+                _ca_fit_line(f"🔎 {anchor}"),
+                _ca_fit_line(f"{_esc('/'.join(tried))} 都没查到持有人"),
+                "可能是全新的币、还没人买,也可能是猜错了链 —— 可指定:/chips &lt;地址&gt; &lt;链&gt;",
+            ]
+            if unfinished:
+                miss.append(_ca_fit_line(f"(猜链耗时太久,{_esc('/'.join(unfinished))} 没试完)"))
+            return "\n".join(miss)
+
+        # 分母:先问接口(匿名,不花会话),拿不到再退本地推算。两者都拿不到就是 None,
+        # 下游据此让整个占比消失 —— 绝不补 0
+        meta = self._chips_meta(ca, net)
+        supply = total_supply_of(meta)
+        estimated = False
+        if supply is None:
+            supply = _chips_local_supply(ca, net)
+            estimated = supply is not None
+        symbol = (_chips_meta_symbol(meta) or local_symbol or "?").lstrip("$")
+
+        st = _chips_stats(data, members, supply)
+        head = [f"<b>${_ca_clip(symbol, CA_TICKER_CHARS)}</b> · "
+                f"{_ca_clip(_chain_name(net), CA_CHAIN_CHARS)}"]
+        head += _chips_platform_lines(st, err)
+        head += _chips_watch_lines(st, err)
+
+        tail: list[str] = []
+        if err is None and not st["empty"] and supply is None:
+            # 只在分子确实拿到时才提分母 —— 分子都没有的时候说"拿不到供应量"是答非所问
+            tail = ["", "⚠️ 拿不到总供应量,只能报持有人与数量,占比算不出来"]
+        elif estimated:
+            tail = ["", "ℹ️ 总供应量取自本地行情推算(市值÷价格),占比是近似值"]
+
+        return _ca_assemble(head, st["matched"], tail, anchor,
+                            render=_chips_member_row, max_rows=MAX_CHIPS_MEMBER_ROWS,
+                            omit_fmt="…按持仓数量排序,还有 {n} 人未显示")
+
+    def _chips_fetch(self, ca: str, candidates: list[str]):
+        """
+        依次试链拉持有人榜。返回 (命中的那份数据, 命中的链, 试过的链, 出错文案, 没试完的链)。
+
+        ⚠️ "命中"的判据是**有人持有**(topHolders 非空,或 totalHolders > 0),
+           而不是"请求成功"—— 猜错链时服务端照样 200,只是给一份空榜(与 /ca 同一套行为)。
+           代价是:用户**指定了链**、而这个币在那条链上真的一个人都没有时,我们也走
+           "没命中"这条路。这是刻意的取舍 —— 猜链阶段分不清"空"和"错",而指定链时
+           candidates 只有一条,tried 里就是他给的那条,文案不会误导。
+        ⚠️ 与 _ca_fetch 共用 CA_GUESS_BUDGET_SEC 这道总时长闸门:命令层严格串行,
+           单条命令阻塞太久会让排在后面的命令超过 STALE_COMMAND_SEC 被静默丢弃。
+        """
+        used_net: str | None = None
+        tried: list[str] = []
+        err: str | None = None
+        deadline = time.monotonic() + CA_GUESS_BUDGET_SEC
+        for i, net in enumerate(candidates):
+            if i and time.monotonic() > deadline:
+                logger.warning("/chips 猜链超时,剩下 {} 不再试 | {}", candidates[i:], ca[:16])
+                return {}, used_net, tried, err, list(candidates[i:])
+            tried.append(net)
+            try:
+                # 与 get_token_thesis 同一条:networkId 要 FOMO 原生的数字链 ID,不是本地别名
+                raw_net = _NETWORK_RAW_ID.get(net, net)
+                data = self._client.get_top_holders(ca, raw_net)
+            except Exception as e:  # noqa: BLE001
+                err = self._chips_error(ca, e)
+                break
+            if not isinstance(data, dict):
+                continue
+            holders = [h for h in (data.get("topHolders") or []) if isinstance(h, dict)]
+            if holders or (_chips_int(data.get("totalHolders")) or 0) > 0:
+                return data, net, tried, err, []
+        return {}, used_net, tried, err, []
+
+    def _chips_meta(self, ca: str, net: str) -> dict:
+        """
+        分母那一路。**整段吞异常**:它与分子是两个互相独立的数据源,
+        分母挂掉只该让占比消失,绝不能把已经拿到手的持有人数一起拖走。
+        """
+        try:
+            return self._client.get_token_meta(ca, _NETWORK_RAW_ID.get(net, net)) or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("/chips 取总供应量失败(降级为本地推算) | {} | {}", ca[:16], e)
+            return {}
+
+    def _chips_error(self, ca: str, e: Exception) -> str:
+        """把 client 层异常翻成人话。与 _ca_error 同一套分类,只是换了端点名"""
+        from src.auth import AuthError
+        from src.client import FomoAPIError
+
+        if isinstance(e, AuthError):
+            logger.warning("get_top_holders 鉴权失败 | {}", e)
+            return "❌ 登录态失效,请到服务器执行 <code>.\\bot.ps1 --login</code> 重新登录"
+        status = getattr(e, "status", None) or getattr(e, "status_code", None)
+        text = str(e)
+        if status in (401, 403) or "401" in text or "403" in text:
+            return (
+                "❌ FOMO 接口拒绝访问(登录态失效,或 Cloudflare 拦截)\n"
+                "先试 <code>.\\bot.ps1 --login</code>;仍不行则把 FOMO_CLIENT_IMPL 改成 playwright"
+            )
+        if isinstance(e, FomoAPIError):
+            logger.warning("get_top_holders 失败 | {} | {}", ca[:16], e)
+            return f"❌ FOMO 接口异常: {_esc(text[:150])}"
+        logger.exception("get_top_holders 未知异常 | {}", ca[:16])
+        return f"❌ 查询失败: {_esc(text[:150])}"
+
+
+def _local_token_nets(conn, ca: str) -> list[str]:
+    """
+    本地在哪几条链上见过这个地址。/ca 与 /chips 的链解析第 2 级共用这一条 ——
+    "本地已经认识就不用发探测请求"这个判据必须两条命令完全一致,
+    否则同一个地址在两条命令下会定到不同的链,用户看到的是两份对不上的数据。
+
+    ⚠️ 用 fomo_events 而不是 user_token_stats:后者只是前者按"算数的买入"聚合出来的
+       派生表,任何一行 user_token_stats 必然对应一行 fomo_events,反过来不成立
+       (SELL、非计数原因的 BUY 只落 fomo_events)。这里要的是"本地是否见过这个地址"
+       这个更宽的信号,token_snapshot 再补上"持有但没见过买入事件"(比如转入)的那一小撮。
+    ⚠️ store.py 是冻结契约,没有"按地址反查链"的函数,与 _cmd_who 同样的处理:
+       这是条只读 SELECT、不含任何判定逻辑,就地写比动冻结文件代价小。
+    """
+    return [
+        r["network_id"]
+        for r in conn.execute(
+            "SELECT DISTINCT network_id FROM fomo_events WHERE token_address = ? "
+            "UNION SELECT DISTINCT network_id FROM token_snapshot WHERE token_address = ?",
+            (ca, ca),
+        ).fetchall()
+        if r["network_id"]
+    ]
 
 
 # ============================================================
@@ -1851,9 +2041,16 @@ def _ca_size(lines: list[str]) -> int:
     return sum(len(x) + 1 for x in lines)
 
 
-def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str) -> str:
+def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str, *,
+                 render=None, max_rows: int = MAX_CA_THESIS_ROWS,
+                 omit_fmt: str = "…按投入本金排序,还有 {n} 位未显示") -> str:
     """
-    头部 + 观点行 + 本地名单区 + CA 锚点 → 最终消息。
+    头部 + 可变长的主体行 + 尾部 + CA 锚点 → 最终消息。
+
+    render / max_rows / omit_fmt 三个关键字参数只是把"主体行长什么样"外置出去,
+    好让 /chips 复用同一套出口不变式 —— 不变式的价值全在"已经被证明过、被测试守住",
+    照抄一份到新命令里等于把它的证明也一起复制,两份迟早走岔。
+    默认值就是 /ca 原来写死的那三样,/ca 的调用点一个字都不用改。
 
     ## 出口不变式(**无论四个入参是什么**,返回值一定同时满足这三条)
       1. len(返回值) <= CA_MSG_BUDGET
@@ -1875,6 +2072,7 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
          所以"砍到一行不剩 + 贴上锚点"这个最坏情况仍然在预算内 —— 第 1 条成立。
          (旧写法在这里破功:掏空 lines 之后仍然无条件 append 一个可能几千字符的锚点。)
     """
+    render = render or _ca_thesis_row
     head = [_ca_fit_line(x) for x in head]
     tail = [_ca_fit_line(x) for x in tail]
     anchor = _ca_fit_line(anchor)         # 幂等:调用方已经收过口也不会二次损坏
@@ -1882,8 +2080,8 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
     body: list[str] = []
     used = 0
     shown = 0
-    for it in rows[:MAX_CA_THESIS_ROWS]:
-        block = [_ca_fit_line(x) for x in _ca_thesis_row(it)]
+    for it in rows[:max_rows]:
+        block = [_ca_fit_line(x) for x in render(it)]
         cost = _ca_size(block)
         if used + cost > room:
             # ⚠️ 必须 continue 不能 break:break 会让一条长评论(正常人就写得出来)
@@ -1896,11 +2094,11 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
         shown += 1
 
     lines = [*head, *body]
-    # 未显示 = 总作者数 - **真正渲染出来的**条数。跳过的和超出 MAX_CA_THESIS_ROWS 的
-    # 都算在里面,shown 只在真正 extend 之后才自增,所以 continue 不会让它少报/多报
+    # 未显示 = 总条数 - **真正渲染出来的**条数。跳过的和超出 max_rows 的都算在里面,
+    # shown 只在真正 extend 之后才自增,所以 continue 不会让它少报/多报
     omitted = len(rows) - shown
     if omitted:
-        lines.append(f"…按投入本金排序,还有 {omitted} 位未显示")
+        lines.append(omit_fmt.format(n=omitted))
     lines.extend(tail)
     # 兜底:哪一段自己就撑破预算都照样只按整行砍(_ca_size(lines) + len(anchor)
     # 恰好等于 "\n".join(lines + [anchor]) 的长度,不是估算)
@@ -1908,3 +2106,266 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
         lines.pop()
     lines.append(anchor)
     return "\n".join(lines)
+
+
+# ============================================================
+# /chips 辅助(纯函数 + 两条只读 SELECT)
+# ============================================================
+def _chips_int(v) -> int | None:
+    """转 int,转不出来返回 None。⚠️ 绝不退化成 0 —— 0 是「真的一个持有人都没有」这个真实值"""
+    n = _f(v)
+    return int(n) if n is not None else None
+
+
+def _chips_exact(holders: list[dict], total_holders: int | None) -> bool:
+    """
+    手上这份 topHolders 是不是这个币的**全部**持有人。
+
+    ⚠️⚠️ 这一行是整条 /chips 的支点:为真才敢说「持仓 X%」,为假就只能说「≥X%」。
+       判据只有一条 —— 返回条数与服务端自报的 totalHolders **相等**。
+       服务端把返回条数硬钳在 100,还叠了一道约 $2 的持仓市值下限
+       (见 client.EP_TOP_HOLDERS),所以两者不等就意味着有人被过滤掉了,
+       我们算出来的只是下界。实测四个样本全部相等因而精确:
+         Whimsy 62/62 · Maliens 46/46 · FOREST 26/26 · LESTER 5/5;
+       反例 copycat totalHolders=113 却只返 8 条。
+    ⚠️ totalHolders 缺失时返回 False 而不是「就当它精确」:不知道总数就没有资格
+       声称精确,宁可多打一个 ≥ 也不能把下界谎报成实数。
+    """
+    return total_holders is not None and len(holders) == total_holders
+
+
+def _chips_sum(values: list[float | None]) -> float | None:
+    """
+    求和,但**一个都没解析出来时返回 None 而不是 0**。
+
+    ⚠️ sum([]) == 0 会让「字段全缺」和「加起来真的是 0」变成同一个值,
+       下游据此打出一个 0.000% 的占比 —— 那是凭空造出来的假事实。
+    """
+    vals = [v for v in values if v is not None]
+    return sum(vals) if vals else None
+
+
+def _chips_ratio(amount: float | None, supply: float | None) -> float | None:
+    """占比(百分数)。任何一半缺失就返回 None,让那一段整段消失 —— 绝不用 0 顶替"""
+    if amount is None or supply is None or supply <= 0:
+        return None
+    return amount / supply * 100.0
+
+
+def _chips_pct(p: float) -> str:
+    """
+    占比展示。量级越小给的小数位越多 —— 固定两位会把 0.0034% 压成 0.00%,
+    那等于告诉用户「没有仓位」,而真相是「有,但很小」。
+    小到 _CHIPS_PCT_FLOOR 以下就不再报数字:再往下全是量化噪声,写出来只是假精确。
+    """
+    a = abs(p)
+    if a == 0:
+        return "0%"                       # 0 是真实值(确实一枚都不剩),照实写
+    if a < _CHIPS_PCT_FLOOR:
+        return f"&lt;{_CHIPS_PCT_FLOOR:g}%"
+    if a >= 10:
+        return f"{p:.1f}%"
+    if a >= 1:
+        return f"{p:.3f}%"
+    if a >= 0.01:
+        return f"{p:.2f}%"
+    return f"{p:.4f}%"
+
+
+def _chips_qty(v: float) -> str:
+    """
+    持仓数量展示。memecoin 的供应量常在 1e9~1e15 量级,每三位一个逗号能写出
+    二十几个字符,一行就被它吃掉 —— 十亿以上换成 B/T 单位。
+    """
+    a = abs(v)
+    for div, unit in ((1e12, "T"), (1e9, "B")):
+        if a >= div:
+            return f"{v / div:,.2f}{unit}"
+    if 0 < a < 1:
+        return f"{v:,.4f}"                # 高价币可能真的只持有零点几枚,别四舍五入成 0
+    return f"{v:,.0f}"
+
+
+def _chips_match_members(holders: list[dict], members: dict[str, str]) -> list[dict]:
+    """
+    从持有人榜里认出名单成员。返回 [{handle, amount, value}],按持仓数量从多到少。
+
+    ⚠️⚠️ 匹配键是 **topHolders[].user.id ↔ watch_users.user_id**(两边都是同一个 UUID),
+       **绝不按 handle 匹配**:FOMO 的 handle 随时可以改、大小写还不稳定,
+       本项目已经为此踩过坑(store.normalize_handle 存在的全部理由)。
+       按 handle 匹配会同时产生两类错误 —— 改过名的成员认不出来(漏),
+       以及某个陌生人恰好占用了成员的旧 handle 时把他算进名单(错)。
+    """
+    out: list[dict] = []
+    for h in holders:
+        user = h.get("user")
+        if not isinstance(user, dict):
+            continue
+        uid = user.get("id")
+        if uid is None:
+            continue
+        handle = members.get(str(uid))
+        if handle is None:
+            continue
+        out.append({"handle": handle,
+                    "amount": _f(h.get("humanAmount")),
+                    "value": _f(h.get("value"))})
+    # 数量未知的垫底:None 不能与 float 比大小,而且「不知道」绝不该排在「确实很多」前面
+    out.sort(key=lambda m: (m["amount"] is not None, m["amount"] or 0.0), reverse=True)
+    return out
+
+
+def _chips_stats(data: dict, members: dict[str, str], supply: float | None) -> dict:
+    """
+    一份 /hodlers/top 响应 + 名单 + 分母 → 渲染要用的全部数字。纯函数。
+
+    平台侧与名单侧的分子**都从这里的同一份 holders 算出来**,口径天然一致、可以直接
+    相比(见 MAX_CHIPS_MEMBER_ROWS 上面那段说明)。
+    """
+    holders = [h for h in (data.get("topHolders") or []) if isinstance(h, dict)]
+    total = _chips_int(data.get("totalHolders"))
+    matched = _chips_match_members(holders, members)
+    return {
+        "covered": len(holders),
+        "total": total,
+        "exact": _chips_exact(holders, total),
+        # 一条持有人记录都没有、服务端也没给总数:说不清是「还没人买」还是「链不对」
+        "empty": not holders and total is None,
+        "matched": matched,
+        "plat_pct": _chips_ratio(_chips_sum([_f(h.get("humanAmount")) for h in holders]), supply),
+        "watch_pct": _chips_ratio(_chips_sum([m["amount"] for m in matched]), supply),
+    }
+
+
+def _chips_platform_lines(st: dict, err: str | None) -> list[str]:
+    """
+    平台侧文案。**精确与下界必须是两套一眼可辨的写法** —— 这是本功能的核心诚实点:
+    用户见过的第三方工具在 CATE 上只统计 98/79891(覆盖 0.12%)却照样显示成
+    「持仓占比」,不加任何提示;我们宁可多占一行也要把覆盖范围写出来。
+    """
+    if err is not None:
+        return [f"🏦 FOMO 平台 · 持有人榜没拉到:{err}"]
+    if st["empty"]:
+        return ["🏦 FOMO 平台 · 没查到持有人 —— 可能还没人买,也可能这个币不在这条链上"]
+
+    covered, total, pct = st["covered"], st["total"], st["plat_pct"]
+    if st["exact"]:
+        line = f"🏦 FOMO 平台 · 持有人 {total:,}"
+        # 分母缺失时这一段整段消失,绝不打 0%(见 _chips_ratio)
+        if pct is not None:
+            line += f" · 持仓 {_chips_pct(pct)}"
+        return [line]
+
+    lines = [f"🏦 FOMO 平台 · 持有人 {total:,}" if total is not None
+             else f"🏦 FOMO 平台 · 持有人 ≥{covered:,}(服务端没给总数)"]
+    warn = f"⚠️ 仅统计前 {covered:,} 名,真实值更高"
+    lines.append(f"   持仓 ≥ {_chips_pct(pct)}   {warn}" if pct is not None else f"   {warn}")
+    return lines
+
+
+def _chips_watch_lines(st: dict, err: str | None) -> list[str]:
+    """
+    名单侧文案。与平台侧同源同口径,所以两个百分比可以直接相比。
+
+    ⚠️ 被截断时措辞是「N 人在前 X 名内」而不是「N 人持有」:名单成员没出现在前 X 名里
+       **不等于**他没持有(他可能只是仓位小于那道 $2 门槛,或被 100 条截掉了)。
+       写成「无人持有」就是把「我们没看见」谎报成「不存在」。
+    """
+    if err is not None:
+        return ["👥 你的名单 · 与平台侧同一份数据,没拉到就判断不了"]
+    if st["empty"]:
+        return ["👥 你的名单 · 无人持有"]
+
+    matched, covered, pct = st["matched"], st["covered"], st["watch_pct"]
+    if st["exact"]:
+        if not matched:
+            return ["👥 你的名单 · 无人持有"]
+        line = f"👥 你的名单 · {len(matched)} 人持有"
+        if pct is not None:
+            line += f" · {_chips_pct(pct)}"
+        return [line]
+
+    if not matched:
+        return [f"👥 你的名单 · 前 {covered:,} 名内无人"]
+    line = f"👥 你的名单 · {len(matched)} 人在前 {covered:,} 名内"
+    if pct is not None:
+        line += f" · ≥{_chips_pct(pct)}"
+    return [line]
+
+
+def _chips_member_row(m: dict) -> list[str]:
+    """
+    名单成员一行:`   @handle · 1,234,567 枚 · $890`。
+
+    ⚠️ 缺的字段整段消失,不打 "N/A" 也不打 0 —— 与 /ca 的买家行同一条规矩。
+    """
+    seg = [f"@{_ca_clip(m['handle'], CA_HANDLE_CHARS)}"]
+    if m["amount"] is not None:
+        seg.append(f"{_chips_qty(m['amount'])} 枚")
+    if m["value"] is not None:
+        seg.append(_ca_money(m["value"]))
+    return ["   " + " · ".join(seg)]
+
+
+def _chips_meta_symbol(meta: dict) -> str | None:
+    """从 filterTokens 的元数据里捞 ticker。捞不到返回 None,由调用方退回本地 symbol"""
+    token = meta.get("token") if isinstance(meta, dict) else None
+    if not isinstance(token, dict):
+        return None
+    for holder in (token.get("info"), token):
+        if isinstance(holder, dict):
+            s = _pick_str(holder, "symbol", "ticker", "name")
+            if s:
+                return s
+    return None
+
+
+def _chips_local_supply(ca: str, net: str) -> float | None:
+    """
+    兜底分母:本地 token_snapshot 的 市值 ÷ 现价。
+
+    ⚠️ 这是**推算值,不是权威值**,调用方必须在消息里标注出来。依据:FOMO 的「市值」
+       就是按总供应量算的 FDV,所以 marketCap / priceUSD ≈ totalSupply ——
+       实测复核 964,163,717 vs 964,376,492,差 0.02%(价格取整造成)。
+    ⚠️ 价格为 0 / 缺失时返回 None:除零之外,0 价格算出来的「供应量」是无穷大,
+       会把占比压成 0.0000% 这种看起来像真数据的假值。
+    """
+    with store.get_conn() as conn:
+        row = conn.execute(
+            "SELECT market_cap, price_usd FROM token_snapshot "
+            "WHERE network_id = ? AND token_address = ?",
+            (net, ca),
+        ).fetchone()
+    if row is None:
+        return None
+    mcap, price = _f(row["market_cap"]), _f(row["price_usd"])
+    if mcap is None or price is None or price <= 0 or mcap <= 0:
+        return None
+    return mcap / price
+
+
+def _local_token_symbol(conn, ca: str) -> str | None:
+    """本地见过的这个地址的 symbol(随便捞一条就够,只用于标题)。/ca 与 /chips 共用"""
+    row = conn.execute(
+        "SELECT token_symbol FROM fomo_events "
+        "WHERE token_address = ? AND token_symbol IS NOT NULL LIMIT 1",
+        (ca,),
+    ).fetchone()
+    return row["token_symbol"] if row else None
+
+
+def _load_watch_members(conn) -> dict[str, str]:
+    """
+    名单成员:user_id → 展示用 handle。
+
+    ⚠️ 只取 active = 1:/del 是软删除,退出名单的人不该再算进「你的名单」。
+       **不看 stats_ready** —— 那是「历史基线建没建好」(功能 A/B 的门槛),
+       与「他现在持不持有」完全无关,拿它过滤会让刚 /add 的人凭空消失。
+    """
+    return {
+        str(r["user_id"]): (r["handle"] or r["display_name"] or "?")
+        for r in conn.execute(
+            "SELECT user_id, handle, display_name FROM watch_users WHERE active = 1"
+        ).fetchall()
+        if r["user_id"]
+    }

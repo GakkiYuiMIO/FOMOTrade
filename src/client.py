@@ -61,6 +61,30 @@ EP_TRANSFERS = "/v2/users/{uid}/transfers"
 #    遍历监控用户持仓里的币 → 按币拉 thesis → 按 userId 过滤出监控对象(见 poller._collect_thesis)。
 EP_TOKEN_THESIS = "/feed/token/thesis"
 
+# 某个币的**持有人榜**(/chips 的分子)。tokens 参数是 URL 编码后的 JSON 数组,
+# 元素形如 {"address": "<CA>", "networkId": <数字链 ID>}。
+# ⚠️⚠️ 服务端有两道**静默**过滤,不理解它们就会把"下界"当成"精确值"报给用户:
+#   1) 条数硬钳 100:limit 传 100/101/500/1000 返回完全一样;offset / page / skip /
+#      cursor 四种分页参数**全部被静默忽略**(实测四种参数下首条 tradeId 纹丝不动)——
+#      不是参数名没猜对,是这个端点根本没有分页能力。别再去试分页。
+#   2) 按持仓**市值**过滤,门槛约 $2:所以 totalHolders=113 的币可能只返 8 条。
+#      (这个 $2 是从多个币末位 value 落在 $2.20–$2.72 推断出来的**强推断,不是实锤**。)
+# 于是只有 len(topHolders) == totalHolders 时统计才是精确的,否则只能当**下界**用 ——
+# 这个判据是 /chips 全部文案的支点,见 bot._chips_stats。
+EP_TOP_HOLDERS = "/hodlers/top"
+# ⚠️ 服务端硬钳,传更大的值没有任何效果(见上)。写成常量是为了让调用方把
+#    "我们请求了多少"和"实际返回了多少"放在一起判断,而不是两处各写各的字面量。
+TOP_HOLDERS_LIMIT = 100
+
+# 代币元数据批量查询(/chips 的分母:总供应量)。body 是**字符串数组**
+# ["<address>:<networkId>"],数据在 responseObject[0].token.info.totalSupply。
+# ⚠️ 这条**不需要 Authorization**(实测不带任何令牌返回 200)。好处是实打实的:
+#    分母这一步不消耗监控进程共用的那份登录态。
+# ⚠️ 但"不要令牌"绝不等于"随便怎么调都行":必须过 Cloudflare 的 TLS 指纹检查。
+#    实测 urllib 裸调 **HTTP 430**,curl_cffi + impersonate="chrome" 才 200。
+#    下一个人看到"匿名可调"很容易顺手换成 httpx/urllib,那会直接 430。
+EP_FILTER_TOKENS = "/public/proxy/filterTokens"
+
 # 「我关注的人」的活动流。买/卖/观点三类混在一条流里,一次调用就知道名单里谁刚动过。
 # 详见 _BaseFomoClient.get_activity_feed 的说明与实测数据。
 EP_ACTIVITY_FEED = "/feed/tradingActivity"
@@ -222,6 +246,8 @@ class FomoClient(Protocol):
     def iter_transfers(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
+    def get_top_holders(self, token_address: str, network_id) -> dict: ...
+    def get_token_meta(self, token_address: str, network_id) -> dict: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
     def get_activity_feed(self, limit: int = 100) -> list[dict]: ...
@@ -322,6 +348,81 @@ def _as_obj(payload) -> dict:
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         return payload[0]
     return {}
+
+
+def _as_network_number(network_id):
+    """
+    链 ID → JSON 里该写的形态。数字串写成**数字**,写不成数字的原样透传。
+
+    ⚠️ 与 get_token_thesis 踩过的坑同源(传 "bsc" 直接 400):这些端点认的是 FOMO 原生的
+       数字链 ID。这里只做"能转数字就转",不做别名映射 —— 别名表在 bot._NETWORK_RAW_ID,
+       一份表放两个地方早晚会走岔;而原样透传能让服务端的报错说话,不被我们吞掉。
+    """
+    try:
+        return int(str(network_id).strip())
+    except (TypeError, ValueError):
+        return network_id
+
+
+def fetch_token_meta(token_address: str, network_id) -> dict:
+    """
+    匿名查代币元数据(/chips 的分母来源)。返回 responseObject 里对应这个币的那个对象,
+    拿不到返回 {}。总供应量在 `.token.info.totalSupply`,用 total_supply_of() 取。
+
+    ⚠️ 刻意**不走** _fetch_ok:那条路径带 Bearer、会重试、会在 401/403 时调
+       tokens.invalidate()。本请求根本不需要令牌,让它去作废一份好端端的登录态
+       是纯粹的伤害。失败就失败,调用方自己有本地兜底。
+    ⚠️ 必须用 curl_cffi + impersonate="chrome":Cloudflare 认 TLS 指纹,
+       urllib/httpx 裸调实测 HTTP 430(见 EP_FILTER_TOKENS)。
+    ⚠️ 不重试:这是命令层的同步路径,用户在等一条回执;一次没拿到就走本地推算,
+       比让他多等几秒好。
+    """
+    key = f"{token_address}:{_as_network_number(network_id)}"
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        settings = get_settings()
+        resp = cffi_requests.post(
+            BASE_URL + EP_FILTER_TOKENS,
+            json=[key],
+            impersonate="chrome",
+            proxies=settings.proxies,
+            timeout=_TIMEOUT_SEC,
+            headers={
+                "Content-Type": "application/json",
+                "accept": "application/json, text/plain, */*",
+                "origin": FOMO_ORIGIN,
+                "referer": FOMO_ORIGIN + "/",
+                "user-agent": USER_AGENT,
+            },
+        )
+        if not (200 <= resp.status_code < 300):
+            logger.warning("代币元数据查询 HTTP {} | {}", resp.status_code, key[:40])
+            return {}
+        ro = _unwrap(json.loads(resp.text or "null"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("代币元数据查询失败 | {} | {}", key[:40], e)
+        return {}
+
+    if isinstance(ro, list):
+        ro = next((x for x in ro if isinstance(x, dict)), None)
+    return ro if isinstance(ro, dict) else {}
+
+
+def total_supply_of(meta: dict) -> float | None:
+    """
+    从 fetch_token_meta 的返回里取总供应量。取不到返回 None,**绝不返回 0** ——
+    0 会被下游当成"供应量真的是 0"从而算出荒唐的占比,而 None 让那一行整行消失。
+    """
+    token = meta.get("token") if isinstance(meta, dict) else None
+    info = token.get("info") if isinstance(token, dict) else None
+    raw = info.get("totalSupply") if isinstance(info, dict) else None
+    try:
+        supply = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # 0 / 负数不是"供应量",是脏数据 —— 当没拿到处理,而不是让它去当除数
+    return supply if supply > 0 else None
 
 
 def _is_cloudflare_block(text: str) -> bool:
@@ -748,6 +849,42 @@ class _BaseFomoClient:
         if after_ms:
             params["afterTime"] = int(after_ms)
         return _as_list(self._get(EP_TOKEN_THESIS, params))
+
+    def get_top_holders(self, token_address: str, network_id) -> dict:
+        """
+        某个币的持有人榜(/chips 的分子)。返回 responseObject 里对应这个币的那个对象:
+          {"tokenAddress": …, "networkId": …, "totalHolders": 26, "topHolders": [ … ]}
+        每个 topHolders 元素实测含:
+          user{id, userHandle, displayName, address, evmAddress, …}, tradeId,
+          humanAmount, value, price, costBasis, averageEntryPrice,
+          averageHoldTimeSeconds, pnl, unrealizedPnl, realizedPnl, sumSwapOpen,
+          isDev, comment, showComment
+
+        ⚠️ **只发一个请求、不分页**。原因见 EP_TOP_HOLDERS 的注释:这个端点没有分页能力,
+           limit 也钳死在 100。调用方必须自己拿 len(topHolders) 与 totalHolders 比,
+           判断手上这份数据是全量还是截断 —— 那是 /chips「精确 / 下界」两套文案的唯一依据。
+        ⚠️ 解析不出来返回 {} 而不是抛异常:上层据此显示"没查到",与猜错链是同一种表现。
+        """
+        tokens = json.dumps(
+            [{"address": token_address, "networkId": _as_network_number(network_id)}],
+            separators=(",", ":"),
+        )
+        payload = self._get(EP_TOP_HOLDERS, {"tokens": tokens, "limit": TOP_HOLDERS_LIMIT})
+        ro = _unwrap(payload)
+        # 请求里只放了一个币,响应就只有一个元素;仍按"可能是裸对象"兜底(与 _as_obj 同一条理由)
+        if isinstance(ro, list):
+            ro = next((x for x in ro if isinstance(x, dict)), {})
+        return ro if isinstance(ro, dict) else {}
+
+    def get_token_meta(self, token_address: str, network_id) -> dict:
+        """
+        代币元数据(/chips 的分母来源:`.token.info.totalSupply`)。拿不到返回 {}。
+
+        ⚠️ 走的是匿名请求,不占用监控进程共用的登录态(见 EP_FILTER_TOKENS)。
+           两个实现都继承这一份:它与 Bearer 鉴权、与 _fetch_ok 的重试/失效逻辑完全无关,
+           尤其**不能**让一个 403 触发 tokens.invalidate() —— 那会把好端端的登录态作废掉。
+        """
+        return fetch_token_meta(token_address, network_id)
 
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]:
         """
