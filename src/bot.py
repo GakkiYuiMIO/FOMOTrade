@@ -1598,11 +1598,16 @@ class CommandBot:
         head += _chips_watch_lines(st, err)
 
         tail: list[str] = []
-        if err is None and not st["empty"] and supply is None:
-            # 只在分子确实拿到时才提分母 —— 分子都没有的时候说"拿不到供应量"是答非所问
-            tail = ["", "⚠️ 拿不到总供应量,只能报持有人与数量,占比算不出来"]
-        elif estimated:
-            tail = ["", "ℹ️ 总供应量取自本地行情推算(市值÷价格),占比是近似值"]
+        # ⚠️ 两条注脚都在解释「占比这个数怎么来的」,所以**共用同一道守卫**:
+        #    分子没拿到(err)或压根没有持有人(empty)时,消息里根本不存在占比,
+        #    再挂一句"拿不到供应量"或"占比是近似值"都是答非所问。
+        #    这道守卫曾经只加在前一条分支上,于是"分子挂了 + 本地有行情"会渲染出
+        #    一句凭空的"占比是近似值",而上面一个百分号都没有。
+        if err is None and not st["empty"]:
+            if supply is None:
+                tail = ["", "⚠️ 拿不到总供应量,只能报持有人与数量,占比算不出来"]
+            elif estimated:
+                tail = ["", "ℹ️ 总供应量取自本地行情推算(市值÷价格),占比是近似值"]
 
         return _ca_assemble(head, st["matched"], tail, anchor,
                             render=_chips_member_row, max_rows=MAX_CHIPS_MEMBER_ROWS,
@@ -2172,6 +2177,23 @@ def _chips_pct(p: float) -> str:
     return f"{p:.4f}%"
 
 
+def _chips_ge_pct(p: float, sep: str = "") -> str:
+    """
+    「下界」形态的占比展示 —— 平台侧与名单侧共用同一句写法。
+
+    ⚠️ 低于展示下限时**绝不能**直接拼成 `≥<0.0001%`:两个方向相反的比较符黏在一起,
+       读出来是「不小于小于万分之一」,自相矛盾。这时改口说「不足 0.0001%」——
+       方向只剩一个,而且陈述的对象是**已统计到的那部分**;
+       「真实值更高」由旁边那句截断提示负责,不在这里重复。
+    ⚠️ 恰好为 0 仍然走 `≥0%`:0 是有意义的真实值,而 `≥0%` 本身没有方向冲突。
+    ⚠️ sep 只为保住两个调用点各自已验证过的排版(平台侧 `≥ 10.0%` 带空格、
+       名单侧 `≥0.30%` 不带),不是可调风格 —— 那两行的字节形态是被测试钉死的。
+    """
+    if p != 0 and abs(p) < _CHIPS_PCT_FLOOR:
+        return f"不足 {_CHIPS_PCT_FLOOR:g}%"
+    return f"≥{sep}{_chips_pct(p)}"
+
+
 def _chips_qty(v: float) -> str:
     """
     持仓数量展示。memecoin 的供应量常在 1e9~1e15 量级,每三位一个逗号能写出
@@ -2224,11 +2246,19 @@ def _chips_stats(data: dict, members: dict[str, str], supply: float | None) -> d
     """
     holders = [h for h in (data.get("topHolders") or []) if isinstance(h, dict)]
     total = _chips_int(data.get("totalHolders"))
+    exact = _chips_exact(holders, total)
+    # ⚠️ 服务端自报的总数比它自己给的条数还少 —— 这份响应自相矛盾(不该发生,但发生过就会
+    #    渲染成「持有人 0」下面却列着一串持有人)。这时以**手上真有的条数**为准:
+    #    我们数得出来的东西比服务端的自报更可信。
+    # ⚠️ 但绝不因此声称精确 —— exact 在覆盖之前就已经算好了:连总数都不可信,
+    #    更没有资格说「这就是全部」。宁可多打一个下界记号。
+    if total is not None and total < len(holders):
+        total = len(holders)
     matched = _chips_match_members(holders, members)
     return {
         "covered": len(holders),
         "total": total,
-        "exact": _chips_exact(holders, total),
+        "exact": exact,
         # 一条持有人记录都没有、服务端也没给总数:说不清是「还没人买」还是「链不对」
         "empty": not holders and total is None,
         "matched": matched,
@@ -2258,8 +2288,13 @@ def _chips_platform_lines(st: dict, err: str | None) -> list[str]:
 
     lines = [f"🏦 FOMO 平台 · 持有人 {total:,}" if total is not None
              else f"🏦 FOMO 平台 · 持有人 ≥{covered:,}(服务端没给总数)"]
+    if covered == 0:
+        # 服务端自报有持有人、却一条明细都没给(那道约 $2 的市值下限足以把人全滤光)。
+        # 这时说"仅统计前 0 名"是句自相矛盾的废话,直接讲清占比为什么算不出来
+        lines.append("   ⚠️ 没拿到任何持有人明细,占比无从统计")
+        return lines
     warn = f"⚠️ 仅统计前 {covered:,} 名,真实值更高"
-    lines.append(f"   持仓 ≥ {_chips_pct(pct)}   {warn}" if pct is not None else f"   {warn}")
+    lines.append(f"   持仓 {_chips_ge_pct(pct, ' ')}   {warn}" if pct is not None else f"   {warn}")
     return lines
 
 
@@ -2285,11 +2320,14 @@ def _chips_watch_lines(st: dict, err: str | None) -> list[str]:
             line += f" · {_chips_pct(pct)}"
         return [line]
 
+    if covered == 0:
+        # 与平台侧同一条理由:一条明细都没拿到时,「前 0 名内无人」是句什么都没说的话
+        return ["👥 你的名单 · 没有持有人明细,判断不了"]
     if not matched:
         return [f"👥 你的名单 · 前 {covered:,} 名内无人"]
     line = f"👥 你的名单 · {len(matched)} 人在前 {covered:,} 名内"
     if pct is not None:
-        line += f" · ≥{_chips_pct(pct)}"
+        line += f" · {_chips_ge_pct(pct)}"
     return [line]
 
 

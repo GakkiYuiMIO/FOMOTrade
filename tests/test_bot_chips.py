@@ -170,9 +170,14 @@ def test_只差一个也算截断而不是精确(monkeypatch, tmp_path):
     """
     判据是**相等**,不是"差不多"。少一条就意味着有人被服务端过滤掉了,
     我们算出来的就是下界 —— 差 1 和差 79793 在"能不能声称精确"上没有区别。
+
+    ⚠️ 持仓量刻意取在展示下限之上(2,000,000 / 1e9 = 0.20%):低于下限时下界记号
+       另有一套写法(见 test_下界低于展示下限时不出现方向相反的两个比较符),
+       那条路径不该由这条用例顺带盯,否则它盯的到底是哪一件事就说不清了。
     """
     data = {"totalHolders": 3,
-            "topHolders": [_holder("a", "a", 1.0, 1.0), _holder("b", "b", 1.0, 1.0)]}
+            "topHolders": [_holder("a", "a", 1_000_000.0, 1.0),
+                           _holder("b", "b", 1_000_000.0, 1.0)]}
     client = _FakeClient({"1399811149": data})
     b, _ = _bot(monkeypatch, tmp_path, client)
 
@@ -597,3 +602,246 @@ def test_超长地址也不会撑破消息(monkeypatch, tmp_path):
 
     _assert_chips_invariant(out, anchored=False)
     assert len(out) <= _TG_HARD_LIMIT
+
+
+# ============================================================
+# HTML 转义:handle 与 ticker 是两条**各自独立**的路径
+# ============================================================
+# ⚠️ 这两条必须分开写、各自只放一个脏字段。上一轮的漏网正是「一个用例同时传了
+#    handle 和 ticker、却只断言其中一个」,于是另一条路径去掉转义照样全绿。
+def test_名单handle里的活标签必须被转义(monkeypatch, tmp_path):
+    """
+    ⚠️ handle 是陌生人自己起的名字,`<b>` 这类标签在装配出口的白名单里 ——
+       没转义就会被原样放行成**活标签**,等于让名单成员往我们发给 Telegram 的消息里
+       塞标记。而「标签配对闭合」这条出口不变式照样成立,所以只有这条断言守得住。
+    ⚠️ 本用例的 ticker 是干净的,handle 是唯一的脏字段:哪条路径漏了转义一目了然。
+    """
+    data = {"totalHolders": 1,
+            "topHolders": [_holder("u-1", "whatever", 1_000_000.0, 5.0)]}
+    client = _FakeClient({"1399811149": data})              # ticker 用默认的 FOREST
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "<b>evil</b>")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "@&lt;b&gt;evil&lt;/b&gt;" in out, f"handle 没转义:\n{out}"
+    assert "<b>evil</b>" not in out, f"活标签被注入进消息里了:\n{out}"
+    _assert_chips_invariant(out)
+
+
+def test_ticker里的活标签必须被转义(monkeypatch, tmp_path):
+    """
+    ⚠️ ticker 来自 filterTokens 接口,同样不受任何约束。标题行本身就写在一对
+       `<b>` 里,ticker 不转义就会变成 `<b>$<b>PWN</b></b>` —— 标签仍然配对闭合,
+       出口不变式一个字都不会响,只有这条断言能逮到。
+    ⚠️ 本用例的 handle 是干净的,ticker 是唯一的脏字段。
+    """
+    data = {"totalHolders": 1,
+            "topHolders": [_holder("u-1", "alice", 1_000_000.0, 5.0)]}
+    client = _FakeClient({"1399811149": data}, meta=_meta(symbol="<b>PWN</b>"))
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "$&lt;b&gt;PWN&lt;/b&gt;" in out, f"ticker 没转义:\n{out}"
+    assert "$<b>PWN</b>" not in out, f"活标签被注入进标题里了:\n{out}"
+    _assert_chips_invariant(out)
+
+
+# ============================================================
+# 占比展示的下限:小仓位既不能被吞掉,也不能被伪造成 0
+# ============================================================
+def test_小仓位仍报出可读的数字(monkeypatch, tmp_path):
+    """
+    ⚠️ 展示下限调大一点点(比如到 0.01%),`0.0050%` 这种完全可读的真实值就会被
+       吞成一句「低于下限」—— 用户读到的是「小到看不见」,而真相是「有,0.005%」。
+       50,000 / 1e9 = 0.005%。
+    """
+    data = {"totalHolders": 1,
+            "topHolders": [_holder("u-1", "alice", 50_000.0, 5.0)]}
+    client = _FakeClient({"1399811149": data})              # 默认供应量 1e9
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert _line_with(out, "FOMO 平台") == "🏦 FOMO 平台 · 持有人 1 · 持仓 0.0050%", out
+    assert "&lt;" not in out, f"0.005% 是报得出来的真实值,不该退成下限写法:\n{out}"
+    _assert_chips_invariant(out)
+
+
+def test_尘埃仓位报下限而不是伪造出来的0(monkeypatch, tmp_path):
+    """
+    ⚠️ 反方向:展示下限如果没了(或降到 0),8e-7% 会被四位小数印成 `0.0000%` ——
+       一个看起来像真数据的假值,读出来就是「他一枚都没有」。
+       8,000,000 / 1e15 = 0.0000008%。
+    """
+    data = {"totalHolders": 1,
+            "topHolders": [_holder("u-1", "alice", 8_000_000.0, 2.4)]}
+    client = _FakeClient({"1399811149": data}, meta=_meta(supply="1000000000000000"))
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "持仓 &lt;0.0001%" in out, f"尘埃仓位该报下限写法:\n{out}"
+    assert "0.0000%" not in out, f"凭空造了一个『没有仓位』的假值:\n{out}"
+    _assert_chips_invariant(out)
+
+
+def test_下界低于展示下限时不出现方向相反的两个比较符(monkeypatch, tmp_path):
+    """
+    ⚠️ 截断态叠上尘埃仓位,曾经渲染成 `持仓 ≥ &lt;0.0001%` 与 `· ≥&lt;0.0001%` ——
+       读出来是「不小于小于万分之一」,两个方向相反的比较符黏在一起,自相矛盾。
+       改口说「不足 0.0001%」:方向只剩一个,陈述的是**已统计到的那部分**;
+       「真实值更高」由旁边那句截断提示负责。
+       98 × 8,000,000 / 1e15 = 0.0000784%,名单那一位单独是 0.0000008%,两边都在下限以下。
+    """
+    holders = [_holder(f"z-{i}", f"u{i}", 8_000_000.0, 2.4) for i in range(97)]
+    holders.append(_holder("u-1", "alice", 8_000_000.0, 2.4))
+    data = {"totalHolders": 79891, "topHolders": holders}
+    client = _FakeClient({"1399811149": data}, meta=_meta(supply="1000000000000000"))
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    for ln in out.split("\n"):
+        assert not ("≥" in ln and "&lt;" in ln), f"一行里出现了两个方向相反的比较符: {ln!r}"
+    assert _line_with(out, "持仓") == "   持仓 不足 0.0001%   ⚠️ 仅统计前 98 名,真实值更高", out
+    assert _line_with(out, "你的名单") == "👥 你的名单 · 1 人在前 98 名内 · 不足 0.0001%", out
+    _assert_chips_invariant(out)
+
+
+# ============================================================
+# 持仓数量的写法
+# ============================================================
+def test_十亿以上的持仓换成B单位(monkeypatch, tmp_path):
+    """
+    ⚠️ memecoin 的供应量常在 1e9~1e15。`5,000,000,000 枚` 一个字段就吃掉十三个字符,
+       一行塞不下 handle + 数量 + 金额三段。分母故意不给,把这条用例焦点收在数量上。
+    """
+    data = {"totalHolders": 1, "topHolders": [_holder("u-1", "alice", 5e9, 5.0)]}
+    client = _FakeClient({"1399811149": data}, meta={})
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "@alice · 5.00B 枚 · $5.00" in out, out
+    assert "5,000,000,000" not in out, f"没换单位,一行被它吃掉:\n{out}"
+    _assert_chips_invariant(out)
+
+
+def test_不足一枚的持仓保留小数而不是被抹成0(monkeypatch, tmp_path):
+    """⚠️ 高价币真的可能只持有零点几枚。四舍五入成 `0 枚` 就是把「有」说成「没有」"""
+    data = {"totalHolders": 1, "topHolders": [_holder("u-1", "alice", 0.5, 5.0)]}
+    client = _FakeClient({"1399811149": data}, meta={})
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "@alice · 0.5000 枚 · $5.00" in out, out
+    assert "· 0 枚" not in out, f"半枚被抹成了 0:\n{out}"
+    _assert_chips_invariant(out)
+
+
+# ============================================================
+# 求和:一个都没解析出来 ≠ 加起来是 0
+# ============================================================
+def test_求和在一个数都没有时返回None而不是0():
+    """
+    ⚠️ `sum([]) == 0` 会让「字段全缺」和「加起来真的是 0」变成同一个值,
+       下游据此打出一个 0% 的占比 —— 那是凭空造出来的假事实。
+       0 本身仍然是有意义的真实值,必须原样返回。
+    """
+    from src.bot import _chips_sum
+
+    assert _chips_sum([]) is None, "空列表 = 什么都没解析出来,不是 0"
+    assert _chips_sum([None, None]) is None, "全是缺失 = 什么都没解析出来,不是 0"
+    assert _chips_sum([0.0]) == 0.0, "0 是真实值,照实返回"
+    assert _chips_sum([None, 2.0, 3.0]) == 5.0, "缺的跳过,有的照加"
+
+
+def test_持仓数量全缺时占比整段消失而不是打成0(monkeypatch, tmp_path):
+    """求和退化成 0 之后,这里会渲染出一句「持仓 0%」—— 一个凭空造出来的事实"""
+    data = {"totalHolders": 2,
+            "topHolders": [{"user": {"id": "u-1"}, "value": 5.0},
+                           {"user": {"id": "x-9"}, "value": 5.0}]}
+    client = _FakeClient({"1399811149": data})              # 分母是有的,只缺分子
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert _line_with(out, "FOMO 平台") == "🏦 FOMO 平台 · 持有人 2", out
+    assert "持仓 0%" not in out, f"字段全缺被当成了「加起来是 0」:\n{out}"
+    assert "%" not in out, f"分子一个都没解析出来,不该有任何占比:\n{out}"
+    _assert_chips_invariant(out)
+
+
+# ============================================================
+# 注脚:没有占比就不该解释占比
+# ============================================================
+def test_分子挂了就不该挂一句占比是近似值(monkeypatch, tmp_path):
+    """
+    ⚠️ 两条注脚都在解释「占比这个数怎么来的」。分子挂掉时消息里一个百分号都没有,
+       却挂着「占比是近似值」,等于回答一个没人问的问题、还暗示上面有个近似的占比。
+       复现条件:用户指定链 + 持有人榜抛异常 + 本地有行情(于是走本地推算)。
+    """
+    from src.models import EVENT_BUY, REASON_LOCAL_STATS, FomoEvent
+
+    client = _FakeClient(exc=FomoAPIError("/hodlers/top HTTP 500: oops"), meta={})
+    b, store_ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+    with store_.get_conn() as conn:
+        store_.mark_stats_ready(conn, "u-1")
+        store_.insert_event(conn, FomoEvent(
+            event_id="e1", event_type=EVENT_BUY, user_id="u-1",
+            event_ts="2026-08-01T00:00:00+00:00", raw_json="{}",
+            network_id="solana", token_address=CA_SOL, token_symbol="FOREST",
+            amount_usd=1.0, badge_reason=REASON_LOCAL_STATS, user_handle="alice"))
+        # 市值 1000 / 价格 0.000001 = 十亿枚 —— 本地推算这一路是能走通的
+        store_.upsert_token_snapshots(conn, [("solana", CA_SOL, "FOREST", 0.000001, 1000.0)])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "FOMO 接口异常" in out, out
+    assert "%" not in out, f"分子都没拿到,消息里不该有占比:\n{out}"
+    assert "近似值" not in out, f"消息里没有占比,却解释了占比怎么来的:\n{out}"
+    assert "推算" not in out, out
+    _assert_chips_invariant(out)
+
+
+# ============================================================
+# 服务端自报数据不一致时,不许输出自相矛盾的话
+# ============================================================
+def test_总数比条数还少时以实际条数为准(monkeypatch, tmp_path):
+    """
+    ⚠️ 服务端说 totalHolders=0 却给了一条持有人明细。照抄这个 0 就会渲染成
+       「持有人 0」,下面紧跟着列出一位持有人 —— 一条自己打自己脸的消息。
+       手上数得出来的条数比服务端的自报更可信。
+    ⚠️ 但也绝不能因此翻成「精确」:连总数都不可信,更没资格说「这就是全部」。
+    """
+    data = {"totalHolders": 0,
+            "topHolders": [_holder("u-1", "alice", 200_000_000.0, 100.0)]}
+    client = _FakeClient({"1399811149": data})
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "持有人 0" not in out, f"说没有持有人,却列出了持有人:\n{out}"
+    assert _line_with(out, "FOMO 平台") == "🏦 FOMO 平台 · 持有人 1", out
+    assert "@alice" in out, out
+    assert "仅统计前 1 名" in out, f"总数不可信时仍然只能报下界:\n{out}"
+    _assert_chips_invariant(out)
+
+
+def test_一条明细都没拿到时不说仅统计前0名(monkeypatch, tmp_path):
+    """
+    ⚠️ 服务端自报有 5 个持有人、却一条明细都没给(那道约 $2 的市值下限足以滤光所有人)。
+       「仅统计前 0 名」和「前 0 名内无人」都是什么都没说的废话,读起来还像是数错了。
+    """
+    client = _FakeClient({"1399811149": {"totalHolders": 5, "topHolders": []}})
+    b, _ = _bot(monkeypatch, tmp_path, client, members=[("u-1", "alice")])
+
+    out = b._cmd_chips(f"{CA_SOL} solana")
+
+    assert "仅统计前 0 名" not in out, f"自相矛盾的措辞:\n{out}"
+    assert "前 0 名内" not in out, f"自相矛盾的措辞:\n{out}"
+    assert _line_with(out, "FOMO 平台") == "🏦 FOMO 平台 · 持有人 5", out
+    assert "没拿到任何持有人明细" in out, out
+    _assert_chips_invariant(out)
