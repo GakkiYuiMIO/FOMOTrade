@@ -1265,3 +1265,32 @@ LESTER 5/5=3.126% 全部精确；copycat 113 人只返 8 条 → 只能给下界
 分母用**总供应量**（FDV 口径，与那个第三方工具一致，便于对照）。
 接口里也有 `circulatingSupply`；memecoin 一般全流通两者相等，
 但碰上有锁仓的币会差很多。用户尚未表态，保持现状。
+
+---
+
+## pump.fun 监控（2026-08-30 调研中）
+
+### 要盯的三个人（地址由用户提供，已链上校验）
+
+| 名字 | Solana 地址 | 校验 |
+|---|---|---|
+| hexiecs | `21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm` | 44 位 base58 ✓，08-30 06:32 UTC 有活动 |
+| 1000XCryptoD | `5f1AoBaqeBZ3sQhNVQp7xYANb7ykj4xzYBh8eW5RYyFE` | 44 位 base58 ✓，08-30 06:31 UTC 有活动 |
+| brc20niubi | `BQ4KBzzXXk6ZMxVQb4mePuUbJfe85MerzYj53eatzUWd` | 44 位 base58 ✓，08-30 06:11 UTC 有活动 |
+
+profile URL 形如 `https://pump.fun/profile/<地址>` —— **路径参数就是钱包地址本身**，
+不是内部 ID。这跟 FOMO 完全不同（FOMO 是托管的，98.7% 的 swap 连 tx hash 都没有）。
+
+### 已验证的事实
+- **公共 Solana RPC `api.mainnet-beta.solana.com` 的 `getSignaturesForAddress`
+  免 key、免注册、免信用卡直接可用**，三个地址都能拉到最近签名。
+  → 链上兜底方案零成本。但公共 RPC 限流凶，是否够高频轮询待定。
+- 三个地址都活跃（最后活动都在调研当时半小时内）。
+
+### 设计约束（调研前已定）
+- **必须独立成第三个 APScheduler job**，不能塞进 `poller.tick()`：
+  `cli.py` 里 tick 抛 `AuthError` 会 `sched.shutdown()` 停掉整个监控，
+  第三方接口抖动不该有权力停掉 FOMO 推送。照 `binance_alpha` 的路子。
+- **名单要另存**：`watch_users` 存的是 FOMO 的 UUID + handle，
+  pump.fun 的身份是钱包地址，口径不同。
+- **命令要另起一组**：`/add` `/del` `/list` `/who` 等已被 FOMO 占用。
