@@ -1907,8 +1907,8 @@ class Poller:
             #    没有这道门,任何一条 sent=0 的转入都会顺着补发路径推出去 ——
             #    也就是把"只推被点名的那几个人"悄悄变成"全名单 ≈807 条/天"。
             #    判不过的当场 mark_sent 排掉,免得它每 15 秒被捞出来一次、连捞 10 分钟。
-            is_watch_transfer = ev.event_type == EVENT_TRANSFER_IN
-            if is_watch_transfer and not self._should_push_transfer_in(ev):
+            is_transfer_in = ev.event_type == EVENT_TRANSFER_IN
+            if is_transfer_in and not self._should_push_transfer_in(ev):
                 with suppress(Exception):
                     store.mark_sent(conn, ev.event_id, None, None)
                 continue
@@ -1919,7 +1919,7 @@ class Poller:
             #    绝不能出现"因为算不出共识数所以整条推送失败"。
             # ⚠️ 转入那条消息里没有共识行(它问的是"这个人拿到了什么",不是
             #    "名单里几个人买过"),所以整段跳过 —— 白算两条 SQL 没有意义。
-            if not is_watch_transfer:
+            if not is_transfer_in:
                 try:
                     baseline_pending = not store.is_stats_ready(conn, ev.user_id)
                     buyers, watchlist = store.count_consensus(conn, ev)
@@ -1933,7 +1933,7 @@ class Poller:
             try:
                 text = (
                     render_transfer_in_watch(ev, starred=ev.user_id in starred)
-                    if is_watch_transfer else
+                    if is_transfer_in else
                     render(
                         ev,
                         buyers=buyers,
