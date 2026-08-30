@@ -2955,6 +2955,10 @@ def test_停机补数那一轮不逐条推转入(db, monkeypatch):
     """
     ⚠️ 停机后第一轮的转账是**整段积压**,而消息里写的是"N 分钟前到账" ——
        补数轮逐条推等于把几百条过期消息一次喷出来(与推送侧/跟单侧同一条守卫)。
+    ⚠️ 光断言"没推出去"是不够的:`_dispatch` 在补数轮会整段改走汇总,
+       于是**判定漏了也照样绿**(实测:把补数轮那道门删掉,只看推送结果的断言全绿)。
+       所以这里同时钉死"这条转入根本没进逐条推送队列",而队列内容是
+       _persist 的返回值 —— 可观测,且不依赖被测函数自己的判断。
     """
     _tin_env(monkeypatch)
     _add_ready("uA", "PoorGoat_")
@@ -2965,6 +2969,13 @@ def test_停机补数那一轮不逐条推转入(db, monkeypatch):
     assert not [m for m in notifier.sent if m.startswith("📥")], \
         f"补数轮不该有逐条转入推送:{notifier.sent}"
     assert _sent_flags() == [1], "补数轮的转账必须当场 mark_sent"
+
+    p2 = Poller(FakeClient(), FakeNotifier())
+    p2._catchup_since = now_iso()
+    p2._tx_watch_ids = {"uA"}
+    with store.get_conn() as c:
+        queued = p2._persist(c, p2.normalize_transfers(_row(), [_deposit(9)]))
+    assert queued == [], "补数轮的转入绝不能进逐条推送队列(积压信号已经过期)"
 
 
 def test_推送失败绝不mark_sent_下一轮补发(db, monkeypatch):
@@ -3013,26 +3024,37 @@ def test_被点名的转入照样喂给聚合告警_人数不许少算(db, monke
        两个信号回答的是不同的问题(这个人又进货了 / 这个币在被分发给一群人)。
        落库侧要是把点名的那条从 transfers 列表里摘出去,聚合告警就会少算一个人 ——
        3 人门槛下少一个人就是整条告警消失。
+
+    ⚠️⚠️ **被点名的那个人必须是最后到的那一个**,否则这条测试抓不到东西:
+       _check_transfer_in 只拿 _new_transfers 当"本轮该查哪些币"的候选集,
+       真正的人数是 SQL 从库里数的。只要同一轮里还有别人的转账把这个币带进候选集,
+       摘不摘那一条都照样告警 —— 实测:让被点名的人第一个到,把 transfers.append
+       删掉之后这条用例仍然全绿。所以这里让前两个人先到(不够门槛、不告警),
+       再让**被点名的人**补上第三个 —— 这一轮的候选集里只有他那一条。
     """
     _tin_env(monkeypatch, alert_usd=500, receivers=3)
     for i in range(3):
         _add_ready(f"u{i}", f"Holder{i}")
-    _mark_tin("Holder0")
+    _mark_tin("Holder2")                                  # 最后到的那个人被点名
 
     snaps = {f"u{i}": UserSnapshot(f"u{i}", swaps=[],
                                    transfers=[_deposit(i, usd=901.37 + i)],
-                                   thesis=[], balances=[]) for i in range(3)}
+                                   thesis=[], balances=[]) for i in range(2)}
+    snaps["u2"] = UserSnapshot("u2", swaps=[], transfers=[], thesis=[], balances=[])
     notifier = FakeNotifier()
     p = Poller(FakeClient(snaps), notifier)
-    # 转账采集是轮转的(3 人 → 每轮 1 个),三轮才把三个人都收进来;
-    # 被点名的 u0 每轮都拉,但游标只让他那一笔进一次库 —— 所以逐条推送也只有一条
-    for _ in range(3):
+    for _ in range(2):                                    # 轮转:每轮 1 个 → u0、u1 先进库
         p.tick()
+    assert notifier.sent == [], "才 2 个人收到,不该有任何推送(前提不成立的话下面都白测)"
+
+    snaps["u2"].transfers = [_deposit(2, usd=903.37)]     # 第三个人(被点名的)到货
+    p.tick()
 
     tin = [m for m in notifier.sent if m.startswith("📥")]
     sig = [m for m in notifier.sent if m.startswith("🚨")]
     assert len(tin) == 1, f"被点名的那个人该有一条逐条推送:{notifier.sent}"
-    assert len(sig) == 1, "聚合告警必须照常发,不能被单人推送吃掉"
+    assert len(sig) == 1, \
+        "聚合告警没发 —— 被点名的那条没被喂给它,这个币这一轮压根没进候选集"
     assert "3 人「收到」" in sig[0], f"聚合告警少算了人:{sig[0].splitlines()[0]}"
 
 
@@ -3107,6 +3129,46 @@ def test_点名不许破坏轮转_没被点名的人仍要在一圈内全被覆�
 
     missed = {u["user_id"] for u in _tin_rows()} - set(client.transfer_calls)
     assert missed == set(), f"一圈下来有 {len(missed)} 个人一次都没被轮到:{sorted(missed)[:5]}"
+
+
+def test_点名不改变轮转对其余人的调度(db):
+    """
+    ⚠️ 这条把"轮转本身一个字节都不动"变成可执行的断言:开不开 /tin、开几个人,
+       **没被点名的人被轮到的次序必须逐轮一模一样**。
+    ⚠️ 为什么不能只断言"一圈内都被覆盖到":把被点名的人从轮转池里摘出去(这是最
+       自然的写法)之后,取模基数从 60 变成 48 —— 覆盖照样完成,只是节奏全变了,
+       而"在长度会变的列表上取模不构成扫描"正是 _rotate_transfers 明确警告过的坑
+       (名单人数、点名人数都会变)。实测:只断言覆盖时那个改法全绿。
+    """
+    _many_users(60)
+    rows = _tin_rows()
+    c1 = FakeClient()
+    p1 = Poller(c1, FakeNotifier())
+    p1._refresh_watched_index(rows)                      # 一个人都没点名
+    base = []
+    for _ in range(20):
+        before = len(c1.transfer_calls)
+        p1._fetch_snapshots(rows)
+        base.append(c1.transfer_calls[before:])
+
+    for i in range(12):
+        _mark_tin(f"h{i:03d}")
+    rows2 = _tin_rows()
+    marked = {f"u{i:03d}" for i in range(12)}
+    c2 = FakeClient()
+    p2 = Poller(c2, FakeNotifier())
+    got = []
+    for _ in range(20):
+        p2._refresh_watched_index(rows2)
+        before = len(c2.transfer_calls)
+        p2._fetch_snapshots(rows2)
+        got.append(sorted(u for u in c2.transfer_calls[before:] if u not in marked))
+
+    want = [sorted(u for u in b if u not in marked) for b in base]
+    first_bad = next((i for i, (a, b) in enumerate(zip(got, want, strict=True)) if a != b), None)
+    assert got == want, (
+        "点名之后,没被点名的人被轮到的次序变了 —— 轮转的取模基数被改动过;"
+        f"第 {first_bad} 轮开始不一致")
 
 
 def test_点名人数超上限就退回轮转并告警(db):
