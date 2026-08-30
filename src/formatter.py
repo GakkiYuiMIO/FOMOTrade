@@ -786,10 +786,21 @@ def _clip(s, limit: int) -> str:
        叠平空白也是必需的:一个 handle 里塞几个换行就能把一行变成十行,
        绕开"按行算预算"这个前提。
     """
+    return _esc(_flatten(s, limit))
+
+
+def _flatten(s, limit: int) -> str:
+    """
+    叠平空白 + 限长,**不转义**。
+
+    ⚠️ 单独拆出来只为一种情况:调用方后面还要把它塞进 `${...}` 之类的模板,
+       而那个模板自己会 escape(见 _style_symbol)。先 escape 再 escape 一次,
+       `&` 会变成 `&amp;amp;` 显示成一串乱码。除此之外一律用 _clip。
+    """
     flat = " ".join(str(s or "").split())
     if len(flat) > limit:
         flat = flat[:limit].rstrip() + "…"
-    return _esc(flat)
+    return flat
 
 
 def _fit_signal(lines: list[str], anchor: str | None) -> str:
@@ -1070,6 +1081,118 @@ def render_transfer_in_signal(
         lines.append(f"…还有 {omitted} 人未显示")
     lines.extend(tail_lines)
     return _fit_signal(lines, anchor)
+
+
+# ============================================================
+# 指定用户的转入 —— 逐条推送(/tin)
+# ============================================================
+# 「到账时刻」那一格用相对时间。⚠️ 绝对时刻要带时区才不会被读错,而这条消息的
+#    唯一用途是"他刚刚拿到货,我还来不来得及",相对时间直接回答这个问题。
+def _watch_ago_line(ev: FomoEvent, now: float | None) -> str | None:
+    got_at = _parse_ts(ev.event_ts)
+    if got_at is None:
+        return None
+    span = _fmt_span((time.time() if now is None else now) - got_at)
+    return None if span is None else f"{EMOJI_CLOCK} {span}前到账"
+
+
+# 「收到时市值」这个**时点断言**最多容忍这笔转账有多旧(秒)。
+# ⚠️ poller 那道闸(_TRANSFER_MCAP_FRESH_SEC = 900)管的是另一件事:900 秒是为了
+#    把首轮/停机后一次性吃进来的历史转账(单页 25 条,最远十几小时)挡在外面,
+#    对**聚合告警**那条路径够用。但它填进来的值是"本轮 balances 观测到的市值",
+#    在 900 秒这个宽度下,「收到时」这三个字最坏会比数据真实含义早 15 分钟 ——
+#    对 memecoin 来说 15 分钟能走出几倍。**标签不能比数据强**,所以逐条推送这条
+#    路径自己再收一道,超了就整行消失(铁律:缺失字段整行消失,绝不降级成弱说法)。
+# ⚠️ 120s 的依据(本地库 read-only 实测,2026-08-30):
+#    拿"每轮都拉"的那条流(BUY,swaps 每 tick 一次)当 /tin 的同构参照,
+#    剔掉停机补数那一段(滞后 > 900s)后 n=5762:p50 29s · p75 51s · p90 98s · p95 248s。
+#    即 120s 覆盖约 91.5% 的推送,而把标签的最坏误差从 15 分钟压到 2 分钟。
+#    再放宽到 300s 只多捞 4.4%,却让误差回到 5 分钟 —— 不值。
+_WATCH_MCAP_MAX_AGE_SEC = 120
+
+
+def _watch_mcap_line(ev: FomoEvent, now: float | None) -> str | None:
+    """
+    「收到时」的市值。
+
+    ⚠️⚠️ 这一格与 _market_cap_line(「💎 市值 X」)**不是一回事,不许合并**:
+       那一格说的是"现在多少",这一格说的是"他拿到货的那一刻多少" ——
+       对这条消息来说后者才是能用来判断早晚的那个数。
+       poller 只在这笔转账足够新时才把本轮观测到的市值填进 ev.market_cap
+       (见 poller._TRANSFER_MCAP_FRESH_SEC),所以有值时这个说法才**可能**成立;
+       取不到就整行消失,**绝不拿"现在的市值"冒充"收到时的市值"**。
+    ⚠️ 渲染时刻距到账越久,"本轮观测值 = 收到时的值"这个等号就越站不住。
+       这里用**渲染时的账龄**再兜一道:它是"观测时账龄"的上界(观测必然发生在
+       渲染之前),所以这道门只会误杀、不会放行不该放行的 —— 正是该偏的那一侧。
+       代价是补发路径(推送失败后最长补 10 分钟)会丢掉这一格,认了。
+    ⚠️ 只卡上界:账龄为小负数是上游时钟偏移(实测 min = -22s),那种情况恰恰是
+       "刚刚到账",不该因为差了几秒就把这一格抹掉。
+    """
+    mc = _fmt_usd_compact(ev.market_cap)
+    if mc is None:
+        return None
+    got_at = _parse_ts(ev.event_ts)
+    if got_at is None:
+        # 连到账时刻都读不出来,就无从证明这个市值是"那一刻"的
+        return None
+    if (time.time() if now is None else now) - got_at > _WATCH_MCAP_MAX_AGE_SEC:
+        return None
+    return f"{EMOJI_MARKET_CAP} 收到时市值 {mc}"
+
+
+def _watch_sender_line(ev: FomoEvent) -> str | None:
+    """发货地址。截短只为好读,判定用的永远是完整地址(在 store 里比对)。"""
+    addr = _short_addr(ev.counterparty_address)
+    return None if addr is None else f"{EMOJI_SENDER} 发货地址 {addr}"
+
+
+def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
+                             now: float | None = None) -> str:
+    """
+    被 /tin 点名的人**收到**了一笔币 —— 逐条推送。
+
+    ⚠️⚠️ **措辞铁律:只摆可证的事实,一个字都不许替用户下结论。**
+       这个功能存在的理由是"有些人在别处成交,币是转进来的,对他们来说收到就是进货"。
+       但报文里只有 fromAddress/toAddress(8404 条真实转账里 userId 键出现 0 次),
+       **没有任何证据**表明这笔转账来自哪个工具、是不是买入、花没花钱。
+       所以这里只写:谁、什么币、多少枚、多少美元、收到时市值、从哪个地址来、多久之前。
+       "他在 XX 上买的" / "他又建仓了" / "一分钱没花" 这类话全部禁止 ——
+       用户自己知道这个人用什么工具,他读得出来;替他断言就是编。
+       (本项目已经因为「他们一分钱没花」这种断言被审查打回过一次。)
+    ⚠️ 也**刻意不带** render() 里那句「⚠️ 转账获得,非市场买入」:那句话在
+       "N 人收到同一个币"的语境里是在防误读,而在这里它恰恰是反方向的断言 ——
+       这笔转账很可能**就是**他在别处付了钱的买入。两边都不说,才是数据支持的位置。
+    ⚠️ 出口不变式与 /ca、与分发预警同一套:≤ TRANSFER_MSG_BUDGET、只在整行边界砍、
+       CA 锚点最后贴且完整(见 _fit_signal)。handle / ticker 是陌生人可控的
+       任意长文本,先 _clip 收口再进模板,否则一个超长昵称就能把整条消息挤没。
+    ⚠️ 本函数是纯函数,不查库(铁律 7);缺失的字段整行消失,绝不打 0 / N/A。
+    """
+    emoji, label = _title_anchor(ev)
+    mark = f"{STAR_MARK} " if starred else ""
+    name = (ev.handle or "").strip() or (ev.user_id or "").strip()
+    head = f"{emoji} {mark}<b>{_clip(name, _SIG_HANDLE_CHARS) if name else TEXT_UNKNOWN_USER}</b>"
+    h = (ev.user_handle or "").strip().lstrip("@")
+    # @handle 与展示名相同时不重复显示(有人没设展示名,handle 会被当展示名用)
+    if h and h.lower() != name.lower():
+        head += f" (@{_clip(h, _SIG_HANDLE_CHARS)})"
+    parts = [head, label]
+    sym = _symbol_plain(ev)
+    if sym is not None:
+        # ⚠️ 传**未转义**的截断结果:_style_symbol 自己会 escape,先转义会变成 &amp;amp;
+        parts.append(_style_symbol(_flatten(sym, _SIG_SYMBOL_CHARS), starred))
+
+    lines = [
+        SEP.join(parts),
+        _amount_line(ev),            # 💰 数量 12,000,000 ≈ $2,439.09
+        _watch_mcap_line(ev, now),   # 💎 收到时市值 $198.2K(太旧就整行消失)
+        _counterparty_line(ev),      # 👤 来自 someone(名单内转账会自己标出来)
+        _watch_sender_line(ev),      # 📮 发货地址 8FtY7n…cZx72
+        _watch_ago_line(ev, now),    # ⏱ 3 分 20 秒前到账
+        _network_line(ev),           # 🧬 Solana
+        _links_line(ev),             # 🔗 FOMO · GMGN(必须排在 CA 之前)
+    ]
+    anchor = f"<code>{_clip(ev.token_address, _SIG_CA_CHARS)}</code>" if ev.token_address else None
+    return _fit_signal([ln for ln in lines if ln], anchor)
 
 
 # ============================================================

@@ -51,7 +51,9 @@ from src.notifier import MAX_MESSAGE_LEN
 
 # _f/_pick_str 是 poller 已经踩过坑写好的"字段可能缺、可能嵌套、可能是脏字符串"
 # 兜底解析器。/ca 解析的是同一个 API(client.get_token_thesis),没道理另起一套。
-from src.poller import _f, _pick_str
+# TRANSFER_WATCH_MAX 同理:上限的依据是 poller 的**单轮请求预算**,
+# 那里才有算式。在这里复制一个字面量,迟早会与真正生效的那个悄悄分家。
+from src.poller import TRANSFER_WATCH_MAX, _f, _pick_str
 
 # TG 服务端 long-poll 挂起秒数。notifier.get_updates 内部的 httpx 超时比它长,不用担心误杀
 POLL_TIMEOUT_SEC = 30
@@ -100,6 +102,7 @@ _COMMAND_MENU = [
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
     ("unstar", "取消特别关注:/unstar <handle>"),
+    ("tin", "转入推送:/tin <handle> 开关 · /tin 看当前开着谁"),
     ("del", "移出监控:/del <handle>"),
     ("rebuild", "重建全部历史基线(回填逻辑改动后用)"),
     ("help", "命令说明"),
@@ -132,6 +135,8 @@ _HELP = (
     "/paper — 跟单台账:每一单现在赚亏多少\n"
     "/star &lt;handle&gt; — 特别关注:他的推送带 ⭐、币名加【】\n"
     "/unstar &lt;handle&gt; — 取消特别关注\n"
+    "/tin &lt;handle&gt; — 开/关这个人的<b>转入逐条推送</b>(再发一次即关闭);"
+    "/tin 不带参数=看当前开着谁\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
     "/status — 运行状态\n"
@@ -606,6 +611,8 @@ class CommandBot:
             return self._cmd_star(arg, on=True)
         if cmd in ("/unstar", "/unfav"):
             return self._cmd_star(arg, on=False)
+        if cmd == "/tin":
+            return self._cmd_tin(arg)
         if cmd == "/list":
             return self._cmd_list()
         if cmd == "/status":
@@ -1147,6 +1154,40 @@ class CommandBot:
         with store.get_conn() as conn:
             _, msg = store.set_starred(conn, key, on)
         return _esc(msg)
+
+    def _cmd_tin(self, arg: str) -> str:
+        """
+        /tin [handle] —— 「转入逐条推送」的开关与清单。
+
+        这个开关的用途:有些人的成交发生在别处,币是**转进来**的,FOMO 这边看到的
+        是一条转入而不是买入。对这些人来说,转入到账才是他动手的那一刻。
+        ⚠️ 但推送文案里只摆事实(谁、什么币、多少、收到时市值、从哪个地址来、多久之前),
+           **绝不替用户断言这是买入、也不猜他用的什么工具** —— 报文里没有任何证据。
+        ⚠️ 默认全员关闭,而且必须一个个开:全名单打开实测约 807 条/天,
+           那会把真正要看的买卖推送整个淹掉(见 poller._persist 里的实测数)。
+        """
+        key = (arg or "").strip()
+        min_usd = self._settings.fomo_transfer_watch_min_usd
+        with store.get_conn() as conn:
+            if key:
+                # 不带 on/off 参数 = 开关:已开就关。上限由 poller 的请求预算决定
+                _, msg = store.set_transfer_watch(conn, key, max_on=TRANSFER_WATCH_MAX)
+                return _esc(msg)
+            rows = [r for r in store.list_active_users(conn) if r["watch_transfer_in"]]
+
+        if not rows:
+            return (
+                "📥 <b>转入逐条推送</b>:当前一个人都没开\n"
+                f"/tin &lt;handle&gt; 打开 —— 他每收到一笔 ≥ ${min_usd:,.2f} 的币就单独推一条。\n"
+                f"最多同时开 {TRANSFER_WATCH_MAX} 人(每多一人,每轮多一个请求)。"
+            )
+        lines = [f"📥 <b>转入逐条推送</b>({len(rows)}/{TRANSFER_WATCH_MAX} 人)"
+                 f" · 门槛 ${min_usd:,.2f}"]
+        for i, r in enumerate(rows, 1):
+            name = r["display_name"] or r["handle"]
+            lines.append(f"{i}. <b>{_esc(name)}</b> @{_esc(r['handle'])}")
+        lines.append("再发一次 /tin &lt;handle&gt; 即可关闭。")
+        return "\n".join(lines)
 
     def _cmd_list(self) -> str:
         with store.get_conn() as conn:

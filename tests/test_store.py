@@ -723,6 +723,127 @@ def test_老库升级后自动补starred列(conn):
 
 
 # ============================================================
+# 转入逐条推送(/tin)—— 会真的改采集频率和推送量的开关
+# ============================================================
+def test_转入推送标记默认关_开了才落库(conn):
+    """
+    默认必须是 0:这个开关一开就是"每轮多一个请求 + 逐条推送",
+    悄悄默认打开等于把全名单 760 条/天喷给用户。
+    """
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    assert store.transfer_watch_user_ids(conn) == set(), "新加的人默认必须是关的"
+
+    ok, msg = store.set_transfer_watch(conn, "alice")       # handle 大小写不敏感
+    assert ok and "已开启" in msg
+    assert store.transfer_watch_user_ids(conn) == {"u1"}
+    # 真的落到了列上,不是只活在内存里
+    row = conn.execute("SELECT watch_transfer_in FROM watch_users WHERE user_id='u1'").fetchone()
+    assert row["watch_transfer_in"] == 1
+
+
+def test_tin是开关_再发一次就关掉(conn):
+    """/tin 只有一个参数,开与关全靠它自己翻面 —— 翻不动的话用户没有别的办法关掉"""
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    ok, _ = store.set_transfer_watch(conn, "alice")
+    assert ok and store.transfer_watch_user_ids(conn) == {"u1"}
+
+    ok, msg = store.set_transfer_watch(conn, "u1")          # 也认 user_id
+    assert ok and "已关闭" in msg
+    assert store.transfer_watch_user_ids(conn) == set()
+
+
+def test_显式设成已经是的状态要如实回执(conn):
+    """幂等的那一支必须说人话:开关命令唯一的反馈就是回执"""
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True)
+    ok, msg = store.set_transfer_watch(conn, "alice", True)
+    assert not ok and "本来就是开" in msg
+
+
+def test_给名单外的人开转入推送要给出可操作的提示(conn):
+    """静默失败会让用户一直等一条永远不会来的推送"""
+    ok, msg = store.set_transfer_watch(conn, "nobody")
+    assert not ok
+    assert "没有" in msg and "/add" in msg, f"要引导他先 /add,实际:{msg}"
+
+
+def test_移出名单的人不再算转入推送(conn):
+    """poller 根本不会去拉他的转账,还留在名单里只会让人数对不上"""
+    store.add_watch_user(conn, "u1", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True)
+    store.remove_watch_user(conn, "alice")
+    assert store.transfer_watch_user_ids(conn) == set()
+
+
+def test_转入推送有人数上限_超了要在开的时候就拦住(conn):
+    """
+    ⚠️ 上限必须在**开之前**拦:poller 那边超限只会退回轮转 + 刷日志,
+       用户在 TG 里什么都看不到,还以为开成功了。
+    """
+    for i in range(3):
+        store.add_watch_user(conn, f"u{i}", f"H{i}", f"H{i}")
+        store.set_transfer_watch(conn, f"u{i}", True, max_on=3)
+    assert len(store.transfer_watch_user_ids(conn)) == 3
+
+    store.add_watch_user(conn, "u9", "H9", "H9")
+    ok, msg = store.set_transfer_watch(conn, "u9", True, max_on=3)
+    assert not ok and "最多" in msg
+    assert store.transfer_watch_user_ids(conn) == {"u0", "u1", "u2"}, "第 4 个人绝不能被开进去"
+    # 关掉一个之后就该放行 —— 上限是"同时开几个",不是"这辈子开过几个"
+    store.set_transfer_watch(conn, "u0", False, max_on=3)
+    ok, _ = store.set_transfer_watch(conn, "u9", True, max_on=3)
+    assert ok
+
+
+def test_软删除再加回来不许把转入推送顶到上限之外(conn):
+    """
+    ⚠️⚠️ 实测出来的绕过路径(/del 与 /add 直落这两个函数,store 层就能完整复现):
+       开满 12 → /del 掉一个(软删除)→ 名额看着空出来 → 再 /tin 开第 13 个 →
+       /add 把删掉那个加回来。软删除时若把标记位留着,而 add_watch_user 的
+       ON CONFLICT 分支又不碰它,active 且开着的人数就变成 13。
+    ⚠️ 后果不是"多推几条":poller 每轮都会撞上超限分支、**整体退回轮转**,
+       这个功能的时效承诺当场作废,而 /tin 清单显示的还是「13/12 人」—— 全程零报错。
+    ⚠️ 12 写死(poller 的单轮请求预算),不从被测模块 import。
+    """
+    for i in range(12):
+        store.add_watch_user(conn, f"u{i:02d}", f"h{i:02d}", f"H{i:02d}")
+        ok, msg = store.set_transfer_watch(conn, f"u{i:02d}", True, max_on=12)
+        assert ok, f"前提不成立,第 {i} 个没开上:{msg}"
+    store.add_watch_user(conn, "u99", "h99", "H99")
+    assert not store.set_transfer_watch(conn, "u99", True, max_on=12)[0], "满员时该拦住"
+
+    store.remove_watch_user(conn, "h00")                  # /del —— 软删除
+    ok, msg = store.set_transfer_watch(conn, "u99", True, max_on=12)
+    assert ok, f"名额确实空出来了,这时候该开得成:{msg}"
+    store.add_watch_user(conn, "u00", "h00", "H00")       # /add —— 用户改主意,加回来
+
+    on = store.transfer_watch_user_ids(conn)
+    assert len(on) <= 12, f"上限被绕过了:active 且开着的有 {len(on)} 人 —— {sorted(on)}"
+    assert "u00" not in on, \
+        "回归的人必须重新 /tin:这一位会真的多花请求、多发消息,不能静默恢复"
+
+
+def test_老库升级后自动补转入推送列(conn):
+    """
+    CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。补不上的话,升级后第一条
+    /tin(以及每一轮采集时的读取)直接 no such column —— 整个 tick 崩掉。
+    """
+    conn.execute("ALTER TABLE watch_users DROP COLUMN watch_transfer_in")
+    cols = lambda: {r["name"] for r in conn.execute("PRAGMA table_info(watch_users)")}  # noqa: E731
+    assert "watch_transfer_in" not in cols()
+    # 老库里本来就有的人,升级后必须原样还在、且是"关"的状态
+    conn.execute("INSERT INTO watch_users (user_id, handle, added_at) VALUES ('old','Bob','x')")
+
+    store.init_db(conn)
+
+    assert "watch_transfer_in" in cols()
+    assert store.transfer_watch_user_ids(conn) == set(), "升级不能把任何人默认打开"
+    assert store.get_watch_user(conn, "old") is not None, "迁移不许动老数据"
+    ok, _ = store.set_transfer_watch(conn, "Bob")
+    assert ok and store.transfer_watch_user_ids(conn) == {"old"}
+
+
+# ============================================================
 # /hot 买入榜:按倍数排序 + 首买人 + 基准市值
 # ============================================================
 def _hot_buy(conn, uid, ca, ts, mcap=None, usd=100.0, handle=None):

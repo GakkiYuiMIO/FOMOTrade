@@ -1663,3 +1663,79 @@ def test_status的今日事件不把转账算进去(monkeypatch, tmp_path):
 
     out = b._cmd_status()
     assert "📨 今日事件 1 条" in out, f"转账把今日事件灌水了:{out}"
+
+
+# ============================================================
+# /tin —— 指定用户的转入逐条推送:开关 + 清单
+# ============================================================
+def test_tin命令名不与既有命令冲突且已挂进菜单和帮助():
+    """
+    ⚠️ 菜单里有、_dispatch 里没有 = 用户点了只得到"未知命令";
+       反过来则是"有这个功能但没人知道"。两边必须同步维护。
+    """
+    from src.bot import _COMMAND_MENU, _HELP
+
+    names = [n for n, _ in _COMMAND_MENU]
+    assert names.count("tin") == 1, f"命令名重复或没挂上菜单:{names}"
+    assert len(names) == len(set(names)), f"菜单里有重名命令:{names}"
+    assert "/tin" in _HELP
+
+
+def test_tin对名单外的人给出可操作提示(monkeypatch, tmp_path):
+    b, _ = _bot(monkeypatch, tmp_path)
+    out = b._dispatch("/tin", "nobody")
+    assert "未知命令" not in out, "命令没挂进 _dispatch"
+    assert "没有" in out and "/add" in out, f"要引导他先 /add:{out}"
+
+
+def test_tin是开关_再发一次就关掉并且清单跟着变(monkeypatch, tmp_path):
+    b, store = _bot(monkeypatch, tmp_path)
+    with store.get_conn() as c:
+        store.add_watch_user(c, "u1", "PoorGoat_", "PoorGoat")
+
+    assert "一个人都没开" in b._dispatch("/tin", "")
+
+    on = b._dispatch("/tin", "PoorGoat_")
+    assert "已开启" in on, on
+    listed = b._dispatch("/tin", "")
+    assert "PoorGoat" in listed and "@PoorGoat_" in listed
+    assert "$100.00" in listed, f"清单里要写清门槛,否则用户不知道为什么没推:{listed}"
+
+    off = b._dispatch("/tin", "PoorGoat_")
+    assert "已关闭" in off, off
+    assert "一个人都没开" in b._dispatch("/tin", "")
+
+
+def test_tin命令真的把人数上限传下去了_第十三个必须被拦(monkeypatch, tmp_path):
+    """
+    ⚠️⚠️ 上限的**唯一执行路径**就是 /tin,而 store.set_transfer_watch 的 max_on
+       默认是 None(= 不限)。直接调 store 并显式传 max_on 只证明"这个形参能用",
+       一个字都不证明命令这一侧真的把上限传了下去 —— 不传就是彻底没有上限。
+    ⚠️ 超限的后果不是"多推几条":poller 每轮都会撞上超限分支、**整体退回轮转**,
+       时效承诺当场作废,而用户在 TG 里收到的回执是"已开启"。所以必须在开之前就拦。
+    ⚠️ 12 写死(它是 poller 的单轮请求预算算出来的外部事实),不从被测模块 import。
+    """
+    b, store = _bot(monkeypatch, tmp_path)
+    with store.get_conn() as c:
+        for i in range(13):
+            store.add_watch_user(c, f"u{i:02d}", f"h{i:02d}", f"H{i:02d}")
+
+    outs = [b._dispatch("/tin", f"h{i:02d}") for i in range(13)]
+    assert all("已开启" in o for o in outs[:12]), f"前 12 个都该开得成:{outs[:12]}"
+    assert "已开启" not in outs[12], f"第 13 个被放行了 —— 上限压根没传下去:{outs[12]}"
+    assert "最多" in outs[12] and "12" in outs[12], f"回执要说清为什么被拦:{outs[12]}"
+
+    with store.get_conn() as c:
+        assert len(store.transfer_watch_user_ids(c)) == 12, "库里真正开着的必须只有 12 个"
+    assert "12/12" in b._dispatch("/tin", ""), "清单上的人数也不许超"
+
+
+def test_tin的回执与清单都要转义(monkeypatch, tmp_path):
+    """昵称/handle 带 '<' 并不罕见,不转义整条回执直接 400 —— 用户什么都收不到"""
+    b, store = _bot(monkeypatch, tmp_path)
+    with store.get_conn() as c:
+        store.add_watch_user(c, "u1", "ev<il", "<b>boom</b>")
+    assert "<b>boom</b>" not in b._dispatch("/tin", "ev<il"), "回执没转义"
+    listed = b._dispatch("/tin", "")
+    assert "&lt;b&gt;boom" in listed and "<b>boom</b>" not in listed
+    assert _tag_fault(listed) == "", listed
