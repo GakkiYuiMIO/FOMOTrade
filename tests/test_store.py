@@ -795,6 +795,34 @@ def test_转入推送有人数上限_超了要在开的时候就拦住(conn):
     assert ok
 
 
+def test_软删除再加回来不许把转入推送顶到上限之外(conn):
+    """
+    ⚠️⚠️ 实测出来的绕过路径(/del 与 /add 直落这两个函数,store 层就能完整复现):
+       开满 12 → /del 掉一个(软删除)→ 名额看着空出来 → 再 /tin 开第 13 个 →
+       /add 把删掉那个加回来。软删除时若把标记位留着,而 add_watch_user 的
+       ON CONFLICT 分支又不碰它,active 且开着的人数就变成 13。
+    ⚠️ 后果不是"多推几条":poller 每轮都会撞上超限分支、**整体退回轮转**,
+       这个功能的时效承诺当场作废,而 /tin 清单显示的还是「13/12 人」—— 全程零报错。
+    ⚠️ 12 写死(poller 的单轮请求预算),不从被测模块 import。
+    """
+    for i in range(12):
+        store.add_watch_user(conn, f"u{i:02d}", f"h{i:02d}", f"H{i:02d}")
+        ok, msg = store.set_transfer_watch(conn, f"u{i:02d}", True, max_on=12)
+        assert ok, f"前提不成立,第 {i} 个没开上:{msg}"
+    store.add_watch_user(conn, "u99", "h99", "H99")
+    assert not store.set_transfer_watch(conn, "u99", True, max_on=12)[0], "满员时该拦住"
+
+    store.remove_watch_user(conn, "h00")                  # /del —— 软删除
+    ok, msg = store.set_transfer_watch(conn, "u99", True, max_on=12)
+    assert ok, f"名额确实空出来了,这时候该开得成:{msg}"
+    store.add_watch_user(conn, "u00", "h00", "H00")       # /add —— 用户改主意,加回来
+
+    on = store.transfer_watch_user_ids(conn)
+    assert len(on) <= 12, f"上限被绕过了:active 且开着的有 {len(on)} 人 —— {sorted(on)}"
+    assert "u00" not in on, \
+        "回归的人必须重新 /tin:这一位会真的多花请求、多发消息,不能静默恢复"
+
+
 def test_老库升级后自动补转入推送列(conn):
     """
     CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。补不上的话,升级后第一条

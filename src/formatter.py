@@ -1096,7 +1096,22 @@ def _watch_ago_line(ev: FomoEvent, now: float | None) -> str | None:
     return None if span is None else f"{EMOJI_CLOCK} {span}前到账"
 
 
-def _watch_mcap_line(ev: FomoEvent) -> str | None:
+# 「收到时市值」这个**时点断言**最多容忍这笔转账有多旧(秒)。
+# ⚠️ poller 那道闸(_TRANSFER_MCAP_FRESH_SEC = 900)管的是另一件事:900 秒是为了
+#    把首轮/停机后一次性吃进来的历史转账(单页 25 条,最远十几小时)挡在外面,
+#    对**聚合告警**那条路径够用。但它填进来的值是"本轮 balances 观测到的市值",
+#    在 900 秒这个宽度下,「收到时」这三个字最坏会比数据真实含义早 15 分钟 ——
+#    对 memecoin 来说 15 分钟能走出几倍。**标签不能比数据强**,所以逐条推送这条
+#    路径自己再收一道,超了就整行消失(铁律:缺失字段整行消失,绝不降级成弱说法)。
+# ⚠️ 120s 的依据(本地库 read-only 实测,2026-08-30):
+#    拿"每轮都拉"的那条流(BUY,swaps 每 tick 一次)当 /tin 的同构参照,
+#    剔掉停机补数那一段(滞后 > 900s)后 n=5762:p50 29s · p75 51s · p90 98s · p95 248s。
+#    即 120s 覆盖约 91.5% 的推送,而把标签的最坏误差从 15 分钟压到 2 分钟。
+#    再放宽到 300s 只多捞 4.4%,却让误差回到 5 分钟 —— 不值。
+_WATCH_MCAP_MAX_AGE_SEC = 120
+
+
+def _watch_mcap_line(ev: FomoEvent, now: float | None) -> str | None:
     """
     「收到时」的市值。
 
@@ -1104,11 +1119,25 @@ def _watch_mcap_line(ev: FomoEvent) -> str | None:
        那一格说的是"现在多少",这一格说的是"他拿到货的那一刻多少" ——
        对这条消息来说后者才是能用来判断早晚的那个数。
        poller 只在这笔转账足够新时才把本轮观测到的市值填进 ev.market_cap
-       (见 poller._TRANSFER_MCAP_FRESH_SEC),所以有值时这个说法才成立;
+       (见 poller._TRANSFER_MCAP_FRESH_SEC),所以有值时这个说法才**可能**成立;
        取不到就整行消失,**绝不拿"现在的市值"冒充"收到时的市值"**。
+    ⚠️ 渲染时刻距到账越久,"本轮观测值 = 收到时的值"这个等号就越站不住。
+       这里用**渲染时的账龄**再兜一道:它是"观测时账龄"的上界(观测必然发生在
+       渲染之前),所以这道门只会误杀、不会放行不该放行的 —— 正是该偏的那一侧。
+       代价是补发路径(推送失败后最长补 10 分钟)会丢掉这一格,认了。
+    ⚠️ 只卡上界:账龄为小负数是上游时钟偏移(实测 min = -22s),那种情况恰恰是
+       "刚刚到账",不该因为差了几秒就把这一格抹掉。
     """
     mc = _fmt_usd_compact(ev.market_cap)
-    return f"{EMOJI_MARKET_CAP} 收到时市值 {mc}" if mc is not None else None
+    if mc is None:
+        return None
+    got_at = _parse_ts(ev.event_ts)
+    if got_at is None:
+        # 连到账时刻都读不出来,就无从证明这个市值是"那一刻"的
+        return None
+    if (time.time() if now is None else now) - got_at > _WATCH_MCAP_MAX_AGE_SEC:
+        return None
+    return f"{EMOJI_MARKET_CAP} 收到时市值 {mc}"
 
 
 def _watch_sender_line(ev: FomoEvent) -> str | None:
@@ -1155,7 +1184,7 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
     lines = [
         SEP.join(parts),
         _amount_line(ev),            # 💰 数量 12,000,000 ≈ $2,439.09
-        _watch_mcap_line(ev),        # 💎 收到时市值 $198.2K
+        _watch_mcap_line(ev, now),   # 💎 收到时市值 $198.2K(太旧就整行消失)
         _counterparty_line(ev),      # 👤 来自 someone(名单内转账会自己标出来)
         _watch_sender_line(ev),      # 📮 发货地址 8FtY7n…cZx72
         _watch_ago_line(ev, now),    # ⏱ 3 分 20 秒前到账

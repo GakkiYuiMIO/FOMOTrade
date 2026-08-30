@@ -1706,6 +1706,30 @@ def test_tin是开关_再发一次就关掉并且清单跟着变(monkeypatch, tm
     assert "一个人都没开" in b._dispatch("/tin", "")
 
 
+def test_tin命令真的把人数上限传下去了_第十三个必须被拦(monkeypatch, tmp_path):
+    """
+    ⚠️⚠️ 上限的**唯一执行路径**就是 /tin,而 store.set_transfer_watch 的 max_on
+       默认是 None(= 不限)。直接调 store 并显式传 max_on 只证明"这个形参能用",
+       一个字都不证明命令这一侧真的把上限传了下去 —— 不传就是彻底没有上限。
+    ⚠️ 超限的后果不是"多推几条":poller 每轮都会撞上超限分支、**整体退回轮转**,
+       时效承诺当场作废,而用户在 TG 里收到的回执是"已开启"。所以必须在开之前就拦。
+    ⚠️ 12 写死(它是 poller 的单轮请求预算算出来的外部事实),不从被测模块 import。
+    """
+    b, store = _bot(monkeypatch, tmp_path)
+    with store.get_conn() as c:
+        for i in range(13):
+            store.add_watch_user(c, f"u{i:02d}", f"h{i:02d}", f"H{i:02d}")
+
+    outs = [b._dispatch("/tin", f"h{i:02d}") for i in range(13)]
+    assert all("已开启" in o for o in outs[:12]), f"前 12 个都该开得成:{outs[:12]}"
+    assert "已开启" not in outs[12], f"第 13 个被放行了 —— 上限压根没传下去:{outs[12]}"
+    assert "最多" in outs[12] and "12" in outs[12], f"回执要说清为什么被拦:{outs[12]}"
+
+    with store.get_conn() as c:
+        assert len(store.transfer_watch_user_ids(c)) == 12, "库里真正开着的必须只有 12 个"
+    assert "12/12" in b._dispatch("/tin", ""), "清单上的人数也不许超"
+
+
 def test_tin的回执与清单都要转义(monkeypatch, tmp_path):
     """昵称/handle 带 '<' 并不罕见,不转义整条回执直接 400 —— 用户什么都收不到"""
     b, store = _bot(monkeypatch, tmp_path)

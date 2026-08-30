@@ -652,13 +652,28 @@ def remove_watch_user(conn, handle_or_id: str) -> tuple[bool, str]:
 
     共识 SQL 带 WHERE active=1,所以移除后相关代币的共识数会下降 —— 这是正确行为,
     语义是"我**现在**关注的这批人里有几个买过"。
+
+    ⚠️ **watch_transfer_in 必须一并清零**,不能像 starred 那样留着等回归时自动恢复。
+       留着有两个后果,而且都是静默的:
+         1. 上限被绕过。set_transfer_watch 数的是 active=1 且开着的人,而 /add 回归走
+            add_watch_user 的 ON CONFLICT 分支、根本不碰这一位 —— 开满 12 → /del 掉一个
+            (名额空出来)→ 再 /tin 开一个 → /add 把那个人加回来,于是 active 且开着的
+            变成 13。poller 每轮都会撞上超限分支、整体退回轮转,这个功能的时效承诺
+            当场作废,而用户在 TG 里看到的还是「13/12 人」。
+         2. 就算不谈上限:/add 回来的那一刻,采集频率和推送量会在用户**没下过任何指令**
+            的情况下自己变回去。starred 只是给消息加个 ⭐,恢复了也无所谓;这一位是
+            花请求、发消息的开关,静默恢复不叫贴心叫失控。
+       代价是回归后要重新 /tin 一次 —— 与「默认全员关闭、必须一个个开」是同一条规矩。
+       清零之后 `watch_transfer_in = 1 ⟹ active = 1` 成为库上恒真的不变式,
+       set_transfer_watch 那道人数上限才真的兜得住。
     """
     row = get_watch_user(conn, handle_or_id) or find_user_by_handle(conn, handle_or_id)
     if not row or not row["active"]:
         return False, f"⚠️ 未在监控名单中: {handle_or_id}"
     with tx(conn):
         conn.execute(
-            "UPDATE watch_users SET active = 0, removed_at = ? WHERE user_id = ?",
+            "UPDATE watch_users SET active = 0, removed_at = ?, watch_transfer_in = 0 "
+            "WHERE user_id = ?",
             (now_iso(), row["user_id"]),
         )
     name = row["display_name"] or row["handle"]
