@@ -1294,3 +1294,62 @@ profile URL 形如 `https://pump.fun/profile/<地址>` —— **路径参数就�
 - **名单要另存**：`watch_users` 存的是 FOMO 的 UUID + handle，
   pump.fun 的身份是钱包地址，口径不同。
 - **命令要另起一组**：`/add` `/del` `/list` `/who` 等已被 FOMO 占用。
+
+---
+
+## pump.fun 调研结论（2026-08-30，未动手实现）
+
+⚠️ 调研 workflow 跑到 14:39 挂死（两个 agent 一个出结果、一个卡死无返回），
+下面是从 journal 里捞出的结果 + 我本人补验的部分。**接口事实都是实测的，不是推测。**
+
+### 三个目标（反查成功，与用户手动提供的地址逐字一致）
+| 名字 | 地址 | 粉丝 |
+|---|---|---|
+| hexiecs | `21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm` | 24,267 |
+| brc20niubi | `BQ4KBzzXXk6ZMxVQb4mePuUbJfe85MerzYj53eatzUWd` | 520 |
+| 1000XCryptoD | `5f1AoBaqeBZ3sQhNVQp7xYANb7ykj4xzYBh8eW5RYyFE` | 17,354（X 名 CryptoDevinL） |
+
+### 可用接口（全部 `https://frontend-api-v3.pump.fun`，免登录免 key，curl_cffi Chrome 指纹）
+| 端点 | 用途 | 限流/分 |
+|---|---|---|
+| `GET /users/{名字或地址}` | 名字↔地址双向反查 | 30 |
+| `GET /user-portfolio/{钱包}?filter=open&page=&pageSize=&sortBy=POSITION_SIZE` | 枚举全部持仓（含所有链） | 60 |
+| `GET /user-positions/{钱包}?mints=…&updatesLimit=0` | 拿 `updatedAt` + `realizedPnlUsd`，**mints 必填 1~200，可批量** | 600 |
+
+`/user-positions` 的 position 字段：amountBought / amountBoughtUsd / amountHeld /
+callout / chainId / coinMint / costBasisAmount / costBasisUsd / hasTransfers /
+isExited / likelyLost / pnlPercentage / pnlUsd / **realizedPnlUsd** / tokenPriceUsd /
+**updatedAt**(真实 ISO 时间戳) / valueUsd / walletAddress
+
+### ❌ 死掉的线索（我本人验过，别再试）
+- **没有「按钱包列出逐笔成交」的公开端点。** 28 个 chunk 里零 `/trades/` 路径；
+  已验证响应里没有 signature / txHash / 逐笔时间戳 / 买卖方向。
+- `updatesLimit>0` **不返回任何逐笔记录**（原以为是突破口，实测 position 对象里
+  一个列表字段都没有）。
+
+### ⚠️ 关键：pump.fun 已是多链，只盯 Solana 会漏一半
+hexiecs 的 80 个持仓：**Solana 40 · BSC 32 · Robinhood 7 · Base 1**。
+→ 之前「就算没接口也能从链上盯」那句话**只对 Solana 成立**，覆盖全链要接四条链的数据源。
+→ 但 `/user-portfolio` **一次调用就返回所有链**，所以走 pump.fun 接口反而更省事。
+
+### 推荐方案（未实现）
+持仓快照 diff：每轮 `/user-portfolio` 枚举 + `/user-positions` 批量拿 updatedAt，
+盯 3 人 ≈ **每轮 6 个请求**，1 分钟一轮都绰绰有余。
+**代价**：快照对比不是流水 —— 两次轮询之间买了又卖只看到净变化，
+没有签名、没有单笔成交价。但能抓到「新开仓 / 清仓 / 加仓多少」。
+
+### 还没验的两条（值得先花一轮）
+1. **NATS over WebSocket** —— 端点与只读 subscriber 口令直接内联在公开首页 HTML 里
+   （`wss://prod-advanced.nats.realtime.pump.fun` 等 5 组）。agent 按「绝不使用任何凭据」
+   的约束没去连，所以订阅 subject 能否按钱包过滤、消息里有没有 signature **全部未知**。
+   如果能按钱包过滤，就不用轮询、也可能有逐笔数据 —— 比 diff 方案好一个档次。
+2. **剩约 75 个 chunk 没扒**（只下了 profile 独有的 28 个）。定义 API 常量表的
+   turbopack 模块 38279（含 API.SOL_PRICE / BASE_URL.PROFILE / QUERY_KEY）在共享 chunk 里，
+   大概率列全了所有端点。币种详情页路由完全没爬，i18n 里有 "trades":"Transactions"，
+   说明「按币」的成交列表接口存在。
+
+### 落地约束（沿用既有判断）
+- 必须独立成第三个 APScheduler job（`cli.py` 里 tick 抛 AuthError 会 `sched.shutdown()`）
+- 名单另存（`watch_users` 是 FOMO 的 UUID+handle，pump.fun 是钱包地址）
+- 命令另起一组（add/del/list/who/ca/chips/tin/hot/top/copy/paper/star/unstar/
+  following/status/rebuild/help 已占用）
