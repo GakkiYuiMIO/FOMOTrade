@@ -2305,7 +2305,10 @@ def test_三个人收到同一个币就告警_两个人不告警(db):
     assert "一分钱没花" not in msg and "没花" not in msg
 
 
-def test_人数不够阈值时不告警(db):
+def test_人数不够阈值时不告警(db, monkeypatch):
+    # ⚠️ 必须钉死阈值:仓库根 .env 会覆盖 config 默认值,
+    #    不钉的话「2 个人够不够」取决于这台机器怎么配的(实测配成 2 时这条必挂)。
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_RECEIVERS=3)
     p, _ = _seed_receivers([901.37, 912.05])
     with store.get_conn() as c:
         p._check_transfer_in(c, dry_run=False)
@@ -2399,7 +2402,7 @@ def test_跟单开着的时候转账也绝不会下单(db):
             f"转账改了 user_token_stats,共识数会把白拿的人算成买家:{stats}"
 
 
-def test_整条tick真的把转账采进来并在够人数时告警(db):
+def test_整条tick真的把转账采进来并在够人数时告警(db, monkeypatch):
     """
     整条链路的集成证明:tick() → _fetch_snapshots(轮转到谁就拉谁)→ 归一化 →
     游标过滤 → 落库 → 转入告警。
@@ -2411,6 +2414,9 @@ def test_整条tick真的把转账采进来并在够人数时告警(db):
        "最后一个人也被轮到"的那一轮才凑得齐 3 个收到者。这正是分摊换来的覆盖延迟,
        这里顺便把它钉住。
     """
+    # ⚠️ 必须在构造 Poller **之前**钉死阈值(Poller.__init__ 就把 settings 抓走了),
+    #    否则「3 个人够不够」取决于仓库根 .env 怎么配的。
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_RECEIVERS=3)
     ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     snaps = {}
     for i in range(3):
@@ -2441,6 +2447,28 @@ def test_整条tick真的把转账采进来并在够人数时告警(db):
 
 
 # ---- 时间窗:配置必须真的生效,而且不许被写死的数字架空 ----------------------
+@pytest.fixture(autouse=True)
+def _pin_transfer_alert_env(monkeypatch):
+    """
+    把转入告警的三个门槛钉死在**代码默认值**上,整个模块生效。
+
+    ⚠️ 存在的理由:仓库根目录的 .env 会覆盖 config 的默认值,
+       而本模块大量用例是「造 3 个人 → 期待告警」的形态 ——
+       不钉的话结果取决于「这台机器怎么配的」。实测:
+         .env 配成 2 或 3 → 全绿;配成 5 → 13 条挂
+       挂的原因还是「阈值变了」而不是被测行为坏了,**挂错原因比不挂更费时间**。
+    ⚠️ 要测「阈值/窗口本身生效」的用例,在测试体里再调一次 _env(...) 覆盖即可
+       (fixture 先跑,测试体后跑,后者赢)。
+    """
+    from src.config import get_settings
+
+    for k, v in (("FOMO_TRANSFER_ALERT_RECEIVERS", "3"),
+                 ("FOMO_TRANSFER_ALERT_WINDOW_HOURS", "24"),
+                 ("FOMO_TRANSFER_ALERT_MIN_USD", "500")):
+        monkeypatch.setenv(k, v)
+    get_settings.cache_clear()
+
+
 def _env(monkeypatch, **kw) -> None:
     """
     改环境变量并清缓存。⚠️ 必须在**构造 Poller 之前**调用 ——
@@ -2485,13 +2513,41 @@ def test_窗口之外的到账不算数_窗口是配置说了算(db, monkeypatch
     窗口内只有 2 个人,不够 3 人门槛,一条都不该推。
     只要窗口被写死成更大的数(720)、或者被取消(since=""),第三个人就会被算进来。
     """
-    _env(monkeypatch, FOMO_TRANSFER_ALERT_WINDOW_HOURS=2)
+    # RECEIVERS 也要钉:不钉的话仓库根 .env 配成 2 时,窗口内那 2 个人就够数了,
+    # 这条用例会因为「阈值变了」而不是「窗口失效」而失败 —— 挂错原因比不挂更费时间。
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_WINDOW_HOURS=2, FOMO_TRANSFER_ALERT_RECEIVERS=3)
     p, _ = _seed_receivers([901.37, 912.05, 2439.09], ages_min=[10, 20, 300])
     assert p.settings.fomo_transfer_alert_window_hours == 2, "配置没吃到,测试前提不成立"
     with store.get_conn() as c:
         p._check_transfer_in(c, dry_run=False)
     assert p.notifier.sent == [], \
         "5 小时前那笔落在 2 小时窗口之外,却被算进了人数 —— 窗口没生效"
+
+
+def test_人数阈值是配置说了算_不许被写死(db, monkeypatch):
+    """
+    ⚠️ 这条守的是「人数门槛真的取自配置」。此前**完全没有守卫** ——
+       把 poller 里的 `need = s.fomo_transfer_alert_receivers` 改成写死的 `need = 3`
+       (整个无视配置),全量 822 条一条都不红。窗口那边有对应的用例,人数这边漏了。
+
+    做法与窗口那条同构:把阈值配成 2,只造 2 个人 ——
+    写死成 3 的实现会一条都推不出来。
+    """
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_RECEIVERS=2)
+    p, _ = _seed_receivers([901.37, 912.05])
+    assert p.settings.fomo_transfer_alert_receivers == 2, "配置没吃到,测试前提不成立"
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert len(p.notifier.sent) == 1,         "阈值配成 2、来了 2 个人,却没告警 —— 人数门槛没有取自配置"
+
+
+def test_人数阈值调高就不该告警_反向对照(db, monkeypatch):
+    """上一条的反向:阈值配成 4,只来 3 个人 —— 写死成 3 的实现会误报。"""
+    _env(monkeypatch, FOMO_TRANSFER_ALERT_RECEIVERS=4)
+    p, _ = _seed_receivers([901.37, 912.05, 2439.09])
+    with store.get_conn() as c:
+        p._check_transfer_in(c, dry_run=False)
+    assert p.notifier.sent == [],         "阈值配成 4、只来 3 个人,却告警了 —— 人数门槛被写死了"
 
 
 def test_窗口配多大就认多大_不许被写死成更小的数(db, monkeypatch):
