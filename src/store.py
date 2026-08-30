@@ -61,6 +61,12 @@ CREATE TABLE IF NOT EXISTS watch_users (
     -- 特别关注:这个人的推送要加醒目标识。纯展示,**不影响任何判定**
     -- (不改徽章、不改共识分子分母、不改采集频率),所以哪怕它错了也只是不好看
     starred      INTEGER NOT NULL DEFAULT 0,
+    -- 【转入逐条推送】这个人的 TRANSFER_IN 够金额就逐条推,且转账采集不再参与轮转。
+    -- ⚠️ 与 starred **语义不同,绝不合并**:starred 是纯展示(推送加 ⭐),
+    --    这一位会实打实地改采集频率与推送量 —— 全名单打开约 807 条/天。
+    --    它存在的理由:有些人在别处成交、币是转进来的,对这些人来说「收到」
+    --    才是他动手的那一刻。是不是这种情况由用户自己判断,我们只推可证的事实。
+    watch_transfer_in INTEGER NOT NULL DEFAULT 0,
     note         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_watch_users_active ON watch_users(active);
@@ -358,6 +364,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE watch_users ADD COLUMN missing_since TEXT")
         logger.info("迁移:watch_users 补列 missing_since(上游 404,账号已不存在)")
 
+    if wcols and "watch_transfer_in" not in wcols:
+        # ⚠️ 默认 0 —— 老库升级后行为与升级前**逐字节相同**:没人被标记,
+        #    转账照旧只入库不推送。这个功能只能由用户一个个 /tin 打开。
+        conn.execute(
+            "ALTER TABLE watch_users ADD COLUMN watch_transfer_in INTEGER NOT NULL DEFAULT 0")
+        logger.info("迁移:watch_users 补列 watch_transfer_in(转入逐条推送)")
+
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(token_snapshot)").fetchall()}
     if tcols and "max_market_cap" not in tcols:
         conn.execute("ALTER TABLE token_snapshot ADD COLUMN max_market_cap REAL")
@@ -521,6 +534,65 @@ def set_starred(conn, handle_or_id: str, on: bool) -> tuple[bool, str]:
         conn.execute("UPDATE watch_users SET starred = ? WHERE user_id = ?",
                      (1 if on else 0, row["user_id"]))
     return True, (f"⭐ 已把 {who} 加入特别关注" if on else f"☆ 已把 {who} 移出特别关注")
+
+
+def transfer_watch_user_ids(conn) -> set[str]:
+    """
+    开了「转入逐条推送」的人。
+
+    ⚠️ 与 starred_user_ids 长得像,但**后果完全不同**:星标查不出来只是不好看,
+       这个查不出来就是"该推的没推 / 不该推的推了"。所以调用方绝不该 except 之后
+       当成空集继续 —— 空集恰好是"谁都不推",那是安全的一侧,但要留痕。
+    """
+    rows = conn.execute(
+        "SELECT user_id FROM watch_users WHERE active = 1 AND watch_transfer_in = 1"
+    ).fetchall()
+    return {r["user_id"] for r in rows}
+
+
+def set_transfer_watch(conn, handle_or_id: str, on: bool | None = None,
+                       *, max_on: int | None = None) -> tuple[bool, str]:
+    """
+    开/关一个人的「转入逐条推送」。返回 (是否改动了, 回执文案)。
+
+    on = None 时是**开关**(已开就关),这是 /tin 的默认用法;传显式 True/False
+    则是幂等设置,此时"本来就是这样"会如实回执 —— 开关命令唯一的反馈就是回执,
+    含糊的回执会让用户分不清自己刚才是开了还是关了。
+
+    ⚠️ 与 set_starred 同一套找人规矩(handle 或 user_id,**只认 active 的**):
+       给已经移出名单的人开这个开关没有意义 —— poller 根本不会去拉他的转账。
+    ⚠️ max_on 是"最多同时开几个人"的上限,**由调用方注入**:上限的依据是 poller
+       的单轮请求预算(见 poller.TRANSFER_WATCH_MAX 那段算式),而 poller 依赖
+       本模块 —— 在这里 import 它就是循环依赖。传 None 表示不限。
+    """
+    key = (handle_or_id or "").strip()
+    if not key:
+        return False, "❓ 用法:/tin <handle>"
+    row = conn.execute(
+        "SELECT user_id, handle, display_name, watch_transfer_in FROM watch_users "
+        "WHERE active = 1 AND (lower(handle) = ? OR user_id = ?)",
+        (normalize_handle(key), key),
+    ).fetchone()
+    if row is None:
+        return False, f"❓ 名单里没有 {clean_handle(key)}(先 /add 加进来)"
+
+    who = row["display_name"] or row["handle"]
+    cur = bool(row["watch_transfer_in"])
+    target = (not cur) if on is None else bool(on)
+    if cur == target:
+        return False, f"ℹ️ {who} 的转入推送本来就是{'开' if target else '关'}着的"
+    if target and max_on is not None:
+        # ⚠️ 上限在**开之前**拦,而不是让 poller 事后降级:poller 那边超限只会
+        #    退回轮转 + 刷日志,用户在 TG 里什么都看不到,还以为开成功了。
+        n = len(transfer_watch_user_ids(conn))
+        if n >= max_on:
+            return False, (f"❗ 转入推送最多同时开 {max_on} 人(现在已开 {n} 人)—— "
+                           f"每多一个人,每轮就多一个请求。先 /tin 关掉一个再来")
+    with tx(conn):
+        conn.execute("UPDATE watch_users SET watch_transfer_in = ? WHERE user_id = ?",
+                     (1 if target else 0, row["user_id"]))
+    return True, (f"📥 已开启 {who} 的转入逐条推送" if target
+                  else f"🔕 已关闭 {who} 的转入逐条推送")
 
 
 def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) -> tuple[bool, str]:

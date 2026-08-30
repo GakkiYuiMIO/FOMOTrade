@@ -2798,3 +2798,362 @@ def test_两处谓词漂移时必须留下告警而不是悄悄发出假数(db):
     assert drift, f"谓词漂移了却一声不吭,日志里只有:{warns}"
     assert "3" in drift[0] and "2" in drift[0], \
         f"告警里必须写清楚两边各是多少,否则排查时无从下手:{drift[0]}"
+
+
+# ============================================================
+# 指定用户的转入逐条推送(/tin)
+# ============================================================
+# ⚠️ 门槛/上限一律**写死字面量**并显式配环境变量,不从 config / poller import ——
+#    从被测模块 import 门槛再拿它断言,等于用被测代码给自己打分(这个文件里
+#    转入告警那几条已经踩过一次:四种变异全绿)。
+def _tin_env(monkeypatch, watch_usd=100, alert_usd=500, receivers=3) -> None:
+    """
+    把两个**语义不同**的门槛都钉死,再构造 Poller。
+
+    ⚠️ 必须显式配 alert 那两项:仓库根目录的 .env 会覆盖 config 的默认值,
+       不钉死的话这些用例的结果取决于"这台机器怎么配的"。
+    """
+    _env(monkeypatch,
+         FOMO_TRANSFER_WATCH_MIN_USD=watch_usd,
+         FOMO_TRANSFER_ALERT_MIN_USD=alert_usd,
+         FOMO_TRANSFER_ALERT_RECEIVERS=receivers)
+
+
+def _mark_tin(handle: str, on: bool = True) -> None:
+    """打开/关闭某个人的转入逐条推送"""
+    with store.get_conn() as c:
+        ok, msg = store.set_transfer_watch(c, handle, on)
+    assert ok, f"前提不成立,开关没拨动:{msg}"
+
+
+def _deposit(i: int = 0, usd: float = 2439.09, minutes_ago: float = 0.0, **kw) -> dict:
+    """一笔**刚刚到账**的转入,形态取真实报文;默认金额就是真实那笔 $2,439.09"""
+    ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
+    return dict(_REAL_DEPOSIT, id=f"tin-{i}", usdAmount=usd, createdAt=ts, **kw)
+
+
+def _tick_transfers(raws, *, uid="uA", ok=True, poller=None):
+    """跑一轮完整 tick,快照里只有这些转账。返回 (poller, notifier)"""
+    client = FakeClient({uid: UserSnapshot(uid, swaps=[], transfers=list(raws),
+                                           thesis=[], balances=[])})
+    notifier = FakeNotifier(ok=ok)
+    p = poller or Poller(client, notifier)
+    p.client, p.notifier = client, notifier
+    p.tick()
+    return p, notifier
+
+
+def _sent_flags() -> list[int]:
+    with store.get_conn() as c:
+        return [r["sent"] for r in
+                c.execute("SELECT sent FROM fomo_events ORDER BY event_id")]
+
+
+def test_没被点名的人的转账绝不逐条推送(db, monkeypatch):
+    """
+    ⚠️⚠️ **本功能最危险的回归**:这道门一旦漏,全名单的转入约 807 条/天
+       (实测人均 8.49 条/天),把真正要看的买卖推送整个淹掉,而且没有任何报错。
+       金额故意给到 $250,000 —— 门槛拦不住它,唯一拦得住的就是"他没被点名"。
+    """
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")                       # 刻意**不**开 /tin
+    p, notifier = _tick_transfers([_deposit(usd=250_000.0)])
+
+    assert notifier.sent == [], f"没被点名的人的转入被推了出去:{notifier.sent}"
+    assert _sent_flags() == [1], "没推的转账必须当场 mark_sent,否则补发队列会反复捞它"
+    assert len(p._new_transfers) == 1, "但它仍然要喂给聚合告警(两个信号互不影响)"
+
+
+def test_被点名的人的转入够门槛就逐条推(db, monkeypatch):
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    p, notifier = _tick_transfers([_deposit()])
+
+    assert len(notifier.sent) == 1, f"该推一条,实际 {len(notifier.sent)} 条"
+    msg = notifier.sent[0]
+    assert msg.startswith("📥"), f"行首锚点应是 📥(收到转入):{msg[:40]}"
+    assert "$2,439.09" in msg and "PoorGoat" in msg
+    assert msg.split("\n")[-1] == f"<code>{_CA_FIH}</code>", "CA 必须独占最后一行"
+    assert _sent_flags() == [1], "TG 确认收到之后才置 sent=1"
+
+
+def test_金额不到门槛的转入不推_但照常落库(db, monkeypatch):
+    """
+    ⚠️ 门槛是这个功能能不能用的分水岭:不设门槛人均 8.49 条/天,≥$100 只剩 1.10 条/天。
+       绝大多数被拦下的是几美元的空投灰尘。
+    ⚠️ 边界必须是 >= :恰好等于门槛的那一笔是"够了",不是"差一点"。
+    """
+    _tin_env(monkeypatch, watch_usd=100)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+
+    _, notifier = _tick_transfers([_deposit(1, usd=99.99)])
+    assert notifier.sent == [], f"$99.99 低于 $100 门槛,不该推:{notifier.sent}"
+    assert _sent_flags() == [1], "不推也要 mark_sent"
+
+    _, notifier = _tick_transfers([_deposit(2, usd=100.0)])
+    assert len(notifier.sent) == 1, "恰好等于门槛的必须推(>= 不是 >)"
+
+
+def test_门槛取的是转入推送那项配置_不是聚合告警那项(db, monkeypatch):
+    """
+    ⚠️⚠️ 两个门槛语义完全不同,复用就是让两个功能互相改灵敏度:
+         fomo_transfer_alert_min_usd  →「同一个币被**几个人**收到」的聚合信号,默认 $500
+         fomo_transfer_watch_min_usd  →「**这一个人**又进货了」,默认 $100
+       两个方向各测一次,任何一次拿错配置项都会红。
+    """
+    _tin_env(monkeypatch, watch_usd=100, alert_usd=5000)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    _, notifier = _tick_transfers([_deposit(1)])            # $2,439.09
+    assert len(notifier.sent) == 1, \
+        "$2,439.09 ≥ 转入推送门槛 $100 就该推 —— 拿去比聚合告警的 $5000 才会推不出来"
+
+    _tin_env(monkeypatch, watch_usd=5000, alert_usd=100)
+    _add_ready("uB", "Holder2")
+    _mark_tin("Holder2")
+    _, notifier = _tick_transfers([_deposit(2)], uid="uB")
+    assert notifier.sent == [], \
+        "$2,439.09 < 转入推送门槛 $5000,不该推 —— 拿去比聚合告警的 $100 就会漏出来"
+
+
+def test_转入推送的默认门槛(monkeypatch):
+    """
+    ⚠️ 写死字面量,并用 _env_file=None 构造 —— 否则断言的是"这台机器怎么配的",
+       而不是"代码的默认值是多少"。
+    ⚠️ 默认 100 的依据(本地库 20 天真实数据,人均条/天):
+       不设门槛 8.49 · ≥$100 1.10 · ≥$500 0.73。$500 会开始筛掉真的小额建仓。
+    """
+    from src.config import FomoSettings
+
+    for k in ("FOMO_TRANSFER_WATCH_MIN_USD", "FOMO_TRANSFER_ALERT_MIN_USD"):
+        monkeypatch.delenv(k, raising=False)
+    s = FomoSettings(_env_file=None)
+    assert s.fomo_transfer_watch_min_usd == 100.0
+    assert s.fomo_transfer_alert_min_usd == 500.0, "两个门槛是两个数,不是同一个"
+
+
+def test_方向不明或计价币不推(db, monkeypatch):
+    """
+    方向判不出时"收到"这个说法本身就没依据(那笔可能是转出);
+    USDC 到账是在给自己充钱,不是"他拿到了某个币"。两者都与"他进货了"无关。
+    """
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    no_side = _deposit(1)
+    no_side.pop("type")                                  # 方向字段没了 → side_unknown
+    usdc = _deposit(2, tokenAddress="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    tokenMetadata={"symbol": "USDC"})
+    _, notifier = _tick_transfers([no_side, usdc])
+    assert notifier.sent == [], f"这两条都不该推:{notifier.sent}"
+    assert _sent_flags() == [1, 1], "不推也要 mark_sent"
+
+
+def test_停机补数那一轮不逐条推转入(db, monkeypatch):
+    """
+    ⚠️ 停机后第一轮的转账是**整段积压**,而消息里写的是"N 分钟前到账" ——
+       补数轮逐条推等于把几百条过期消息一次喷出来(与推送侧/跟单侧同一条守卫)。
+    """
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    _stale_tick(8)                                       # 8 小时没跑过 → 补数轮
+    p, notifier = _tick_transfers([_deposit()])
+
+    assert not [m for m in notifier.sent if m.startswith("📥")], \
+        f"补数轮不该有逐条转入推送:{notifier.sent}"
+    assert _sent_flags() == [1], "补数轮的转账必须当场 mark_sent"
+
+
+def test_推送失败绝不mark_sent_下一轮补发(db, monkeypatch):
+    """
+    ⚠️ 转账原来走的是"落库即 mark_sent"。改成推送路径之后,若还照旧当场标已发,
+       TG 一次 400 / 网络一次抖动就是**这条消息永久丢失** —— 下一 tick 该事件
+       已在库里,INSERT OR IGNORE 直接跳过,再也不会被重新发现。
+    """
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+
+    p, notifier = _tick_transfers([_deposit()], ok=False)
+    assert len(notifier.sent) == 1, "试过发一次"
+    assert _sent_flags() == [0], "TG 没收到,sent 必须还是 0"
+
+    # 下一轮:补发队列把它捞回来重发
+    p, notifier = _tick_transfers([], poller=p)
+    assert len(notifier.sent) == 1 and notifier.sent[0].startswith("📥"), \
+        f"补发队列没把它捞回来:{notifier.sent}"
+    assert _sent_flags() == [1]
+
+
+def test_补发队列不许把没点名的人的转入漏出去(db, monkeypatch):
+    """
+    ⚠️⚠️ 补发队列捞的是"库里所有 10 分钟内没发出去的行",它并不知道这条转入
+       当初为什么留在那里。判定只写在落库侧的话,任何一条 sent=0 的转入都会
+       顺着补发路径推出去 —— 也就是把"只推被点名的几个人"悄悄变成全名单。
+       (这里用最自然的方式造出这种行:推送失败 → 用户随后把 /tin 关掉。)
+    """
+    _tin_env(monkeypatch)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    p, notifier = _tick_transfers([_deposit()], ok=False)
+    assert _sent_flags() == [0], "前提不成立:库里没有待补发的转入"
+
+    _mark_tin("PoorGoat_", on=False)                     # 用户改主意了
+    p, notifier = _tick_transfers([], poller=p)
+    assert notifier.sent == [], f"已经关掉的人的转入被补发出去了:{notifier.sent}"
+    assert _sent_flags() == [1], "不推的必须就地排掉,否则它会每轮被捞一次、连捞 10 分钟"
+
+
+def test_被点名的转入照样喂给聚合告警_人数不许少算(db, monkeypatch):
+    """
+    ⚠️ 同一条 TRANSFER_IN 既触发单人推送、又计入聚合告警的人数,**这是对的,不许去重**:
+       两个信号回答的是不同的问题(这个人又进货了 / 这个币在被分发给一群人)。
+       落库侧要是把点名的那条从 transfers 列表里摘出去,聚合告警就会少算一个人 ——
+       3 人门槛下少一个人就是整条告警消失。
+    """
+    _tin_env(monkeypatch, alert_usd=500, receivers=3)
+    for i in range(3):
+        _add_ready(f"u{i}", f"Holder{i}")
+    _mark_tin("Holder0")
+
+    snaps = {f"u{i}": UserSnapshot(f"u{i}", swaps=[],
+                                   transfers=[_deposit(i, usd=901.37 + i)],
+                                   thesis=[], balances=[]) for i in range(3)}
+    notifier = FakeNotifier()
+    p = Poller(FakeClient(snaps), notifier)
+    # 转账采集是轮转的(3 人 → 每轮 1 个),三轮才把三个人都收进来;
+    # 被点名的 u0 每轮都拉,但游标只让他那一笔进一次库 —— 所以逐条推送也只有一条
+    for _ in range(3):
+        p.tick()
+
+    tin = [m for m in notifier.sent if m.startswith("📥")]
+    sig = [m for m in notifier.sent if m.startswith("🚨")]
+    assert len(tin) == 1, f"被点名的那个人该有一条逐条推送:{notifier.sent}"
+    assert len(sig) == 1, "聚合告警必须照常发,不能被单人推送吃掉"
+    assert "3 人「收到」" in sig[0], f"聚合告警少算了人:{sig[0].splitlines()[0]}"
+
+
+def test_转入绝不进跟单信号(db, monkeypatch):
+    """
+    ⚠️⚠️ 铁律:「收到免费筹码」与「自己掏钱买入」是相反的含义,拿它去触发花钱的操作
+       方向就是错的。转入现在会进 new_events(为了走推送路径),而 _check_copytrade
+       吃的正是 new_events —— 这条测试钉死那道 EVENT_BUY 过滤。
+    """
+    _tin_env(monkeypatch)
+    _enable_copy(min_buyers=1)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")
+    _, notifier = _tick_transfers([_deposit()])
+
+    assert _signals() == [], f"转入生成了跟单信号:{_signals()}"
+    assert not [m for m in notifier.sent if "跟单" in m], \
+        f"转入触发了跟单推送:{notifier.sent}"
+
+
+# ---- 采集:被点名的人跳出轮转 --------------------------------------------
+def _tin_rows():
+    with store.get_conn() as c:
+        return store.list_active_users(c)
+
+
+def test_被点名的人每轮都拉转账_不参与轮转(db):
+    """
+    ⚠️ 转入既然等于这些人的买入,时效就该和买入推送一样(每轮)。
+       靠轮转的话 60 人 → ⌈60/20⌉ = 3 个/轮 → 一圈 20 轮 ≈ 5 分钟才轮到他一次。
+    ⚠️ 门槛写死字面量(60 人 · 20 轮 → 3,再加被点名的 1 个 = 4),
+       不从 poller import 周期常量再拿它算门槛。
+    """
+    _many_users(60)
+    _mark_tin("h007")
+    rows = _tin_rows()
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+
+    batches = []
+    for _ in range(5):
+        p._refresh_watched_index(rows)
+        before = len(client.transfer_calls)
+        p._fetch_snapshots(rows)
+        batches.append(client.transfer_calls[before:])
+
+    missed = [i for i, b in enumerate(batches) if "u007" not in b]
+    assert missed == [], f"被点名的人在第 {missed} 轮没被拉到 —— 他仍然在跟着轮转走"
+    assert max(len(b) for b in batches) <= 4, \
+        f"单轮转账请求峰值 {max(len(b) for b in batches)},超过 ⌈60/20⌉ + 1 = 4"
+
+
+def test_点名不许破坏轮转_没被点名的人仍要在一圈内全被覆盖(db):
+    """
+    ⚠️ 分摊的代价是覆盖延迟,而覆盖必须**可证**:60 人 · 每轮 3 个 → 20 轮里
+       每个人至少被轮到一次,一个都不能漏。
+    ⚠️ 中途故意把点名对象换掉一次:如果实现把被点名的人从轮转池里**摘出去**,
+       池子的长度/内容就会随开关变化,而在长度会变的列表上取模不构成扫描 ——
+       会有人永远排不上队(_rotate_transfers 的 docstring 里写明了这条)。
+    """
+    _many_users(60)
+    _mark_tin("h007")
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+    for i in range(20):
+        if i == 10:                                     # 用户改主意,换一个人盯
+            _mark_tin("h007", on=False)
+            _mark_tin("h042")
+        rows = _tin_rows()
+        p._refresh_watched_index(rows)
+        p._fetch_snapshots(rows)
+
+    missed = {u["user_id"] for u in _tin_rows()} - set(client.transfer_calls)
+    assert missed == set(), f"一圈下来有 {len(missed)} 个人一次都没被轮到:{sorted(missed)[:5]}"
+
+
+def test_点名人数超上限就退回轮转并告警(db):
+    """
+    ⚠️ 每多点名一个人,每轮就多一个请求。稳态每轮约 104 个请求、间隔 15s、
+       单轮 5~18s —— 余量不多,不封顶就会把一个已经超预算的 tick 推得更糟。
+    ⚠️ 退回轮转只影响**时效**(最迟一圈),推送该来的一条都不会少;
+       但必须**大声告警**,否则用户以为开着、实际时效已经不成立了。
+    ⚠️ 上限写死 12(= 默认并发度,恰好多一整波),不从 poller import。
+    """
+    _many_users(60)
+    for i in range(13):                                  # 13 > 12
+        _mark_tin(f"h{i:03d}")
+    rows = _tin_rows()
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+    p._refresh_watched_index(rows)
+
+    warned, close = _capture_warnings()
+    try:
+        p._fetch_snapshots(rows)
+    finally:
+        close()
+
+    assert len(client.transfer_calls) <= 3, \
+        f"超上限时该退回纯轮转(⌈60/20⌉ = 3 个),实际打了 {len(client.transfer_calls)} 个"
+    assert [w for w in warned if "超过上限" in w], f"退回轮转必须留痕,实际日志:{warned}"
+
+
+def test_点名十二个人时每轮多打十二个请求(db):
+    """
+    成本核算的**可执行版本**:上限内的 K 个人,每轮最多多 K 个请求。
+    ⚠️ 断言的是上界(轮转批次可能与点名的人重合,重合就是白赚的),
+       但"最多多 K 个"这条必须成立 —— 否则请求预算的算式就是假的。
+    """
+    _many_users(60)
+    for i in range(12):
+        _mark_tin(f"h{i:03d}")
+    rows = _tin_rows()
+    client = FakeClient()
+    p = Poller(client, FakeNotifier())
+    p._refresh_watched_index(rows)
+
+    peaks = []
+    for _ in range(10):
+        before = len(client.transfer_calls)
+        p._fetch_snapshots(rows)
+        peaks.append(len(client.transfer_calls) - before)
+    assert max(peaks) <= 3 + 12, f"单轮转账请求峰值 {max(peaks)},超过 ⌈60/20⌉ + 12"
+    assert min(peaks) >= 12, f"被点名的 12 个人每轮都该被拉到,实际最少的一轮只有 {min(peaks)} 个"

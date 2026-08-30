@@ -821,3 +821,118 @@ def test_没有链名时不出链接段():
     msg = _sig(network_id=None)
     assert "http" not in msg
     assert "🧬" not in msg
+
+
+# ============================================================
+# 指定用户的转入 —— 逐条推送(/tin)
+# ============================================================
+# 渲染时刻:比事件时间晚 3 分 20 秒。写死才能断言"多久之前到账"那一格。
+_TIN_TS = "2026-08-26T00:37:40+00:00"
+_NOW_TIN = datetime(2026, 8, 26, 0, 41, 0, tzinfo=UTC).timestamp()
+
+render_transfer_in_watch = formatter.render_transfer_in_watch
+
+
+def _tin(**kw):
+    """一条形态完整的"被点名的人收到了一笔币",字段取 $fih 那笔真实转账"""
+    base = {
+        "event_type": EVENT_TRANSFER_IN,
+        "event_id": "TRANSFER_IN:x1",
+        "user_id": "uA",
+        "handle": "PoorGoat",
+        "user_handle": "PoorGoat_",
+        "network_id": "solana",
+        "token_address": _SIG_CA,
+        "token_symbol": "fih",
+        "event_ts": _TIN_TS,
+        "amount_usd": 2439.09,
+        "token_amount": "12000000",
+        "market_cap": 198_200.0,
+        "counterparty_address": _SIG_SENDER,
+    }
+    base.update(kw)
+    return render_transfer_in_watch(make_event(**base), now=_NOW_TIN)
+
+
+def test_转入推送只摆事实_绝不替用户断言这是买入():
+    """
+    ⚠️⚠️ 这个功能存在的前提是"有些人在别处成交,币是转进来的" —— 但报文里
+       **只有 fromAddress/toAddress**,没有任何证据说明这笔转账来自哪个工具、
+       是不是买入、花没花钱。用户自己知道这个人用什么工具,他读得出来;
+       我们替他写出来就是编(本项目已经因为「他们一分钱没花」被打回过一次)。
+    ⚠️ 断言的是"这些说法**不出现**",换个措辞不该让它变红;
+       但只要有人把任何一句意图断言塞进模板就必须红。
+    """
+    msg = _tin()
+    for claim in ("买入", "DEBOT", "建仓", "抄底", "没花", "一分钱",
+                  "免费", "白拿", "空投", "非市场"):
+        assert claim not in msg, f"消息里出现了数据证明不了的断言:{claim}"
+
+
+def test_转入推送把可证的事实一条不落地摆出来():
+    """谁 / 什么币 / 多少枚 / 多少美元 / 收到时市值 / 发货地址 / 多久之前 / 链 / CA"""
+    msg = _tin()
+    assert msg.split("\n")[0].startswith("📥"), "行首锚点复用 📥(收到转入),不新增第七个"
+    assert "PoorGoat" in msg and "@PoorGoat_" in msg
+    assert "$fih" in msg
+    assert "12,000,000" in msg, "多少枚"
+    assert "$2,439.09" in msg, "多少美元"
+    assert "收到时市值 $198.20K" in msg
+    assert "8FtY7n…cZx72" in msg, "发货地址要截短显示"
+    assert "3 分 20 秒前到账" in msg, "多久之前"
+    assert "🧬 Solana" in msg
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "CA 独占最后一行、纯 code"
+
+
+def test_拿不到收到时市值就整行消失_绝不用现在的市值冒充():
+    """
+    poller 只在转账足够新时才把本轮观测到的市值填进去(那时它才**等于**收到时的市值)。
+    拿不到时这一格必须整格消失 —— 写一个"现在的市值"进去就是陈述假事实。
+    """
+    msg = _tin(market_cap=None)
+    assert "市值" not in msg, "市值那一行必须整行消失"
+    assert "$2,439.09" in msg, "其余的事实照常显示"
+
+
+def test_发货地址取不到就少那一行而不是打问号():
+    msg = _tin(counterparty_address=None)
+    assert "📮" not in msg
+    assert "8FtY7n" not in msg
+
+
+def test_转入推送里名单内转账必须标出来():
+    """B-9:筹码在名单内部搬家与从外面进货是两回事,不标出来用户分不出"""
+    msg = _tin(counterparty_handle="unipcs", counterparty_is_watched=True)
+    assert "unipcs" in msg and "名单内转账" in msg
+
+
+def test_转入推送的超长昵称和ticker不许把整条消息挤没():
+    """
+    ⚠️ handle / ticker 由陌生人和服务端决定,长度不受任何约束。
+       出口不变式与 /ca、与分发预警同一套:≤ 预算、HTML 合法、CA 锚点完整。
+    ⚠️ 而且**不能靠出口那道闸兜底**:出口只会整行整行往回砍,标题一旦自己就超预算,
+       砍到最后只剩一个 CA —— 消息里连是谁、收到了什么都没有了。
+    ⚠️ 4096 是 Telegram 的硬上限(外部事实),不从被测模块 import。
+    """
+    msg = _tin(handle="'" * 400, user_handle="x" * 400, token_symbol="&" * 400)
+    assert len(msg) <= _TG_HARD_LIMIT, f"实际 {len(msg)} 字符,会被 notifier 盲切"
+    assert _html_ok(msg), "标签必须全部配对闭合,残缺实体 = 整条 400"
+    assert msg.split("\n")[-1] == f"<code>{_SIG_CA}</code>", "锚点必须活到最后且完整"
+    assert "$2,439.09" in msg, "把名字截短就够了,不该连事实一起丢掉"
+    assert "&amp;amp;" not in msg, "币名被转义了两次(先 escape 又进了会 escape 的模板)"
+
+
+def test_方向不明时标题不许写收到转入():
+    """把一笔实际是转出的记录渲染成「收到转入」是彻底的错误信息"""
+    msg = _tin(side_unknown=True)
+    assert "收到转入" not in msg
+    assert "交易" in msg.split("\n")[0]
+
+
+def test_特别关注的人转入推送也带星标():
+    ev = make_event(event_type=EVENT_TRANSFER_IN, user_id="uA", handle="PoorGoat",
+                    token_symbol="fih", event_ts=_TIN_TS, amount_usd=2439.09)
+    plain = render_transfer_in_watch(ev, now=_NOW_TIN)
+    starred = render_transfer_in_watch(ev, starred=True, now=_NOW_TIN)
+    assert "⭐" not in plain and "⭐" in starred
+    assert starred[0] == plain[0] == "📥", "星标绝不能顶掉行首的事件锚点"

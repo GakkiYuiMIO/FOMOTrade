@@ -39,7 +39,12 @@ from src.client import (
 )
 from src.config import get_settings
 from src.copytrade import Candidate, decide
-from src.formatter import render, render_copy_signal, render_transfer_in_signal
+from src.formatter import (
+    render,
+    render_copy_signal,
+    render_transfer_in_signal,
+    render_transfer_in_watch,
+)
 from src.models import (
     EVENT_BUY,
     EVENT_SELL,
@@ -234,6 +239,24 @@ _PNL_EVERY_N_TICKS = 20
 #    (原 _TRANSFERS_TICK_PHASE 已删除):那个相位存在的唯一理由就是别让 91 个
 #    请求和另一批撞在同一轮,现在每轮就 5 个,撞不撞已经无所谓了。
 _TRANSFERS_CYCLE_TICKS = 20
+# ---- /tin:被点名的人**每轮都拉**,不参与上面那个轮转 ----
+# 为什么值得为这几个人破例:对他们来说「收到」就是他动手的那一刻(他在别处成交),
+# 那么这条信号的时效要求就和买入推送一样 —— 4.75 分钟的轮转覆盖延迟太久了。
+#
+# ⚠️ 成本必须按**峰值**算,不能按均值(这是上一版转账采集踩过的坑):
+#     稳态每轮 ≈ 104 个请求(91 swaps + ~8 balances + 5 transfers)
+#     标记 K 个人 → 每轮最多多 K 个请求(与轮转批次重合的那部分是白赚的,
+#     期望重合 5K/91 ≈ 0.05K,小到不该算进保护里 —— 保护要按最坏情况定)
+#     K = 12: 116 个请求 / fomo_fetch_workers=12 → 10 波(原 9 波),
+#             × p50 0.3~1.2s/请求 = 单轮 3.0~12.0s(原 2.7~10.8s),峰值 +1.2s
+#   上限取 12 就是这么来的:**恰好多一整波**,轮询间隔 15s 仍有余量。
+#   再往上是有拐点的 —— fomo_fetch_workers 的注释里写着 12→24 线程能提速,
+#   但服务端一旦打满就掉到 66.6s,所以宁可在这里封死,也不要靠加线程去追。
+# ⚠️ 超过上限时**整体退回轮转**(而不是砍一半、也不是照打不误):
+#   砍一半要再引入一个游标,而那个游标一旦写错就是"有人永远排不上"——
+#   与其多一处能悄悄坏掉的地方,不如退回一条已经被测试钉死的老路并大声告警。
+#   退回只影响**时效**(最迟 4.75 分钟),推送该来的一条都不会少。
+TRANSFER_WATCH_MAX = 12
 # 一笔转账"多新"才敢把本轮观测到的市值当作它**收到时**的市值(秒)。
 # 900s = 3 倍采集周期,稳态下每一笔都轻松达标;真正被这道门拦住的是首轮/停机后
 # 一次性吃进来的那批历史转账(单页 25 条最远能到十几小时前)。见 _transfer_to_event。
@@ -662,6 +685,10 @@ class Poller:
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
+        # 开了「转入逐条推送」的人(/tin)。同样每 tick 从名单行刷新一次。
+        # ⚠️ 默认空集 = 谁都不推、转账采集也一切照旧 —— 没调用过 _refresh_watched_index
+        #    的调用方(单测直接调 _fetch_snapshots)因此拿到与改造前完全一致的行为。
+        self._tx_watch_ids: set[str] = set()
         # 每 tick 从 balances 重建(见 _build_token_index)
         self._token_meta: dict[tuple, dict] = {}    # (net, ca)        → symbol/市值/现价
         self._positions: dict[tuple, dict] = {}     # (uid, net, ca)   → 持仓/均价/盈亏
@@ -862,6 +889,12 @@ class Poller:
         self._watched_handles = {
             n for n in (_norm_handle(_row_get(u, "handle")) for u in users) if n
         }
+        # /tin 名单直接从同一批行里取,不再单开一次查询 —— 它每 tick 都要用,
+        # 而这批行本来就是刚从 watch_users 读出来的。
+        # ⚠️ 走 _row_get:老库/单测里的行可能压根没有这一列,缺列时它给 None(= 没开)。
+        self._tx_watch_ids = {
+            u["user_id"] for u in users if _row_get(u, "watch_transfer_in")
+        }
 
     def _fetch_snapshots(self, users) -> dict:
         """
@@ -993,7 +1026,7 @@ class Poller:
         # ⚠️ 而且是**每轮一小批**、不是"某一轮把 91 个一次打完":后者让转账轮的请求数
         #    冲到 190(峰值 1.74x、单轮理论耗时上界 19.0s > 15s 轮询间隔),
         #    详见 _TRANSFERS_CYCLE_TICKS 那段实测与算式。
-        need_tx = self._rotate_transfers(uids)
+        need_tx = self._transfer_targets(uids)
         self._transfers_attempted = set(need_tx)
         res = run([("swaps", u) for u in need_swaps]
                   + [("balances", u) for u in need_bal]
@@ -1220,6 +1253,31 @@ class Poller:
         now = time.monotonic()
         for k in [k for k, exp in self._thesis_priority.items() if exp <= now]:
             del self._thesis_priority[k]
+
+    def _transfer_targets(self, uids: list[str]) -> list[str]:
+        """
+        本轮要拉 transfers 的人 = 轮转到的那一小批 ∪ 被 /tin 点名的人。
+
+        ⚠️ **轮转本身一个字节都不动**:游标照旧走**完整名单**、批量照旧
+           ⌈人数/周期⌉ —— 被点名的人只是**额外**每轮再拉一次,不从轮转池里摘出去。
+           摘出去会让轮转的取模基数随"开了几个 /tin"变化,而
+           _rotate_transfers 的 docstring 里写明了这正是"有人永远排不上"的成因。
+           代价只是被点名的人偶尔在同一轮被轮到(集合去重,不会真打两次请求)。
+        ⚠️ 超过上限时**整体退回轮转**并告警,理由见 TRANSFER_WATCH_MAX。
+        """
+        rotated = self._rotate_transfers(uids)
+        extra = self._tx_watch_ids & set(uids)
+        if not extra:
+            return rotated
+        if len(extra) > TRANSFER_WATCH_MAX:
+            # ⚠️ 每轮都会走到这里,所以日志级别必须扛得住 4 秒一条 —— 但也绝不能降到
+            #    debug:此刻这个功能的**时效承诺已经不成立了**,用户必须看得见。
+            logger.warning(
+                "转入逐条推送已开 {} 人,超过上限 {} —— 本轮退回轮转采集"
+                "(推送不会少,但最迟要等一圈 ≈ {} 轮)",
+                len(extra), TRANSFER_WATCH_MAX, _TRANSFERS_CYCLE_TICKS)
+            return rotated
+        return sorted(set(rotated) | extra)
 
     def _rotate_transfers(self, uids: list[str]) -> list[str]:
         """
@@ -1716,6 +1774,7 @@ class Poller:
             return []
         new_events: list[FomoEvent] = []
         transfers: list[FomoEvent] = []
+        tin = 0                                  # 其中要逐条推的转入(只用于日志)
         try:
             with store.tx(conn):
                 for ev in events:
@@ -1732,15 +1791,27 @@ class Poller:
                             store.mark_sent(conn, ev.event_id, None, None)
                             continue
                         if ev.event_type in (EVENT_TRANSFER_IN, EVENT_TRANSFER_OUT):
-                            # 转账**落库但不逐条推送**(与 quote_only 同一处置,含 mark_sent
-                            # 那条理由)。
-                            # ⚠️ 逐条推是灾难性的:实测名单 91 人的非稳定币转入就有
+                            # 转账**默认落库但不逐条推送**(与 quote_only 同一处置,含
+                            # mark_sent 那条理由)。
+                            # ⚠️ 全名单逐条推是灾难性的:实测 91 人的非稳定币转入就有
                             #    13.1 条/人/天 ≈ 1200 条/天,而且绝大多数是几美元的空投灰尘
                             #    (1 小时窗口 ≥3 人的 42 次命中里,39 次单人到账不足 $100)。
-                            #    真正有价值的是聚合出来的那一件事 ——「同一个币被 N 个名单成员
-                            #    收到」,由 _check_transfer_in 统一推一条。
-                            store.mark_sent(conn, ev.event_id, None, None)
+                            #    **这个判断至今成立,下面那道口子绝不能扩大到全名单。**
+                            #    聚合出来的那件事 ——「同一个币被 N 个名单成员收到」——
+                            #    仍然由 _check_transfer_in 统一推一条。
+                            # ⚠️ transfers 无论推不推**都要 append**:_check_transfer_in
+                            #    拿它当"本轮该查哪些币"的候选集,漏掉就等于让聚合告警
+                            #    少算一个收到者。两个信号回答不同的问题,不许互相去重。
                             transfers.append(ev)
+                            if self._should_push_transfer_in(ev):
+                                # /tin 点名的人 + 够门槛:走 _dispatch 逐条推。
+                                # ⚠️ 这一支**刻意不 mark_sent** —— 必须等 TG 确认收到
+                                #    之后才置 1(见 _dispatch 末尾),否则推送失败
+                                #    = 这条消息永久丢失,日志里连痕迹都没有。
+                                new_events.append(ev)
+                                tin += 1
+                            else:
+                                store.mark_sent(conn, ev.event_id, None, None)
                             continue
                         new_events.append(ev)
         except Exception as e:  # noqa: BLE001
@@ -1752,9 +1823,44 @@ class Poller:
         #    拿它们去查"有几个人收到"必然算出比真实更小的数,还可能凭空推一条告警
         self._new_transfers = transfers
         if new_events or transfers:
-            logger.info("本 tick 新事件 {} 条(另有转账 {} 条,只入库不逐条推送)",
-                        len(new_events), len(transfers))
+            # ⚠️ 被 /tin 点名的转入同时出现在两个列表里(要推、也要喂给聚合告警),
+            #    所以这里必须把它单独报出来,否则两个数加起来对不上、看日志的人会以为漏了。
+            logger.info("本 tick 新事件 {} 条(其中 /tin 转入 {} 条),另有转账 {} 条只入库不推送",
+                        len(new_events), tin, len(transfers) - tin)
         return new_events
+
+    def _should_push_transfer_in(self, ev: FomoEvent) -> bool:
+        """
+        这一笔转入该不该逐条推。**全项目唯一的判据**,落库侧与补发侧共用同一个函数
+        (两处各写一遍迟早会漂移,而漂移的方向恰恰是"不该推的推了出去")。
+
+        五道门,任何一道不过就不推:
+          1. 必须是 TRANSFER_IN —— 转出与"他进货了"无关。
+          2. 停机补数轮不推:那时的转账是整段积压,而消息里写的是"N 分钟前到账",
+             两者对不上(与 _check_transfer_in / _check_copytrade 同一条守卫)。
+          3. **这个人被 /tin 点名过**。没点名的人行为一个字节都不变(全名单 ≈807 条/天)。
+          4. 方向判得出、且不是计价币:方向不明时"收到"这个说法本身就没依据;
+             USDC/WSOL 到账是在给自己充钱,不是"他拿到了某个币"。
+             (与 _check_transfer_in 的候选过滤同口径。)
+          5. 金额够门槛。⚠️ 门槛是 **fomo_transfer_watch_min_usd**,不是
+             fomo_transfer_alert_min_usd —— 后者是"几个人收到同一个币"那个聚合信号的
+             阈值,语义与量级都不同,复用它就是让两个功能互相改灵敏度。
+        ⚠️ amount_usd is None 一律不推:证不出它够门槛。判据必须是 is None 而不是
+           真值判断 —— 配置允许门槛为 0,那时 $0.00 的到账是"确实是 0"、该推,
+           而 None 是"不知道多少"、不该推。(实测本地库 15254 条 TRANSFER_IN 里
+           amount_usd 缺失 0 条,所以这一支是纯防御。)
+        """
+        if ev.event_type != EVENT_TRANSFER_IN:
+            return False
+        if self._catchup_since:
+            return False
+        if ev.user_id not in self._tx_watch_ids:
+            return False
+        if ev.side_unknown or ev.is_quote:
+            return False
+        if ev.amount_usd is None:
+            return False
+        return ev.amount_usd >= self.settings.fomo_transfer_watch_min_usd
 
     def _dispatch(self, conn, snapshots: dict, new_events: list[FomoEvent], dry_run: bool) -> None:
         """
@@ -1791,28 +1897,47 @@ class Poller:
             logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
             starred = set()
         for ev in pending:
+            # ---- /tin:被点名的人的转入,走另一套渲染 ----
+            # ⚠️⚠️ 这道门必须在这里**再判一次**:上面的补发队列捞的是"库里所有
+            #    10 分钟内没发出去的行",它并不知道这条转入当初为什么留在那里。
+            #    没有这道门,任何一条 sent=0 的转入都会顺着补发路径推出去 ——
+            #    也就是把"只推被点名的那几个人"悄悄变成"全名单 ≈807 条/天"。
+            #    判不过的当场 mark_sent 排掉,免得它每 15 秒被捞出来一次、连捞 10 分钟。
+            is_watch_transfer = ev.event_type == EVENT_TRANSFER_IN
+            if is_watch_transfer and not self._should_push_transfer_in(ev):
+                with suppress(Exception):
+                    store.mark_sent(conn, ev.event_id, None, None)
+                continue
+
             buyers = watchlist = holders = None
             baseline_pending = False
             # ⚠️ 共识计算整段包在 try 里,失败一律降级为 None。
             #    绝不能出现"因为算不出共识数所以整条推送失败"。
-            try:
-                baseline_pending = not store.is_stats_ready(conn, ev.user_id)
-                buyers, watchlist = store.count_consensus(conn, ev)
-                # buyers 为 None 时共识行整段消失,holders 也就没有存在的意义了
-                if buyers is not None:
-                    holders = count_holders(snapshots, ready, ev)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("共识计算失败,降级为不显示 | {} | {}", ev.event_id, e)
-                buyers = watchlist = holders = None
+            # ⚠️ 转入那条消息里没有共识行(它问的是"这个人拿到了什么",不是
+            #    "名单里几个人买过"),所以整段跳过 —— 白算两条 SQL 没有意义。
+            if not is_watch_transfer:
+                try:
+                    baseline_pending = not store.is_stats_ready(conn, ev.user_id)
+                    buyers, watchlist = store.count_consensus(conn, ev)
+                    # buyers 为 None 时共识行整段消失,holders 也就没有存在的意义了
+                    if buyers is not None:
+                        holders = count_holders(snapshots, ready, ev)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("共识计算失败,降级为不显示 | {} | {}", ev.event_id, e)
+                    buyers = watchlist = holders = None
 
             try:
-                text = render(
-                    ev,
-                    buyers=buyers,
-                    watchlist=watchlist,
-                    holders=holders,
-                    baseline_pending=baseline_pending,
-                    starred=ev.user_id in starred,
+                text = (
+                    render_transfer_in_watch(ev, starred=ev.user_id in starred)
+                    if is_watch_transfer else
+                    render(
+                        ev,
+                        buyers=buyers,
+                        watchlist=watchlist,
+                        holders=holders,
+                        baseline_pending=baseline_pending,
+                        starred=ev.user_id in starred,
+                    )
                 )
             except Exception as e:  # noqa: BLE001
                 # 渲染炸了只丢这一条,后面的照发。sent 保持 0,下一 tick 会再试
