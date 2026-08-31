@@ -123,8 +123,84 @@ def test_关掉开关就不注册币安Alpha的job(monkeypatch):
     """对照组:证明上面那条钉的是开关真的生效,而不是无条件注册。"""
     from src.config import FomoSettings
 
-    s = FomoSettings(fomo_alpha_enabled=False)
+    # ⚠️ 三个可选开关**必须全部显式关掉**:只写 alpha 那一个的话,
+    #    其余仍然从仓库根 .env 读 —— 这条用例的结果就取决于「这台机器怎么配的」
+    #    (实测 .env 里 FOMO_PUMP_ENABLED=true 时它恒红,而被测行为完全正常)。
+    s = FomoSettings(fomo_alpha_enabled=False,
+                     fomo_pump_enabled=False,
+                     fomo_pump_callout_enabled=False)
     sched, _ = _stub_run(monkeypatch, s)
 
     assert cli.cmd_run() == 0
     assert [j["id"] for j in sched.jobs] == ["fomo_tick"]
+
+
+# ============================================================
+# pump.fun 的两个 job:买卖 / 观点,两个**互相独立**的开关
+# ============================================================
+# ⚠️⚠️ 与上面币安 Alpha 那两条同一条理由:仓库原先没有任何测试碰过 cmd_run,
+#    把 `if s.fomo_pump_callout_enabled:` 改成 `if False:`(= 观点功能压根没接进
+#    APScheduler)时,别的测试照样全绿 —— 而用户端的表现是「一条观点都收不到」,
+#    日志里没有任何报错。
+def _stub_pump(monkeypatch, settings):
+    """在 _stub_run 的基础上,再把 pump 的两个 watcher 换成 Mock。"""
+    sched, _alpha = _stub_run(monkeypatch, settings)
+    pump_cls, callout_cls = Mock(), Mock()
+    monkeypatch.setattr("src.pumpfun.PumpWatcher", pump_cls)
+    monkeypatch.setattr("src.pumpfun.PumpCalloutWatcher", callout_cls)
+    return sched, pump_cls, callout_cls
+
+
+def test_观点开关打开时注册成独立的第五个job(monkeypatch):
+    """
+    ⚠️ 同时钉住「它是**独立的一个** job」:与买卖那个分开注册,
+       portfolio 挂了不该让观点也停,反之亦然。
+    """
+    from src.config import FomoSettings
+
+    s = FomoSettings(fomo_alpha_enabled=False, fomo_pump_enabled=False,
+                     fomo_pump_callout_enabled=True, fomo_pump_interval_sec=90)
+    sched, _pump, callout_cls = _stub_pump(monkeypatch, s)
+
+    assert cli.cmd_run() == 0
+
+    ids = [j["id"] for j in sched.jobs]
+    assert "pumpfun_callout" in ids, "开关打开却没注册 = 用户一条观点都收不到,且日志无异常"
+    job = next(j for j in sched.jobs if j["id"] == "pumpfun_callout")
+    assert job["func"] is callout_cls.return_value.run_once, \
+        "注册进去的必须是 PumpCalloutWatcher.run_once —— 它是唯一契约上不抛异常的入口"
+    assert job["trigger"] == "interval"
+    assert job["seconds"] == 90
+    assert job["max_instances"] == 1, "两轮叠在一起会重复推送"
+
+
+def test_关掉观点开关就不注册那个job(monkeypatch):
+    """对照组:证明上面那条钉的是开关真的生效,而不是无条件注册。"""
+    from src.config import FomoSettings
+
+    s = FomoSettings(fomo_alpha_enabled=False, fomo_pump_enabled=False,
+                     fomo_pump_callout_enabled=False)
+    sched, _pump, _callout = _stub_pump(monkeypatch, s)
+
+    assert cli.cmd_run() == 0
+    assert [j["id"] for j in sched.jobs] == ["fomo_tick"]
+
+
+def test_两个pump开关互相独立(monkeypatch):
+    """
+    ⚠️⚠️ 这是"分成两个开关"那条决定的守卫:只想看观点的人不该被逼着
+       连逐笔成交一起收,反过来也一样。共用一个开关的实现会让下面两条都红。
+    """
+    from src.config import FomoSettings
+
+    only_callout = FomoSettings(fomo_alpha_enabled=False, fomo_pump_enabled=False,
+                                fomo_pump_callout_enabled=True)
+    sched, _p, _c = _stub_pump(monkeypatch, only_callout)
+    assert cli.cmd_run() == 0
+    assert [j["id"] for j in sched.jobs] == ["fomo_tick", "pumpfun_callout"]
+
+    only_trade = FomoSettings(fomo_alpha_enabled=False, fomo_pump_enabled=True,
+                              fomo_pump_callout_enabled=False)
+    sched2, _p2, _c2 = _stub_pump(monkeypatch, only_trade)
+    assert cli.cmd_run() == 0
+    assert [j["id"] for j in sched2.jobs] == ["fomo_tick", "pumpfun"]

@@ -895,6 +895,31 @@ def cmd_run() -> int:
             next_run_time=datetime.now(UTC),  # 第一轮只播种持仓,不会推任何东西
         )
 
+    # ---- 第五个 job:pump.fun 指定用户的观点(callout) ----
+    # ⚠️⚠️ **与上面那个买卖 job 分开注册,开关也分开**(理由见 config 里
+    #    fomo_pump_callout_enabled 的注释):两路是含义不同的两个信号,
+    #    成本模型也不是一本账。合成一个 job 的话,只想看观点的人必须连
+    #    逐笔成交一起收,而"关掉噪音"的唯一办法会变成整个功能关掉。
+    # ⚠️ 巡检节奏**共用** fomo_pump_interval_sec:两路都是"pump 侧的巡检",
+    #    依据也一样(观点实测约 3.2 条/天/人,与持仓变动同为低频事件)。
+    #    再加一个只会调错的旋钮。
+    # ⚠️ 总开关默认 **False**:老库升级后行为逐字节不变,由用户显式打开。
+    callout_watcher = None
+    if s.fomo_pump_callout_enabled:
+        from src.pumpfun import PumpCalloutWatcher
+
+        callout_watcher = PumpCalloutWatcher(notifier)
+        sched.add_job(
+            # run_once 契约上**绝不抛异常**(自己吞掉并记日志),所以这里不再包一层
+            callout_watcher.run_once, "interval",
+            seconds=s.fomo_pump_interval_sec,
+            id="pumpfun_callout",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=s.fomo_pump_interval_sec,
+            next_run_time=datetime.now(UTC),  # 第一轮只播种观点,不会推任何东西
+        )
+
     logger.info("=" * 60)
     logger.info("FOMO 监控启动 | 轮询 {}s | client={} | Ctrl+C 退出",
                 s.fomo_poll_interval_sec, s.fomo_client_impl)
@@ -904,6 +929,9 @@ def cmd_run() -> int:
     if pump_watcher is not None:
         logger.info("pump.fun 买卖监控已启用 | 巡检 {}s | 门槛 ${:.2f} | 单轮最多 {} 个变动 mint",
                     s.fomo_pump_interval_sec, s.fomo_pump_min_usd, s.fomo_pump_max_mints)
+    if callout_watcher is not None:
+        logger.info("pump.fun 观点监控已启用 | 巡检 {}s | 新鲜窗口 {}s",
+                    s.fomo_pump_interval_sec, s.fomo_pump_callout_max_age_sec)
     logger.info("=" * 60)
     try:
         sched.start()
@@ -928,6 +956,9 @@ def cmd_run() -> int:
         if pump_watcher is not None:
             with suppress(Exception):
                 pump_watcher.close()
+        if callout_watcher is not None:
+            with suppress(Exception):
+                callout_watcher.close()
     logger.info("已退出")
     return 0
 

@@ -1227,25 +1227,35 @@ class CommandBot:
         s = self._settings
         with store.get_conn() as conn:
             rows = store.list_pump_users(conn)
-        head = "🎯 <b>pump.fun 买卖监控</b>"
+        head = "🎯 <b>pump.fun 监控</b>"
         if not rows:
             return (
                 f"{head}:当前一个人都没加\n"
-                "/pump add &lt;名字或钱包&gt; 加人 —— 他在 pump.fun 上每成交一笔就推一条。\n"
+                "/pump add &lt;名字或钱包&gt; 加人 —— 他在 pump.fun 上每成交一笔、"
+                "每发一条观点就推一条。\n"
                 f"门槛 ${s.fomo_pump_min_usd:,.2f} · 巡检 {s.fomo_pump_interval_sec}s\n"
-                "⚠️ 第一轮只记下当前持仓、<b>一条都不推</b>,之后的买卖才会推。"
+                "⚠️ 第一轮只记下当前持仓与已有观点、<b>一条都不推</b>,之后的才会推。"
             )
         lines = [f"{head}({len(rows)} 人) · 门槛 ${s.fomo_pump_min_usd:,.2f}"
                  f" · 巡检 {s.fomo_pump_interval_sec}s"]
+        # ⚠️ 必须说出来:名单加了人却没开开关,用户会一直等一条永远不来的推送。
+        # ⚠️⚠️ 买卖与观点是**两个独立开关**,所以分别报 —— 只报一个的话,
+        #    另一路的"开了却没推送"在界面上完全没有解释。
         if not s.fomo_pump_enabled:
-            # ⚠️ 必须说出来:名单加了人却没开开关,用户会一直等一条永远不来的推送
-            lines.append("⚠️ <b>总开关未打开</b>,现在不会巡检 —— "
+            lines.append("⚠️ <b>买卖开关未打开</b>,不会推成交 —— "
                          "到 .env 设 <code>FOMO_PUMP_ENABLED=true</code> 后重启")
+        if not s.fomo_pump_callout_enabled:
+            lines.append("⚠️ <b>观点开关未打开</b>,不会推观点 —— "
+                         "到 .env 设 <code>FOMO_PUMP_CALLOUT_ENABLED=true</code> 后重启")
         for i, r in enumerate(rows[:MAX_LIST_ROWS], 1):
             name = r["username"] or r["user_id"]
-            # 播种状态要显示:没播过种的人这一轮不会有任何推送,不说清楚会被当成坏了
+            # 播种状态要显示:没播过种的人这一轮不会有任何推送,不说清楚会被当成坏了。
+            # ⚠️ 两路**各播各的种**(库里两列),所以两个状态都要报:一个人可能买卖
+            #    早就就绪、而观点开关刚打开还在首轮记录 —— 只报一个会让另一路的静默
+            #    看起来像坏了。
             state = "✅就绪" if r["seeded"] else "⏳首轮记录中"
-            lines.append(f"{i}. <b>{_esc(name)}</b> · {state}")
+            c_state = "✅就绪" if r["callout_seeded"] else "⏳首轮记录中"
+            lines.append(f"{i}. <b>{_esc(name)}</b> · 买卖{state} · 观点{c_state}")
         if len(rows) > MAX_LIST_ROWS:
             lines.append(f"…另有 {len(rows) - MAX_LIST_ROWS} 人未显示")
         lines.append("/pump del &lt;名字或钱包&gt; 移出。")
@@ -1273,8 +1283,8 @@ class CommandBot:
             return f"ℹ️ <b>{name}</b> 已在 pump.fun 监控中"
         return (
             f"✅ 已加入 pump.fun 监控 <b>{name}</b>\n"
-            "⏳ 下一轮先把他<b>当前的持仓记为已知、一条都不推</b>,"
-            "再之后的买卖才会逐笔推送"
+            "⏳ 下一轮先把他<b>当前的持仓与已有观点记为已知、一条都不推</b>,"
+            "再之后的买卖与观点才会逐条推送"
         )
 
     def _pump_del(self, key: str) -> str:

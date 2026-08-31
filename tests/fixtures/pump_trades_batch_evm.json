@@ -1,0 +1,33 @@
+{
+  "21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm": [],
+  "0xbebbad0b95ed88e6c56c8d79daa82257e97c3f44": [
+    {
+      "slotIndexId": "247",
+      "tx": "0x0be83456dc44a5b13f9c64843a17d19a701db9dbb03688781f35970f75cd912d",
+      "timestamp": "2026-08-30T22:20:30.000Z",
+      "userAddress": "0xbebbad0b95ed88e6c56c8d79daa82257e97c3f44",
+      "type": "sell",
+      "isBondingCurve": false,
+      "priceUSD": "717.13966468592901072",
+      "priceSOL": null,
+      "amountUSD": "122.68478317762780712436553883491807632",
+      "amountSOL": null,
+      "baseAmount": "0.171075160417123981",
+      "quoteAmount": "122.68478317762780712436553883491807632"
+    },
+    {
+      "slotIndexId": "433",
+      "tx": "0x901fcdecc2b4c326ef3f2261430af38076960be5de1d14f94c7f94cf52967cc0",
+      "timestamp": "2026-08-30T13:09:38.000Z",
+      "userAddress": "0xbebbad0b95ed88e6c56c8d79daa82257e97c3f44",
+      "type": "sell",
+      "isBondingCurve": false,
+      "priceUSD": "719.35815774709495605",
+      "priceSOL": null,
+      "amountUSD": "270.08774524144741185087733405036210755",
+      "amountSOL": null,
+      "baseAmount": "0.375456568237601431",
+      "quoteAmount": "270.08774524144741185087733405036210755"
+    }
+  ]
+}
