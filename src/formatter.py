@@ -229,6 +229,29 @@ def _fmt_price(v) -> str | None:
     return f"{sign}${s or '0'}"
 
 
+def _fmt_usd_tiny(v) -> str | None:
+    """
+    金额,但**非零的粉尘额按有效数字给**:$1,234.50 / $0.00 / $0.000002848
+
+    ⚠️⚠️ 存在的理由:pump.fun 逐笔里真的有 amountUSD=0.0000028483994 这种成交。
+       两位小数会把它渲染成「💰 金额 $0.00」—— 一行**看起来像缺失值的真实值**,
+       与"缺失整行消失、绝不打 0"的观感直接打架(用户会以为字段没取到)。
+    ⚠️ 恰好是 0 的仍然走 _fmt_usd 显示成 $0.00:0 是真实值,它就该显示成 0,
+       不能被"小额一律有效数字"顺手改掉语义。
+    ⚠️ 判据是「两位小数会不会把这个非零值渲染成 0」本身,**不是拍一个阈值**:
+       quantize 默认是 banker's rounding,恰好 0.005 也会塌成 0.00,
+       写 `< 0.005` 就正好在边界上漏一个。
+       (`abs(d) < 1` 只是先挡掉大额 —— 大额永远塌不成 0,却会在默认 prec 下
+        让 quantize 抛 InvalidOperation。)
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    if d != 0 and abs(d) < 1 and d.quantize(Decimal("0.01")) == 0:
+        return _fmt_price(d)
+    return _fmt_usd(d)
+
+
 def _fmt_qty(v) -> str | None:
     """
     token 数量:1,200,000 / 1,250,000.5 / 0.00000123
@@ -1346,3 +1369,126 @@ def render_alpha_batch(items: list[tuple[str | None, int]]) -> str:
     if n > _ALPHA_BATCH_SYMBOLS:
         lines.append(f"…还有 {n - _ALPHA_BATCH_SYMBOLS} 个未列出")
     return _fit_signal(lines, None)
+
+
+# ============================================================
+# pump.fun 指定用户的逐笔成交
+# ============================================================
+# 行首锚点。⚠️ 全局唯一(铁律 1):买卖那六个、跟单的 🧪/🛒、分发预警的 🚨、
+#    Alpha 的 🆕 都不重样。这条消息说的是"我盯的这个人在 pump.fun 上成交了",
+#    在聊天列表预览里必须一眼与 FOMO 那边的买卖分得开 —— 认错锚点就是认错平台。
+EMOJI_PUMP_BUY = "🟩"
+EMOJI_PUMP_SELL = "🟥"
+LABEL_PUMP = "pump.fun"
+LABEL_PUMP_BUY = "买入"
+LABEL_PUMP_SELL = "卖出"
+EMOJI_PUMP_TX = "🧾"          # 成交签名
+# 用户名来自 pump.fun,是**本人可改的任意字符串**:限长 + 转义,且只转一次
+_PUMP_NAME_CHARS = 24
+# 签名:Solana base58 88 位 / EVM 0x+64 = 66 位。128 绰绰有余,又挡得住脏数据撑爆预算
+_PUMP_TX_CHARS = 128
+
+
+def render_pump_trade(
+    *,
+    username: str | None,
+    side: str | None,
+    token_symbol: str | None,
+    coin_mint: str | None,
+    amount_usd=None,
+    price_usd=None,
+    traded_at: str | None = None,
+    network_id: str | None = None,
+    chain_display: str | None = None,
+    tx: str | None = None,
+    now: float | None = None,
+) -> str:
+    """
+    「被盯的人在 pump.fun 上成交了一笔」的推送。
+
+    参数:
+        username       pump 用户名,**本人可控** —— 一律走 _clip(叠平空白→限长→转义)
+        side           "buy" / "sell"。其它值(含 None)→ 退化成中性的「交易」,
+                       **绝不猜方向** —— 猜错方向比不说方向糟得多
+        token_symbol   链上文本,同样陌生人可控
+        network_id     已归一化的内部链标识,用来查展示名与链接;查不到就没链接行
+        chain_display  链展示名的兜底(pump 只给数字 chainId,没有链名字段)
+        traded_at      成交时刻 ISO;解析不出来 → 那一行整行消失
+        now            渲染时刻(unix 秒),只用来算"多久之前"
+
+    ⚠️⚠️ **措辞铁律:只摆可证的事实,一个字都不许替用户下结论。**
+       这里的数据是 swap-api 的逐笔成交(签名/时刻/方向/价格/金额),
+       所以可以如实说"买入 / 卖出" —— 那是报文里 type 字段的原话。
+       但"他在建仓"/"他在跑路"/"该跟"这类**意图断言**全部禁止:
+       报文里没有任何证据支持它们,用户自己读得出来。
+    ⚠️ 出口不变式与 /ca、Alpha、转入推送同一套:≤ TRANSFER_MSG_BUDGET、
+       只在整行边界砍、CA 锚点最后贴且完整(见 _fit_signal)。
+    ⚠️ 本函数是纯函数,不查库、不发请求(铁律 7);缺失字段整行消失,绝不打 0 / N/A。
+    """
+    s = str(side or "").strip().lower()
+    if s == "buy":
+        emoji, label = EMOJI_PUMP_BUY, LABEL_PUMP_BUY
+    elif s == "sell":
+        emoji, label = EMOJI_PUMP_SELL, LABEL_PUMP_SELL
+    else:
+        # 上游给了个没见过的 type。方向未知就说未知 —— 绝不默认成买入
+        emoji, label = EMOJI_PUMP_BUY, LABEL_UNKNOWN_SIDE
+    title = f"{emoji} <b>{LABEL_PUMP}</b>{SEP}{label}"
+    name = _clip(username or "", _PUMP_NAME_CHARS)
+    if name:
+        title += f"{SEP}<b>{name}</b>"
+    sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+
+    lines = [title]
+    # ⚠️ 用 _fmt_usd_tiny 而不是 _fmt_usd:门槛调到 0 之后粉尘成交会进来,
+    #    两位小数会把 $0.0000028 渲染成 $0.00,看着像字段没取到(其实是真实值)
+    usd = _fmt_usd_tiny(amount_usd)
+    if usd is not None:
+        lines.append(f"{EMOJI_AMOUNT_IN if s != 'sell' else EMOJI_AMOUNT_OUT} 金额 {usd}")
+    px = _fmt_price(price_usd)
+    if px is not None:
+        lines.append(f"{EMOJI_AVG_PRICE} 单价 {px}")
+    ts_line = _pump_time_line(traded_at, now)
+    if ts_line is not None:
+        lines.append(ts_line)
+
+    net = (network_id or "").strip()
+    # 链展示名:先查内部映射表,查不到才用调用方给的兜底名(它也可能没有 → 整行消失)
+    disp = NETWORK_DISPLAY.get(net) or " ".join(str(chain_display or "").split()) or None
+    if disp:
+        lines.append(f"{EMOJI_NETWORK} {_esc(disp)}")
+    txt = " ".join(str(tx or "").split())
+    if txt:
+        # 签名独占一行、纯 <code>:它是这条消息里**唯一可自行核验**的东西,
+        # 必须能一键复制粘到浏览器里。⚠️ 排在 CA 之前 —— CA 独占最后一行是硬规则
+        lines.append(f"{EMOJI_PUMP_TX} <code>{_clip(txt, _PUMP_TX_CHARS)}</code>")
+    ca = " ".join(str(coin_mint or "").split())
+    link = _links_line(_fake_ev(net, ca))
+    if link:
+        lines.append(link)
+
+    # CA 独占最后一行、纯 <code>(铁律 6)。拿不到就没有这一行 ——
+    # 空的 <code></code> 是个点了复制不出东西的假区域,比没有更糟
+    anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
+    return _fit_signal(lines, anchor)
+
+
+def _pump_time_line(traded_at, now: float | None = None) -> str | None:
+    """
+    ⏱ 2026-08-31 01:59 UTC · 3M前
+
+    ⚠️ 绝对时刻必须有 —— "3M前"在一条隔夜才看到的消息里是错的,绝对时刻永远对。
+    ⚠️ 解析不出来整行消失(铁律 2),绝不拿 0 或当前时间冒充。
+    """
+    secs = _parse_ts(traded_at)
+    if secs is None:
+        return None
+    try:
+        stamp = datetime.fromtimestamp(secs, UTC).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, OverflowError, OSError):
+        return None
+    line = f"{EMOJI_CLOCK} {stamp}"
+    age = fmt_token_age(secs, now)
+    return f"{line}{SEP}{age}前" if age else line

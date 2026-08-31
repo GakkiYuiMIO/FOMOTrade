@@ -232,6 +232,83 @@ CREATE TABLE IF NOT EXISTS binance_alpha_pushed (
 -- 专给清理任务用:prune 按 listing_time_ms 单列判过期,用不上以 network_id 打头的主键索引
 CREATE INDEX IF NOT EXISTS idx_alpha_pushed_listing ON binance_alpha_pushed(listing_time_ms);
 
+-- ============ 【pump.fun】被盯的人 ============
+-- ⚠️⚠️ **刻意另起一张表,绝不给 watch_users 加 platform 列。**
+--    watch_users.user_id 是 FOMO 的 UUID,被 fomo_events / user_token_stats /
+--    fomo_cursors / copytrade 一路当聚合键。加一列 platform 之后,
+--    list_active_users / fetchable_users / ready_user_ids / starred_user_ids /
+--    transfer_watch_user_ids / bot._cmd_list / bot._cmd_status / web 查询
+--    **每一个都要补 `AND platform='fomo'`,漏一个就是错的**。
+--    最贵的是 fetchable_users —— 它直接驱动 poller 打 FOMO API:
+--    一行 pump 数据漏进去,poller 会拿 Solana 钱包去问 fomo.family,
+--    404 之后把这个人标成「账号已不存在」,而他本来好好的。
+--    这与 transfer_in_signals 表上写过的是同一条教训(复用会让两类东西互相吃掉)。
+-- ⚠️ 主键用 pump 的 userId(UUID),**不用 username** ——
+--    /users/{name} 的响应里带 last_username_update_timestamp,
+--    证明用户名是本人可改的,拿它当主键等于改个名就换了个人。
+-- ⚠️ 两个 canonical 钱包都要存,理由见 pumpfun.py 顶部:
+--    portfolio 用哪个查都返回同一份(2026-08-31 实测逐行相同),
+--    但**逐笔成交必须两个都查** —— EVM 链上的成交记在 canonical_evm_wallet 名下,
+--    只传 SVM 地址会得到空数组(实测:1000XCryptoD 的 BSC 买入只在 EVM 地址下)。
+-- ⚠️ 这张表与跟单执行器**没有任何关系**,永远不要让它参与下单判定。
+CREATE TABLE IF NOT EXISTS pump_watch_users (
+    user_id     TEXT PRIMARY KEY,           -- pump.fun userId(UUID),权威主键
+    username    TEXT,                       -- 仅展示,可被本人改
+    svm_wallet  TEXT,                       -- canonical_svm_wallet
+    evm_wallet  TEXT,                       -- canonical_evm_wallet
+    added_at    TEXT NOT NULL,              -- UTC ISO
+    active      INTEGER NOT NULL DEFAULT 1, -- 软删除:/pump del 置 0,再 add 置回 1
+    removed_at  TEXT,
+    -- 冷启动静默播种位。0 = 还没播过种,这一轮只记快照、**一条都不推**。
+    -- ⚠️ 必须是**每人一位**,不能做成全局一位:名单跑了三天之后再加一个新人,
+    --    全局位早就是 1 了,那个新人的几百个持仓会在第一轮全部当成"刚变动"推出去
+    --    (实测 1000XCryptoD 有 1905 个持仓)。
+    -- ⚠️ 也不能靠「他在快照表里有没有行」来猜:一个真的一个持仓都没有的人
+    --    会永远被判成"没播过种",于是他第一次买入永远被静默吃掉。
+    seeded      INTEGER NOT NULL DEFAULT 0
+);
+
+-- ============ 【pump.fun】持仓快照 ============
+-- 上一轮看到的持仓,用来 diff 出「哪些 mint 变了」。
+-- ⚠️ 它只是**发现层**:只回答"要去问哪些 mint 的逐笔成交",
+--    绝不拿它自己的差值当成交额推出去 —— 那是"两次快照之间的净变化",不是成交。
+--    真相一律来自 swap-api 的逐笔记录。
+-- ⚠️ amount_held 允许为 0:filter=ALL 会带回 isExited=true / amountHeld=0 的行,
+--    清仓因此是**正面可观测**的,不用靠"这一行消失了"去猜。
+--    所以判空一律 is None,绝不用真值判断(0 是有意义的真实值)。
+-- ⚠️ 主键必须带 chain_id:pump.fun 是多链的(实测 hexiecs 一页里就有
+--    Solana / Robinhood / BNB Chain 三条链),同一个地址串在两条链上是两个币。
+CREATE TABLE IF NOT EXISTS pump_positions (
+    user_id     TEXT NOT NULL,
+    chain_id    TEXT NOT NULL,              -- pump 的原始 chainId,原样存(1399811149 等)
+    coin_mint   TEXT NOT NULL,              -- 归一化后的 mint/CA
+    amount_held REAL,                       -- 拿不到就 NULL,**不写 0**(0 是"已清仓")
+    realized_pnl_usd REAL,
+    updated_at  TEXT,                       -- pump 给的这一行的更新时刻
+    snapshot_at TEXT NOT NULL,              -- 我们写下这一行的时刻(UTC ISO)
+    PRIMARY KEY (user_id, chain_id, coin_mint)
+);
+
+-- ============ 【pump.fun】已推逐笔成交台账 ============
+-- ⚠️⚠️ 存在的理由:portfolio 的一次变动会让我们把该 mint 的逐笔成交整段拉回来,
+--    而下一轮这个 mint 若又变了,**同一批成交会再被拉回来一次**。
+--    没有这张表就是每变动一次重推一遍。
+-- ⚠️ 主键带 slot_index_id:一个 tx 里可以有同一个 mint 的多笔成交(拆单),
+--    只按 tx 去重会把后面几笔静默吃掉。上游没给 slot_index_id 时存空串 ——
+--    那时退化成"按 tx 去重",仍然不会重推。
+-- ⚠️ traded_at 必须存:清理任务靠它判「已经掉出新鲜窗口、永远不会再成为候选」。
+CREATE TABLE IF NOT EXISTS pump_pushed_trades (
+    user_id       TEXT NOT NULL,
+    coin_mint     TEXT NOT NULL,
+    tx            TEXT NOT NULL,
+    slot_index_id TEXT NOT NULL DEFAULT '',
+    traded_at     TEXT NOT NULL,            -- 成交时刻 UTC ISO(pump 给的 timestamp)
+    pushed_at     TEXT NOT NULL,            -- UTC ISO
+    PRIMARY KEY (user_id, coin_mint, tx, slot_index_id)
+);
+-- 专给清理任务用:prune 按 traded_at 单列判过期,用不上以 user_id 打头的主键索引
+CREATE INDEX IF NOT EXISTS idx_pump_pushed_traded ON pump_pushed_trades(traded_at);
+
 -- ============ 【买入榜】代币行情快照 ============
 -- 每 tick 从 balances 拿到的最新价与市值,按币覆盖写一行。
 -- 存在的理由:/hot 要算"买入时市值 → 现在市值"的倍数,
@@ -1917,6 +1994,170 @@ def prune_alpha_pushed(conn, upto_ms: int) -> int:
     cur = conn.execute(
         "DELETE FROM binance_alpha_pushed WHERE listing_time_ms <= ?", (int(upto_ms),)
     )
+    return cur.rowcount
+
+
+# ============================================================
+# 【pump.fun】名单 / 持仓快照 / 已推台账
+# ============================================================
+# ⚠️ 与 alpha 那三个同一约定:本节函数**都不自己开事务**。
+#    调用方要把「写快照 + 记台账 + 置播种位」放进同一个 tx,
+#    拆开的话中途崩一次就会留下自相矛盾的状态(快照前移了但台账没记 → 重推;
+#    播种位置了但快照没写 → 下一轮把全部持仓当成刚变动全推一遍)。
+def add_pump_user(conn, user_id: str, username: str | None,
+                  svm_wallet: str | None, evm_wallet: str | None) -> bool:
+    """
+    加人 / 复活一个软删除掉的人。返回 True = 这次真的是新加(或从删除态复活)。
+
+    ⚠️ 复活时 **seeded 归零**:人被移出去这段时间他照样在交易,
+       快照早就过期了。不归零的话复活那一轮会把这期间的全部变动一次推出来。
+    ⚠️ 钱包与用户名每次都覆盖写:用户名可改(last_username_update_timestamp),
+       钱包也可能被 pump 换掉,库里存着旧值会让逐笔成交永远查不到人。
+    """
+    row = conn.execute(
+        "SELECT active FROM pump_watch_users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO pump_watch_users "
+            "(user_id, username, svm_wallet, evm_wallet, added_at, active, seeded) "
+            "VALUES (?, ?, ?, ?, ?, 1, 0)",
+            (user_id, username, svm_wallet, evm_wallet, now_iso()),
+        )
+        return True
+    was_active = row["active"] == 1
+    conn.execute(
+        "UPDATE pump_watch_users SET username = ?, svm_wallet = ?, evm_wallet = ?, "
+        "active = 1, removed_at = NULL, seeded = CASE WHEN active = 1 THEN seeded ELSE 0 END "
+        "WHERE user_id = ?",
+        (username, svm_wallet, evm_wallet, user_id),
+    )
+    return not was_active
+
+
+def remove_pump_user(conn, user_id: str) -> bool:
+    """
+    软删除。返回 True = 这次真的关掉了一个开着的人。
+
+    ⚠️ 软删除而不是 DELETE:快照与台账都以 user_id 为键,行留着,
+       再 add 回来时**先归零 seeded 再重新播种**(见 add_pump_user)。
+    """
+    cur = conn.execute(
+        "UPDATE pump_watch_users SET active = 0, removed_at = ? "
+        "WHERE user_id = ? AND active = 1",
+        (now_iso(), user_id),
+    )
+    return cur.rowcount == 1
+
+
+def list_pump_users(conn, *, active_only: bool = True) -> list[sqlite3.Row]:
+    """名单。默认只给还开着的 —— 软删除掉的人绝不能进巡检(那等于没删)。"""
+    sql = "SELECT * FROM pump_watch_users"
+    if active_only:
+        sql += " WHERE active = 1"
+    return conn.execute(sql + " ORDER BY added_at").fetchall()
+
+
+def find_pump_user(conn, key: str):
+    """
+    按 userId / 用户名 / 任一钱包查一个人。/pump del 用它把用户输入落到 user_id。
+
+    ⚠️ 用户名比对忽略大小写(库里存的是 pump 给的规范大小写,用户敲的未必一致);
+       钱包不能一刀切 lower —— Solana 是 base58、大小写敏感,所以两种形态都比。
+    """
+    k = (key or "").strip().lstrip("@")
+    if not k:
+        return None
+    return conn.execute(
+        "SELECT * FROM pump_watch_users WHERE user_id = ? OR lower(username) = ? "
+        "OR svm_wallet = ? OR lower(evm_wallet) = ? LIMIT 1",
+        (k, k.lower(), k, k.lower()),
+    ).fetchone()
+
+
+def pump_positions(conn, user_id: str) -> dict[tuple[str, str], sqlite3.Row]:
+    """这个人上一轮的持仓快照,键是 (chain_id, coin_mint)。"""
+    rows = conn.execute(
+        "SELECT * FROM pump_positions WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    return {(r["chain_id"], r["coin_mint"]): r for r in rows}
+
+
+def upsert_pump_positions(conn, user_id: str, rows) -> None:
+    """
+    覆盖写若干行快照。rows: (chain_id, coin_mint, amount_held, realized_pnl_usd, updated_at)。
+
+    ⚠️ 只 upsert、**不删除本轮没出现的行**:我们只拉 page 0(最近变动的那一页),
+       没出现在这一页里的币不等于消失了,删掉它下一轮它再冒出来就成了"新持仓"。
+    """
+    payload = [(user_id, str(chain), mint, amt, pnl, upd, now_iso())
+               for chain, mint, amt, pnl, upd in rows]
+    if not payload:
+        return
+    conn.executemany(
+        """
+        INSERT INTO pump_positions
+            (user_id, chain_id, coin_mint, amount_held, realized_pnl_usd, updated_at, snapshot_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, chain_id, coin_mint) DO UPDATE SET
+            amount_held = excluded.amount_held,
+            realized_pnl_usd = excluded.realized_pnl_usd,
+            updated_at = excluded.updated_at,
+            snapshot_at = excluded.snapshot_at
+        """,
+        payload,
+    )
+
+
+def mark_pump_seeded(conn, user_id: str) -> None:
+    """置播种位 —— 这个人的历史持仓已记为已知,从下一轮起他的变动才会被推。"""
+    conn.execute("UPDATE pump_watch_users SET seeded = 1 WHERE user_id = ?", (user_id,))
+
+
+def pump_pushed_since(conn, after_iso: str) -> set[tuple[str, str, str, str]]:
+    """
+    台账里 traded_at 严格大于阈值的那些键 (user_id, coin_mint, tx, slot_index_id)。
+
+    ⚠️ 与 alpha_pushed_since 同一条理由:按时间捞整段,不拿候选键逐个 IN 查 ——
+       候选在异常轮次可能有几百个,拼几百个占位符只会更慢更脆;
+       而这张表被清理策略钉死在新鲜窗口内,整段捞出来也就几十行。
+    """
+    rows = conn.execute(
+        "SELECT user_id, coin_mint, tx, slot_index_id FROM pump_pushed_trades "
+        "WHERE traded_at > ?",
+        (after_iso,),
+    ).fetchall()
+    return {(r["user_id"], r["coin_mint"], r["tx"], r["slot_index_id"]) for r in rows}
+
+
+def record_pump_pushed(conn, rows) -> None:
+    """
+    记若干行「这笔成交已经推过」。rows: (user_id, coin_mint, tx, slot_index_id, traded_at)。
+
+    ⚠️ INSERT OR IGNORE:重复键不是错误,两轮之间的竞态撞上同一笔是正常的。
+    """
+    payload = [(uid, mint, tx, sid or "", ts, now_iso())
+               for uid, mint, tx, sid, ts in rows]
+    if not payload:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO pump_pushed_trades
+            (user_id, coin_mint, tx, slot_index_id, traded_at, pushed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
+
+
+def prune_pump_pushed(conn, upto_iso: str) -> int:
+    """
+    删掉 traded_at **小于等于** 阈值的行,返回删除行数。
+
+    ⚠️ 阈值传的是新鲜窗口下界:等于下界的那笔已经不满足「严格大于下界」,
+       永远不会再成为候选,留着只是让表无限长大。
+    """
+    cur = conn.execute("DELETE FROM pump_pushed_trades WHERE traded_at <= ?", (upto_iso,))
     return cur.rowcount
 
 
