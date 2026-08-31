@@ -1435,8 +1435,9 @@ def render_pump_trade(
         market_cap_usd 当前市值(美元)。⚠️ 必须是 coins-v3 的 `usd_market_cap`,
                        **绝不是 `market_cap`** —— 后者在 Solana 上是 SOL 计价
         ath_market_cap_usd 历史最高市值(美元),只用来算「距最高 -X%」
-        holders_in_list 名单里仍持有这个币的人数;**只报分子不报分母**,理由见
-                       _pump_holders_line
+        holders_in_list 名单里仍持有这个币的人数,而且是**本轮亲眼观测到的下界**
+                       (调用方绝不能把库里的旧快照混进来);**只报分子不报分母**,
+                       渲染出来带「至少」二字 —— 理由见 _pump_holders_line
         network_id     已归一化的内部链标识,用来查展示名与链接;查不到就没链接行
         chain_display  链展示名的兜底(pump 只给数字 chainId,没有链名字段)
         traded_at      成交时刻 ISO;解析不出来 → 那一行整行消失
@@ -1583,36 +1584,56 @@ def _pump_mcap_line(market_cap_usd, ath_market_cap_usd) -> str | None:
        usd_market_cap=2906.09,前者恰好等于 bonding curve 的 SOL 市值),
        拿它当美元就是把一个 $2,906 的币说成 $28 —— 差两个数量级,而且一眼看不出错。
     ⚠️ 市值拿不到 → **整行消失**(连带「距最高」),绝不用 ath / 入场价 / 0 顶替。
+    ⚠️⚠️ 市值**恰好 ≤ 0 时同样整行消失**。这不是拿真值判断代替 is None ——
+       取值一路仍然只用 is None 判缺失(0 与缺失在解析层分得很清楚);
+       这里判的是另一件事:**这一行说不出口**。
+       市值 0 的含义是"这个币的全部流通份额加起来一分钱不值",而同一条消息里
+       紧挨着的是一笔以非零单价成交的真实交易 —— 两者直接矛盾,现实里它几乎
+       只可能是上游算漏(缺储备量 / 缺价 / 新币还没被索引)。
+       而这一行此刻会打出「💎 市值 $0.00 · 距最高 -100.0%」:两个数字连起来
+       就是"这币归零了"这句**替读者下的结论**,我们手上一个字的证据都没有。
+       负数同理(市值没有负的)。少一行是"我们没说",打这两个数字是"我们说错了"。
     ⚠️ 「距最高」只在 ath 严格大于当前市值时才出:
        · ath <= 当前 = 正在创新高或数据同步滞后,「距最高 -0.0%」是纯噪音;
        · 顺带也挡住了单位错配 —— 万一哪条链的 ath 换成了 quote 计价,
          它会比美元市值小,这一段自己就不出现,而不是打出一个 +10000% 的鬼数。
     """
+    cur = _to_decimal(market_cap_usd)
+    if cur is None or cur <= 0:
+        return None
     mc = _fmt_usd_compact(market_cap_usd)
     if mc is None:
         return None
     line = f"{EMOJI_MARKET_CAP} 市值 {mc}"
     ath = _to_decimal(ath_market_cap_usd)
-    cur = _to_decimal(market_cap_usd)
-    if ath is None or cur is None or ath <= 0 or ath <= cur:
+    if ath is None or ath <= 0 or ath <= cur:
         return line
     return f"{line}{SEP}{LABEL_PUMP_DRAWDOWN} -{(ath - cur) / ath * 100:.1f}%"
 
 
 def _pump_holders_line(holders_in_list: int | None) -> str | None:
     """
-    👥 名单内 2 人持有
+    👥 名单内至少 2 人持有
 
-    ⚠️⚠️ **只报分子,不报分母** —— 与 FOMO 那条的「名单内 3/101 人买过」刻意不同。
-       分母的含义是"另外 98 个人没买过",而这里我们根本证明不了它:
-       持仓快照每人**只覆盖 page 0 的 50 行**(实测 1000XCryptoD 有 1905 个持仓),
-       名单里某人没出现在这个币上,可能只是他那一页没排到。写成「2/3 人持有」
-       就是拿一个部分视图冒充全量,而且名单只有个位数时那个分数还会被读成"共识"。
-    ⚠️ 同理 **0 不显示**:0 不是"没人持有",是"我们这份部分视图里没看见"。
+    ⚠️⚠️ **「至少」这两个字是这句话为真的全部条件,任何时候都不许拿掉。**
+       这个 N 的来源是「**本轮**每个人的 portfolio page 0 里,真的看见 N 行
+       这个币的正数持仓」—— 它只能往少了数,原因有两条,而且都是常态:
+         · page 0 只有 50 行(实测有人 1905 个持仓),某人拿着但那一页没排到;
+         · 某人这一轮的 portfolio 请求失败了(返回 None),他整个人都没被观测到。
+       所以真实人数 ≥ N。写成「名单内 2 人持有」就是断言"恰好 2 个",
+       而我们证明不了那个"恰好"。
+       ⚠️⚠️ 反过来更严重的是**多报**:上一版这个数是从 pump_positions 快照表里
+       数出来的,而那张表只 upsert、从不删除本轮没出现的行 —— 一个三个月前
+       清了仓、清仓那次又恰好没被看见的人,会被永远算成持有者。
+       那是主动说了一句假话,比少报严重得多。现在的数只认本轮的正面观测。
+    ⚠️ **只报分子,不报分母** —— 与 FOMO 那条的「名单内 3/101 人买过」刻意不同。
+       分母的含义是"另外 98 个人没买过",而同样因为上面那个部分视图,
+       我们连一个人"没持有"都证明不了。名单只有个位数时那个分数还会被读成"共识"。
+    ⚠️ 同理 **0 不显示**:0 不是"没人持有",是"我们这份部分视图里一个都没看见"。
        这不是拿真值判断代替 is None —— None 与 0 在这里指向同一件事
        (都不构成任何可摆出来的事实),而 N ≥ 1 是**正面观测到的**:
        那 N 行持仓我们真的看见了。
-    ⚠️ 用「持有」不用「买过」:数据来自持仓快照(当前还拿着多少),
+    ⚠️ 用「持有」不用「买过」:数据来自本轮的持仓视图(现在还拿着多少),
        不是买入历史。FOMO 那边有 user_token_stats 才敢说"买过"。
     """
     if holders_in_list is None:
@@ -1621,7 +1642,7 @@ def _pump_holders_line(holders_in_list: int | None) -> str | None:
         n = int(holders_in_list)
     except (TypeError, ValueError):
         return None
-    return f"{EMOJI_CONSENSUS} 名单内 {n} 人持有" if n > 0 else None
+    return f"{EMOJI_CONSENSUS} 名单内至少 {n} 人持有" if n > 0 else None
 
 
 def _pump_time_line(traded_at, now: float | None = None) -> str | None:
@@ -1641,3 +1662,165 @@ def _pump_time_line(traded_at, now: float | None = None) -> str | None:
     line = f"{EMOJI_CLOCK} {stamp}"
     age = fmt_token_age(secs, now)
     return f"{line}{SEP}{age}前" if age else line
+
+
+# ============================================================
+# pump.fun 指定用户的观点(callout)
+# ============================================================
+# 行首锚点。⚠️ 全局唯一(铁律 1):FOMO 那边的 💭 是"名单里的人在 FOMO 上发了观点",
+#    这里是**另一个平台**上的另一件事。两条消息在聊天列表预览里必须一眼分得开 ——
+#    认错锚点就是认错平台,而"他在 pump.fun 上喊了一句"与"他在 FOMO 上写了篇观点"
+#    的可信度完全不是一回事。
+EMOJI_PUMP_CALLOUT = "📣"
+LABEL_PUMP_CALLOUT = "观点"
+EMOJI_PUMP_THESIS = "💬"      # 正文
+EMOJI_PUMP_LIKE = "👍"        # 点赞数
+EMOJI_PUMP_VIEW = "👀"        # 浏览数
+# 「发表时市值」—— 刻意不是"当前市值":这条消息说的是**他说话的那一刻**这个币多大。
+# 数字直接来自 callout 自己的 marketCap 字段(零额外请求)。
+LABEL_PUMP_CALLOUT_MCAP = "发表时市值"
+# 「发表至今 ×0.26」—— upstream 的 multiple 字段原样透传(现价 / 发表时价格)。
+LABEL_PUMP_CALLOUT_MULTIPLE = "发表至今"
+# 正文长度上限。⚠️ thesis 是**用户自由输入的正文**,没有任何天然上界
+#    (接口对它不设限,实测里就有整段话)。必须收口,否则一条观点能把整条消息挤爆,
+#    而 _fit_signal 只会按整行砍 —— 一行超长的话它要么整行没了、要么顶破预算。
+# ⚠️ 比 bot 那边的 CA_THESIS_SNIPPET_CHARS(140)宽一倍是有理由的:那边是
+#    「一屏塞 8 个人的观点」,每人只能给一小格;这里一条消息就一个人一句话,
+#    砍到 140 会把大半句话吃掉,而这句话正是这条推送的**主体**。
+_PUMP_THESIS_CHARS = 280
+
+
+def render_pump_callout(
+    *,
+    username: str | None,
+    thesis: str | None,
+    coin_mint: str | None,
+    token_symbol: str | None = None,
+    market_cap_usd=None,
+    multiple=None,
+    likes=None,
+    view_count=None,
+    created_at: str | None = None,
+    network_id: str | None = None,
+    chain_display: str | None = None,
+    now: float | None = None,
+) -> str:
+    """
+    「被盯的人在 pump.fun 上发了一条观点(callout)」的推送。
+
+    参数:
+        username       pump 用户名,**本人可控** —— 一律走 _clip(叠平空白→限长→转义)
+        thesis         观点正文,**完全自由的用户输入** —— 同样走 _clip,
+                       转义**只转一次**(_clip 内部转,调用方绝不能再转一遍,
+                       否则 `&` 会变成 `&amp;amp;` 显示成乱码)
+        coin_mint      他说的是哪个币(CA);独占最后一行的锚点
+        token_symbol   币的符号,来自 /coins-v3(/callout/list 自己不给)
+        market_cap_usd **发表时**的市值(callout.marketCap),不是当前市值
+        multiple       发表至今的倍数(callout.multiple = 现价 / 发表时价格)
+        likes/view_count 点赞数 / 浏览数;各自缺失就各自那一段消失
+        created_at     发表时刻 ISO(调用方已把 epoch 毫秒归一化过);解析不出来整行消失
+        network_id     已归一化的内部链标识,用来查展示名与链接;查不到就没链接行
+        chain_display  链展示名的兜底
+
+    ⚠️⚠️ **措辞铁律:只摆可证的事实。** 这条消息里唯一的"内容"是他自己说的那句话,
+       我们**原样引用、不做任何解读**。「他看好」「值得跟」这类意图断言全部禁止 ——
+       一条 callout 就是一句话,它不构成任何关于他仓位的证据
+       (他可能一股没买,也可能早就卖光了)。
+    ⚠️ 出口不变式与 render_pump_trade 完全同一套:≤ TRANSFER_MSG_BUDGET、
+       只在整行边界砍、CA 锚点最后贴且完整(见 _fit_signal)。
+    ⚠️ 本函数是纯函数,不查库、不发请求(铁律 7);缺失字段整行消失,绝不打 0 / N/A。
+    """
+    title = f"{EMOJI_PUMP_CALLOUT} <b>{LABEL_PUMP}</b>{SEP}{LABEL_PUMP_CALLOUT}"
+    name = _clip(username or "", _PUMP_NAME_CHARS)
+    if name:
+        title += f"{SEP}<b>{name}</b>"
+    sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+
+    lines = [title]
+    # ⚠️ 正文:_clip 一次搞定"叠平空白 → 截断 → 转义"三件事,顺序不能反
+    #    (反过来会在截断点切断一个 &amp;,残缺实体让整条消息 400)。
+    #    叠平空白也是必需的:正文里塞几十个换行就能把一行变成几十行,
+    #    绕开 _fit_signal「按整行算预算」这个前提。
+    body = _clip(thesis or "", _PUMP_THESIS_CHARS)
+    if body:
+        lines.append(f"{EMOJI_PUMP_THESIS} {body}")
+    for extra in (_pump_callout_mcap_line(market_cap_usd),
+                  _pump_callout_multiple_line(multiple),
+                  _pump_callout_stats_line(likes, view_count)):
+        if extra is not None:
+            lines.append(extra)
+    ts_line = _pump_time_line(created_at, now)
+    if ts_line is not None:
+        lines.append(ts_line)
+
+    net = (network_id or "").strip()
+    disp = NETWORK_DISPLAY.get(net) or " ".join(str(chain_display or "").split()) or None
+    if disp:
+        lines.append(f"{EMOJI_NETWORK} {_esc(disp)}")
+    ca = " ".join(str(coin_mint or "").split())
+    link = _links_line(_fake_ev(net, ca))
+    if link:
+        lines.append(link)
+
+    # CA 独占最后一行、纯 <code>(铁律 6),与买卖那条逐字同一套
+    anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
+    return _fit_signal(lines, anchor)
+
+
+def _pump_callout_mcap_line(market_cap_usd) -> str | None:
+    """
+    💎 发表时市值 $16.38K
+
+    ⚠️ 措辞必须是「发表时」:这个数来自 callout 自己的 marketCap 字段,是他
+       **按下发送键那一刻**的市值,不是现在的。写成「市值」会被读成当前值,
+       而这条消息可能是几小时前的观点 —— 那就是一个错的数。
+    ⚠️ 与 _pump_mcap_line 同一条:拿不到 / ≤ 0 一律整行消失。市值 0 的币
+       更可能是上游算漏而不是事实,打出「$0.00」等于替读者断言这币归零了。
+    """
+    d = _to_decimal(market_cap_usd)
+    if d is None or d <= 0:
+        return None
+    mc = _fmt_usd_compact(d)
+    if mc is None:
+        return None
+    return f"{EMOJI_MARKET_CAP} {LABEL_PUMP_CALLOUT_MCAP} {mc}"
+
+
+def _pump_callout_multiple_line(multiple) -> str | None:
+    """
+    📈 发表至今 ×1.29 / 📉 发表至今 ×0.26
+
+    ⚠️ 原样透传上游的 multiple(现价 / 发表时价格),**不换算成百分比、不加任何评价**。
+       「×0.26」是事实,「跌了 74%」也是同一个事实的另一种写法,但再往前一步的
+       「他喊在了顶上」就是替读者下结论了。
+    ⚠️ ≤ 0 整行消失:价格没有负的,而 ×0 意味着现价恰好是 0 —— 与市值 0 同一条,
+       更可能是上游算漏。比值本身也没有 0 这个有意义的取值。
+    ⚠️ 判空一律 is None(0 与缺失是两件事),再单独判 ≤ 0 那件"说不出口"的事。
+    """
+    d = _to_decimal(multiple)
+    if d is None or d <= 0:
+        return None
+    emoji = EMOJI_PNL_UP if d >= 1 else EMOJI_PNL_DOWN
+    return f"{emoji} {LABEL_PUMP_CALLOUT_MULTIPLE} ×{d:,.2f}"
+
+
+def _pump_callout_stats_line(likes, view_count) -> str | None:
+    """
+    👍 3 · 👀 844
+
+    ⚠️ 两个数各自独立降级:只拿到一个就只显示一个,两个都没有整行消失。
+       绝不给缺失的那个补 0 —— 「👍 0」是"没人点赞"(真实值),
+       而缺失是"我们没拿到这个字段",两者含义相反。
+    ⚠️ 0 照常显示(_fmt_count 用 is None 判空):一条没人点赞的观点是常见的真实情况,
+       实测夹具里就有 likes=0 的那条。
+    """
+    parts = []
+    n_like = _fmt_count(likes)
+    if n_like is not None:
+        parts.append(f"{EMOJI_PUMP_LIKE} {n_like}")
+    n_view = _fmt_count(view_count)
+    if n_view is not None:
+        parts.append(f"{EMOJI_PUMP_VIEW} {n_view}")
+    return SEP.join(parts) if parts else None
