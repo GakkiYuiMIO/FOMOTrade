@@ -123,7 +123,12 @@ def test_关掉开关就不注册币安Alpha的job(monkeypatch):
     """对照组:证明上面那条钉的是开关真的生效,而不是无条件注册。"""
     from src.config import FomoSettings
 
-    s = FomoSettings(fomo_alpha_enabled=False)
+    # ⚠️ 三个可选开关**必须全部显式关掉**:只写 alpha 那一个的话,
+    #    其余仍然从仓库根 .env 读 —— 这条用例的结果就取决于「这台机器怎么配的」
+    #    (实测 .env 里 FOMO_PUMP_ENABLED=true 时它恒红,而被测行为完全正常)。
+    s = FomoSettings(fomo_alpha_enabled=False,
+                     fomo_pump_enabled=False,
+                     fomo_pump_callout_enabled=False)
     sched, _ = _stub_run(monkeypatch, s)
 
     assert cli.cmd_run() == 0

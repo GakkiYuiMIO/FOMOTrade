@@ -2208,6 +2208,30 @@ class Test观点冷启动播种:
             assert store.list_pump_users(conn)[0]["callout_seeded"] == 0
         assert callout_ledger_ids() == set()
 
+    def test_还没发过观点的人照样要播种_否则第一条会被吞掉(self, db, cfg):
+        """
+        ⚠️ `rows is None`(拉取失败)与 `rows == []`(他确实还没发过)是两件事。
+           判据写成 `if not rows: continue` 看着更"稳",实际后果是:
+           一个还没发过观点的人**永远不会被播种**,等他发第一条时才轮到播种,
+           而播种会把那一条当成"历史"吞掉 —— 他这辈子的第一条观点永久收不到。
+
+        ⚠️ 上一轮的变异表把这条列成"已验证转红",实测是绿的(watcher 层没有守卫),
+           所以补这条。断言分两段:先证明空数组就该置位,再证明下一条真的推得出去。
+        """
+        add_user()
+        client = FakeClient(callouts={HEX_UID: callout_payload()})   # 200 + 空数组
+        tg = FakeNotifier()
+        assert pf.PumpCalloutWatcher(tg, client).run_once() == 0
+        assert tg.sent == []
+        with store.get_conn() as conn:
+            assert store.list_pump_users(conn)[0]["callout_seeded"] == 1,                 "他确实没发过观点(200 空数组),这不是拉取失败,必须照常播种"
+
+        # 第二段才是真正的代价:他发了第一条,必须推出来,不能被当成历史吞掉
+        client.callouts[HEX_UID] = callout_payload(
+            callout_row(cid="first-ever", thesis="my very first take"))
+        assert pf.PumpCalloutWatcher(tg, client).run_once() == 1,             "他的第一条观点被播种吞掉了"
+        assert len(tg.sent) == 1 and "my very first take" in tg.sent[0]
+
     def test_复活的人重新播种观点(self, db, cfg):
         """
         ⚠️ 人被移出去这段时间他照样在发观点,而台账里那几条早被清理任务
@@ -2744,11 +2768,20 @@ class Test配置上界:
             FomoSettings(fomo_pump_interval_sec=29)
         assert FomoSettings(fomo_pump_interval_sec=30).fomo_pump_interval_sec == 30
 
-    def test_两个开关默认都是关的(self):
-        """⚠️ 老库升级后行为必须逐字节不变:谁也不该因为拉了个新版本就多收一路推送。"""
+    def test_两个开关默认都是关的(self, monkeypatch):
+        """
+        ⚠️ 老库升级后行为必须逐字节不变:谁也不该因为拉了个新版本就多收一路推送。
+
+        ⚠️ 断言的是**代码默认值**,所以必须同时隔离掉 .env 文件与真实环境变量 ——
+           直接 FomoSettings() 测到的是「这台机器怎么配的」:
+           实测本机 .env 里 FOMO_PUMP_ENABLED=true,这条就恒红,
+           而被测的代码默认值完全正常。挂错原因比不挂更费时间。
+        """
         from src.config import FomoSettings
 
-        s = FomoSettings()
+        for k in ("FOMO_PUMP_ENABLED", "FOMO_PUMP_CALLOUT_ENABLED"):
+            monkeypatch.delenv(k, raising=False)
+        s = FomoSettings(_env_file=None)
         assert s.fomo_pump_enabled is False
         assert s.fomo_pump_callout_enabled is False
 
