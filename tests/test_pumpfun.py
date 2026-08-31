@@ -99,12 +99,24 @@ class FakeClient:
        `raise_on_portfolio` 是**故意违约**,用来验证 PumpWatcher 顶得住。
     """
 
-    def __init__(self, portfolios=None, trades=None, *, raise_on_portfolio=None) -> None:
+    def __init__(self, portfolios=None, trades=None, coins=None, *,
+                 raise_on_portfolio=None) -> None:
         self.portfolios = portfolios or {}      # wallet -> 载荷 或 None(拉取失败)
         self.trades = trades or {}              # mint   -> 载荷 或 None
+        # mint -> /coins-v3 载荷 或 None(拉取失败)。⚠️ 缺省是**空表**:没显式给载荷的
+        #    用例里市值就是拿不到,而那些用例照样该绿 —— 市值绝不是推送的前置条件。
+        self.coins = coins or {}
         self.raise_on_portfolio = raise_on_portfolio
         self.portfolio_calls: list[str] = []
         self.trade_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.coin_calls: list[str] = []
+
+    def fetch_coin(self, mint):
+        self.coin_calls.append(mint)
+        payload = self.coins.get(mint)
+        if payload is None:
+            return None
+        return pf.parse_coin(payload)
 
     def fetch_portfolio(self, wallet):
         self.portfolio_calls.append(wallet)
@@ -292,6 +304,184 @@ class Test链映射:
         p = pf.Position("777777", "0x" + "a" * 40, 1, 0, None)
         assert p.network_id is None
         assert p.chain_display is None
+
+
+# ============================================================
+# 市值:/coins-v3 的解析
+# ============================================================
+class Test市值解析:
+    """
+    ⚠️ 三份夹具都是 2026-08-31 从 /coins-v3/{mint} 真实抓下来的,
+       只删了 image_uri / description 这类展示字段,**数值一位没动**。
+    ⚠️ 断言全部写死字面量,绝不从 pf 里取 —— 否则取错字段时断言跟着一起错。
+    """
+
+    SOL = "pump_coin_sol.json"            # PUNCHMA / Solana,还在 bonding curve 上
+    SOL_EXITED = "pump_coin_sol_exited.json"   # GTA / Solana,已经跑起来的币
+    EVM = "pump_coin_evm.json"            # KISS / Robinhood(eip155:4663)
+    BSC = "pump_coin_bsc.json"            # QQQB / BNB Chain(eip155:56)
+
+    def test_市值必须取usd_market_cap而不是SOL计价的market_cap(self):
+        """
+        ⚠️⚠️⚠️ 这条是这次改动里最贵的一个坑。同一个响应里:
+           · Solana 的 `market_cap` 是 **SOL 计价**(PUNCHMA 28.0355,
+             恰好等于 bonding curve 自己算出来的 SOL 市值);
+           · `usd_market_cap` 才是美元(2906.09)。
+           取错字段 = 把一个 $2,906 的币说成 $28,差两个数量级,而且一眼看不出来。
+        ⚠️ 两个 Solana 样本都验:两者的比值(103.66 / 104.01)就是当时的 SOL 价 ——
+           一个样本可能是巧合,两个样本对上同一个汇率就不是了。
+        """
+        sol = pf.parse_coin(_load(self.SOL))
+        assert sol.market_cap_usd == 2906.090666119672
+        assert sol.market_cap_usd != 28.035521634857712      # ← 这就是 SOL 计价那个数
+
+        gta = pf.parse_coin(_load(self.SOL_EXITED))
+        assert gta.market_cap_usd == 276774.6685814697
+        assert gta.market_cap_usd != 2661.0081513200334      # ← 同上
+
+    def test_EVM链上两个字段相等所以只用EVM验测不出上一条(self):
+        """
+        ⚠️ 留这条不是为了凑覆盖率,是为了钉住"**只用 EVM 验一遍就上线**"这个失败模式:
+           EVM 上 market_cap == usd_market_cap,取错字段照样全绿,
+           而 Solana 的每一条推送都会把市值说小两个数量级。
+        """
+        raw = _load(self.EVM)
+        assert raw["market_cap"] == raw["usd_market_cap"] == 445526.7119903613
+        assert pf.parse_coin(raw).market_cap_usd == 445526.7119903613
+        raw_bsc = _load(self.BSC)
+        assert raw_bsc["market_cap"] == raw_bsc["usd_market_cap"] == 573660.6510680942
+
+    def test_两条链字段集不同但要取的那两个都在(self):
+        """⚠️ Solana 多 bonding_curve / complete / market_cap_quote,EVM 多
+           canonical_pool_liquidity_usd —— 解析必须对两种形态都成立。"""
+        sol, evm = _load(self.SOL), _load(self.EVM)
+        assert "bonding_curve" in sol and "bonding_curve" not in evm
+        assert "canonical_pool_liquidity_usd" in evm and "canonical_pool_liquidity_usd" not in sol
+        for raw in (sol, evm, _load(self.BSC), _load(self.SOL_EXITED)):
+            s = pf.parse_coin(raw)
+            assert s.market_cap_usd is not None
+            assert s.ath_market_cap_usd is not None
+
+    def test_历史最高市值也取得到(self):
+        assert pf.parse_coin(_load(self.SOL)).ath_market_cap_usd == 18489.197465326295
+        assert pf.parse_coin(_load(self.EVM)).ath_market_cap_usd == 2116892.897778326
+
+    def test_缺字段或结构不对时是None而不是0(self):
+        """⚠️ 0 会被渲染成「💎 市值 $0.00」—— 一条一眼假的信息比没有这一行糟得多。"""
+        assert pf.parse_coin(None) is None
+        assert pf.parse_coin([1, 2]) is None
+        empty = pf.parse_coin({})
+        assert empty.market_cap_usd is None and empty.ath_market_cap_usd is None
+        # ⚠️ 只给 SOL 计价的那个字段时也必须是 None —— 绝不拿它兜底
+        assert pf.parse_coin({"market_cap": 28.0355}).market_cap_usd is None
+
+
+# ============================================================
+# 持仓 / 盈亏:portfolio 那一行里本来就有、以前没用上的字段
+# ============================================================
+class Test持仓与盈亏:
+    """夹具 pump_portfolio.json 是 2026-08-31 真实响应,数值一位没动。"""
+
+    def _row(self, symbol: str):
+        rows = _load("pump_portfolio.json")["positions"]
+        raw = next(r for r in rows if r["coin"]["symbol"] == symbol)
+        return raw, pf.parse_positions({"positions": [raw]})[0]
+
+    def test_未实现盈亏是市值减成本而不是报文里的pnlUsd(self):
+        """
+        ⚠️⚠️ `pnlUsd` 是**总**盈亏(已实现 + 未实现),不是未实现。
+           真实夹具六行逐行验过:pnlUsd == (valueUsd − costBasisUsd) + realizedPnlUsd,
+           差值恰好为 0。QQQB 那行 pnlUsd = -12,346.57 里有 -444.51 是已经落袋的,
+           把它当未实现打出去就是把账面浮亏凭空多报了 444 美元。
+        """
+        raw, pos = self._row("QQQB")
+        assert pos.unrealized_pnl_usd == -11902.050877559918
+        assert raw["pnlUsd"] == -12346.565395949918          # ← 报文里那个总盈亏
+        assert pos.unrealized_pnl_usd != raw["pnlUsd"]
+        # 恒等式本身也钉住:哪天上游改了语义,这条会先红
+        assert raw["pnlUsd"] == pytest.approx(
+            pos.unrealized_pnl_usd + raw["realizedPnlUsd"], rel=0, abs=1e-9)
+
+    def test_未实现盈亏率的基数是持仓成本而不是累计买入额(self):
+        """
+        ⚠️⚠️ 报文里的 `pnlPercentage` 分子是总盈亏、分母是 amountBoughtUsd
+           (累计买入额)—— 两头都跟"未实现"对不上。QQQB 这一行:
+           报文说 -11.01%(总盈亏 / 11.2 万累计买入),而账面上那点残仓
+           实际浮亏 -99.97%。差了整整一个数量级,而且方向上会让人以为"还好"。
+        """
+        raw, pos = self._row("QQQB")
+        assert raw["pnlPercentage"] == -11.006025934156668
+        assert pos.unrealized_pnl_pct == pytest.approx(-99.96615, abs=1e-4)
+
+    def test_成本为0时不给百分比但金额照出(self):
+        """⚠️ 整仓靠转入拿到的(costBasisUsd=0)算不出收益率,除零之外
+           "成本 0 赚无穷倍"本身也不是个能摆给人看的数。金额那一段不受影响。"""
+        _raw, pos = self._row("DJT")
+        assert pos.cost_basis_usd == 0
+        assert pos.unrealized_pnl_usd == 4.675107218680533
+        assert pos.unrealized_pnl_pct is None
+
+    def test_清仓的判据与已实现百分比(self):
+        """⚠️ 清仓时 value == cost == 0,未实现恒为 0,pnlPercentage 说的就是已实现的
+           百分比 —— 只有在这个前提成立时才取用它。"""
+        _raw, gta = self._row("GTA")
+        assert gta.is_cleared is True
+        assert gta.unrealized_pnl_usd == 0
+        assert gta.realized_pnl_usd == 1072.6177752902256
+        assert gta.realized_pnl_pct == 35.84117610173922
+
+    def test_还持有的行绝不会被当成清仓(self):
+        for sym in ("QQQB", "DJT", "PUNCHMA"):
+            _raw, pos = self._row(sym)
+            assert pos.is_cleared is False, sym
+
+    def test_isExited给字符串false时不算清仓(self):
+        """
+        ⚠️⚠️ bool("false") 是 **True**。原样真值判断会把一个还满仓的人
+           渲染成「📦 已清仓」,而且盈亏行跟着切到已实现 —— 整条消息全错。
+           认不出来就退回 amountHeld(这里是 5.0,所以仍在持仓)。
+        """
+        pos = pf.parse_positions(position_payload(
+            {**pos_row(held=5.0), "isExited": "false"}))[0]
+        assert pos.is_exited is None
+        assert pos.is_cleared is False
+
+    def test_拿不到持有量时不推断成清仓(self):
+        """⚠️ None 是"这一轮没拿到量",不是"清仓了"。"""
+        pos = pf.parse_positions(position_payload(
+            {"coinMint": MINT_SOL, "chainId": 1399811149, "coin": {"symbol": "X"}}))[0]
+        assert pos.amount_held is None
+        assert pos.is_cleared is False
+
+    def test_持仓字段不进快照(self):
+        """
+        ⚠️ 快照只存 diff 判据要用的那几列。多存一列 = 多一个每轮都在变的触发器。
+        """
+        base = {**pos_row(held=1.0, pnl=0.0), "valueUsd": 100.0, "costBasisUsd": 10.0}
+        moved = {**base, "valueUsd": 999.0, "costBasisUsd": 11.0, "pnlPercentage": 42.0}
+        prev = pf.parse_positions(position_payload(base))[0]
+        now = pf.parse_positions(position_payload(moved))[0]
+        assert pf._snap_row(prev) == pf._snap_row(now)       # 快照一字不差
+        assert now.value_usd == 999.0                        # 但推送拿得到新值
+
+    def test_清仓但未实现不为0时不给已实现百分比(self):
+        """
+        ⚠️⚠️ pnlPercentage 能当"已实现百分比"用,**前提**是清仓时未实现恒为 0
+           (那时 pnlUsd == realizedPnlUsd)。上游哪天把 isExited 与 valueUsd
+           说岔了,这个前提就没了 —— 那时贴上去的百分比说的是**总**盈亏率,
+           而标签写着"已实现",两者对不上却看不出来。宁可只报金额。
+        ⚠️ 这条现在打不到真实数据(实测清仓行 value/cost 都是 0),它钉的是
+           那道自查本身:去掉自查这条就绿了,而线上没有任何东西会告诉你它错了。
+        """
+        pos = pf.parse_positions(position_payload({
+            **pos_row(held=0.0), "isExited": True,
+            "valueUsd": 5.0, "costBasisUsd": 0.0,
+            "realizedPnlUsd": 100.0, "pnlPercentage": 12.34,
+        }))[0]
+        assert pos.is_cleared is True
+        assert pos.unrealized_pnl_usd == 5.0                 # 前提被打破了
+        assert pos.realized_pnl_pct is None                  # → 不给百分比
+        assert pos.realized_pnl_usd == 100.0                 # 金额照出
 
 
 # ============================================================
@@ -707,6 +897,28 @@ class Test请求预算:
         assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 0
         assert client.trade_calls == []
 
+    def test_只有行情字段变动时一个逐笔请求都不打(self, db, cfg):
+        """
+        ⚠️⚠️ valueUsd / costBasisUsd / pnlPercentage 随行情每轮都在动 ——
+           它们一旦被算进 diff 判据,整页 mint 每轮都会被当成"刚变动"全问一遍:
+           K 从 0 变成 50,而这次还给每个 mint 又挂了一个市值请求,
+           一轮就能把两个端点的限流全打光。判据必须只认 amountHeld / realizedPnlUsd。
+        ⚠️ 这条必须让持仓行**真的带上** valueUsd —— 不带的话把它加进判据也看不出来
+           (None 参与比较恰好还是"没变"),等于白写一条用例。
+        """
+        seeded_user()
+        with store.get_conn() as conn, store.tx(conn):
+            store.upsert_pump_positions(conn, HEX_UID,
+                                        [("1399811149", MINT_SOL, 1.0, 0.0, "T0")])
+        row = {**pos_row(held=1.0, pnl=0.0), "valueUsd": 987.65,
+               "costBasisUsd": 12.34, "pnlPercentage": 42.0}
+        client = FakeClient(portfolios={HEX_SVM: position_payload(row)},
+                            trades={MINT_SOL: trade_payload()},
+                            coins={MINT_SOL: {"usd_market_cap": 1.0}})
+        assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 0
+        assert client.trade_calls == []
+        assert client.coin_calls == []
+
     def test_清仓之后重新买回来也算变动(self, db, cfg):
         """
         ⚠️⚠️ 上一轮 amountHeld=0(已清仓)是**真实值不是缺失**。
@@ -734,6 +946,296 @@ class Test请求预算:
         tg = FakeNotifier()
         assert pf.PumpWatcher(tg, client).run_once() == 1
         assert "卖出" in tg.sent[0]
+
+
+# ============================================================
+# 市值:每轮多打的那几个请求
+# ============================================================
+def coin_payload(mcap=445526.7119903613, ath=2116892.897778326) -> dict:
+    """
+    造一个 /coins-v3 响应。
+
+    ⚠️ 同时给 SOL 计价的 `market_cap`,而且**故意给一个明显不同的值** ——
+       被测代码但凡取错字段,渲染断言就会看见 $28.04 而不是 $445.53K。
+    """
+    return {"usd_market_cap": mcap, "market_cap": 28.035521634857712,
+            "ath_market_cap": ath, "symbol": "X"}
+
+
+class Test市值请求与缓存:
+    """
+    ⚠️⚠️ 这一组钉的是**成本**:市值是这次唯一按 mint 计费的额外请求。
+       没有闸的话每轮请求数会从 3+K 涨到 3+2K 以上(甚至按"人×成交笔数"膨胀),
+       而 /coins-v3 只有 60 次/分。
+    """
+
+    def _many_trades(self, addr, prefix, n):
+        payload = trade_payload(addr=addr, tx=f"{prefix}0", slot="0")
+        payload[addr] = [{**payload[addr][0], "tx": f"{prefix}{i}", "slotIndexId": str(i)}
+                         for i in range(n)]
+        return payload
+
+    def test_一个mint一轮只问一次市值哪怕推了很多条(self, db, cfg):
+        """
+        ⚠️⚠️ 市值是**按 mint** 的属性,不是按成交、也不是按人的。
+           在逐笔渲染那一层现问现取的话,一个人拆 12 单就是 12 个请求;
+           两个人各 12 单就是 24 个 —— 一个 mint 就能把 60/分 的额度打掉小半。
+        """
+        seeded_user()
+        seeded_user(username="brc20niubi", uid="uid-2", svm="BQ4Kzz", evm="0x" + "b" * 40)
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=2.0)),
+                        "BQ4Kzz": position_payload(pos_row(held=7.0))},
+            trades={MINT_SOL: {**self._many_trades(HEX_SVM, "M", 6),
+                               **self._many_trades("BQ4Kzz", "H", 6)}},
+            coins={MINT_SOL: coin_payload()},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 12
+        assert client.coin_calls == [MINT_SOL]           # 12 条消息,1 个市值请求
+        assert all("💎 市值 $445.53K" in m for m in tg.sent)
+
+    def test_没有要推的成交就一个市值请求都不打(self, db, cfg):
+        """
+        ⚠️⚠️ 变动的 mint 里有相当一部分最后一条都推不出来(金额没过门槛 /
+           已在台账里 / 掉出新鲜窗口)。无条件先问一次 coins-v3 就是拿限流额度
+           换一个没人会看到的数 —— 而"变动"比"该推"常见得多。
+        """
+        cfg(FOMO_PUMP_MIN_USD="100")
+        seeded_user()
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+            trades={MINT_SOL: trade_payload(usd="1.0")},   # 低于门槛,推不出去
+            coins={MINT_SOL: coin_payload()},
+        )
+        assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 0
+        assert client.trade_calls != []                   # 逐笔照问(要它才知道推不出去)
+        assert client.coin_calls == []                    # 市值一个都不问
+
+    def test_推送预算见底的mint也不问市值(self, db, cfg):
+        """⚠️ 那些成交本轮根本不发,现在问到的市值到下一轮已经过期了。"""
+        seeded_user()
+        mint_b = "MintBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbpump"   # 排序在 MINT_SOL 之后
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(mint=MINT_SOL, held=2.0),
+                                                  pos_row(mint=mint_b, held=3.0))},
+            trades={MINT_SOL: self._many_trades(HEX_SVM, "A", 25),
+                    mint_b: self._many_trades(HEX_SVM, "B", 3)},
+            coins={MINT_SOL: coin_payload(), mint_b: coin_payload()},
+        )
+        assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 20
+        assert client.coin_calls == [MINT_SOL]
+
+    def test_市值问不到时成交照推只是少一行(self, db, cfg):
+        """⚠️⚠️ 市值**绝不是推送的前置条件**:限流抖一下就把成交推送整段吃掉,
+           那是拿一个锦上添花的字段勒索整个功能。"""
+        seeded_user()
+        client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+                            trades={MINT_SOL: trade_payload()},
+                            coins={MINT_SOL: None})       # 拉取失败
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 1
+        assert client.coin_calls == [MINT_SOL]
+        assert "市值" not in tg.sent[0] and "💎" not in tg.sent[0]
+        assert "💰 金额 $1,234.50" in tg.sent[0]
+
+    # ---- 跨轮缓存 --------------------------------------------------------
+    def _round_two_client(self):
+        """两轮都有变动、都有新成交的一个 client(第二轮持仓量与成交都换了)。"""
+        return FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+            trades={MINT_SOL: trade_payload(tx="T1", slot="1")},
+            coins={MINT_SOL: coin_payload()},
+        )
+
+    def _advance_round(self, client, held, tx):
+        client.portfolios[HEX_SVM] = position_payload(pos_row(held=held))
+        client.trades[MINT_SOL] = trade_payload(tx=tx, slot=tx)
+
+    def test_TTL之内的第二轮不再问同一个mint(self, db, cfg):
+        """
+        ⚠️ 缓存的主职责是"同一轮里同一个 mint 只查一次";跨轮命中只在把巡检间隔
+           调到 TTL 以下时才发生,那正是请求最密、最需要压一压的时候。
+        """
+        seeded_user()
+        client = self._round_two_client()
+        w = pf.PumpWatcher(FakeNotifier(), client)
+        assert w.run_once() == 1
+        self._advance_round(client, 3.0, "T2")
+        assert w.run_once() == 1
+        assert client.coin_calls == [MINT_SOL]            # 两轮共 1 个市值请求
+        assert client.trade_calls != []                   # 逐笔照旧每轮都问
+
+    def test_缓存过期之后重新问(self, db, cfg):
+        """⚠️ 市值变化快,缓存不能变成"问过一次就永远不再问"。"""
+        seeded_user()
+        client = self._round_two_client()
+        w = pf.PumpWatcher(FakeNotifier(), client)
+        assert w.run_once() == 1
+        # 把这一项的时间戳往回拨一小时 —— 等价于"这条缓存早就过期了"
+        ts, stats = w._coin_cache[MINT_SOL]
+        w._coin_cache[MINT_SOL] = (ts - 3600.0, stats)
+        self._advance_round(client, 3.0, "T2")
+        assert w.run_once() == 1
+        assert client.coin_calls == [MINT_SOL, MINT_SOL]
+
+    def test_失败绝不进缓存下一轮还会重试(self, db, cfg):
+        """
+        ⚠️⚠️ 把失败也缓存下来 = 一次网络抖动把市值那一行按住整个 TTL,
+           而且没有任何日志会说"这行是被缓存按住的"。
+        """
+        seeded_user()
+        client = self._round_two_client()
+        client.coins[MINT_SOL] = None                     # 第一轮拉取失败
+        w = pf.PumpWatcher(FakeNotifier(), client)
+        assert w.run_once() == 1
+        assert w._coin_cache == {}
+        client.coins[MINT_SOL] = coin_payload()
+        self._advance_round(client, 3.0, "T2")
+        tg = w._notifier
+        assert w.run_once() == 1
+        assert client.coin_calls == [MINT_SOL, MINT_SOL]
+        assert "💎 市值 $445.53K" in tg.sent[-1]
+
+    def test_一轮的峰值请求数是人数加两倍变动mint数(self, db, cfg):
+        """
+        ⚠️⚠️ 这是这次改动的成本核算,写成断言钉住:
+           portfolio 每人 1 个(P),逐笔每个变动 mint 1 个(K),
+           市值每个**要推的** mint 至多 1 个(≤ K)—— 合计 P + 2K 封顶。
+           少一道闸(不缓存 / 按成交问 / 无条件问)这个等式立刻破。
+        """
+        cfg(FOMO_PUMP_MAX_MINTS="8")
+        seeded_user()
+        seeded_user(username="brc20niubi", uid="uid-2", svm="BQ4Kzz", evm="0x" + "b" * 40)
+        mints = [f"Mint{i}fixturepump" for i in range(3)]
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(
+                *[pos_row(mint=m, held=1.0 + i) for i, m in enumerate(mints)]),
+                "BQ4Kzz": position_payload(
+                *[pos_row(mint=m, held=5.0 + i) for i, m in enumerate(mints)])},
+            trades={m: {**self._many_trades(HEX_SVM, f"A{i}", 1),
+                        **self._many_trades("BQ4Kzz", f"B{i}", 1)}
+                    for i, m in enumerate(mints)},
+            coins={m: coin_payload() for m in mints},
+        )
+        assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 6
+        p, k = 2, 3
+        assert len(client.portfolio_calls) == p
+        assert len(client.trade_calls) == k
+        assert len(client.coin_calls) == k
+        total = len(client.portfolio_calls) + len(client.trade_calls) + len(client.coin_calls)
+        assert total == p + 2 * k == 8
+
+
+# ============================================================
+# 👥 名单内 N 人持有 —— 纯本地,零请求
+# ============================================================
+class Test名单内人数:
+    def _snap(self, uid, chain, mint, held):
+        with store.get_conn() as conn, store.tx(conn):
+            store.upsert_pump_positions(conn, uid, [(chain, mint, held, 0.0, "T0")])
+
+    def test_只数名单里还在的人(self, db, cfg):
+        """
+        ⚠️⚠️ /pump del 是**软删除**:active 置 0,持仓快照那几行照旧留在库里。
+           不 join watch_users 的话,一个早就被移出名单的人会永远留在分子里 ——
+           而这个数字的全部含义就是「**名单里**有几个人拿着」。
+        """
+        seeded_user()
+        seeded_user(username="走了的人", uid="uid-gone", svm="GoneSvm", evm=None)
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 5.0)
+        self._snap("uid-gone", "1399811149", MINT_SOL, 5.0)
+        with store.get_conn() as conn:
+            assert len(store.pump_mint_holders(conn, "1399811149", MINT_SOL)) == 2
+        with store.get_conn() as conn, store.tx(conn):
+            store.remove_pump_user(conn, "uid-gone")
+        with store.get_conn() as conn:
+            assert store.pump_mint_holders(conn, "1399811149", MINT_SOL) == {HEX_UID}
+
+    def test_清仓和拿不到量的都不算持有(self, db, cfg):
+        """⚠️ 0 是"已清仓"、NULL 是"不知道" —— 两者都不足以支撑"他持有"这句断言。"""
+        seeded_user()
+        seeded_user(username="清了的人", uid="uid-zero", svm="ZeroSvm", evm=None)
+        seeded_user(username="没量的人", uid="uid-null", svm="NullSvm", evm=None)
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 5.0)
+        self._snap("uid-zero", "1399811149", MINT_SOL, 0.0)
+        self._snap("uid-null", "1399811149", MINT_SOL, None)
+        with store.get_conn() as conn:
+            assert store.pump_mint_holders(conn, "1399811149", MINT_SOL) == {HEX_UID}
+
+    def test_同一个地址串在两条链上分开数(self, db, cfg):
+        """⚠️ 同一个地址串在两条链上是**两个币**(见建表注释)。"""
+        seeded_user()
+        seeded_user(username="别的链", uid="uid-bsc", svm="BscSvm", evm=None)
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 5.0)
+        self._snap("uid-bsc", "56", MINT_SOL, 5.0)
+        with store.get_conn() as conn:
+            assert store.pump_mint_holders(conn, "1399811149", MINT_SOL) == {HEX_UID}
+            assert store.pump_mint_holders(conn, "56", MINT_SOL) == {"uid-bsc"}
+
+    # ---- 与巡检合起来 ----------------------------------------------------
+    def test_人数进了推送而且是本轮的新值不是过期快照(self, db, cfg):
+        """
+        ⚠️⚠️ 库里那份快照对**本轮变动的人**是过期的:快照要等推送成功才前移。
+           不拿本轮的新值盖住它,这条消息说的那个人就会被按上一轮的量计数 ——
+           他刚刚首次买入(上一轮库里根本没有这一行)却不算进分子里。
+        """
+        seeded_user()
+        seeded_user(username="老持有者", uid="uid-old", svm="OldSvm", evm=None)
+        self._snap("uid-old", "1399811149", MINT_SOL, 9.0)     # 别人早就拿着
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=3.0)),
+                        "OldSvm": position_payload()},         # 老持有者本轮没变动
+            trades={MINT_SOL: trade_payload(side="buy")},
+            coins={MINT_SOL: coin_payload()},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 1
+        assert "👥 名单内 2 人持有" in tg.sent[0]
+
+    def test_本轮刚清仓的人不算进分子(self, db, cfg):
+        """
+        ⚠️⚠️ 反过来的那一半:库里还记着他上一轮的 100,而他本轮卖光了。
+           直接读库 = 把一个刚跑掉的人算成持有者,而这条消息说的正是他跑掉这件事。
+        """
+        seeded_user()
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 100.0)
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=0.0))},
+            trades={MINT_SOL: trade_payload(side="sell")},
+            coins={MINT_SOL: coin_payload()},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 1
+        assert "名单内" not in tg.sent[0]                  # 0 人 → 整行消失
+        assert "📦 已清仓" in tg.sent[0]
+
+    def test_名单外的地址不进人数(self, db, cfg):
+        """⚠️ 与"只推被盯的人"同一道闸:分子里也绝不能混进名单外的人。"""
+        seeded_user()
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 5.0)
+        with store.get_conn() as conn, store.tx(conn):
+            # 直接往快照表塞一个从没进过名单的 user_id(模拟历史遗留脏行)
+            store.upsert_pump_positions(conn, "uid-陌生人",
+                                        [("1399811149", MINT_SOL, 5.0, 0.0, "T0")])
+        client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=6.0))},
+                            trades={MINT_SOL: trade_payload()},
+                            coins={MINT_SOL: coin_payload()})
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 1
+        assert "👥 名单内 1 人持有" in tg.sent[0]
+
+    def test_数人数不打任何请求(self, db, cfg):
+        """⚠️ 这一行是**纯本地**的:它一个请求都不该增加。"""
+        seeded_user()
+        self._snap(HEX_UID, "1399811149", MINT_SOL, 5.0)
+        client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=6.0))},
+                            trades={MINT_SOL: trade_payload()},
+                            coins={MINT_SOL: coin_payload()})
+        assert pf.PumpWatcher(FakeNotifier(), client).run_once() == 1
+        assert len(client.portfolio_calls) == 1
+        assert len(client.trade_calls) == 1
+        assert len(client.coin_calls) == 1                 # 1 + 1 + 1,没有第四种请求
 
 
 class _FakeResp:
@@ -994,6 +1496,213 @@ class Test推送文案:
             assert out.count("<b>") == out.count("</b>")
             assert out.count("<code>") == out.count("</code>")
             assert "<b>坏昵称" not in out                # 原始标签必须被转义掉
+
+
+# ============================================================
+# 渲染:这次补上的四组字段
+# ============================================================
+class Test补齐的字段:
+    """
+    对齐 FOMO 那条推送的 📦 持仓 / 📈 盈亏 / 💎 市值 / 👥 名单内。
+    ⚠️ 断言写死字面量,不从 formatter 里 import 任何标签常量。
+    """
+
+    def _render(self, **kw):
+        from src.formatter import render_pump_trade
+
+        base = dict(username="hexiecs", side="buy", token_symbol="PUNCHMA",
+                    coin_mint=MINT_SOL, amount_usd=1234.5, price_usd=0.0000285,
+                    holding_usd=4321.0, is_cleared=False,
+                    unrealized_pnl_usd=123.45, unrealized_pnl_pct=11.11,
+                    realized_pnl_usd=-970.6830142173674, realized_pnl_pct=-88.77873844252953,
+                    market_cap_usd=445526.7119903613, ath_market_cap_usd=2116892.897778326,
+                    holders_in_list=2,
+                    traded_at="2026-08-31T01:59:02.000Z", network_id="solana",
+                    chain_display="Solana", tx="SIG_ABC", now=1787193542.0)
+        base.update(kw)
+        return render_pump_trade(**base)
+
+    # ---- 📦 持仓 ---------------------------------------------------------
+    def test_买入说持仓卖出说剩余(self):
+        assert "📦 持仓 $4,321.00" in self._render(side="buy")
+        assert "📦 剩余 $4,321.00" in self._render(side="sell")
+
+    def test_清仓时说已清仓而不是持仓0(self):
+        """
+        ⚠️⚠️ 与 bot._ca_thesis_row 同一条教训:「📦 持仓 $0.00」这半句没错,
+           但紧跟着的「未实现盈亏 +$0.00」会把一个刚落袋 -$970.68 的人渲染成
+           "不赚不亏"—— 那是凭空断言的假事实。清仓必须换措辞、换成已实现。
+        """
+        out = self._render(is_cleared=True, holding_usd=0.0, side="sell",
+                           unrealized_pnl_usd=0.0, unrealized_pnl_pct=None)
+        assert "📦 已清仓" in out
+        assert "持仓 $0.00" not in out and "剩余 $0.00" not in out
+        assert "未实现" not in out
+        assert "📉 已实现盈亏 -$970.68 (-88.78%)" in out
+
+    def test_清仓判定为真时哪怕持仓额还在也不报持仓额(self):
+        """⚠️ 两个来源打架时以 is_cleared 为准:一条消息里既说"已清仓"又说
+           "持仓 $4,321"是自相矛盾,读者不知道该信哪一句。"""
+        out = self._render(is_cleared=True)
+        assert "$4,321.00" not in out
+        assert "📦 已清仓" in out
+
+    def test_持仓额拿不到时只掉这一行(self):
+        out = self._render(holding_usd=None)
+        assert "📦" not in out
+        assert "💰 金额 $1,234.50" in out                 # 主干照推
+        assert "N/A" not in out and "--" not in out
+
+    def test_粉尘仓位不塌成看着像缺失的0(self):
+        """⚠️ 实测 PUNCHMA 那一行 valueUsd = 0.00000703。两位小数会把它渲染成
+           「📦 持仓 $0.00」,而 $0.00 在这条消息里已经被「已清仓」占走了含义。"""
+        out = self._render(holding_usd=7.03771423819e-06,
+                           unrealized_pnl_usd=4.164011864051587e-06,
+                           unrealized_pnl_pct=144.9005958837345)
+        assert "📦 持仓 $0.000007038" in out
+        assert "📈 未实现盈亏 +$0.000004164 (+144.90%)" in out
+
+    # ---- 📈 盈亏 ---------------------------------------------------------
+    def test_在仓看未实现清仓看已实现(self):
+        """⚠️ 混用就是把落袋的钱说成账面的,或者反过来 —— 清仓那一刻两者差的是全部。"""
+        held = self._render(is_cleared=False)
+        assert "📈 未实现盈亏 +$123.45 (+11.11%)" in held
+        assert "已实现" not in held
+        closed = self._render(is_cleared=True)
+        assert "📉 已实现盈亏 -$970.68 (-88.78%)" in closed
+        assert "未实现" not in closed
+
+    def test_盈亏正好是0照常显示(self):
+        """⚠️ 判据一律 is None:0 是有意义的真实值(刚开仓、或买卖打平)。"""
+        assert "📈 未实现盈亏 +$0.00" in self._render(unrealized_pnl_usd=0.0,
+                                                 unrealized_pnl_pct=0.0)
+
+    def test_百分比拿不到时只掉括号金额照出(self):
+        out = self._render(unrealized_pnl_pct=None)
+        assert "📈 未实现盈亏 +$123.45" in out
+        assert "(" not in out.split("未实现盈亏")[1].split("\n")[0]
+
+    def test_盈亏拿不到时整行消失(self):
+        out = self._render(unrealized_pnl_usd=None, unrealized_pnl_pct=None)
+        assert "盈亏" not in out
+        assert "📈" not in out and "📉" not in out
+
+    def test_涨跌用不同的emoji且带正负号(self):
+        assert "📈 未实现盈亏 +$123.45" in self._render(unrealized_pnl_usd=123.45)
+        assert "📉 未实现盈亏 -$123.45" in self._render(unrealized_pnl_usd=-123.45)
+
+    # ---- 💎 市值 ---------------------------------------------------------
+    def test_市值按缩写显示并带距最高(self):
+        out = self._render()
+        assert "💎 市值 $445.53K · 距最高 -79.0%" in out
+
+    def test_市值拿不到时整行消失绝不打0或占位符(self):
+        """
+        ⚠️⚠️ 市值是这次唯一要多打一个请求换来的字段,它**最容易拿不到**
+           (限流、404、上游改字段)。拿不到时绝不能退化成 $0.00 / N/A / -- ——
+           那三种写法都会被读成"这币市值是 0 / 归零了",而真相是"我们没问到"。
+        """
+        out = self._render(market_cap_usd=None)
+        assert "💎" not in out and "市值" not in out
+        # ⚠️ 只比对整行:`$0.00` 会命中「单价 $0.0000285」的前缀,
+        #    那种松断言换个字段照样绿(等于没测)
+        for ln in out.splitlines():
+            assert ln not in ("💎 市值 $0.00", "💎 市值 N/A", "💎 市值 --", "💎 市值 0")
+        assert "N/A" not in out and " -- " not in out
+        assert "距最高" not in out                        # 连带那一段也不能留
+        assert "💰 金额 $1,234.50" in out                 # 成交本身照推
+
+    def test_市值拿不到时连带距最高也不出(self):
+        out = self._render(market_cap_usd=None, ath_market_cap_usd=2116892.897778326)
+        assert "距最高" not in out
+
+    def test_历史最高拿不到时只掉后半段市值照出(self):
+        out = self._render(ath_market_cap_usd=None)
+        assert "💎 市值 $445.53K" in out
+        assert "距最高" not in out
+
+    def test_历史最高不高于当前时不出距最高(self):
+        """
+        ⚠️ 两层意思:① 正在创新高时「距最高 -0.0%」是纯噪音;
+           ② 万一哪条链的 ath 换成了 quote 计价(会比美元市值小一两个数量级),
+           这一段自己就不出现,而不是打出一个 +10000% 的鬼数。
+        """
+        for ath in (445526.7119903613, 28.0355, 0, -1):
+            out = self._render(ath_market_cap_usd=ath)
+            assert "距最高" not in out, ath
+            assert "💎 市值 $445.53K" in out
+
+    def test_市值是SOL计价那个数时渲染出来差两个数量级(self):
+        """
+        ⚠️ 这条钉的是"取错字段的后果长什么样",让人一眼看出它有多贵:
+           同一个 Solana 币,usd_market_cap 是 $2.91K,market_cap 是 28.04(SOL)。
+        """
+        assert "💎 市值 $2.91K" in self._render(market_cap_usd=2906.090666119672,
+                                              ath_market_cap_usd=None)
+        assert "💎 市值 $28.04" in self._render(market_cap_usd=28.035521634857712,
+                                              ath_market_cap_usd=None)
+
+    # ---- 👥 名单内 -------------------------------------------------------
+    def test_名单内人数只报分子不报分母(self):
+        """
+        ⚠️⚠️ 与 FOMO 那条的「3/101 人买过」刻意不同:分母的含义是"另外那些人没买过",
+           而持仓快照每人**只覆盖 page 0 的 50 行**(实测有人 1905 个持仓),
+           我们根本证明不了它。写成「2/3」既是拿部分视图冒充全量,
+           又会在名单只有个位数时被读成"共识"。
+        """
+        out = self._render(holders_in_list=2)
+        assert "👥 名单内 2 人持有" in out
+        assert "/" not in out.split("名单内")[1].split("\n")[0]
+
+    def test_名单内人数为0时整行消失(self):
+        """⚠️ 0 不是"没人持有",是"我们这份部分视图里没看见"—— 不能拿它下断言。"""
+        out = self._render(holders_in_list=0)
+        assert "名单内" not in out and "👥" not in out
+
+    def test_名单内人数拿不到时整行消失(self):
+        assert "名单内" not in self._render(holders_in_list=None)
+
+    def test_措辞是持有不是买过(self):
+        """⚠️ 数据来自持仓快照(现在还拿着多少),不是买入历史 ——
+           FOMO 那边有 user_token_stats 才敢说"买过"。"""
+        out = self._render(holders_in_list=3)
+        assert "3 人持有" in out and "买过" not in out
+
+    # ---- 行序 / 出口不变式 -----------------------------------------------
+    def test_行序与FOMO那条对齐(self):
+        """标题 → 金额 → 单价 → 持仓 → 盈亏 → 市值 → 名单内 → 时刻 → 链 → 签名 → 链接 → CA"""
+        lines = self._render().splitlines()
+        heads = [ln.split(" ")[0] for ln in lines]
+        assert heads == ["🟩", "💰", "📊", "📦", "📈", "💎", "👥", "⏱", "🧬", "🧾", "🔗",
+                         "<code>SIG"[:0] + "<code>G2ZYvnesQzucoSy3VP7xap1PpMb3btiVXYNWCPKepump</code>"]
+
+    def test_行全满时仍然满足出口不变式(self):
+        """⚠️ 多了四行,≤ 预算 / HTML 合法 / CA 独占最后一行三条都不许破。"""
+        out = self._render()
+        assert len(out) <= 4000 - 400
+        assert out.count("<b>") == out.count("</b>")
+        assert out.count("<code>") == out.count("</code>")
+        assert out.count("<a ") == out.count("</a>")
+        assert out.splitlines()[-1] == f"<code>{MINT_SOL}</code>"
+
+    def test_行全满且陌生人可控字段超长时CA仍然完整在最后一行(self):
+        out = self._render(username="超长" * 5000, token_symbol="X" * 5000,
+                           tx="T" * 5000)
+        assert len(out) <= 4000 - 400
+        assert out.splitlines()[-1] == f"<code>{MINT_SOL}</code>"
+
+    def test_预算被顶破时先砍新增的行而CA仍在(self, monkeypatch):
+        from src import formatter
+
+        monkeypatch.setattr(formatter, "TRANSFER_MSG_BUDGET", 80)
+        out = self._render()
+        assert len(out) <= 80
+        assert out.splitlines()[-1] == f"<code>{MINT_SOL}</code>"
+
+    def test_新增的字段一个都不许替用户下结论(self):
+        out = self._render()
+        for banned in ("建仓", "跑路", "该跟", "抄底", "看好", "共识", "腰斩", "回本"):
+            assert banned not in out
 
 
 # ============================================================

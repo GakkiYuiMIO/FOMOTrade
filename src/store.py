@@ -2083,6 +2083,33 @@ def pump_positions(conn, user_id: str) -> dict[tuple[str, str], sqlite3.Row]:
     return {(r["chain_id"], r["coin_mint"]): r for r in rows}
 
 
+def pump_mint_holders(conn, chain_id: str, coin_mint: str) -> set[str]:
+    """
+    名单里**快照显示仍持有**这个币的人(user_id 集合)。
+
+    ⚠️⚠️ 必须 join pump_watch_users 且只算 active = 1:/pump del 是**软删除**,
+       它只把 active 置 0,持仓快照那几行照旧留在库里。不 join 的话,
+       一个早就被移出名单的人会永远留在「名单内 N 人持有」的分子里 ——
+       而这个数字的全部含义就是「**名单里**有几个人拿着」。
+    ⚠️ 判据是 amount_held > 0,而不是"这一行存在":
+       0 是"已清仓"(真实值),NULL 是"这一轮没拿到量"(不知道)——
+       两者都不足以支撑"他持有"这句断言,一个都不算。
+    ⚠️ 带 chain_id:同一个地址串在两条链上是**两个币**(见建表注释),
+       不带的话 BSC 上的持有者会被算进 Base 上那个同名合约的人头里。
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT p.user_id
+          FROM pump_positions p
+          JOIN pump_watch_users u ON u.user_id = p.user_id
+         WHERE p.chain_id = ? AND p.coin_mint = ?
+           AND u.active = 1 AND p.amount_held > 0
+        """,
+        (str(chain_id), coin_mint),
+    ).fetchall()
+    return {r["user_id"] for r in rows}
+
+
 def upsert_pump_positions(conn, user_id: str, rows) -> None:
     """
     覆盖写若干行快照。rows: (chain_id, coin_mint, amount_held, realized_pnl_usd, updated_at)。

@@ -1387,6 +1387,13 @@ EMOJI_PUMP_TX = "🧾"          # 成交签名
 _PUMP_NAME_CHARS = 24
 # 签名:Solana base58 88 位 / EVM 0x+64 = 66 位。128 绰绰有余,又挡得住脏数据撑爆预算
 _PUMP_TX_CHARS = 128
+# 清仓措辞。⚠️ 与 bot._CA_CLOSED_MARK 同一句话、同一条理由:清仓之后再报
+#    「📦 持仓 $0.00 / 📈 未实现盈亏 +$0.00」,读者只会读成"他空仓且不赚不亏"——
+#    前半句对、后半句是**凭空断言的假事实**,而真正落袋的那笔在已实现里。
+LABEL_PUMP_CLEARED = "已清仓"
+# 「距最高 -X%」。ath_market_cap 与 usd_market_cap 同为**美元**(见 pumpfun.parse_coin
+# 里那段实测推导),所以两者可以直接相比。
+LABEL_PUMP_DRAWDOWN = "距最高"
 
 
 def render_pump_trade(
@@ -1397,6 +1404,15 @@ def render_pump_trade(
     coin_mint: str | None,
     amount_usd=None,
     price_usd=None,
+    holding_usd=None,
+    is_cleared: bool = False,
+    unrealized_pnl_usd=None,
+    unrealized_pnl_pct=None,
+    realized_pnl_usd=None,
+    realized_pnl_pct=None,
+    market_cap_usd=None,
+    ath_market_cap_usd=None,
+    holders_in_list: int | None = None,
     traded_at: str | None = None,
     network_id: str | None = None,
     chain_display: str | None = None,
@@ -1411,6 +1427,16 @@ def render_pump_trade(
         side           "buy" / "sell"。其它值(含 None)→ 退化成中性的「交易」,
                        **绝不猜方向** —— 猜错方向比不说方向糟得多
         token_symbol   链上文本,同样陌生人可控
+        holding_usd    成交后还剩多少美元的仓位(portfolio 的 valueUsd)
+        is_cleared     已清仓(isExited / amountHeld=0)。为真时持仓行改说「已清仓」,
+                       盈亏行改看**已实现** —— 见 LABEL_PUMP_CLEARED
+        unrealized_*   未实现盈亏与百分比;**只在还持有时使用**
+        realized_*     已实现盈亏与百分比;**只在已清仓时使用**
+        market_cap_usd 当前市值(美元)。⚠️ 必须是 coins-v3 的 `usd_market_cap`,
+                       **绝不是 `market_cap`** —— 后者在 Solana 上是 SOL 计价
+        ath_market_cap_usd 历史最高市值(美元),只用来算「距最高 -X%」
+        holders_in_list 名单里仍持有这个币的人数;**只报分子不报分母**,理由见
+                       _pump_holders_line
         network_id     已归一化的内部链标识,用来查展示名与链接;查不到就没链接行
         chain_display  链展示名的兜底(pump 只给数字 chainId,没有链名字段)
         traded_at      成交时刻 ISO;解析不出来 → 那一行整行消失
@@ -1450,6 +1476,14 @@ def render_pump_trade(
     px = _fmt_price(price_usd)
     if px is not None:
         lines.append(f"{EMOJI_AVG_PRICE} 单价 {px}")
+    # 行序与 FOMO 那条推送对齐(持仓 → 盈亏 → 市值 → 共识),让两种推送看着是一家的
+    for extra in (_pump_holding_line(holding_usd, is_cleared, s),
+                  _pump_pnl_line(is_cleared, unrealized_pnl_usd, unrealized_pnl_pct,
+                                 realized_pnl_usd, realized_pnl_pct),
+                  _pump_mcap_line(market_cap_usd, ath_market_cap_usd),
+                  _pump_holders_line(holders_in_list)):
+        if extra is not None:
+            lines.append(extra)
     ts_line = _pump_time_line(traded_at, now)
     if ts_line is not None:
         lines.append(ts_line)
@@ -1473,6 +1507,121 @@ def render_pump_trade(
     # 空的 <code></code> 是个点了复制不出东西的假区域,比没有更糟
     anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
     return _fit_signal(lines, anchor)
+
+
+def _pump_holding_line(holding_usd, is_cleared: bool, side: str) -> str | None:
+    """
+    📦 持仓 $1,234.56 / 📦 剩余 $1,234.56 / 📦 已清仓
+
+    ⚠️⚠️ 已清仓时**必须换措辞**,绝不能报「📦 持仓 $0.00」。与 bot._ca_thesis_row
+       同一条教训:那半句读起来是"他空仓",没错;但紧跟着的「未实现盈亏 +$0.00」
+       会把一个刚落袋 -$970 的人渲染成"不赚不亏",那是凭空断言的**假事实**。
+       清仓之后手上确实一分未实现盈亏都没有 —— 该看的是已实现,由 _pump_pnl_line 接手。
+    ⚠️ 还持有时判据一律 is None:holding_usd = 0.0 是"卖到只剩粉尘"的真实值,
+       照常显示(它与"已清仓"是两件事 —— 前者手上还有量,只是不值钱了)。
+    ⚠️ 卖出用「剩余」、其余用「持仓」,与 FOMO 那条推送的 LABEL_HOLDING_* 同一套口径。
+    """
+    if is_cleared:
+        return f"{EMOJI_HOLDING} {LABEL_PUMP_CLEARED}"
+    if holding_usd is None:
+        return None
+    # ⚠️ 与「💰 金额」同一条理由用 _fmt_usd_tiny:pump 上粉尘仓位是**常态**
+    #    (实测 PUNCHMA 那一行 valueUsd = 0.00000703)。两位小数会把它渲染成
+    #    「📦 持仓 $0.00」—— 而这条消息里「$0.00」已经被 LABEL_PUMP_CLEARED 占走了
+    #    "清仓"这个含义,粉尘仓位再塌成同一个字面量就真的分不出来了。
+    usd = _fmt_usd_tiny(holding_usd)
+    if usd is None:
+        return None
+    label = LABEL_HOLDING_SELL if side == "sell" else LABEL_HOLDING_BUY
+    return f"{EMOJI_HOLDING} {label} {usd}"
+
+
+def _pump_pnl_line(is_cleared: bool, unrealized_usd, unrealized_pct,
+                   realized_usd, realized_pct) -> str | None:
+    """
+    📈 未实现盈亏 +$123.45 (+11.11%) / 📉 已实现盈亏 -$970.68 (-88.78%)
+
+    ⚠️⚠️ 清仓看**已实现**、在仓看**未实现**,与 formatter._pnl_line 同一套取舍
+       (那边卖出看已实现、其余看未实现)。混用就是把落袋的钱说成账面的、
+       或者反过来 —— 两者在清仓那一刻差的正是全部。
+    ⚠️ 判据一律 is None:盈亏恰好是 0 是有意义的真实值(刚开仓、或买卖打平)。
+    ⚠️ 百分比拿不到时**只掉括号那一段**,金额照常显示 —— 与 _consensus_line 的
+       副指标同一种降级。
+    """
+    if is_cleared:
+        val, pct, label = realized_usd, realized_pct, LABEL_PNL_REALIZED
+    else:
+        val, pct, label = unrealized_usd, unrealized_pct, LABEL_PNL_UNREALIZED
+    if val is None:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    # 同上:粉尘仓位的盈亏同样是粉尘,两位小数会把它塌成一个看着像"字段没取到"的 $0.00
+    usd = _fmt_usd_tiny(abs(v))
+    if usd is None:
+        return None
+    line = f"{EMOJI_PNL_DOWN if v < 0 else EMOJI_PNL_UP} {label} {'-' if v < 0 else '+'}{usd}"
+    if pct is None:
+        return line
+    try:
+        p = float(pct)
+    except (TypeError, ValueError):
+        return line
+    return f"{line} ({p:+.2f}%)" if math.isfinite(p) else line
+
+
+def _pump_mcap_line(market_cap_usd, ath_market_cap_usd) -> str | None:
+    """
+    💎 市值 $445.53K · 距最高 -78.9%
+
+    ⚠️⚠️ market_cap_usd 必须来自 coins-v3 的 `usd_market_cap`。**同一个响应里的
+       `market_cap` 在 Solana 上是 SOL 计价**(实测 PUNCHMA:market_cap=28.04、
+       usd_market_cap=2906.09,前者恰好等于 bonding curve 的 SOL 市值),
+       拿它当美元就是把一个 $2,906 的币说成 $28 —— 差两个数量级,而且一眼看不出错。
+    ⚠️ 市值拿不到 → **整行消失**(连带「距最高」),绝不用 ath / 入场价 / 0 顶替。
+    ⚠️ 「距最高」只在 ath 严格大于当前市值时才出:
+       · ath <= 当前 = 正在创新高或数据同步滞后,「距最高 -0.0%」是纯噪音;
+       · 顺带也挡住了单位错配 —— 万一哪条链的 ath 换成了 quote 计价,
+         它会比美元市值小,这一段自己就不出现,而不是打出一个 +10000% 的鬼数。
+    """
+    mc = _fmt_usd_compact(market_cap_usd)
+    if mc is None:
+        return None
+    line = f"{EMOJI_MARKET_CAP} 市值 {mc}"
+    ath = _to_decimal(ath_market_cap_usd)
+    cur = _to_decimal(market_cap_usd)
+    if ath is None or cur is None or ath <= 0 or ath <= cur:
+        return line
+    return f"{line}{SEP}{LABEL_PUMP_DRAWDOWN} -{(ath - cur) / ath * 100:.1f}%"
+
+
+def _pump_holders_line(holders_in_list: int | None) -> str | None:
+    """
+    👥 名单内 2 人持有
+
+    ⚠️⚠️ **只报分子,不报分母** —— 与 FOMO 那条的「名单内 3/101 人买过」刻意不同。
+       分母的含义是"另外 98 个人没买过",而这里我们根本证明不了它:
+       持仓快照每人**只覆盖 page 0 的 50 行**(实测 1000XCryptoD 有 1905 个持仓),
+       名单里某人没出现在这个币上,可能只是他那一页没排到。写成「2/3 人持有」
+       就是拿一个部分视图冒充全量,而且名单只有个位数时那个分数还会被读成"共识"。
+    ⚠️ 同理 **0 不显示**:0 不是"没人持有",是"我们这份部分视图里没看见"。
+       这不是拿真值判断代替 is None —— None 与 0 在这里指向同一件事
+       (都不构成任何可摆出来的事实),而 N ≥ 1 是**正面观测到的**:
+       那 N 行持仓我们真的看见了。
+    ⚠️ 用「持有」不用「买过」:数据来自持仓快照(当前还拿着多少),
+       不是买入历史。FOMO 那边有 user_token_stats 才敢说"买过"。
+    """
+    if holders_in_list is None:
+        return None
+    try:
+        n = int(holders_in_list)
+    except (TypeError, ValueError):
+        return None
+    return f"{EMOJI_CONSENSUS} 名单内 {n} 人持有" if n > 0 else None
 
 
 def _pump_time_line(traded_at, now: float | None = None) -> str | None:

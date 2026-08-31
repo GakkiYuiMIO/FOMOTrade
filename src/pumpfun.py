@@ -81,6 +81,17 @@ PORTFOLIO_PAGE_SIZE = 50
 #    一个 mint 上两个人发了 40 条,而日志还在说「本轮先推最早的 20 笔」。
 MAX_PUSH_PER_ROUND = 20
 
+# 市值缓存的存活时间(秒)。
+# ⚠️ 它的**主职责是"同一轮里同一个 mint 只查一次"**:一轮最长十几秒(全是网络 IO),
+#    60 秒对此有 3 倍以上余量,任何一条路径重复问同一个 mint 都会被它挡住。
+# ⚠️ 跨轮命中只在把巡检间隔调到 60 秒以下时才发生(下限 30 秒,见 config)。
+#    那种配置下一个持续变动的 mint 会每隔一轮才重新问一次,拿到的市值最多旧 60 秒 ——
+#    这一行回答的是"这币现在多大"($2.91K 还是 $445K,量级问题),
+#    60 秒的漂移不会改变答案;而**取错字段**(SOL 当美元)会让答案差两个数量级。
+#    请求增速恰恰在巡检最密的时候被压下来,正是最需要它的地方。
+# ⚠️ 绝不缓存"失败":失败缓存下来就是让一次网络抖动把市值行按住一整个 TTL。
+COIN_STATS_TTL_SEC = 60.0
+
 _TIMEOUT_SEC = 20.0
 
 # pump.fun 的 chainId → 本仓库内部链标识。
@@ -154,10 +165,79 @@ class Position:
     realized_pnl_usd: float | None
     updated_at: str | None
     symbol: str | None = None
+    # ↓ 以下四个**只进推送、不进快照**:diff 判据只认 amount_held / realized_pnl_usd
+    #   (见 _position_changed —— value_usd 随行情每轮都在动,拿它当触发器等于每轮
+    #    把整页 mint 全问一遍)。零额外请求:portfolio 本来就把它们返回了。
+    value_usd: float | None = None           # 当前这笔仓位值多少美元
+    cost_basis_usd: float | None = None      # **当前持有量**的成本(不是累计买入额)
+    pnl_percentage: float | None = None      # pump 自己算的百分比,语义见 realized_pnl_pct
+    is_exited: bool | None = None            # pump 自己的清仓标记
 
     @property
     def key(self) -> tuple[str, str]:
         return (self.chain_id, self.coin_mint)
+
+    @property
+    def is_cleared(self) -> bool:
+        """
+        这一行是不是已经清仓了。
+
+        ⚠️ isExited 是 pump 自己的标记,优先信它;缺失时才退到 amountHeld == 0
+           (filter=ALL 下两者实测总是同进同出)。
+        ⚠️ amount_held is None 时**不推断**:那是"这一轮没拿到量",不是"清仓了"。
+        """
+        if self.is_exited is not None:
+            return bool(self.is_exited)
+        return self.amount_held is not None and self.amount_held == 0
+
+    @property
+    def unrealized_pnl_usd(self) -> float | None:
+        """
+        未实现盈亏 = 当前市值 − 当前持有量的成本。
+
+        ⚠️⚠️ **绝不能直接用报文里的 `pnlUsd`** —— 它是**总**盈亏(已实现 + 未实现)。
+           2026-08-31 的真实 portfolio 六行逐行验过,恒等式
+           `pnlUsd == (valueUsd − costBasisUsd) + realizedPnlUsd` 差值**恰好为 0**:
+           QQQB 那行 pnlUsd = -12,346.57,其中已实现占了 -444.51,
+           把它当未实现打出去,账面浮亏就凭空多报了 444 美元。
+        ⚠️ 这不是"本地推算"的例外(对照 _avg_price_line 那条禁令):均价要拿
+           按 TEXT 存的 token 数量做算术,这里是**同一行报文里两个美元字段相减**,
+           而且结果被上游自己的 pnlUsd 对得上 —— 是校验过的透传,不是发明数字。
+        """
+        if self.value_usd is None or self.cost_basis_usd is None:
+            return None
+        return self.value_usd - self.cost_basis_usd
+
+    @property
+    def unrealized_pnl_pct(self) -> float | None:
+        """
+        未实现盈亏率 = 未实现 / 当前持有量的成本。
+
+        ⚠️⚠️ **绝不能直接用报文里的 `pnlPercentage`**:它的基数是 amountBoughtUsd
+           (累计买入额),分子是**总**盈亏 —— 两头都跟"未实现"对不上。
+        ⚠️ 成本为 0(整仓靠转入拿到的)时返回 None:除零之外,"成本 0 赚无穷倍"
+           本身也不是个能摆给人看的数。金额那一段照常显示。
+        """
+        pnl = self.unrealized_pnl_usd
+        if pnl is None or self.cost_basis_usd is None or self.cost_basis_usd == 0:
+            return None
+        return pnl / self.cost_basis_usd * 100.0
+
+    @property
+    def realized_pnl_pct(self) -> float | None:
+        """
+        已实现盈亏率 —— 直接透传报文的 `pnlPercentage`,但**只在清仓路径上取用**。
+
+        ⚠️ 依据:清仓时 valueUsd == costBasisUsd == 0,未实现恒为 0、
+           pnlUsd 恒等于 realizedPnlUsd,那一刻 pnlPercentage 说的就是已实现的百分比
+           (夹具里 GTA +35.84% / 指甲刀 -88.78% 两行都对得上)。
+           这里把那个前提**再自查一次**:未实现算出来不是 0 就不给百分比 ——
+           前提不成立时宁可只报金额,也不贴一个语义已经漂了的百分比。
+        """
+        pnl = self.unrealized_pnl_usd
+        if pnl is None or pnl != 0:
+            return None
+        return self.pnl_percentage
 
     @property
     def network_id(self) -> str | None:
@@ -171,6 +251,20 @@ class Position:
         if net is not None:
             return NETWORK_DISPLAY.get(net)
         return _CHAIN_ID_DISPLAY_ONLY.get(self.chain_id)
+
+
+@dataclass(frozen=True)
+class CoinStats:
+    """
+    GET /coins-v3/{mint} 里我们要的那两个数。
+
+    ⚠️⚠️ 两条链返回的**字段集不同**(Solana 多 bonding_curve / complete /
+       market_cap_quote…,EVM 多 canonical_pool_liquidity_usd),所以这里
+       只取两条链都有的字段,并且任何一个取不到就是 None(对应行整行消失)。
+    """
+
+    market_cap_usd: float | None
+    ath_market_cap_usd: float | None
 
 
 @dataclass(frozen=True)
@@ -333,6 +427,7 @@ def parse_positions(payload) -> list[Position] | None:
             dropped += 1
             continue
         coin = row.get("coin")
+        exited = row.get("isExited")
         out.append(Position(
             chain_id=chain,
             coin_mint=mint,
@@ -340,11 +435,44 @@ def parse_positions(payload) -> list[Position] | None:
             realized_pnl_usd=_as_float(row.get("realizedPnlUsd")),
             updated_at=_as_text(row.get("updatedAt")),
             symbol=_as_text(coin.get("symbol")) if isinstance(coin, dict) else None,
+            value_usd=_as_float(row.get("valueUsd")),
+            cost_basis_usd=_as_float(row.get("costBasisUsd")),
+            pnl_percentage=_as_float(row.get("pnlPercentage")),
+            # ⚠️ 只认真正的 bool:上游给字符串 "false" 时 bool("false") 是 True,
+            #    那会把一个还持着货的人渲染成「已清仓」。认不出来就 None(退到 amountHeld)
+            is_exited=exited if isinstance(exited, bool) else None,
         ))
     if dropped:
         logger.warning("pump.fun portfolio 有 {} 行缺 coinMint/chainId,已跳过(总 {} 行)",
                        dropped, len(rows))
     return out
+
+
+def parse_coin(payload) -> CoinStats | None:
+    """
+    /coins-v3/{mint} 响应 → CoinStats。结构不对返回 None。
+
+    ⚠️⚠️⚠️ **市值只认 `usd_market_cap`,绝不碰 `market_cap`。**
+       同一个响应里 `market_cap` 在 **Solana 上是 SOL 计价**:
+       2026-08-31 实测 PUNCHMA 拿到 market_cap=28.0355 / usd_market_cap=2906.09,
+       而 28.0355 恰好等于 bonding curve 自己算出来的 SOL 市值
+       (virtual_sol_reserves / 1e9 × total_supply / virtual_token_reserves,逐位相同)。
+       EVM 上两者相等(KISS 两个都是 445526.71),所以**在 EVM 上测不出这个 bug**——
+       只用 EVM 验一遍就上线的话,Solana 的每一条推送都会把市值说小两个数量级。
+       同理不拿 `market_cap_usd` 兜底:它在 Solana 上取的 SOL 价与 usd_market_cap
+       不是同一个(2891.09 vs 2906.09),两个来源混用只会让同一个币每轮跳来跳去。
+
+    ⚠️ `ath_market_cap` 是**美元**,与 usd_market_cap 可比。推导:PUNCHMA 的
+       ath_market_cap = 18489.20,而它 `complete=False`(还在 bonding curve 上),
+       curve 的 SOL 市值上限只有约 411 SOL —— 18489 若是 SOL 计价则根本不可能达到。
+       所以它只能是美元。(渲染层还会再挡一次单位错配,见 _pump_mcap_line。)
+    """
+    if not isinstance(payload, dict):
+        return None
+    return CoinStats(
+        market_cap_usd=_as_float(payload.get("usd_market_cap")),
+        ath_market_cap_usd=_as_float(payload.get("ath_market_cap")),
+    )
 
 
 def parse_trades(payload) -> dict[str, list[Trade]] | None:
@@ -504,6 +632,19 @@ class PumpClient:
         )
         return parse_positions(payload)
 
+    def fetch_coin(self, mint: str) -> CoinStats | None:
+        """
+        某个 mint 的当前市值与历史最高市值。失败一律 None(市值那一行整行消失)。
+
+        ⚠️ 这是本模块**唯一**按 mint 计费的额外请求(60 次/分),
+           所以调用方必须带缓存 —— 见 PumpWatcher._coin_stats。
+        ⚠️ 两条链共用这一个端点(实测 Solana 的 PUNCHMA 与 Robinhood 的
+           0x04a2df…2b36 都是 200),不需要按链分支。
+        """
+        payload = self._json(f"coins-v3/{mint[:8]}…", "get",
+                             f"{FRONTEND_BASE}/coins-v3/{mint}")
+        return parse_coin(payload)
+
     def fetch_trades(self, mint: str, addresses: list[str]) -> dict[str, list[Trade]] | None:
         """
         某个 mint 上、这几个地址的逐笔成交。
@@ -551,6 +692,10 @@ class PumpWatcher:
         self._min_usd = s.fomo_pump_min_usd
         self._max_mints = s.fomo_pump_max_mints
         self._max_age = s.fomo_pump_trade_max_age_sec
+        # mint → (取到的时刻, 市值)。⚠️ 挂在 watcher 而不是 client 上:
+        #    cli 全程只建一个 watcher,缓存才跨得了轮;而 bot 侧那个 client 是另一个实例,
+        #    两边共用一份缓存反而会让"这一轮打了几个请求"变得不可预测。
+        self._coin_cache: dict[str, tuple[float, CoinStats]] = {}
 
     # ---- 对外唯一入口 ----------------------------------------------------
     def run_once(self) -> int:
@@ -723,7 +868,15 @@ class PumpWatcher:
             #    (swap-api 的 URL 里只有 mint、没有 chainId,它自己也不区分)。
             #    那时逐行推等于把同一笔成交说两遍,所以只推一次。
             fresh = self._pick_fresh(per_user.get(w.user_id, []), w, mint, cutoff_ts, done)
-            ok, n, tried = self._push(w, rows[0], fresh, budget - used)
+            room = budget - used
+            # ⚠️ 市值与人数**只在真要发消息时才求**:变动的 mint 里有相当一部分
+            #    最后一条都推不出来(金额没过门槛 / 台账里已推过 / 掉出新鲜窗口),
+            #    无条件先问一次 coins-v3 就是拿限流额度换一个没人会看到的数。
+            #    额度已经见底时同理 —— 那些成交要留到下一轮才推。
+            need = bool(fresh) and room > 0
+            stats = self._coin_stats(mint) if need else None
+            n_holders = self._holders_in_list(rows[0], holders) if need else None
+            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders)
             sent += n
             used += tried
             if ok:
@@ -763,13 +916,64 @@ class PumpWatcher:
             out.append(t)
         return sorted(out, key=lambda x: (x.traded_ts, x.tx))
 
-    def _push(self, w: _Watched, pos: Position, fresh: list[Trade],
-              budget: int) -> tuple[bool, int, int]:
+    def _coin_stats(self, mint: str) -> CoinStats | None:
+        """
+        市值(带 TTL 缓存)。这是本模块唯一按 mint 计费的额外请求,理由见 COIN_STATS_TTL_SEC。
+
+        ⚠️⚠️ **失败绝不入缓存**:缓存一次失败 = 让一次网络抖动把市值行按住整个 TTL。
+           下一次调用重新问一遍才对(而"下一次"最快也是下一轮,不会打成风暴)。
+        """
+        now = time.time()
+        hit = self._coin_cache.get(mint)
+        if hit is not None and now - hit[0] < COIN_STATS_TTL_SEC:
+            return hit[1]
+        stats = self._client.fetch_coin(mint)
+        if stats is None:
+            return None
+        # 顺手清掉过期项 —— 名单和变动的 mint 都是长尾,不清的话这个 dict 只增不减
+        for k, (ts, _v) in list(self._coin_cache.items()):
+            if now - ts >= COIN_STATS_TTL_SEC:
+                del self._coin_cache[k]
+        self._coin_cache[mint] = (now, stats)
+        return stats
+
+    def _holders_in_list(self, pos: Position,
+                         changed: list[tuple[_Watched, Position]]) -> int:
+        """
+        名单里有几个人仍持有这个币。**纯本地,零请求**。
+
+        ⚠️⚠️ 库里那份快照对**本轮变动的人**是过期的:快照要等推送成功才前移
+           (见 _handle_mint),所以此刻它记的还是上一轮的量。不拿本轮的新值盖住它,
+           一个刚刚清仓的人会被继续算成持有者,一个刚刚首次买入的人则根本不算进来 ——
+           而这条消息说的正是他俩之一。
+        ⚠️ 只盖 (chain_id, mint) 都对得上的那些行:同一个地址串在两条链上是两个币。
+        ⚠️ 本轮拿不到量(amount_held is None)时**不动**快照给出的那个答案 ——
+           "不知道"不该被当成"清仓了"。
+        """
+        with store.get_conn() as conn:
+            uids = store.pump_mint_holders(conn, pos.chain_id, pos.coin_mint)
+        for w, p in changed:
+            if p.chain_id != pos.chain_id or p.coin_mint != pos.coin_mint:
+                continue
+            if p.amount_held is None:
+                continue
+            if p.amount_held > 0:
+                uids.add(w.user_id)
+            else:
+                uids.discard(w.user_id)
+        return len(uids)
+
+    def _push(self, w: _Watched, pos: Position, fresh: list[Trade], budget: int,
+              stats: CoinStats | None = None,
+              holders_in_list: int | None = None) -> tuple[bool, int, int]:
         """
         逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
 
         budget 是**本轮剩下的全局额度**(不是这个人这个币的额度)——
         超出的部分本轮不发,靠 all_ok=False 让快照不前移、下一轮接着推。
+
+        stats / holders_in_list 允许为 None(市值问不到 / 没算)——
+        对应的行整行消失,成交本身照推。**市值绝不是推送的前置条件。**
 
         ⚠️⚠️ **推送成功才记台账**(与 poller._dispatch 的 `ok = notifier.send(...)`
            / `if ok:` 同一条铁律)。反过来写的话,一次 TG 400 或网络抖动
@@ -794,6 +998,16 @@ class PumpWatcher:
                 coin_mint=pos.coin_mint,
                 amount_usd=t.amount_usd,
                 price_usd=t.price_usd,
+                # 持仓与盈亏全部来自 portfolio 那一行 —— **零额外请求**
+                holding_usd=pos.value_usd,
+                is_cleared=pos.is_cleared,
+                unrealized_pnl_usd=pos.unrealized_pnl_usd,
+                unrealized_pnl_pct=pos.unrealized_pnl_pct,
+                realized_pnl_usd=pos.realized_pnl_usd,
+                realized_pnl_pct=pos.realized_pnl_pct,
+                market_cap_usd=None if stats is None else stats.market_cap_usd,
+                ath_market_cap_usd=None if stats is None else stats.ath_market_cap_usd,
+                holders_in_list=holders_in_list,
                 traded_at=t.traded_at,
                 network_id=pos.network_id,
                 chain_display=pos.chain_display,
