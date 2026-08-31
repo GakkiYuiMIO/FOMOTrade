@@ -229,6 +229,29 @@ def _fmt_price(v) -> str | None:
     return f"{sign}${s or '0'}"
 
 
+def _fmt_usd_tiny(v) -> str | None:
+    """
+    金额,但**非零的粉尘额按有效数字给**:$1,234.50 / $0.00 / $0.000002848
+
+    ⚠️⚠️ 存在的理由:pump.fun 逐笔里真的有 amountUSD=0.0000028483994 这种成交。
+       两位小数会把它渲染成「💰 金额 $0.00」—— 一行**看起来像缺失值的真实值**,
+       与"缺失整行消失、绝不打 0"的观感直接打架(用户会以为字段没取到)。
+    ⚠️ 恰好是 0 的仍然走 _fmt_usd 显示成 $0.00:0 是真实值,它就该显示成 0,
+       不能被"小额一律有效数字"顺手改掉语义。
+    ⚠️ 判据是「两位小数会不会把这个非零值渲染成 0」本身,**不是拍一个阈值**:
+       quantize 默认是 banker's rounding,恰好 0.005 也会塌成 0.00,
+       写 `< 0.005` 就正好在边界上漏一个。
+       (`abs(d) < 1` 只是先挡掉大额 —— 大额永远塌不成 0,却会在默认 prec 下
+        让 quantize 抛 InvalidOperation。)
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    if d != 0 and abs(d) < 1 and d.quantize(Decimal("0.01")) == 0:
+        return _fmt_price(d)
+    return _fmt_usd(d)
+
+
 def _fmt_qty(v) -> str | None:
     """
     token 数量:1,200,000 / 1,250,000.5 / 0.00000123
@@ -1419,7 +1442,9 @@ def render_pump_trade(
         title += f"{SEP}<b>${sym}</b>"
 
     lines = [title]
-    usd = _fmt_usd(amount_usd)
+    # ⚠️ 用 _fmt_usd_tiny 而不是 _fmt_usd:门槛调到 0 之后粉尘成交会进来,
+    #    两位小数会把 $0.0000028 渲染成 $0.00,看着像字段没取到(其实是真实值)
+    usd = _fmt_usd_tiny(amount_usd)
     if usd is not None:
         lines.append(f"{EMOJI_AMOUNT_IN if s != 'sell' else EMOJI_AMOUNT_OUT} 金额 {usd}")
     px = _fmt_price(price_usd)

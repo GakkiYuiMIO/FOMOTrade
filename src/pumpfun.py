@@ -42,10 +42,12 @@ POST /coins/{mint}/trades/batch(前端匿名就在调这个)。
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 from loguru import logger
 
@@ -73,6 +75,10 @@ PORTFOLIO_PAGE_SIZE = 50
 # ⚠️ 这不是防御性编程:一个人批量清仓几十个币是真实会发生的,逐条推就是几十条,
 #    用户当场静音,这个功能就死了。超限时**剩下的 mint 本轮不处理、快照也不前移**,
 #    下一轮它们仍然与快照不一致,会被重新选中 —— 信息不丢,只是慢一轮。
+# ⚠️⚠️ 「所有人合计」是字面意思:它是**整轮一个预算**,一路从 _check 传到 _push,
+#    不是每层各带一个。曾经每层各判一次,于是"处理下一个 mint 之前 sent<20"通过后,
+#    那个 mint 内部每个人还能各发满 20 条 —— 实测两个 mint 发了 39 条、
+#    一个 mint 上两个人发了 40 条,而日志还在说「本轮先推最早的 20 笔」。
 MAX_PUSH_PER_ROUND = 20
 
 _TIMEOUT_SEC = 20.0
@@ -108,6 +114,13 @@ _CHAIN_ID_DISPLAY_ONLY = {
 # 限流余额低于此就告警。pump 的两个端点分别是 30/分 与 60/分,
 # 剩不到 5 说明我们打得太密(或者别的进程在共用这个出口 IP),该让用户知道。
 _RATE_LIMIT_WARN = 5
+
+# /users/{key} 里 key 的合法字符集 —— **它来自 Telegram 消息,是不可信输入**。
+# 覆盖三种真实形态:pump 用户名(hexiecs / 1000XCryptoD / brc20_niubi)、
+# base58 的 SVM 地址、`0x` 开头的 EVM 地址。长度 64 比最长的 base58 地址还宽。
+# ⚠️ 刻意不含 `.` `/` `?` `#` `%` 与空白:它们是唯一能改变 URL 结构的东西
+#    (见 resolve_user 里那个路径穿越的实例)。
+_USER_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ============================================================
@@ -449,8 +462,26 @@ class PumpClient:
             return None
 
     def resolve_user(self, key: str) -> PumpProfile | None:
-        """名字或钱包 → 档案。查不到 / 失败一律 None(调用方据此回一句"找不到")。"""
-        payload = self._json(f"users/{key}", "get", f"{FRONTEND_BASE}/users/{key}")
+        """
+        名字或钱包 → 档案。查不到 / 失败 / 键非法一律 None(调用方据此回一句"找不到")。
+
+        ⚠️⚠️ key **直接来自 Telegram 消息**,原样拼进 URL 路径就是一个路径穿越口子:
+           `/pump add ../../following-positions/alerts` 会拼出
+           `…/users/../../following-positions/alerts`,curl 把 `..` 正规化掉之后
+           打的正是那个**需要登录**的端点(实测 401)。
+           所以先过白名单(非法的键一个字节都不发出去)、再 quote 一层。
+        ⚠️ 白名单收得比 pump 实际允许的字符窄一点是有意的:合法的键(用户名、
+           base58 的 SVM 地址、0x 开头的 EVM 地址)全在这个集合里,
+           而任何能改变 URL 结构的字符(`/` `?` `#` `.` `%` 空白)一个都不在。
+        """
+        k = (key or "").strip()
+        if not _USER_KEY_RE.match(k):
+            logger.warning("pump.fun 用户键含非法字符,不发请求: {!r}", k[:80])
+            return None
+        # quote 是第二层:白名单已经保证这里没有需要转义的字符,
+        # 留着它是为了将来放宽白名单时不至于又开一次同一个口子
+        payload = self._json(f"users/{k}", "get",
+                             f"{FRONTEND_BASE}/users/{quote(k, safe='')}")
         return parse_profile(payload)
 
     def fetch_portfolio(self, wallet: str) -> list[Position] | None:
@@ -552,15 +583,23 @@ class PumpWatcher:
         if not watched:
             return 0
 
-        # 地址 → 人。**这是"只推我们盯的人"的那道闸**:swap-api 的 batch 响应
-        # 是按地址分组的,任何不在这张表里的键一律丢弃。
-        by_addr: dict[str, _Watched] = {}
+        # 地址 → 认领这个地址的人。**这是"只推我们盯的人"的那道闸**:swap-api 的
+        # batch 响应是按地址分组的,任何不在这张表里的键一律丢弃。
+        # ⚠️⚠️ 值是**列表**而不是单个人:曾经"重复地址只认先加进来的那个",
+        #    后加的那个人于是在归属阶段拿到空列表 → _push 报「本来就没有该推的」→
+        #    **快照照常前移** → 这笔变动对他永久消失,下一轮也不重来。
+        #    名单里两个人共用一个钱包 = 同一个钱包的两个身份,两个都是用户自己加的,
+        #    两条都发出去(消息重复看得见,静默丢数据看不见)。
+        by_addr: dict[str, list[_Watched]] = {}
         for w in watched:
             for a in w.wallets:
-                if a in by_addr:
-                    logger.warning("pump.fun 名单里两个人共用地址 {} —— 只认先加进来的那个", a)
-                    continue
-                by_addr[a] = w
+                holders = by_addr.setdefault(a, [])
+                if holders:
+                    logger.warning("pump.fun 名单里 {} 与 {} 共用地址 {} —— "
+                                   "这个地址上的成交两个人各推一条",
+                                   holders[0].username or holders[0].user_id,
+                                   w.username or w.user_id, a)
+                holders.append(w)
         all_addrs = list(by_addr)
 
         # 第一段:每人一个请求,拿最近变动的一页持仓,diff 出候选
@@ -592,13 +631,19 @@ class PumpWatcher:
                 store.prune_pump_pushed(conn, cutoff_iso)
             done = store.pump_pushed_since(conn, cutoff_iso)
 
+        # ⚠️⚠️ budget 是**整轮唯一的一份推送预算**,一路传到 _push 那层做截断。
+        #    在这里判一次、下面每层再各判一次自己的 20 = 上限根本不是上限。
         sent = 0
+        budget = MAX_PUSH_PER_ROUND
         for mint in mints:
-            if sent >= MAX_PUSH_PER_ROUND:
-                logger.warning("pump.fun 本轮已推 {} 条,达到单轮上限 —— 剩下的 mint "
-                               "快照不前移、下一轮继续", sent)
+            if budget <= 0:
+                logger.warning("pump.fun 本轮已发满单轮上限 {} 条 —— 剩下的 mint "
+                               "快照不前移、下一轮继续", MAX_PUSH_PER_ROUND)
                 break
-            sent += self._handle_mint(mint, by_mint[mint], by_addr, all_addrs, cutoff_ts, done)
+            n, used = self._handle_mint(mint, by_mint[mint], by_addr, all_addrs,
+                                        cutoff_ts, done, budget)
+            sent += n
+            budget -= used
         return sent
 
     def _candidates(self, w: _Watched) -> list[Position]:
@@ -630,10 +675,14 @@ class PumpWatcher:
         return [p for p in positions if _position_changed(prev.get(p.key), p)]
 
     def _handle_mint(self, mint: str, holders: list[tuple[_Watched, Position]],
-                     by_addr: dict[str, _Watched], all_addrs: list[str],
-                     cutoff_ts: float, done: set) -> int:
+                     by_addr: dict[str, list[_Watched]], all_addrs: list[str],
+                     cutoff_ts: float, done: set, budget: int) -> tuple[int, int]:
         """
         一个变动的 mint:问逐笔成交 → 过滤 → 推送 → 只对**推干净了**的人前移快照。
+
+        返回 (真正发出去的条数, 消耗掉的推送预算)。
+        ⚠️ 消耗的是**尝试发的条数**而不是发成功的条数:预算存在的理由是防刷屏,
+           而"发过去被 TG 拒了"同样占掉了这一轮的额度,不该让下一个人再借一次。
 
         ⚠️⚠️ 快照前移与推送成功是绑在一起的:任何一笔该推而没推成的,
            这个人这个 mint 的快照就**不前移**,下一轮它仍然与快照不一致、会被重新选中。
@@ -642,15 +691,15 @@ class PumpWatcher:
         batch = self._client.fetch_trades(mint, all_addrs)
         if batch is None:
             # 这个 mint 本轮问不到 → 快照不动,下一轮重来
-            return 0
+            return 0, 0
 
         # 归属:只认在我们名单里的地址。
         # ⚠️⚠️ 这道闸是"未被盯的人的成交绝不外泄"的唯一保障 —— batch 响应里
         #    出现任何我们没问过/不认识的地址,一律丢弃并留痕。
         per_user: dict[str, list[Trade]] = {}
         for addr, trades in batch.items():
-            w = by_addr.get(addr)
-            if w is None:
+            ws = by_addr.get(addr)
+            if not ws:
                 logger.warning("pump.fun trades/batch 返回了名单外的地址 {} —— 已丢弃", addr)
                 continue
             for t in trades:
@@ -658,22 +707,30 @@ class PumpWatcher:
                 if t.user_address and t.user_address != addr:
                     logger.warning("pump.fun 成交 {} 的 userAddress 与分组键不符,已丢弃", t.tx)
                     continue
-                per_user.setdefault(w.user_id, []).append(t)
+                # 共用这个地址的人各拿一份(绝大多数情况 ws 就一个人)
+                for w in ws:
+                    per_user.setdefault(w.user_id, []).append(t)
 
         sent = 0
+        used = 0
         for w, rows in _group_by_user(mint, holders):
+            # ⚠️ 这里**刻意不加**「预算见底就 break」那道闸:_push 拿到 0 额度自然就
+            #    一条不发、all_ok=False、快照不前移,结果完全一样;而 break 会连
+            #    "本来就没有该推的"那些人也一起卡住 —— 他们的快照本该照常前移。
+            #    (多一道等价的闸还有个隐性代价:两道闸互相遮蔽,改坏一道测试照样绿。)
             # 推送用第一行(取符号与链名),快照对该人这个 mint 的**全部**行一起前移。
             # ⚠️ rows 有多行只在一种退化情况下发生:同一个人在两条链上持有同一个地址串
             #    (swap-api 的 URL 里只有 mint、没有 chainId,它自己也不区分)。
             #    那时逐行推等于把同一笔成交说两遍,所以只推一次。
             fresh = self._pick_fresh(per_user.get(w.user_id, []), w, mint, cutoff_ts, done)
-            ok, n = self._push(w, rows[0], fresh)
+            ok, n, tried = self._push(w, rows[0], fresh, budget - used)
             sent += n
+            used += tried
             if ok:
                 # 推干净了(或本来就没有该推的)→ 这个人这个 mint 的快照可以前移
                 with store.get_conn() as conn, store.tx(conn):
                     store.upsert_pump_positions(conn, w.user_id, [_snap_row(p) for p in rows])
-        return sent
+        return sent, used
 
     def _pick_fresh(self, trades: list[Trade], w: _Watched, mint: str,
                     cutoff_ts: float, done: set) -> list[Trade]:
@@ -685,8 +742,12 @@ class PumpWatcher:
         ⚠️ 金额门槛用 `is not None and >=`:拿不到金额就证明不了它过线,
            不推并留痕(实测响应里这个字段一条都不缺,真出现说明上游变了)。
            **绝不用真值判断** —— 金额恰好是 0 的成交存在,那是真实值不是缺失。
+        ⚠️⚠️ 台账只挡**跨轮**重复(done 是轮首读的一份快照),所以这里必须自己挡
+           **轮内**重复:上游在同一个数组里给出两条同 tx 同 slotIndexId 的行,
+           或者同一笔成交同时挂在这个人的两个钱包名下,不去重就是两条一模一样的消息。
         """
         out = []
+        seen = set()
         for t in trades:
             if t.traded_ts <= cutoff_ts:
                 continue
@@ -695,14 +756,20 @@ class PumpWatcher:
                 continue
             if t.amount_usd < self._min_usd:
                 continue
-            if t.ledger_key(w.user_id, mint) in done:
+            key = t.ledger_key(w.user_id, mint)
+            if key in done or key in seen:
                 continue
+            seen.add(key)
             out.append(t)
         return sorted(out, key=lambda x: (x.traded_ts, x.tx))
 
-    def _push(self, w: _Watched, pos: Position, fresh: list[Trade]) -> tuple[bool, int]:
+    def _push(self, w: _Watched, pos: Position, fresh: list[Trade],
+              budget: int) -> tuple[bool, int, int]:
         """
-        逐笔推送。返回 (是否全都推成功了, 真正发出去的条数)。
+        逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
+
+        budget 是**本轮剩下的全局额度**(不是这个人这个币的额度)——
+        超出的部分本轮不发,靠 all_ok=False 让快照不前移、下一轮接着推。
 
         ⚠️⚠️ **推送成功才记台账**(与 poller._dispatch 的 `ok = notifier.send(...)`
            / `if ok:` 同一条铁律)。反过来写的话,一次 TG 400 或网络抖动
@@ -710,15 +777,15 @@ class PumpWatcher:
         """
         all_ok = True
         sent = 0
-        if len(fresh) > MAX_PUSH_PER_ROUND:
+        if len(fresh) > budget:
             # 一个人在一个币上一轮之内有几十笔(高频拆单)是可能的。截断只截**本轮**:
             # 返回 all_ok=False 让快照不前移,剩下的下一轮接着推(已推的那些被台账挡住),
             # 每轮都在推进,不会卡死也不会丢。
-            logger.warning("pump.fun {} 在 {} 上有 {} 笔待推,超过单轮上限 {} —— "
+            logger.warning("pump.fun {} 在 {} 上有 {} 笔待推,本轮只剩 {} 条额度 —— "
                            "本轮先推最早的 {} 笔,快照不前移、下一轮继续",
                            w.username or w.user_id, pos.coin_mint, len(fresh),
-                           MAX_PUSH_PER_ROUND, MAX_PUSH_PER_ROUND)
-            fresh, all_ok = fresh[:MAX_PUSH_PER_ROUND], False
+                           budget, budget)
+            fresh, all_ok = fresh[:budget], False
         for t in fresh:
             text = render_pump_trade(
                 username=w.username,
@@ -741,7 +808,7 @@ class PumpWatcher:
             with store.get_conn() as conn, store.tx(conn):
                 store.record_pump_pushed(
                     conn, [(w.user_id, pos.coin_mint, t.tx, t.slot_index_id, t.traded_at)])
-        return all_ok, sent
+        return all_ok, sent, len(fresh)
 
 
 # ============================================================

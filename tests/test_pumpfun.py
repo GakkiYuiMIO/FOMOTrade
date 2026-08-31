@@ -209,10 +209,29 @@ class Test解析:
         assert t_lower.price_usd == pytest.approx(2.852012996042046e-06)
 
     def test_金额恰好是0的成交要解析成0而不是缺失(self):
-        """0 是真实值(粉尘成交),真值判断会把它读成「没有这个字段」。"""
-        got = pf.parse_trades(trade_payload(usd="0", price="0"))[HEX_SVM][0]
+        """
+        0 是真实值(粉尘成交),真值判断会把它读成「没有这个字段」。
+
+        ⚠️⚠️ 这里必须传**真正的 0**,不能传字符串 "0" —— `"0"` 的真值是 True,
+           拿它去测「用 `in` 判存在还是用真值判断」根本测不出区别(本项目踩过:
+           把 `if n in row` 改成 `if row.get(n)` 之后这条用例照样全绿)。
+        """
+        got = pf.parse_trades(trade_payload(usd=0, price=0))[HEX_SVM][0]
         assert got.amount_usd == 0.0
         assert got.price_usd == 0.0
+
+    def test_缺type字段的方向必须是未知而不是默认成买入(self):
+        """
+        ⚠️⚠️ 猜错方向比不说方向糟得多:默认成 "buy" 的话,一笔卖出会被说成买入。
+           渲染器那头「没见过的方向 → 中性措辞」有用例钉着,**解析器这头**
+           一直没有 —— 把 `side.lower() if side else None` 改成 `else "buy"`
+           整套用例照样全绿。
+        """
+        missing = trade_payload()
+        missing[HEX_SVM][0].pop("type")
+        assert pf.parse_trades(missing)[HEX_SVM][0].side is None
+        # 上游给空串也是"没说方向",同样不许猜
+        assert pf.parse_trades(trade_payload(side=""))[HEX_SVM][0].side is None
 
     def test_持仓解析完全不看summary里的positionCount(self):
         """
@@ -356,6 +375,22 @@ class Test已推台账:
         assert pf.PumpWatcher(tg, client).run_once() == 2
         assert {r["slot_index_id"] for r in ledger_rows()} == {"0001", "0002"}
 
+    def test_同一轮里重复出现的同一笔只推一次(self, db, cfg):
+        """
+        ⚠️⚠️ 跨轮由台账挡着,**轮内不挡**:done 只在轮首读一次,
+           推送边发边写台账却不回填 done,而候选列表本身也不去重。
+           上游把同一行给两遍(同 tx 同 slotIndexId)就是两条一模一样的消息。
+        """
+        seeded_user()
+        payload = trade_payload(tx="TX_DUP", slot="0007")
+        payload[HEX_SVM].append(dict(payload[HEX_SVM][0]))       # 逐字段相同的第二行
+        client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+                            trades={MINT_SOL: payload})
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 1
+        assert len(tg.sent) == 1
+        assert len(ledger_rows()) == 1
+
 
 class Test只推被盯的人:
     def test_名单外地址的成交一条都不推(self, db, cfg):
@@ -409,6 +444,26 @@ class Test只推被盯的人:
         assert "hexiecs" in tg.sent[0]
         assert {r["tx"] for r in ledger_rows()} == {"EVM_TX"}
 
+    def test_两个人共用一个钱包时两个人都要拿到这笔成交(self, db, cfg):
+        """
+        ⚠️⚠️ 「重复地址只认先加进来的那个」是条静默丢数据的路:后加的那个人在
+           归属阶段拿到空列表 → _push 返回「本来就没有该推的」→ **快照照常前移** →
+           这笔变动对他永久消失,下一轮也不会重来。
+           名单里两个人共用一个钱包,那就是同一个钱包的两个身份,
+           两个人都是用户自己加进来的,两条都该发出去。
+        """
+        seeded_user()
+        seeded_user(username="影子", uid="uid-2", svm=HEX_SVM, evm=None)
+        client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+                            trades={MINT_SOL: trade_payload(tx="SHARED")})
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 2
+        assert len(tg.sent) == 2
+        assert {r["user_id"] for r in ledger_rows()} == {HEX_UID, "uid-2"}
+        # 两条消息各自说的是各自的名字,绝不能把一条重复两遍
+        assert any("hexiecs" in t for t in tg.sent)
+        assert any("影子" in t for t in tg.sent)
+
 
 class Test门槛与窗口:
     def test_门槛设成0时金额恰好为0的成交照样推(self, db, cfg):
@@ -416,11 +471,14 @@ class Test门槛与窗口:
         ⚠️⚠️ 「拿不到金额」与「金额是 0」是两件事,判空必须 is None。
            用真值判断的话,把门槛调到 0(= 明确表示"什么都想看")之后,
            粉尘成交会被当成"缺字段"静默丢掉 —— 而用户要的恰恰是它们。
+        ⚠️⚠️ 金额传的必须是**真正的 0**,不是字符串 "0":`"0"` 的真值是 True,
+           传字符串的话 `if n in row` 与 `if row.get(n)` 表现一模一样,
+           这条用例就测不到它自称要测的那个区别(本项目踩过)。
         """
         cfg(FOMO_PUMP_MIN_USD="0")
         seeded_user()
         client = FakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
-                            trades={MINT_SOL: trade_payload(usd="0", price="0")})
+                            trades={MINT_SOL: trade_payload(usd=0, price=0)})
         tg = FakeNotifier()
         assert pf.PumpWatcher(tg, client).run_once() == 1
         assert "$0.00" in tg.sent[0]
@@ -563,6 +621,82 @@ class Test请求预算:
         assert pf.PumpWatcher(tg, client).run_once() == 5      # 下一轮把剩下的推完
         assert len(ledger_rows()) == 25
 
+    def test_单轮上限是全局的两个mint加起来也不许超(self, db, cfg):
+        """
+        ⚠️⚠️ 上限的语义是「一轮最多发几条消息(**所有人合计**)」,它存在的唯一理由
+           是防刷屏 —— 而刷屏不认 mint 边界。只在"处理每个 mint 之前"判一次的话,
+           最后一个 mint 自己还能再发满一轮:19 + 20 = 39 条,
+           而日志还在说「本轮先推最早的 20 笔」。
+        """
+        seeded_user()
+        mint_b = "MintBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbpump"   # 排序在 MINT_SOL 之后
+        first = trade_payload(tx="A0", slot="0")
+        first[HEX_SVM] = [{**first[HEX_SVM][0], "tx": f"A{i}", "slotIndexId": str(i)}
+                          for i in range(19)]
+        second = trade_payload(tx="B0", slot="0")
+        second[HEX_SVM] = [{**second[HEX_SVM][0], "tx": f"B{i}", "slotIndexId": str(i)}
+                           for i in range(40)]
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(mint=MINT_SOL, held=2.0),
+                                                  pos_row(mint=mint_b, held=3.0))},
+            trades={MINT_SOL: first, mint_b: second},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 20     # 写死字面量,不从模块取
+        assert len(tg.sent) == 20
+        assert len(ledger_rows()) == 20
+
+    def test_同一个mint上两个人分着用同一份预算(self, db, cfg):
+        """
+        ⚠️⚠️ 单个 mint 内部按"人"再循环一次,每个人各自还能推满一轮 ——
+           所以"一个 mint 最多 20 条"也是错的,盯 N 个人就是 20×N 条。
+           上限必须是**整轮一份预算,谁先用谁扣掉**。
+
+        ⚠️ 两个人各 15 笔(而不是各 25 笔)是刻意的:各 25 笔的话第一个人一次就把
+           预算用光,后面那个人被任何一道"见底就跳过"的闸挡住都能让总数停在 20 ——
+           于是"预算有没有真的扣减"根本测不出来(实测:把传给第二个人的额度写成
+           整轮预算,各 25 笔那版用例照样全绿)。15 + 15 才逼出**扣减**本身:
+           第一个人拿 20 剩 5,第二个人只能拿到那 5 条。
+        """
+        seeded_user()
+        seeded_user(username="brc20niubi", uid="uid-2", svm="BQ4Kzz", evm="0x" + "b" * 40)
+        mine = trade_payload(addr=HEX_SVM, tx="M0", slot="0")
+        mine[HEX_SVM] = [{**mine[HEX_SVM][0], "tx": f"M{i}", "slotIndexId": str(i)}
+                         for i in range(15)]
+        his = trade_payload(addr="BQ4Kzz", tx="H0", slot="0")
+        his["BQ4Kzz"] = [{**his["BQ4Kzz"][0], "tx": f"H{i}", "slotIndexId": str(i)}
+                         for i in range(15)]
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(held=2.0)),
+                        "BQ4Kzz": position_payload(pos_row(held=7.0))},
+            trades={MINT_SOL: {**mine, **his}},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 20     # 15 + 5,不是 15 + 15
+        assert len(tg.sent) == 20
+        # 先来的推干净了 → 快照前移;后面那个被截断 → 快照不前移,剩下 10 条下一轮补
+        assert snapshot_keys(HEX_UID) == {("1399811149", MINT_SOL)}
+        assert snapshot_keys("uid-2") == set()
+
+    def test_预算用光之后剩下的mint连逐笔请求都不打(self, db, cfg):
+        """
+        ⚠️ 上限不只是"少发几条消息":超限的 mint 本轮**整个不处理**,
+           那一个逐笔请求也省下来了(变动的 mint 数 = 本轮的额外请求数)。
+        """
+        seeded_user()
+        mint_b = "MintBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbpump"   # 排序在 MINT_SOL 之后
+        first = trade_payload(tx="A0", slot="0")
+        first[HEX_SVM] = [{**first[HEX_SVM][0], "tx": f"A{i}", "slotIndexId": str(i)}
+                          for i in range(25)]
+        client = FakeClient(
+            portfolios={HEX_SVM: position_payload(pos_row(mint=MINT_SOL, held=2.0),
+                                                  pos_row(mint=mint_b, held=3.0))},
+            trades={MINT_SOL: first, mint_b: trade_payload(tx="B0")},
+        )
+        tg = FakeNotifier()
+        assert pf.PumpWatcher(tg, client).run_once() == 20
+        assert [m for m, _addrs in client.trade_calls] == [MINT_SOL]
+
     def test_没有变动就一个逐笔请求都不打(self, db, cfg):
         seeded_user()
         with store.get_conn() as conn, store.tx(conn):
@@ -674,6 +808,76 @@ class TestHTTP层:
         assert params["sortBy"] == "RECENCY"
         assert params["page"] == 0
 
+    def test_逐笔请求体里两个钱包一个都不能少(self, cfg):
+        """
+        ⚠️⚠️ EVM 链上的成交**只挂在 canonical_evm_wallet 名下**(实测 1000XCryptoD
+           在 BSC 的 QQQB:传 SVM 得到 `[]`,传 EVM 才拿到那笔 $1.46 的 buy)。
+           少传一个 = 整条 EVM 侧的成交永久静默丢失,不报错、不告警。
+        ⚠️⚠️ 这条必须打在**真 client 的请求体**上:上层用例喂的是假 client,
+           压根走不到 fetch_trades 里那句 `json=`,把它改成 `list(addresses)[:1]`
+           照样全绿(本项目踩过)。
+        """
+        c, sess = self._client(_FakeResp(201, {}))
+        c.fetch_trades(MINT_SOL, [HEX_SVM, HEX_EVM])
+        method, _url, kw = sess.calls[0]
+        assert method == "post"
+        assert kw["json"]["userAddresses"] == [HEX_SVM, HEX_EVM]
+
+    def test_用户键里的路径分隔符不许拼出别的端点(self, cfg):
+        """
+        ⚠️⚠️ key 直接来自 Telegram 消息。原样拼进路径的话,
+           `/pump add ../../following-positions/alerts` 会拼出
+           `…/users/../../following-positions/alerts` —— curl 把 `..` 正规化掉之后,
+           打的正是那个**需要登录**的端点(实测 401)。
+           白名单挡在发请求之前:非法的键**一个字节都不发出去**。
+        """
+        c, sess = self._client(_FakeResp(200, _load("pump_user_profile.json")))
+        for bad in ("../../following-positions/alerts", "hexiecs/../x", "a b",
+                    "hexiecs?x=1", "", "  "):
+            assert c.resolve_user(bad) is None
+        assert sess.calls == []
+
+    def test_合法的名字与两种钱包地址照常反查(self, cfg):
+        """白名单不能把正常的键也挡掉 —— 挡掉了这个功能就没法用了。"""
+        c, sess = self._client(_FakeResp(200, _load("pump_user_profile.json")))
+        for good in ("hexiecs", "1000XCryptoD", "brc20_niubi", HEX_SVM, HEX_EVM):
+            assert c.resolve_user(good) is not None
+        assert [url.rsplit("/", 1)[-1] for _m, url, _kw in sess.calls] == [
+            "hexiecs", "1000XCryptoD", "brc20_niubi", HEX_SVM, HEX_EVM]
+
+    def test_传输层异常也当成拉取失败而不是往上抛(self, cfg):
+        """
+        ⚠️⚠️ 真实世界的失败绝大多数是 TimeoutError / ConnectionResetError 这类
+           **传输层异常**,不是 JSON 解析错。把 `except Exception` 收窄成
+           `except ValueError` 之后,一个人的网络抖动会顺着
+           _candidates → _check 一路炸上去 —— 本轮别人的成交本来是推得出来的。
+           (原来一条驱动这条路的用例都没有,收窄之后 56 条 pump 用例全绿。)
+        """
+        class _BoomSession:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def get(self, url, **kw):
+                raise self.exc
+
+            def post(self, url, **kw):
+                raise self.exc
+
+            def close(self):
+                pass
+
+        for exc in (TimeoutError("超时"), ConnectionResetError("对端断开"),
+                    OSError("网络不可达")):
+            c = pf.PumpClient(proxy="")
+            # ⚠️ 每次都要重新塞:_json 失败后会 close() 把线程本地的 session 置空,
+            #    不重塞的话下一句就去建**真的** curl 会话、真的打网络了。
+            c._tl.session = _BoomSession(exc)
+            assert c.fetch_portfolio(HEX_SVM) is None
+            c._tl.session = _BoomSession(exc)
+            assert c.fetch_trades(MINT_SOL, [HEX_SVM]) is None
+            c._tl.session = _BoomSession(exc)
+            assert c.resolve_user("hexiecs") is None
+
     def test_只打公开端点绝不碰要登录的那些(self, cfg):
         """
         ⚠️ 实测 /following-positions/alerts 需要登录(401)。本模块只用免鉴权端点,
@@ -726,6 +930,26 @@ class Test推送文案:
         assert "$0.0000285" in out
         assert "2026-08-31 01:59 UTC" in out
         assert "SIG_ABC" in out
+
+    def test_粉尘金额按有效数字渲染绝不塌成两位小数的0(self):
+        """
+        ⚠️⚠️ 真实夹具里就有 amountUSD=0.0000028483994 这一笔卖出。
+           金额行按两位小数 quantize 会把它渲染成「💰 金额 $0.00」——
+           一行**看起来像缺失值的真实值**,与「缺失整行消失、绝不打 0」的观感
+           直接打架。单价行早就有有效数字处理,金额行也得有。
+        """
+        assert "金额 $0.000002848" in self._render(amount_usd=0.0000028483994)
+        assert "金额 $0.004999" in self._render(amount_usd=0.004999)
+        # ⚠️ 边界:quantize 是 banker's rounding,恰好 0.005 也会塌成 $0.00,
+        #    所以它同样得走有效数字那条路(写死 `< 0.005` 的阈值会正好在这里漏一个)
+        assert "金额 $0.005" in self._render(amount_usd=0.005)
+        # 够得着两位小数的金额照旧,别把正常金额也改成有效数字
+        assert "金额 $1,234.50" in self._render(amount_usd=1234.5)
+        assert "金额 $0.01" in self._render(amount_usd=0.0051)
+
+    def test_金额真的是0时照常显示0(self):
+        """⚠️ 0 是真实值不是缺失,它必须显示出来 —— 别被上一条带偏成"小额一律有效数字"。"""
+        assert "金额 $0.00" in self._render(amount_usd=0)
 
     def test_CA独占最后一行且完整(self):
         out = self._render()
