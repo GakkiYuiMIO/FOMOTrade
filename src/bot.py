@@ -103,6 +103,7 @@ _COMMAND_MENU = [
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
     ("unstar", "取消特别关注:/unstar <handle>"),
     ("tin", "转入推送:/tin <handle> 开关 · /tin 看当前开着谁"),
+    ("pump", "pump.fun 名单:/pump 看名单 · /pump add|del <名字或钱包>"),
     ("del", "移出监控:/del <handle>"),
     ("rebuild", "重建全部历史基线(回填逻辑改动后用)"),
     ("help", "命令说明"),
@@ -137,6 +138,7 @@ _HELP = (
     "/unstar &lt;handle&gt; — 取消特别关注\n"
     "/tin &lt;handle&gt; — 开/关这个人的<b>转入逐条推送</b>(再发一次即关闭);"
     "/tin 不带参数=看当前开着谁\n"
+    "/pump — <b>pump.fun</b> 买卖监控名单;/pump add|del &lt;名字或钱包&gt;\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
     "/status — 运行状态\n"
@@ -381,17 +383,22 @@ _CHIPS_PCT_FLOOR = 0.0001
 class CommandBot:
     """Telegram 命令处理器。由 cli.py 起一个 daemon 线程跑 run_forever()"""
 
-    def __init__(self, client, notifier, poller=None) -> None:
+    def __init__(self, client, notifier, poller=None, pump_client=None) -> None:
         """
         poller 是可选的:只用来在 /status 里读最近一次 tick 时间
         (该属性由 cli.cmd_run 的调度任务回填,不是 Poller 契约的一部分)。
         取不到就退化成"最近一条事件的入库时间",绝不因为拿不到它而让 /status 失败。
+
+        pump_client 同样可选:/pump add 要打 pump.fun 反查名字。
+        不传就在第一次用到时懒建(见 _pump)—— 不用这个命令的部署不必付
+        curl_cffi 的加载代价,单测也能直接注入一个离线桩。
         """
         self._client = client
         self._notifier = notifier
         self._poller = poller
         self._settings = get_settings()
         self._offset: int | None = None
+        self._pump_client = pump_client
 
     # ============================================================
     # 主循环
@@ -613,6 +620,11 @@ class CommandBot:
             return self._cmd_star(arg, on=False)
         if cmd == "/tin":
             return self._cmd_tin(arg)
+        # ⚠️ 刻意**只烧一个命令名 + 子命令**,不做 /padd /pdel /plist:
+        #    `/plist` 与 `/list` 只差一个字母,最容易手滑,而误用的后果是
+        #    「往错的平台加了人」—— pump 的名单与 FOMO 的名单是两张互不相干的表。
+        if cmd == "/pump":
+            return self._cmd_pump(arg)
         if cmd == "/list":
             return self._cmd_list()
         if cmd == "/status":
@@ -1188,6 +1200,109 @@ class CommandBot:
             lines.append(f"{i}. <b>{_esc(name)}</b> @{_esc(r['handle'])}")
         lines.append("再发一次 /tin &lt;handle&gt; 即可关闭。")
         return "\n".join(lines)
+
+    def _cmd_pump(self, arg: str) -> str:
+        """
+        /pump —— pump.fun 买卖监控的名单与增删。
+
+        ⚠️⚠️ 这是**另一个平台的另一张名单**,与 /add /del /list 操作的 watch_users
+           没有任何关系:那张表的主键是 FOMO 的 UUID,被 fomo_events / user_token_stats /
+           copytrade 一路当聚合键;pump 的人混进去会让 poller 拿 Solana 钱包去问
+           fomo.family,404 之后把这个人标成「账号已不存在」(表注释里写了完整理由)。
+           所以命令也刻意分开:错的命令名会把人加到错的平台去。
+        ⚠️ 只推通知,**永远不下单**(与 /copy 那条链没有任何交集)。
+        """
+        sub, _, rest = (arg or "").strip().partition(" ")
+        sub = sub.strip().lower()
+        rest = rest.strip()
+        if sub in ("add", "del", "rm", "remove"):
+            if not rest:
+                return f"用法: /pump {_esc(sub)} &lt;名字或钱包&gt;"
+            return (self._pump_add(rest) if sub == "add" else self._pump_del(rest))
+        if sub:
+            return "用法: /pump 看名单 · /pump add &lt;名字或钱包&gt; · /pump del &lt;名字或钱包&gt;"
+        return self._pump_list()
+
+    def _pump_list(self) -> str:
+        s = self._settings
+        with store.get_conn() as conn:
+            rows = store.list_pump_users(conn)
+        head = "🎯 <b>pump.fun 买卖监控</b>"
+        if not rows:
+            return (
+                f"{head}:当前一个人都没加\n"
+                "/pump add &lt;名字或钱包&gt; 加人 —— 他在 pump.fun 上每成交一笔就推一条。\n"
+                f"门槛 ${s.fomo_pump_min_usd:,.2f} · 巡检 {s.fomo_pump_interval_sec}s\n"
+                "⚠️ 第一轮只记下当前持仓、<b>一条都不推</b>,之后的买卖才会推。"
+            )
+        lines = [f"{head}({len(rows)} 人) · 门槛 ${s.fomo_pump_min_usd:,.2f}"
+                 f" · 巡检 {s.fomo_pump_interval_sec}s"]
+        if not s.fomo_pump_enabled:
+            # ⚠️ 必须说出来:名单加了人却没开开关,用户会一直等一条永远不来的推送
+            lines.append("⚠️ <b>总开关未打开</b>,现在不会巡检 —— "
+                         "到 .env 设 <code>FOMO_PUMP_ENABLED=true</code> 后重启")
+        for i, r in enumerate(rows[:MAX_LIST_ROWS], 1):
+            name = r["username"] or r["user_id"]
+            # 播种状态要显示:没播过种的人这一轮不会有任何推送,不说清楚会被当成坏了
+            state = "✅就绪" if r["seeded"] else "⏳首轮记录中"
+            lines.append(f"{i}. <b>{_esc(name)}</b> · {state}")
+        if len(rows) > MAX_LIST_ROWS:
+            lines.append(f"…另有 {len(rows) - MAX_LIST_ROWS} 人未显示")
+        lines.append("/pump del &lt;名字或钱包&gt; 移出。")
+        return "\n".join(lines)
+
+    def _pump_add(self, key: str) -> str:
+        """
+        /pump add <名字或钱包> —— 反查 → 落库 → 回执。
+
+        ⚠️ 主键存 pump 的 userId(UUID),**不是用户名**:接口自己返回
+           last_username_update_timestamp,证明用户名可被本人改 ——
+           拿它当主键等于改个名就换了个人。
+        ⚠️ 两个 canonical 钱包都要存:EVM 链上的成交只挂在 canonical_evm_wallet 名下,
+           只存 SVM 的话那半边成交永久静默丢失(pumpfun.py 顶部有实测)。
+        """
+        profile = self._pump().resolve_user(key)
+        if profile is None:
+            return (f"❌ pump.fun 上找不到 <b>{_esc(key)}</b>"
+                    "(名字拼错?或者他改名了 —— 换钱包地址试试)")
+        with store.get_conn() as conn, store.tx(conn):
+            added = store.add_pump_user(conn, profile.user_id, profile.username,
+                                        profile.svm_wallet, profile.evm_wallet)
+        name = _esc(profile.username or profile.user_id)
+        if not added:
+            return f"ℹ️ <b>{name}</b> 已在 pump.fun 监控中"
+        return (
+            f"✅ 已加入 pump.fun 监控 <b>{name}</b>\n"
+            "⏳ 下一轮先把他<b>当前的持仓记为已知、一条都不推</b>,"
+            "再之后的买卖才会逐笔推送"
+        )
+
+    def _pump_del(self, key: str) -> str:
+        """/pump del —— 软删除(行留着,再 add 回来会重新播种,不会补推这期间的变动)。"""
+        with store.get_conn() as conn:
+            row = store.find_pump_user(conn, key)
+            if row is None:
+                return f"❌ pump.fun 监控里没有 <b>{_esc(key)}</b>"
+            with store.tx(conn):
+                removed = store.remove_pump_user(conn, row["user_id"])
+        name = _esc(row["username"] or row["user_id"])
+        if not removed:
+            return f"ℹ️ <b>{name}</b> 本来就不在 pump.fun 监控中"
+        return f"✅ 已移出 pump.fun 监控 <b>{name}</b>"
+
+    def _pump(self):
+        """
+        懒建 PumpClient —— 没人用 /pump 就不必付 curl_cffi 的加载代价。
+
+        ⚠️ 与推送侧的 PumpWatcher **各用各的实例**:两者跑在不同线程上,
+           而 libcurl 的 easy handle 不能跨线程共用(PumpClient 内部按线程分 Session,
+           共用一个实例其实也安全,但分开更省心且没有任何代价)。
+        """
+        if self._pump_client is None:
+            from src.pumpfun import PumpClient
+
+            self._pump_client = PumpClient()
+        return self._pump_client
 
     def _cmd_list(self) -> str:
         with store.get_conn() as conn:

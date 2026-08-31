@@ -160,6 +160,46 @@ class FomoSettings(BaseSettings):
         description="板块标注配置,格式 rankType:tabId:显示名,逗号分隔;留空则不标注",
     )
 
+    # ---------- pump.fun 指定用户买卖监控 ----------
+    # ⚠️⚠️ 与转入告警、币安 Alpha 同一条理由:**刻意不放进 CopyConfig**。
+    #    CopyConfig 是会花钱的跟单开关,放进去迟早有人顺手把它接进执行器;
+    #    这个信号永远只推通知,绝不参与下单判定。
+    # ⚠️⚠️ 默认 **False**(与 alpha 的 True 刻意不同):这是新加的功能,
+    #    老库升级后行为必须逐字节不变 —— 谁也不该因为拉了个新版本就突然多收一路推送。
+    #    要用就自己在 .env 里打开,并且先 /pump add 把人加进来(名单空 = 一个请求都不打)。
+    fomo_pump_enabled: bool = Field(False, description="pump.fun 指定用户买卖推送总开关")
+    # 60 秒。⚠️ 不能跟 FOMO 轮询共用 27 秒:pump 持仓变动是小时级事件,
+    #    27 秒一次纯粹是白挨 pump 的限流(portfolio 端点 60 次/分)。
+    #    下限 30s 是防手滑写个 5 进去把限流打穿。
+    fomo_pump_interval_sec: int = Field(
+        60, ge=30, description="pump.fun 巡检间隔(秒)"
+    )
+    # 单笔成交的美元门槛。低于此**不推**。
+    # ⚠️ 与 fomo_transfer_watch_min_usd 毫无关系,绝不复用:那个问的是 FOMO 平台上
+    #    「这个人又收到货了没有」,这个问的是「他在 pump.fun 上真金白银成交了多少」——
+    #    共用一个值意味着调其中一个功能的灵敏度会**静默**改掉另一个。
+    # ⚠️ $50 的来由:实测 pump.fun 逐笔里存在 $0.0000028 这种粉尘级成交
+    #    (探针实测的 PUNCHMA 卖出就是),不设门槛会被灰尘刷屏。
+    fomo_pump_min_usd: float = Field(
+        50.0, ge=0, description="pump.fun 单笔成交金额下限(美元),低于此不推送"
+    )
+    # 一轮最多对几个"变动的 mint"去问逐笔成交。
+    # ⚠️ 这是**请求预算的闸**,不是防御性编程:变动的 mint 数直接等于本轮的额外请求数。
+    #    一个人某天批量清仓几十个币时,不夹这道闸就是一轮打几十个请求。
+    #    超限的部分本轮不查(下一轮它们仍然与快照不一致,还会被选中),不会丢。
+    fomo_pump_max_mints: int = Field(
+        8, ge=1, description="pump.fun 单轮最多处理多少个变动的 mint"
+    )
+    # 成交的新鲜窗口(秒)。只推这个窗口之内的成交。
+    # ⚠️⚠️ 必须有:swap-api 返回的是该 mint 上这个人的**一段历史**,不是"刚刚那笔"。
+    #    没有窗口的话,一个持有半年的币今天动一下,半年前的成交会被整段推出来。
+    # ⚠️ 代价要说清楚:进程停机超过这个窗口再启动,停机期间的成交会被判成"过旧"而不推
+    #    (快照仍然照常前移)。这是刻意的取舍 —— 停机一天之后收到几百条隔夜成交,
+    #    用户会当场静音,那比漏推更糟。
+    fomo_pump_trade_max_age_sec: int = Field(
+        7200, ge=60, description="pump.fun 成交新鲜窗口(秒),超过此年龄的成交不推送"
+    )
+
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")
 

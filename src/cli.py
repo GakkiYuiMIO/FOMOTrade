@@ -870,12 +870,40 @@ def cmd_run() -> int:
             next_run_time=datetime.now(UTC),  # 第一轮只播种水位线,不会推任何东西
         )
 
+    # ---- 第四个 job:pump.fun 指定用户的买卖 ----
+    # ⚠️ 与上面那个 Alpha job 同样的三条理由,一条不落:
+    #   1) tick 里的 except AuthError 会 sched.shutdown() —— pump.fun 抖一下
+    #      绝不该有权力停掉整条 FOMO 推送链路;
+    #   2) tick 实测 5~18s / 间隔 27s,余量本来就只剩几秒,再挂外部请求就溢出;
+    #   3) 节奏差两个量级:FOMO 是 27 秒级,pump 持仓变动是小时级 ——
+    #      27 秒打一次纯属白挨 pump 的限流(portfolio 端点 60 次/分)。
+    # ⚠️ 总开关默认 **False**:老库升级后行为逐字节不变,由用户显式打开。
+    #    名单为空时 run_once 一个请求都不打(第一句就 return 0),开着也不费什么。
+    pump_watcher = None
+    if s.fomo_pump_enabled:
+        from src.pumpfun import PumpWatcher
+
+        pump_watcher = PumpWatcher(notifier)
+        sched.add_job(
+            # run_once 契约上**绝不抛异常**(自己吞掉并记日志),所以这里不再包一层
+            pump_watcher.run_once, "interval",
+            seconds=s.fomo_pump_interval_sec,
+            id="pumpfun",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=s.fomo_pump_interval_sec,
+            next_run_time=datetime.now(UTC),  # 第一轮只播种持仓,不会推任何东西
+        )
+
     logger.info("=" * 60)
     logger.info("FOMO 监控启动 | 轮询 {}s | client={} | Ctrl+C 退出",
                 s.fomo_poll_interval_sec, s.fomo_client_impl)
     if alpha_watcher is not None:
         logger.info("币安 Alpha 上新监控已启用 | 巡检 {}s | 板块标注 {} 个",
                     s.fomo_alpha_interval_sec, len(s.alpha_sectors))
+    if pump_watcher is not None:
+        logger.info("pump.fun 买卖监控已启用 | 巡检 {}s | 门槛 ${:.2f} | 单轮最多 {} 个变动 mint",
+                    s.fomo_pump_interval_sec, s.fomo_pump_min_usd, s.fomo_pump_max_mints)
     logger.info("=" * 60)
     try:
         sched.start()
@@ -897,6 +925,9 @@ def cmd_run() -> int:
         if alpha_watcher is not None:
             with suppress(Exception):
                 alpha_watcher.close()
+        if pump_watcher is not None:
+            with suppress(Exception):
+                pump_watcher.close()
     logger.info("已退出")
     return 0
 
