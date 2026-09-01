@@ -510,20 +510,25 @@ def _market_cap_line(ev: FomoEvent) -> str | None:
 
 def _pool_quote_line(symbol, name) -> str | None:
     """
-    🌊 底池 · NVDA · NVIDIA • Robinhood Token
+    🌊 底池 · WYFI · WhiteFiber, Inc.
 
-    这个币最深的那个池子对面摆的是什么。对手是代币化的英伟达股票,意味着 NVDA 一跌
-    它就跟着跌 —— 与一个对着 BNB / SOL 的币是**两种风险**。
+    这个币最深的那个池子对面摆的是**哪家公司的股票**。$Rabbit 的底池对着 WYFI
+    (代币化的 WhiteFiber 股票),意味着 WYFI 一跌它就跟着跌 —— 与一个对着
+    BNB / SOL 的币是**两种风险**。
 
-    ⚠️⚠️ 符号与全名都是 **DexScreener 返回的第三方字符串**,必须 _clip:
+    ⚠️ `name` 这里收的是**公司/产品名**(WhiteFiber, Inc.),不是上游原文
+       "WhiteFiber, Inc. • Robinhood Token" —— 后缀是判据不是信息,剥在数据层
+       (dexscreener.notable)。本模块是纯展示,给什么画什么(铁律 7)。
+    ⚠️⚠️ 符号与公司名**仍然是第三方字符串**(剥了后缀不等于变干净了),必须 _clip:
        叠平空白 → 限长 → 转义。少了转义,一个 `<` 就让整条消息 400(铁律 4);
-       少了限长,一个几千字符的 name 就能把消息顶破预算。
-    ⚠️ 全名与符号相同(去掉大小写和空白之后)时**只出符号** ——
+       少了限长,一个几千字符的 name 就能把消息顶破预算(实测最长的公司名
+       "Space Exploration Technologies Corp. Class A Common Stock" 就有 54 字符)。
+    ⚠️ 公司名与符号相同(去掉大小写和空白之后)时**只出符号** ——
        「NVDA · NVDA」是纯粹的重复,占一行却什么都没多说。
     ⚠️ 两个都没有 → 整行消失(铁律 2)。绝不退化成打一个地址:
        这一行的价值在于"对手是**什么东西**",一串 hex 回答不了这个问题。
-    ⚠️ 是否显示(常见计价资产要不要藏)**不在这里判** —— 那是数据层的判断,
-       落在 dexscreener.notable。本模块是纯展示,给什么画什么(铁律 7)。
+    ⚠️ 是否显示(对手够不够格占这一行)**不在这里判** —— 那是数据层的判断,
+       落在 dexscreener.notable。
     """
     sym = _clip(symbol, _SIG_SYMBOL_CHARS)
     full = _clip(name, _POOL_NAME_CHARS)
@@ -699,8 +704,8 @@ def render(
         baseline_pending 基线未就绪 → 末尾追加 ⏳ 尾行
         starred          特别关注 → 标题加 ⭐、币名加方括号。**纯展示**,
                          不影响徽章、共识、采集的任何判定
-        pool_quote_*     底池对手资产的符号与全名(见 _pool_quote_line)。
-                         ⚠️ 调用方只在对手**不是常见计价资产**时才传(dexscreener.notable);
+        pool_quote_*     底池对手的符号与**公司/产品名**(见 _pool_quote_line)。
+                         ⚠️ 调用方只在对手是**币股**时才传(dexscreener.notable);
                          本模块不做那个判断,也不做任何 IO(铁律 7)。
 
     ⚠️ 本函数**不得抛异常**。它在 poller 的发送循环里被调用,
@@ -1489,9 +1494,9 @@ def render_pump_trade(
         chain_display  链展示名的兜底(pump 只给数字 chainId,没有链名字段)
         traded_at      成交时刻 ISO;解析不出来 → 那一行整行消失
         now            渲染时刻(unix 秒),只用来算"多久之前"
-        pool_quote_*   底池对手资产的符号与全名(见 _pool_quote_line)。
-                       ⚠️ 与 FOMO 那条推送同一套:调用方只在对手**不是常见计价资产**
-                       时才传;判断落在 dexscreener.notable,不在这里
+        pool_quote_*   底池对手的符号与**公司/产品名**(见 _pool_quote_line)。
+                       ⚠️ 与 FOMO 那条推送同一套:调用方只在对手是**币股**时才传;
+                       判断落在 dexscreener.notable,不在这里
 
     ⚠️⚠️ **措辞铁律:只摆可证的事实,一个字都不许替用户下结论。**
        这里的数据是 swap-api 的逐笔成交(签名/时刻/方向/价格/金额),

@@ -1057,8 +1057,11 @@ class PumpWatcher:
         本轮这些 mint 的底池对手资产 → {内部链标识: {归一化地址: PoolQuote}}。
 
         ⚠️ 链取自持仓行的 network_id(已由 _CHAIN_ID_TO_NETWORK 归一化)。
-           取不到链的 mint 直接跳过 —— DexScreener 的 URL 里链是必填的,没链就没法问,
-           **绝不拿别的链去试**(实测拿错 slug 会返回 HTTP 200 + 空数组,白挨一次限流)。
+           取不到链的 mint 直接跳过 —— 没链就没法按 chainId 过滤响应,**绝不拿别的链去试**。
+        ⚠️⚠️ pump 覆盖的 solana / bsc / base 上都**没有**可靠的币股判据,
+           所以 lookup 在这几条链上一个请求都不发、也不会有这一行
+           (见 dexscreener.STOCK_NAME_MARKERS 里的调研记录)。这里的调用留着 ——
+           判据补上的那天,这一行和请求会一起自动回来。
         ⚠️⚠️ 整段包在 try 里,失败一律降级为空。
            **绝不能出现"因为查不到底池对手所以成交没推出去"**。
         """
@@ -1169,8 +1172,8 @@ class PumpWatcher:
             need = bool(fresh) and room > 0
             stats = self._coin_stats(mint) if need else None
             n_holders = len(observed.get(rows[0].key, ())) if need else None
-            # ⚠️ 只有对手**不是常见计价资产**时 notable 才给东西 ——
-            #    绝大多数 pump 币对着 SOL,那一行是噪音(见 dexscreener.notable)
+            # ⚠️ 只有对手是**币股**时 notable 才给东西 —— 绝大多数 pump 币对着 SOL,
+            #    那一行是噪音;而 pump 覆盖的这几条链目前都没有币股判据(见 dexscreener)
             pq = notable((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
             ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq)
             sent += n
