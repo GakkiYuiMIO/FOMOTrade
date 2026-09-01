@@ -1,0 +1,1818 @@
+{
+ "schemaVersion": "1.0.0",
+ "pairs": [
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xd5f829a0eac8f5326cc9eabcd1325fdcde43ce6b949187f5a36c114b0a98c290",
+   "pairAddress": "0xd5f829a0eac8f5326cc9eabcd1325fdcde43ce6b949187f5a36c114b0a98c290",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C",
+    "name": "SPDR S&P 500 ETF Trust • Robinhood Token",
+    "symbol": "SPY"
+   },
+   "priceNative": "0.00002572",
+   "priceUsd": "0.01947",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 1
+    },
+    "h1": {
+     "buys": 56,
+     "sells": 24
+    },
+    "h6": {
+     "buys": 329,
+     "sells": 236
+    },
+    "h24": {
+     "buys": 4040,
+     "sells": 2501
+    }
+   },
+   "volume": {
+    "h24": 2583855.7,
+    "h6": 201252.24,
+    "h1": 31339.76,
+    "m5": 113.59
+   },
+   "priceChange": {
+    "m5": -0.01,
+    "h1": 24.93,
+    "h6": -5.58,
+    "h24": -32.86
+   },
+   "liquidity": {
+    "usd": 371746.69,
+    "base": 10033977,
+    "quote": 233.03636
+   },
+   "fdv": 1947054,
+   "marketCap": 1947054,
+   "pairCreatedAt": 1788133560000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x37a4aabd26054207156e67e101d10444d865b585e5ceb3981d0ca28090690ef3",
+   "pairAddress": "0x37a4aabd26054207156e67e101d10444d865b585e5ceb3981d0ca28090690ef3",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01976",
+   "priceUsd": "0.01976",
+   "txns": {
+    "m5": {
+     "buys": 3,
+     "sells": 2
+    },
+    "h1": {
+     "buys": 25,
+     "sells": 16
+    },
+    "h6": {
+     "buys": 173,
+     "sells": 125
+    },
+    "h24": {
+     "buys": 1439,
+     "sells": 1315
+    }
+   },
+   "volume": {
+    "h24": 598755.74,
+    "h6": 47385.88,
+    "h1": 9927.4,
+    "m5": 500.83
+   },
+   "priceChange": {
+    "m5": -0.03,
+    "h1": 27.57,
+    "h6": 0.95,
+    "h24": -31.36
+   },
+   "liquidity": {
+    "usd": 25208.85,
+    "base": 577924,
+    "quote": 13788
+   },
+   "fdv": 1976247,
+   "marketCap": 1976247,
+   "pairCreatedAt": 1788147648000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x6c89a7a497266f991ece6291ba57682d894e0be1be986516677f23013b35e74e",
+   "pairAddress": "0x6c89a7a497266f991ece6291ba57682d894e0be1be986516677f23013b35e74e",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.03792",
+   "priceUsd": "0.03793",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 5,
+     "sells": 5
+    }
+   },
+   "volume": {
+    "h24": 651.89,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -3.24
+   },
+   "liquidity": {
+    "usd": 4975.55,
+    "base": 131157,
+    "quote": 0.4843
+   },
+   "fdv": 3793195,
+   "marketCap": 3793195,
+   "pairCreatedAt": 1788157542000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xf89d2bc1e89292790aea821be2566af249c0830fee4416ecb0ed49633a1490df",
+   "pairAddress": "0xf89d2bc1e89292790aea821be2566af249c0830fee4416ecb0ed49633a1490df",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.03587",
+   "priceUsd": "0.03587",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 96,
+     "sells": 80
+    }
+   },
+   "volume": {
+    "h24": 2976.87,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 13.42
+   },
+   "liquidity": {
+    "usd": 1000.11,
+    "base": 0.08745,
+    "quote": 999.9968
+   },
+   "fdv": 3587464,
+   "marketCap": 3587464,
+   "pairCreatedAt": 1788157364000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xb08c4be4cc9913b333357e876db9fc4f8c13a94e10c865f6de121c74dde994f0",
+   "pairAddress": "0xb08c4be4cc9913b333357e876db9fc4f8c13a94e10c865f6de121c74dde994f0",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01551",
+   "priceUsd": "0.01551",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 381,
+     "sells": 316
+    }
+   },
+   "volume": {
+    "h24": 9046.11,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -68.58
+   },
+   "liquidity": {
+    "usd": 238.4,
+    "base": 4268.7068,
+    "quote": 172.1593
+   },
+   "fdv": 1551510,
+   "marketCap": 1551510,
+   "pairCreatedAt": 1788178825000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x87a4cad27cb0806be0e4cfb93169b7eff24c3182c16a5f29f8c4476463b58689",
+   "pairAddress": "0x87a4cad27cb0806be0e4cfb93169b7eff24c3182c16a5f29f8c4476463b58689",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01998",
+   "priceUsd": "0.01998",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 5,
+     "sells": 1
+    },
+    "h6": {
+     "buys": 14,
+     "sells": 11
+    },
+    "h24": {
+     "buys": 266,
+     "sells": 195
+    }
+   },
+   "volume": {
+    "h24": 16276.08,
+    "h6": 87.57,
+    "h1": 21.29,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 32.08,
+    "h6": -0.96,
+    "h24": -54.13
+   },
+   "liquidity": {
+    "usd": 107.88,
+    "base": 1929.08825,
+    "quote": 69.3439
+   },
+   "fdv": 1998089,
+   "marketCap": 1998089,
+   "pairCreatedAt": 1788177408000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x8b0a9348e24ad93415d3d1873328db93ef74af450e918850d420556996b185c0",
+   "pairAddress": "0x8b0a9348e24ad93415d3d1873328db93ef74af450e918850d420556996b185c0",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000008042",
+   "priceUsd": "0.01989",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 3,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 16,
+     "sells": 6
+    },
+    "h24": {
+     "buys": 179,
+     "sells": 232
+    }
+   },
+   "volume": {
+    "h24": 11850.19,
+    "h6": 74.09,
+    "h1": 13.81,
+    "m5": 3.22
+   },
+   "priceChange": {
+    "m5": 4.99,
+    "h1": 23.76,
+    "h6": -2.24,
+    "h24": -25.07
+   },
+   "liquidity": {
+    "usd": 256.3,
+    "base": 6442.9522,
+    "quote": 0.05181
+   },
+   "fdv": 1989002,
+   "marketCap": 1989002,
+   "pairCreatedAt": 1788173456000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xd94e2610910af4134c13af7f937405a211e373c4d5c4269b168a4bdcf5b44c98",
+   "pairAddress": "0xd94e2610910af4134c13af7f937405a211e373c4d5c4269b168a4bdcf5b44c98",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000007370",
+   "priceUsd": "0.01822",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 1,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 3,
+     "sells": 2
+    },
+    "h24": {
+     "buys": 50,
+     "sells": 40
+    }
+   },
+   "volume": {
+    "h24": 430.79,
+    "h6": 18.75,
+    "h1": 7.89,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 12.01,
+    "h6": -1.44,
+    "h24": -43.55
+   },
+   "liquidity": {
+    "usd": 244.93,
+    "base": 6721.2413,
+    "quote": 0.04954
+   },
+   "fdv": 1822086,
+   "marketCap": 1822086,
+   "pairCreatedAt": 1788136099000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x5e597af5bc53bf25a4c47472f8e91569d372e31dd81eb0c92e5a943b0b3115b2",
+   "pairAddress": "0x5e597af5bc53bf25a4c47472f8e91569d372e31dd81eb0c92e5a943b0b3115b2",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00001028",
+   "priceUsd": "0.02505",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 24,
+     "sells": 22
+    }
+   },
+   "volume": {
+    "h24": 658.51,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -1.48
+   },
+   "liquidity": {
+    "usd": 436.8,
+    "base": 10450,
+    "quote": 0.07185
+   },
+   "fdv": 2505275,
+   "marketCap": 2505275,
+   "pairCreatedAt": 1788150949000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x238683a2a84417ce8d2e0315caf8782fce029c3cab0aedd2c259a8cdd38f7a2a",
+   "pairAddress": "0x238683a2a84417ce8d2e0315caf8782fce029c3cab0aedd2c259a8cdd38f7a2a",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01833",
+   "priceUsd": "0.01833",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 2,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 4,
+     "sells": 3
+    },
+    "h24": {
+     "buys": 41,
+     "sells": 30
+    }
+   },
+   "volume": {
+    "h24": 132.54,
+    "h6": 9.37,
+    "h1": 3.24,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 19.36,
+    "h6": 6.01,
+    "h24": -31.32
+   },
+   "liquidity": {
+    "usd": 71.18,
+    "base": 1941.5972,
+    "quote": 35.5959
+   },
+   "fdv": 1833178,
+   "marketCap": 1833178,
+   "pairCreatedAt": 1788147870000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x24d15ce8c86b1e323470b0938e42f88d600a21e042091774596fb1b4cfc04ac4",
+   "pairAddress": "0x24d15ce8c86b1e323470b0938e42f88d600a21e042091774596fb1b4cfc04ac4",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02242",
+   "priceUsd": "0.02243",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 9,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 40.64,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 34.83
+   },
+   "liquidity": {
+    "usd": 247.38,
+    "base": 5514.1192,
+    "quote": 123.6807
+   },
+   "fdv": 2243231,
+   "marketCap": 2243231,
+   "pairCreatedAt": 1788134406000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xd3508a6fa7ec08032bb2deb6b6d3380b228286e55a8e38849cfd2fc24f559bb3",
+   "pairAddress": "0xd3508a6fa7ec08032bb2deb6b6d3380b228286e55a8e38849cfd2fc24f559bb3",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000003130",
+   "priceUsd": "0.007663",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 4.85,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {},
+   "liquidity": {
+    "usd": 76.2,
+    "base": 4972.002424,
+    "quote": 0.01556
+   },
+   "fdv": 766314,
+   "marketCap": 766314,
+   "pairCreatedAt": 1788134335000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x1759dd05cad77d7297d2e65d2736bc789e836b0e205dc2b4576f709efd77903b",
+   "pairAddress": "0x1759dd05cad77d7297d2e65d2736bc789e836b0e205dc2b4576f709efd77903b",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00002014",
+   "priceUsd": "0.04970",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 1
+    }
+   },
+   "volume": {
+    "h24": 11.68,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 1356182072
+   },
+   "fdv": 4970030,
+   "marketCap": 4970030,
+   "pairCreatedAt": 1788193299000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x6f376fa4605802815f3fac0c6460f4a66434936442398a09922727254373991c",
+   "pairAddress": "0x6f376fa4605802815f3fac0c6460f4a66434936442398a09922727254373991c",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00001864",
+   "priceUsd": "0.04597",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 1
+    }
+   },
+   "volume": {
+    "h24": 11.57,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 1213923918
+   },
+   "fdv": 4597094,
+   "marketCap": 4597094,
+   "pairCreatedAt": 1788193429000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xa3a2d6b7d2669451aff77e1e58928d3d828662b495b16c1e8fbac453e8f38332",
+   "pairAddress": "0xa3a2d6b7d2669451aff77e1e58928d3d828662b495b16c1e8fbac453e8f38332",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00001777",
+   "priceUsd": "0.04388",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 1
+    }
+   },
+   "volume": {
+    "h24": 11.21,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 742567856
+   },
+   "fdv": 4388158,
+   "marketCap": 4388158,
+   "pairCreatedAt": 1788193193000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xe1581bab82ad3138b1e181ac0c54ae24d8b1ee331e6771bece915f66abf3573f",
+   "pairAddress": "0xe1581bab82ad3138b1e181ac0c54ae24d8b1ee331e6771bece915f66abf3573f",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.0000002458",
+   "priceUsd": "0.0006017",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 0.39,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {},
+   "liquidity": {
+    "usd": 0.05,
+    "base": 42.9374,
+    "quote": 1.055e-05
+   },
+   "fdv": 60174,
+   "marketCap": 60174,
+   "pairCreatedAt": 1788176440000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x7bf9458544fff21337765203e3a133bd0d595d3d23345d9398bdb6fd996bb1d5",
+   "pairAddress": "0x7bf9458544fff21337765203e3a133bd0d595d3d23345d9398bdb6fd996bb1d5",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "941258823869116781487525680.1181",
+   "priceUsd": "15753703898630328280546223.95",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 2,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 3,
+     "sells": 2
+    },
+    "h24": {
+     "buys": 3,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 50.01,
+    "h6": 50.01,
+    "h1": 17.25,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 1.0128173278780781e+29,
+    "h6": 1.0166987979337917e+29,
+    "h24": 1.0166987979337917e+29
+   },
+   "pairCreatedAt": 1788241408000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xc50f0fcefc3025560be21272e3577c3628f9924743651d2b42b758229abdf7ea",
+   "pairAddress": "0xc50f0fcefc3025560be21272e3577c3628f9924743651d2b42b758229abdf7ea",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.000000000000000000000000002938",
+   "priceUsd": "0.000000000000000000000000002939",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 236.94,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -100
+   },
+   "pairCreatedAt": 1788195120000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x9e4e85b71a44d2ccd8679b247fcb78b199a3821ec35f97b51de2e9cb315a0e33",
+   "pairAddress": "0x9e4e85b71a44d2ccd8679b247fcb78b199a3821ec35f97b51de2e9cb315a0e33",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000009562",
+   "priceUsd": "0.02375",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 1
+    },
+    "h24": {
+     "buys": 33,
+     "sells": 9
+    }
+   },
+   "volume": {
+    "h24": 136.84,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -0.52,
+    "h24": -12.69
+   },
+   "liquidity": {
+    "usd": 2.44,
+    "base": 51.504,
+    "quote": 0.0004925
+   },
+   "fdv": 2375141,
+   "marketCap": 2375141,
+   "pairCreatedAt": 1788134334000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x4251fdf6be7198aa3ce9a491d63fbe549330b9842e37059ac6834ea961af925e",
+   "pairAddress": "0x4251fdf6be7198aa3ce9a491d63fbe549330b9842e37059ac6834ea961af925e",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01505",
+   "priceUsd": "0.01506",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 12,
+     "sells": 12
+    }
+   },
+   "volume": {
+    "h24": 13.72,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -39.82
+   },
+   "liquidity": {
+    "usd": 2.99,
+    "base": 145.7119,
+    "quote": 0.7997
+   },
+   "fdv": 1506114,
+   "marketCap": 1506114,
+   "pairCreatedAt": 1788147806000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xef5db8661dab8649cc4fb85b67a82e7ffb1ba8e9cd91ee2521827f4b6de12042",
+   "pairAddress": "0xef5db8661dab8649cc4fb85b67a82e7ffb1ba8e9cd91ee2521827f4b6de12042",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02154",
+   "priceUsd": "0.02154",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 8,
+     "sells": 5
+    }
+   },
+   "volume": {
+    "h24": 12.52,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -15.29
+   },
+   "liquidity": {
+    "usd": 17.95,
+    "base": 416.702,
+    "quote": 8.9763
+   },
+   "fdv": 2154374,
+   "marketCap": 2154374,
+   "pairCreatedAt": 1788136072000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xbe0ba45c305a7a687ee7cef24ca91cdda154e6408e0cf224d7eb9feea0b482ed",
+   "pairAddress": "0xbe0ba45c305a7a687ee7cef24ca91cdda154e6408e0cf224d7eb9feea0b482ed",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02171",
+   "priceUsd": "0.02171",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 4,
+     "sells": 6
+    }
+   },
+   "volume": {
+    "h24": 26.39,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -19.06
+   },
+   "liquidity": {
+    "usd": 31.96,
+    "base": 735.9239,
+    "quote": 15.9784
+   },
+   "fdv": 2171447,
+   "marketCap": 2171447,
+   "pairCreatedAt": 1788140856000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x4e6899a85cf7d02d01ac915428cf353a50e8148b040b4af60813a2a5dc9ad4b0",
+   "pairAddress": "0x4e6899a85cf7d02d01ac915428cf353a50e8148b040b4af60813a2a5dc9ad4b0",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02278",
+   "priceUsd": "0.02278",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 3.32,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -24.55
+   },
+   "liquidity": {
+    "usd": 43.55,
+    "base": 955.5489,
+    "quote": 21.7731
+   },
+   "fdv": 2278854,
+   "marketCap": 2278854,
+   "pairCreatedAt": 1788150177000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x9358c892991def1b7ddb808c3eb17a4645ae64c8c0e42bbbe8874856f9a96dd9",
+   "pairAddress": "0x9358c892991def1b7ddb808c3eb17a4645ae64c8c0e42bbbe8874856f9a96dd9",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02712",
+   "priceUsd": "0.02712",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 1
+    },
+    "h24": {
+     "buys": 2,
+     "sells": 1
+    }
+   },
+   "volume": {
+    "h24": 0.19,
+    "h6": 0.04,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -6.43,
+    "h24": 4.08
+   },
+   "liquidity": {
+    "usd": 2.61,
+    "base": 48.1312,
+    "quote": 1.3055
+   },
+   "fdv": 2712221,
+   "marketCap": 2712221,
+   "pairCreatedAt": 1788136621000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x3f0edb677089fbb1ae7f99f02c34f6fce16c5291056cdb10263e979d4b924855",
+   "pairAddress": "0x3f0edb677089fbb1ae7f99f02c34f6fce16c5291056cdb10263e979d4b924855",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.02450",
+   "priceUsd": "0.02450",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 2,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 0.9,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 19.46
+   },
+   "liquidity": {
+    "usd": 10.69,
+    "base": 218.2541,
+    "quote": 5.3479
+   },
+   "fdv": 2450583,
+   "marketCap": 2450583,
+   "pairCreatedAt": 1788135714000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xd11a989b7c45a6fde10cc05edec48de2828e46c9f2ed2625072d7be78e727199",
+   "pairAddress": "0xd11a989b7c45a6fde10cc05edec48de2828e46c9f2ed2625072d7be78e727199",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.1049",
+   "priceUsd": "0.1049",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 1
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 1
+    },
+    "h24": {
+     "buys": 0,
+     "sells": 1
+    }
+   },
+   "volume": {
+    "h24": 34.26,
+    "h6": 34.26,
+    "h1": 34.26,
+    "m5": 0
+   },
+   "priceChange": {},
+   "liquidity": {
+    "usd": 46.61,
+    "base": 444.3025,
+    "quote": 8e-06
+   },
+   "fdv": 10491859,
+   "marketCap": 10491859,
+   "pairCreatedAt": 1788156632000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x3029071834b31a0e62fbc3b791967c25f995e1bffdc436456202648cfa9d2cc0",
+   "pairAddress": "0x3029071834b31a0e62fbc3b791967c25f995e1bffdc436456202648cfa9d2cc0",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x29fFC36bcC7D857f325B435533041C3DD9Fa26e5",
+    "name": "Quantums",
+    "symbol": "QUANT"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "941258823869116781487525680.1181",
+   "priceUsd": "716188819555850447866266793.088",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 73,
+     "sells": 41
+    }
+   },
+   "volume": {
+    "h24": 755.68,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 2.3687982657287387e+30
+   },
+   "pairCreatedAt": 1788157678000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/4C40KYDX1GtHzdWD?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/fr2MmZTgZxi4eE6Z?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x29ffc36bcc7d857f325b435533041c3dd9fa26e5?timestamp=1788246900000",
+    "websites": [],
+    "socials": [
+     {
+      "url": "https://x.com/QuantumsHQ",
+      "type": "twitter"
+     }
+    ]
+   }
+  }
+ ]
+}

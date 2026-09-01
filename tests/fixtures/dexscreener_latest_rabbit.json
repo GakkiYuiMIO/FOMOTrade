@@ -1,0 +1,1910 @@
+{
+ "schemaVersion": "1.0.0",
+ "pairs": [
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x3946ec6613decda05844dbe3c7f2f00e73afb8fe99c61388d67d0e08c3cdd6c6",
+   "pairAddress": "0x3946ec6613decda05844dbe3c7f2f00e73afb8fe99c61388d67d0e08c3cdd6c6",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000006165",
+   "priceUsd": "0.01525",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 1
+    },
+    "h1": {
+     "buys": 71,
+     "sells": 22
+    },
+    "h6": {
+     "buys": 1305,
+     "sells": 1129
+    },
+    "h24": {
+     "buys": 8991,
+     "sells": 8587
+    }
+   },
+   "volume": {
+    "h24": 7519342.16,
+    "h6": 544346.14,
+    "h1": 9539.94,
+    "m5": 36.25
+   },
+   "priceChange": {
+    "m5": 0.26,
+    "h1": 24.45,
+    "h6": 338,
+    "h24": 1425
+   },
+   "liquidity": {
+    "usd": 31068.88,
+    "base": 384111,
+    "quote": 10.1913
+   },
+   "fdv": 15251219,
+   "marketCap": 15251219,
+   "pairCreatedAt": 1788205877000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x1684d2d3fd510dfbf60a3899fa948da695b481ab4796ae28176df2f675a3e269",
+   "pairAddress": "0x1684d2d3fd510dfbf60a3899fa948da695b481ab4796ae28176df2f675a3e269",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x9e7ABD3C9139D14E4c86DcE0e455AAB7A0C2FB3E",
+    "name": "WhiteFiber, Inc. • Robinhood Token",
+    "symbol": "WYFI"
+   },
+   "priceNative": "0.0005759",
+   "priceUsd": "0.01491",
+   "txns": {
+    "m5": {
+     "buys": 27,
+     "sells": 36
+    },
+    "h1": {
+     "buys": 789,
+     "sells": 553
+    },
+    "h6": {
+     "buys": 7071,
+     "sells": 6827
+    },
+    "h24": {
+     "buys": 32642,
+     "sells": 29179
+    }
+   },
+   "volume": {
+    "h24": 19803720.35,
+    "h6": 5381560.67,
+    "h1": 604872.88,
+    "m5": 22742.13
+   },
+   "priceChange": {
+    "m5": -2.9,
+    "h1": 18.65,
+    "h6": 328,
+    "h24": 479077
+   },
+   "liquidity": {
+    "usd": 466662.61,
+    "base": 15766202,
+    "quote": 8937.8349
+   },
+   "fdv": 14917054,
+   "marketCap": 14917054,
+   "pairCreatedAt": 1788204740000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x1a1e4199838d701c316ef0b2b003b62a9a0abfcf4d0ad38e10ebf4f411fe0228",
+   "pairAddress": "0x1a1e4199838d701c316ef0b2b003b62a9a0abfcf4d0ad38e10ebf4f411fe0228",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01505",
+   "priceUsd": "0.01505",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 70,
+     "sells": 13
+    },
+    "h6": {
+     "buys": 663,
+     "sells": 591
+    },
+    "h24": {
+     "buys": 2612,
+     "sells": 2638
+    }
+   },
+   "volume": {
+    "h24": 1744400.89,
+    "h6": 416951.69,
+    "h1": 11860.97,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 19.21,
+    "h6": 347,
+    "h24": 7197
+   },
+   "liquidity": {
+    "usd": 50139.96,
+    "base": 1093700,
+    "quote": 33674
+   },
+   "fdv": 15057409,
+   "marketCap": 15057409,
+   "pairCreatedAt": 1788205542000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x979d44c1eee2c03b0d80dad34882dae2d9cea369cbd78d2b23fd1590a4da32b4",
+   "pairAddress": "0x979d44c1eee2c03b0d80dad34882dae2d9cea369cbd78d2b23fd1590a4da32b4",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01536",
+   "priceUsd": "0.01536",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 180,
+     "sells": 70
+    },
+    "h6": {
+     "buys": 2351,
+     "sells": 2000
+    },
+    "h24": {
+     "buys": 4034,
+     "sells": 3561
+    }
+   },
+   "volume": {
+    "h24": 2966898.65,
+    "h6": 2364414.41,
+    "h1": 202690.85,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 25.97,
+    "h6": 344,
+    "h24": 391
+   },
+   "liquidity": {
+    "usd": 303083.79,
+    "base": 4092715,
+    "quote": 240206
+   },
+   "fdv": 15368310,
+   "marketCap": 15368310,
+   "pairCreatedAt": 1788207038000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xcd73a88d4dc2cd718dfce72428d10ed8183e8edd",
+   "pairAddress": "0xCD73A88D4dC2CD718Dfce72428D10Ed8183E8edd",
+   "labels": [
+    "v3"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "name": "WETH",
+    "symbol": "WETH"
+   },
+   "priceNative": "0.000006201",
+   "priceUsd": "0.01534",
+   "txns": {
+    "m5": {
+     "buys": 30,
+     "sells": 23
+    },
+    "h1": {
+     "buys": 797,
+     "sells": 661
+    },
+    "h6": {
+     "buys": 2708,
+     "sells": 2393
+    },
+    "h24": {
+     "buys": 6639,
+     "sells": 5724
+    }
+   },
+   "volume": {
+    "h24": 3050545.02,
+    "h6": 2795103.05,
+    "h1": 1040764.11,
+    "m5": 33592.19
+   },
+   "priceChange": {
+    "m5": -0.53,
+    "h1": 27.22,
+    "h6": -100,
+    "h24": 434
+   },
+   "liquidity": {
+    "usd": 325829.97,
+    "base": 3268859,
+    "quote": 111.4441
+   },
+   "fdv": 15340925,
+   "marketCap": 15340925,
+   "pairCreatedAt": 1788207065000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x8ddd9d6d404c29fe2ac15b9cf80d72418b9a2edb",
+   "pairAddress": "0x8DDD9d6d404C29FE2aC15b9CF80d72418b9A2edB",
+   "labels": [
+    "v3"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01534",
+   "priceUsd": "0.01534",
+   "txns": {
+    "m5": {
+     "buys": 24,
+     "sells": 23
+    },
+    "h1": {
+     "buys": 498,
+     "sells": 393
+    },
+    "h6": {
+     "buys": 1205,
+     "sells": 1005
+    },
+    "h24": {
+     "buys": 1205,
+     "sells": 1005
+    }
+   },
+   "volume": {
+    "h24": 68915.8,
+    "h6": 68915.8,
+    "h1": 43659.93,
+    "m5": 3853.62
+   },
+   "priceChange": {
+    "m5": 0.5,
+    "h1": 27.76,
+    "h6": -5.66,
+    "h24": -5.66
+   },
+   "liquidity": {
+    "usd": 29685.56,
+    "base": 140097,
+    "quote": 27536
+   },
+   "fdv": 15342527,
+   "marketCap": 15342527,
+   "pairCreatedAt": 1788240173000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xec806599929361eb53eaf14aa7b5bc5ed543a43fc0422bdb864c944290e841bc",
+   "pairAddress": "0xec806599929361eb53eaf14aa7b5bc5ed543a43fc0422bdb864c944290e841bc",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000006001",
+   "priceUsd": "0.01484",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 1
+    },
+    "h1": {
+     "buys": 340,
+     "sells": 281
+    },
+    "h6": {
+     "buys": 628,
+     "sells": 579
+    },
+    "h24": {
+     "buys": 628,
+     "sells": 579
+    }
+   },
+   "volume": {
+    "h24": 156212.38,
+    "h6": 156212.38,
+    "h1": 73353.59,
+    "m5": 11.14
+   },
+   "priceChange": {
+    "m5": -100,
+    "h1": 23.72,
+    "h6": 3.69,
+    "h24": 3.69
+   },
+   "liquidity": {
+    "usd": 19791.32,
+    "base": 87.6566,
+    "quote": 8.00007389
+   },
+   "fdv": 14846273,
+   "marketCap": 14846273,
+   "pairCreatedAt": 1788241340000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x861a9832a8ae95dc3ccdac745e04b26c7c8f5ddaf2e657dd6eb25164469b73f7",
+   "pairAddress": "0x861a9832a8ae95dc3ccdac745e04b26c7c8f5ddaf2e657dd6eb25164469b73f7",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01537",
+   "priceUsd": "0.01537",
+   "txns": {
+    "m5": {
+     "buys": 36,
+     "sells": 24
+    },
+    "h1": {
+     "buys": 43,
+     "sells": 35
+    },
+    "h6": {
+     "buys": 43,
+     "sells": 35
+    },
+    "h24": {
+     "buys": 43,
+     "sells": 35
+    }
+   },
+   "volume": {
+    "h24": 17516.09,
+    "h6": 17516.09,
+    "h1": 17516.09,
+    "m5": 13107.88
+   },
+   "priceChange": {
+    "m5": -0.93,
+    "h1": -2.04,
+    "h6": -2.04,
+    "h24": -2.04
+   },
+   "liquidity": {
+    "usd": 29214.72,
+    "base": 148235,
+    "quote": 26937
+   },
+   "fdv": 15375782,
+   "marketCap": 15375782,
+   "pairCreatedAt": 1788245857000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x15f0a1cdb974a9a14f5887d0c1d10b4d741804973f742350ea909b2b8e870321",
+   "pairAddress": "0x15f0a1cdb974a9a14f5887d0c1d10b4d741804973f742350ea909b2b8e870321",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000006122",
+   "priceUsd": "0.01516",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 19,
+     "sells": 7
+    },
+    "h6": {
+     "buys": 424,
+     "sells": 383
+    },
+    "h24": {
+     "buys": 430,
+     "sells": 386
+    }
+   },
+   "volume": {
+    "h24": 42705.76,
+    "h6": 42451.81,
+    "h1": 872.25,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 23.56,
+    "h6": 350,
+    "h24": 374
+   },
+   "liquidity": {
+    "usd": 3587.52,
+    "base": 107253,
+    "quote": 0.7915
+   },
+   "fdv": 15166409,
+   "marketCap": 15166409,
+   "pairCreatedAt": 1788224118000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xf413eaa58e7caa4e73c7da0c87c94b35cfa771044afacce1606e0c4f9adb4e9a",
+   "pairAddress": "0xf413eaa58e7caa4e73c7da0c87c94b35cfa771044afacce1606e0c4f9adb4e9a",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x9e7ABD3C9139D14E4c86DcE0e455AAB7A0C2FB3E",
+    "name": "WhiteFiber, Inc. • Robinhood Token",
+    "symbol": "WYFI"
+   },
+   "priceNative": "0.0001375",
+   "priceUsd": "0.002697",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 20,
+     "sells": 24
+    },
+    "h24": {
+     "buys": 134,
+     "sells": 111
+    }
+   },
+   "volume": {
+    "h24": 19833.38,
+    "h6": 13488.27,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -33.94,
+    "h24": 38.81
+   },
+   "liquidity": {
+    "usd": 12174.71,
+    "base": 0.0005384,
+    "quote": 620.7802
+   },
+   "fdv": 2697537,
+   "marketCap": 2697537,
+   "pairCreatedAt": 1788218563000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xc9175c4cf46595f11538306ddddbfb0afd5ffe44098ca27d2c6f44f8b085889c",
+   "pairAddress": "0xc9175c4cf46595f11538306ddddbfb0afd5ffe44098ca27d2c6f44f8b085889c",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.002764",
+   "priceUsd": "0.002764",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 106,
+     "sells": 84
+    },
+    "h24": {
+     "buys": 133,
+     "sells": 123
+    }
+   },
+   "volume": {
+    "h24": 22120.08,
+    "h6": 17932.22,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -21.27,
+    "h24": -24.77
+   },
+   "liquidity": {
+    "usd": 13243.93,
+    "base": 54602,
+    "quote": 13091
+   },
+   "fdv": 2764791,
+   "marketCap": 2764791,
+   "pairCreatedAt": 1788222617000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x1cb27330fa9e04172775938b921760083b6aceba158c460a3f31cafdcde1292b",
+   "pairAddress": "0x1cb27330fa9e04172775938b921760083b6aceba158c460a3f31cafdcde1292b",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.000006163",
+   "priceUsd": "0.01524",
+   "txns": {
+    "m5": {
+     "buys": 4,
+     "sells": 5
+    },
+    "h1": {
+     "buys": 9,
+     "sells": 16
+    },
+    "h6": {
+     "buys": 9,
+     "sells": 16
+    },
+    "h24": {
+     "buys": 9,
+     "sells": 16
+    }
+   },
+   "volume": {
+    "h24": 3057.97,
+    "h6": 3057.97,
+    "h1": 3057.97,
+    "m5": 1294.09
+   },
+   "priceChange": {
+    "m5": -2.43,
+    "h1": 0.69,
+    "h6": 0.69,
+    "h24": 0.69
+   },
+   "liquidity": {
+    "usd": 15224.81,
+    "base": 887362,
+    "quote": 0.6854
+   },
+   "fdv": 15246398,
+   "marketCap": 15246398,
+   "pairCreatedAt": 1788245619000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x26f5bbecdac8c056e92b3704e6a713f97a268d6d31ed3058461558466a73bf67",
+   "pairAddress": "0x26f5bbecdac8c056e92b3704e6a713f97a268d6d31ed3058461558466a73bf67",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01291",
+   "priceUsd": "0.01291",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 26,
+     "sells": 19
+    },
+    "h6": {
+     "buys": 26,
+     "sells": 19
+    },
+    "h24": {
+     "buys": 26,
+     "sells": 19
+    }
+   },
+   "volume": {
+    "h24": 10771.93,
+    "h6": 10771.93,
+    "h1": 10771.93,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": -13.03,
+    "h6": -13.03,
+    "h24": -13.03
+   },
+   "liquidity": {
+    "usd": 9779.87,
+    "base": 231185,
+    "quote": 6794.1375
+   },
+   "fdv": 12917414,
+   "marketCap": 12917414,
+   "pairCreatedAt": 1788243341000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x68a87cd2eabacd2ed99ffe1fa67b3758270e01d78d72ee6c2a3bcb54bc90d566",
+   "pairAddress": "0x68a87cd2eabacd2ed99ffe1fa67b3758270e01d78d72ee6c2a3bcb54bc90d566",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "name": "WETH",
+    "symbol": "WETH"
+   },
+   "priceNative": "0.0000007585",
+   "priceUsd": "0.001882",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 0,
+     "sells": 5
+    }
+   },
+   "volume": {
+    "h24": 1131.55,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -8.25
+   },
+   "liquidity": {
+    "usd": 6936.84,
+    "base": 566292,
+    "quote": 2.3664
+   },
+   "fdv": 1882008,
+   "marketCap": 1882008,
+   "pairCreatedAt": 1788206234000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x1a4ff864c98114397606f4b2eef6834ca55be6d1a5ac3c605375ef2ad71f5f99",
+   "pairAddress": "0x1a4ff864c98114397606f4b2eef6834ca55be6d1a5ac3c605375ef2ad71f5f99",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01526",
+   "priceUsd": "0.01526",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 19,
+     "sells": 29
+    },
+    "h24": {
+     "buys": 19,
+     "sells": 29
+    }
+   },
+   "volume": {
+    "h24": 8662.12,
+    "h6": 8662.12,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -8.07,
+    "h24": -8.07
+   },
+   "liquidity": {
+    "usd": 9879.32,
+    "base": 110405,
+    "quote": 8194.9636
+   },
+   "fdv": 15262525,
+   "marketCap": 15262525,
+   "pairCreatedAt": 1788240262000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xd904572293ccc3288c66c84a72f9899c572786c5e7f65949803326a85b3787f3",
+   "pairAddress": "0xd904572293ccc3288c66c84a72f9899c572786c5e7f65949803326a85b3787f3",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01285",
+   "priceUsd": "0.01285",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 13,
+     "sells": 1
+    },
+    "h6": {
+     "buys": 57,
+     "sells": 62
+    },
+    "h24": {
+     "buys": 57,
+     "sells": 62
+    }
+   },
+   "volume": {
+    "h24": 9009.51,
+    "h6": 9009.51,
+    "h1": 837.12,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 6,
+    "h6": -20.62,
+    "h24": -20.62
+   },
+   "liquidity": {
+    "usd": 7882.62,
+    "base": 93813,
+    "quote": 6676.8772
+   },
+   "fdv": 12858760,
+   "marketCap": 12858760,
+   "pairCreatedAt": 1788240177000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xa8f9185f75c102ec68452db67d86303c556dc9e0f411b79247af2cfa8a8eedc9",
+   "pairAddress": "0xa8f9185f75c102ec68452db67d86303c556dc9e0f411b79247af2cfa8a8eedc9",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01480",
+   "priceUsd": "0.01480",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 27,
+     "sells": 22
+    },
+    "h24": {
+     "buys": 27,
+     "sells": 22
+    }
+   },
+   "volume": {
+    "h24": 3991.63,
+    "h6": 3991.63,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": 1.38,
+    "h24": 1.38
+   },
+   "liquidity": {
+    "usd": 7999.31,
+    "base": 0.0005946,
+    "quote": 7999.9999
+   },
+   "fdv": 14800819,
+   "marketCap": 14800819,
+   "pairCreatedAt": 1788239987000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xe728d4f7a51cfc523f7e3571d618203acbe328f39dda772ca044ff40376f9129",
+   "pairAddress": "0xe728d4f7a51cfc523f7e3571d618203acbe328f39dda772ca044ff40376f9129",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01543",
+   "priceUsd": "0.01543",
+   "txns": {
+    "m5": {
+     "buys": 1,
+     "sells": 1
+    },
+    "h1": {
+     "buys": 70,
+     "sells": 29
+    },
+    "h6": {
+     "buys": 180,
+     "sells": 162
+    },
+    "h24": {
+     "buys": 180,
+     "sells": 162
+    }
+   },
+   "volume": {
+    "h24": 38353.89,
+    "h6": 38353.89,
+    "h1": 4311.49,
+    "m5": 13.59
+   },
+   "priceChange": {
+    "m5": 0.2,
+    "h1": 28.34,
+    "h6": -1.98,
+    "h24": -1.98
+   },
+   "liquidity": {
+    "usd": 2415.94,
+    "base": 8821.2674,
+    "quote": 2279.9758
+   },
+   "fdv": 15436265,
+   "marketCap": 15436265,
+   "pairCreatedAt": 1788240136000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xc270a9f7aef72da33a56d6889a61eaf10ae6b3f587aeafc50f4054a1d0925aa7",
+   "pairAddress": "0xc270a9f7aef72da33a56d6889a61eaf10ae6b3f587aeafc50f4054a1d0925aa7",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01300",
+   "priceUsd": "0.01299",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 30,
+     "sells": 28
+    },
+    "h6": {
+     "buys": 30,
+     "sells": 28
+    },
+    "h24": {
+     "buys": 30,
+     "sells": 28
+    }
+   },
+   "volume": {
+    "h24": 2997.89,
+    "h6": 2997.89,
+    "h1": 2997.89,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 3.34,
+    "h6": 3.34,
+    "h24": 3.34
+   },
+   "liquidity": {
+    "usd": 4999.56,
+    "base": 59.8401,
+    "quote": 4999.2219
+   },
+   "fdv": 12999957,
+   "marketCap": 12999957,
+   "pairCreatedAt": 1788244204000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x847e447d8d1100b8c334f2e23ae3c5716801ec29a20a74dcebf00fff0a2b7d73",
+   "pairAddress": "0x847e447d8d1100b8c334f2e23ae3c5716801ec29a20a74dcebf00fff0a2b7d73",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.002549",
+   "priceUsd": "0.002550",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 5
+    }
+   },
+   "volume": {
+    "h24": 1025.26,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -12.59
+   },
+   "liquidity": {
+    "usd": 3946.39,
+    "base": 257831,
+    "quote": 3288.5124
+   },
+   "fdv": 2550191,
+   "marketCap": 2550191,
+   "pairCreatedAt": 1788206412000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x968179622db1ea186d3c6963b6d2cef8d5cd2bb15e7c9d926c79b047e8407c37",
+   "pairAddress": "0x968179622db1ea186d3c6963b6d2cef8d5cd2bb15e7c9d926c79b047e8407c37",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01490",
+   "priceUsd": "0.01490",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 4,
+     "sells": 3
+    },
+    "h24": {
+     "buys": 4,
+     "sells": 3
+    }
+   },
+   "volume": {
+    "h24": 431.21,
+    "h6": 431.21,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": 5.04,
+    "h24": 5.04
+   },
+   "liquidity": {
+    "usd": 5999.48,
+    "base": 0.001849,
+    "quote": 5999.9999
+   },
+   "fdv": 14901802,
+   "marketCap": 14901802,
+   "pairCreatedAt": 1788240069000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x03b525da05029d049c209960da0bb1200f3e54ada8553277599994a9f7000777",
+   "pairAddress": "0x03b525da05029d049c209960da0bb1200f3e54ada8553277599994a9f7000777",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01377",
+   "priceUsd": "0.01377",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 27,
+     "sells": 21
+    },
+    "h6": {
+     "buys": 27,
+     "sells": 21
+    },
+    "h24": {
+     "buys": 27,
+     "sells": 21
+    }
+   },
+   "volume": {
+    "h24": 2831.97,
+    "h6": 2831.97,
+    "h1": 2831.97,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 3.11,
+    "h6": 3.11,
+    "h24": 3.11
+   },
+   "liquidity": {
+    "usd": 4992.06,
+    "base": 17139,
+    "quote": 4756.4121
+   },
+   "fdv": 13772961,
+   "marketCap": 13772961,
+   "pairCreatedAt": 1788243350000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xcbf8f0bfe781214bb9646aa440c32ef90cbcd1f275e30063700d29500ec8cb7b",
+   "pairAddress": "0xcbf8f0bfe781214bb9646aa440c32ef90cbcd1f275e30063700d29500ec8cb7b",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.003110",
+   "priceUsd": "0.003110",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 32,
+     "sells": 16
+    }
+   },
+   "volume": {
+    "h24": 2552.96,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -25.64
+   },
+   "liquidity": {
+    "usd": 2937.27,
+    "base": 119545,
+    "quote": 2565.101
+   },
+   "fdv": 3110903,
+   "marketCap": 3110903,
+   "pairCreatedAt": 1788210391000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xe8f2d7fa16766bad5a639799e1f744a6659587d26f33bd0f861c60cb178fb69c",
+   "pairAddress": "0xe8f2d7fa16766bad5a639799e1f744a6659587d26f33bd0f861c60cb178fb69c",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.001797",
+   "priceUsd": "0.001797",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 64,
+     "sells": 80
+    }
+   },
+   "volume": {
+    "h24": 5374.57,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -45.06
+   },
+   "liquidity": {
+    "usd": 1393.34,
+    "base": 163252,
+    "quote": 1099.7298
+   },
+   "fdv": 1797780,
+   "marketCap": 1797780,
+   "pairCreatedAt": 1788211776000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x5abeb74735ebfb6abdfb3c1969abae273111de3fa07a26140d1604a1f027fb32",
+   "pairAddress": "0x5abeb74735ebfb6abdfb3c1969abae273111de3fa07a26140d1604a1f027fb32",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.004574",
+   "priceUsd": "0.004574",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 2,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 248.81,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 2.93
+   },
+   "liquidity": {
+    "usd": 1000.11,
+    "base": 0.008186,
+    "quote": 999.9999
+   },
+   "fdv": 4574686,
+   "marketCap": 4574686,
+   "pairCreatedAt": 1788207497000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xada02946f040225af9954a36f62320f1a0f4284f840a25480f298cc78731cf6a",
+   "pairAddress": "0xada02946f040225af9954a36f62320f1a0f4284f840a25480f298cc78731cf6a",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x9e7ABD3C9139D14E4c86DcE0e455AAB7A0C2FB3E",
+    "name": "WhiteFiber, Inc. • Robinhood Token",
+    "symbol": "WYFI"
+   },
+   "priceNative": "0.00009989",
+   "priceUsd": "0.001976",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 0,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 123.01,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": -13.19
+   },
+   "liquidity": {
+    "usd": 2734.89,
+    "base": 691785,
+    "quote": 69.1071
+   },
+   "fdv": 1976691,
+   "marketCap": 1976691,
+   "pairCreatedAt": 1788218344000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x6a70cfac6e9858d47f0a63cf5db9c6c14d3bb69b519a492397aadbbd966c91a6",
+   "pairAddress": "0x6a70cfac6e9858d47f0a63cf5db9c6c14d3bb69b519a492397aadbbd966c91a6",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.003938",
+   "priceUsd": "0.003938",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 25,
+     "sells": 13
+    }
+   },
+   "volume": {
+    "h24": 1592.53,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 2.6
+   },
+   "liquidity": {
+    "usd": 1000.09,
+    "base": 1693.7319,
+    "quote": 993.3178
+   },
+   "fdv": 3938787,
+   "marketCap": 3938787,
+   "pairCreatedAt": 1788206694000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xa48e85b44a11c7a9160db6372b1da27094f0344f7c18f0a0ca974c92d29af48d",
+   "pairAddress": "0xa48e85b44a11c7a9160db6372b1da27094f0344f7c18f0a0ca974c92d29af48d",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.002318",
+   "priceUsd": "0.002318",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 11,
+     "sells": 19
+    }
+   },
+   "volume": {
+    "h24": 628.87,
+    "h6": 0,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h24": 0.8
+   },
+   "liquidity": {
+    "usd": 1000.11,
+    "base": 1.2165,
+    "quote": 999.9971
+   },
+   "fdv": 2318613,
+   "marketCap": 2318613,
+   "pairCreatedAt": 1788220633000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xa548be6bdb8493024f19079806d5ab9d1d1bc05c46164f972bb029b81305d0db",
+   "pairAddress": "0xa548be6bdb8493024f19079806d5ab9d1d1bc05c46164f972bb029b81305d0db",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01461",
+   "priceUsd": "0.01461",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 6,
+     "sells": 13
+    },
+    "h24": {
+     "buys": 6,
+     "sells": 13
+    }
+   },
+   "volume": {
+    "h24": 687.02,
+    "h6": 687.02,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -9.53,
+    "h24": -9.53
+   },
+   "liquidity": {
+    "usd": 2972.31,
+    "base": 23890,
+    "quote": 2623.3761
+   },
+   "fdv": 14615274,
+   "marketCap": 14615274,
+   "pairCreatedAt": 1788240310000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x690c48d1116f839e729b717793bf82516dd51f41de583efb668f22b5b403fe2c",
+   "pairAddress": "0x690c48d1116f839e729b717793bf82516dd51f41de583efb668f22b5b403fe2c",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0xCD1cca2B3d0A11b295c42fe765ea8f895c2D0901",
+    "name": "Quantum White Fiber Rabbit",
+    "symbol": "Rabbit"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.01555",
+   "priceUsd": "0.01555",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 10,
+     "sells": 8
+    },
+    "h24": {
+     "buys": 10,
+     "sells": 8
+    }
+   },
+   "volume": {
+    "h24": 517,
+    "h6": 517,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -6.66,
+    "h24": -6.66
+   },
+   "liquidity": {
+    "usd": 2989.94,
+    "base": 13841,
+    "quote": 2774.9056
+   },
+   "fdv": 15553588,
+   "marketCap": 15553588,
+   "pairCreatedAt": 1788240593000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/2KSXIsnboLfsE83o?width=800&height=800&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xcd1cca2b3d0a11b295c42fe765ea8f895c2d0901?timestamp=1788246300000",
+    "websites": [],
+    "socials": []
+   }
+  }
+ ]
+}

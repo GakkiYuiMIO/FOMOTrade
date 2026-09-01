@@ -985,11 +985,13 @@ def test_特别关注的人转入推送也带星标():
 
 
 # ============================================================
-# 底池对手资产(🌊 底池 · NVDA · NVIDIA • Robinhood Token)
+# 底池对手资产(🌊 底池 · WYFI · WhiteFiber, Inc.)
 # ============================================================
-# 真实字面量,写死不从被测模块取
+# 真实字面量,写死不从被测模块取。
+# ⚠️ 第二段收的是**公司名**(NVIDIA),不是上游原文("NVIDIA • Robinhood Token")——
+#    后缀是判据不是信息,剥在数据层(dexscreener.notable)。
 _POOL_SYM = "NVDA"
-_POOL_NAME = "NVIDIA • Robinhood Token"
+_POOL_NAME = "NVIDIA"
 
 
 def _pool(**kw) -> str:
@@ -999,16 +1001,48 @@ def _pool(**kw) -> str:
     return render(make_event(event_type=EVENT_BUY, badge=BADGE_FIRST), **base)
 
 
-def test_底池对手的符号和全名都要出现():
+def _pool_line(**kw) -> str:
+    return [ln for ln in _pool(**kw).split("\n") if ln.startswith("🌊")][0]
+
+
+def test_底池对手的符号和公司名都要出现():
     """
-    「NVDA · NVIDIA • Robinhood Token」比光一个 NVDA 有用得多 ——
+    「NVDA · NVIDIA」比光一个 NVDA 有用得多 ——
     光看符号读者分不清这是不是又一个 meme。
     """
     msg = _pool()
     line = [ln for ln in msg.split("\n") if ln.startswith("🌊")]
     assert len(line) == 1, "底池行没出来,或出了不止一行"
-    assert "NVDA" in line[0]
-    assert "NVIDIA" in line[0] and "Robinhood Token" in line[0]
+    assert line[0] == "🌊 底池 · NVDA · NVIDIA"
+
+
+def test_Rabbit那一行长这样():
+    """
+    ⚠️ 用户点名要的那条:$Rabbit 的底池是 WYFI(WhiteFiber, Inc.)。
+       整行的真实形态钉死在这里 —— 分隔符、顺序、有没有多余的判据后缀,一起钉。
+    """
+    line = _pool_line(pool_quote_symbol="WYFI", pool_quote_name="WhiteFiber, Inc.")
+    assert line == "🌊 底池 · WYFI · WhiteFiber, Inc.", line
+
+
+def test_ETF那一行长这样():
+    """ETF 也算币股(用户口径),渲染上没有任何特殊待遇。"""
+    line = _pool_line(pool_quote_symbol="SPY", pool_quote_name="SPDR S&P 500 ETF Trust")
+    assert line == "🌊 底池 · SPY · SPDR S&amp;P 500 ETF Trust", line
+
+
+def test_最长的那个真实公司名会被截断():
+    """
+    ⚠️ 实测最长的公司名是 SPCX 的
+       "Space Exploration Technologies Corp. Class A Common Stock"(54 字符)。
+       不截断的话它一行就能吃掉预算里可观的一块。
+    """
+    line = _pool_line(
+        pool_quote_symbol="SPCX",
+        pool_quote_name="Space Exploration Technologies Corp. Class A Common Stock")
+    assert "…" in line, "没截断 / 截了却不告诉读者"
+    assert len(line) < 60, f"底池行太长:{len(line)}"
+    assert line.startswith("🌊 底池 · SPCX · Space Exploration")
 
 
 def test_不传底池对手时整行消失():

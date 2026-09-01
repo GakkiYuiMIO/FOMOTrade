@@ -54,8 +54,10 @@ def _no_dexscreener_network(monkeypatch):
     """
     from src import dexscreener as _d
 
+    # ⚠️ 签名跟着端点走:/latest/dex/tokens 不带链,所以这里也不收 slug。
+    #    参数对不上不会报错、只会在调用处炸 TypeError,那是很难读的失败。
     monkeypatch.setattr(_d.DexScreenerClient, "fetch_pairs",
-                        lambda self, slug, addresses: None)
+                        lambda self, addresses: None)
     yield
 
 

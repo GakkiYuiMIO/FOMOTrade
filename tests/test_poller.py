@@ -3553,10 +3553,11 @@ class _FakeDex:
     def __init__(self, responses=None, *, boom=None):
         self._responses = list(responses or [])
         self.boom = boom
-        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        # ⚠️ 请求里**不带链**:/latest/dex/tokens 是跨链端点,过滤按响应里的 chainId 做
+        self.calls: list[tuple[str, ...]] = []
 
-    def fetch_pairs(self, slug, addresses):
-        self.calls.append((slug, tuple(addresses)))
+    def fetch_pairs(self, addresses):
+        self.calls.append(tuple(addresses))
         if self.boom is not None:
             raise self.boom
         return self._responses.pop(0) if self._responses else None
@@ -3602,9 +3603,9 @@ def test_买入推送带上底池对手资产(db):
     _poller_with_dex(client, notifier, dex).tick()
 
     assert len(notifier.sent) == 1
-    assert "NVDA" in notifier.sent[0], "底池对手没进推送"
-    assert "NVIDIA • Robinhood Token" in notifier.sent[0]
-    assert "🌊" in notifier.sent[0]
+    assert "🌊 底池 · NVDA · NVIDIA" in notifier.sent[0], "底池对手没进推送"
+    # ⚠️ 判据后缀不该印出来:它对每一条命中的记录都一样,是判据不是信息
+    assert "Robinhood Token" not in notifier.sent[0]
 
 
 def test_对手是常见计价资产时那一行不出现(db):
@@ -3625,8 +3626,13 @@ def test_对手是常见计价资产时那一行不出现(db):
     assert "WETH" not in notifier.sent[0]
 
 
-def test_一轮多个币合并成一个请求(db):
-    """⚠️ 一条链一个请求(地址批量合并),不是一个币一个请求。"""
+def test_一个币一个请求且同一个币只问一次(db):
+    """
+    ⚠️⚠️ 刻意**不合并**:整个响应最多 30 条 pair(不是每个币 30 条),而顺序
+       不按深度排 —— 多地址请求里任何一个币的最深池都可能被别的币挤掉,
+       换回来的是一批"看起来正常的错答案"(见 dexscreener.MAX_ADDRS_PER_REQUEST)。
+       但同一个币在一轮里仍然只问一次。
+    """
     _add_ready("uA", "alice")
     _add_ready("uB", "bob")
     client = FakeClient({
@@ -3639,9 +3645,8 @@ def test_一轮多个币合并成一个请求(db):
     dex = _FakeDex([[_rh_pair(_CA_AI_CHECKSUM, _CA_NVDA, "NVDA", "NVIDIA • Robinhood Token")]])
     _poller_with_dex(client, FakeNotifier(), dex).tick()
 
-    assert len(dex.calls) == 1, f"三条事件打了 {len(dex.calls)} 个请求"
-    assert dex.calls[0][0] == "robinhood"
-    assert set(dex.calls[0][1]) == {_CA_AI, _CA_CASHCAT}, "同一个币被问了不止一次"
+    assert [len(c) for c in dex.calls] == [1, 1], "一次请求带了不止一个地址"
+    assert {c[0] for c in dex.calls} == {_CA_AI, _CA_CASHCAT}, "同一个币被问了不止一次"
 
 
 def test_链没映射到DexScreener时一个请求都不发(db):

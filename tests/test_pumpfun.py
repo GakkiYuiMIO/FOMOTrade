@@ -2842,8 +2842,9 @@ class _FakeDex:
         self.boom = boom
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
-    def fetch_pairs(self, slug, addresses):
-        self.calls.append((slug, tuple(addresses)))
+    def fetch_pairs(self, addresses):
+        # ⚠️ 请求里**不带链**:/latest/dex/tokens 是跨链端点,过滤按响应里的 chainId 做
+        self.calls.append(tuple(addresses))
         if self.boom is not None:
             raise self.boom
         return self._responses.pop(0) if self._responses else None
@@ -2868,10 +2869,16 @@ def _watcher_with_dex(tg, client, fake_dex):
 
 
 class Test底池对手:
-    def test_对手不是计价资产时推送里带上它(self, db, cfg):
+    def test_pump这两条链上这一行一律不出现(self, db, cfg):
         """
-        「这个币对着 SpaceX」与「这个币对着 BNB」是两种风险,
-        推送里原先一个字都没说。
+        ⚠️⚠️ **行为变更,如实记在这里**:这一行只在对手是**币股**时才出现,
+           而币股判据只在 Robinhood 链上找到了可靠标记(name 以 " • Robinhood Token"
+           结尾)。pump.fun 的币在 solana / bsc / base 上,那几条链上
+           `SPCXB · SpaceX` 这类代币化股票**确实存在**,但 247 个真实样本里
+           找不到任何一个能把它和 memecoin 分开的标记 ——
+           `BTCB` 也以 B 结尾、`SpaceX`/`GameStop` 是谁都能取的名字。
+           按"宁可漏掉一个股票,也不能把不是股票的说成股票"的口径,这里整行不出现。
+           判据补上的那天,这一行会自动回来(见 dexscreener.STOCK_NAME_MARKERS)。
         """
         seeded_user()
         client = FakeClient(
@@ -2881,8 +2888,7 @@ class Test底池对手:
         tg = FakeNotifier()
         dex = _FakeDex([[_pair("bsc", MINT_BSC, CA_SPCXB, "SPCXB", "SpaceX")]])
         assert _watcher_with_dex(tg, client, dex).run_once() == 1
-        assert "SPCXB" in tg.sent[0] and "SpaceX" in tg.sent[0]
-        assert "🌊" in tg.sent[0]
+        assert "🌊" not in tg.sent[0]
 
     def test_对手是SOL时那一行整行消失(self, db, cfg):
         """⚠️ 绝大多数 pump 币对着 SOL —— 每条都挂一行是纯噪音。"""
@@ -2894,19 +2900,11 @@ class Test底池对手:
         assert _watcher_with_dex(tg, client, dex).run_once() == 1
         assert "🌊" not in tg.sent[0]
 
-    def test_计价币判定不受checksum大小写影响(self, db, cfg):
-        """⚠️⚠️ 不归一化的话真 WBNB 认不出来,BSC 上每条推送都多一行噪音。"""
-        seeded_user()
-        client = FakeClient(
-            portfolios={HEX_SVM: position_payload(
-                pos_row(mint=MINT_BSC, chain=56, held=3.0, symbol="QQQB"))},
-            trades={MINT_BSC: trade_payload()})
-        tg = FakeNotifier()
-        dex = _FakeDex([[_pair("bsc", MINT_BSC, CA_WBNB, "WBNB", "Wrapped BNB")]])
-        assert _watcher_with_dex(tg, client, dex).run_once() == 1
-        assert "🌊" not in tg.sent[0] and "WBNB" not in tg.sent[0]
-
-    def test_一轮里同一条链的多个mint合并成一个请求(self, db, cfg):
+    def test_没有币股判据的链一个请求都不发(self, db, cfg):
+        """
+        ⚠️⚠️ 那条链上这一行**永远显示不出来**,为它打一轮请求是纯浪费。
+           实测口径:pump 侧因此从"每轮每条链一个请求"变成 **0 个请求**。
+        """
         seeded_user()
         client = FakeClient(
             portfolios={HEX_SVM: position_payload(
@@ -2915,11 +2913,7 @@ class Test底池对手:
             trades={MINT_SOL: trade_payload(), MINT_BSC: trade_payload()})
         dex = _FakeDex([[], []])
         _watcher_with_dex(FakeNotifier(), client, dex).run_once()
-        # 两条链 → 两个请求(每条链自己一个),而不是每个 mint 一个
-        assert len(dex.calls) == 2
-        assert {c[0] for c in dex.calls} == {"solana", "bsc"}
-        for _slug, addrs in dex.calls:
-            assert len(addrs) == 1
+        assert dex.calls == [], "在没有币股判据的链上白打了请求"
 
     def test_底池查询失败也照推成交(self, db, cfg):
         """⚠️⚠️ 绝不能出现"因为查不到底池对手所以成交没推出去"。"""
@@ -2939,8 +2933,11 @@ class Test底池对手:
         assert w.run_once() == 1, "一个第三方接口抖了一下就把成交推送吃掉了"
         assert "🌊" not in tg.sent[0]
 
-    def test_对手全名要转义(self, db, cfg):
-        """⚠️ 全名是第三方字符串,一个裸的 '<' 就让整条消息 400。"""
+    def test_第三方字符串一路到推送都不会漏出去(self, db, cfg):
+        """
+        ⚠️ 转义/截断的防线钉在渲染层(test_formatter 里那几条)。这里只钉一件事:
+           一个带 `<script>` 的上游名字**不会**从 pump 这条路径漏进推送。
+        """
         seeded_user()
         client = FakeClient(
             portfolios={HEX_SVM: position_payload(
@@ -2950,4 +2947,3 @@ class Test底池对手:
         dex = _FakeDex([[_pair("bsc", MINT_BSC, CA_SPCXB, "S", "<script>alert(1)</script>")]])
         _watcher_with_dex(tg, client, dex).run_once()
         assert "<script>" not in tg.sent[0]
-        assert "&lt;script&gt;" in tg.sent[0]
