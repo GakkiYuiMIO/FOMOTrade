@@ -88,6 +88,7 @@ EMOJI_PENDING = "⏳"
 EMOJI_PNL_UP = "📈"
 EMOJI_PNL_DOWN = "📉"
 EMOJI_LINK = "🔗"
+EMOJI_POOL = "🌊"            # 底池对手资产
 
 # ============================================================
 # 固定文案
@@ -109,6 +110,12 @@ LABEL_TO = "转给"
 LABEL_COUNTERPARTY = "对手方"
 LABEL_PNL_REALIZED = "已实现盈亏"
 LABEL_PNL_UNREALIZED = "未实现盈亏"
+LABEL_POOL = "底池"
+# 对手全名的限长。⚠️ 它是**第三方(DexScreener)返回的任意字符串**,长度不受任何
+# 天然约束,也可能带 `<`/`&` —— 必须走 _clip(叠平空白 → 截断 → 转义)。
+# 32:实测最长的一个是 "NVIDIA • Robinhood Token"(24 字符),留一点余量即可;
+# 再长就是营销文案,读者也不会读。
+_POOL_NAME_CHARS = 32
 
 # 代币页链接。⚠️ 链 slug 未收录时**整个链接不出** ——
 # 错的链接比没有链接更糟(§10.3),拼一个平台不支持的链只会得到 404。
@@ -501,6 +508,33 @@ def _market_cap_line(ev: FomoEvent) -> str | None:
     return f"{EMOJI_MARKET_CAP} 市值 {mc}" if mc is not None else None
 
 
+def _pool_quote_line(symbol, name) -> str | None:
+    """
+    🌊 底池 · NVDA · NVIDIA • Robinhood Token
+
+    这个币最深的那个池子对面摆的是什么。对手是代币化的英伟达股票,意味着 NVDA 一跌
+    它就跟着跌 —— 与一个对着 BNB / SOL 的币是**两种风险**。
+
+    ⚠️⚠️ 符号与全名都是 **DexScreener 返回的第三方字符串**,必须 _clip:
+       叠平空白 → 限长 → 转义。少了转义,一个 `<` 就让整条消息 400(铁律 4);
+       少了限长,一个几千字符的 name 就能把消息顶破预算。
+    ⚠️ 全名与符号相同(去掉大小写和空白之后)时**只出符号** ——
+       「NVDA · NVDA」是纯粹的重复,占一行却什么都没多说。
+    ⚠️ 两个都没有 → 整行消失(铁律 2)。绝不退化成打一个地址:
+       这一行的价值在于"对手是**什么东西**",一串 hex 回答不了这个问题。
+    ⚠️ 是否显示(常见计价资产要不要藏)**不在这里判** —— 那是数据层的判断,
+       落在 dexscreener.notable。本模块是纯展示,给什么画什么(铁律 7)。
+    """
+    sym = _clip(symbol, _SIG_SYMBOL_CHARS)
+    full = _clip(name, _POOL_NAME_CHARS)
+    if sym and full and sym.strip().lower() == full.strip().lower():
+        full = ""
+    parts = [p for p in (sym, full) if p]
+    if not parts:
+        return None
+    return f"{EMOJI_POOL} {LABEL_POOL}{SEP}{SEP.join(parts)}"
+
+
 def fmt_token_age(created_at: int | float | None, now: float | None = None) -> str | None:
     """
     币龄:8M / 3H / 5D / 2MO / 1.4Y。拿不到就返回 None(整行消失,铁律 2)。
@@ -652,6 +686,8 @@ def render(
     holders: int | None = None,
     baseline_pending: bool = False,
     starred: bool = False,
+    pool_quote_symbol: str | None = None,
+    pool_quote_name: str | None = None,
 ) -> str:
     """
     渲染一条 Telegram HTML 消息。
@@ -663,12 +699,16 @@ def render(
         baseline_pending 基线未就绪 → 末尾追加 ⏳ 尾行
         starred          特别关注 → 标题加 ⭐、币名加方括号。**纯展示**,
                          不影响徽章、共识、采集的任何判定
+        pool_quote_*     底池对手资产的符号与全名(见 _pool_quote_line)。
+                         ⚠️ 调用方只在对手**不是常见计价资产**时才传(dexscreener.notable);
+                         本模块不做那个判断,也不做任何 IO(铁律 7)。
 
     ⚠️ 本函数**不得抛异常**。它在 poller 的发送循环里被调用,
        一条脏数据把渲染炸掉会连带整个 tick 停摆 —— 宁可发一条降级消息。
     """
     try:
-        return _render(ev, buyers, watchlist, holders, baseline_pending, starred)
+        return _render(ev, buyers, watchlist, holders, baseline_pending, starred,
+                       pool_quote_symbol, pool_quote_name)
     except Exception as e:  # noqa: BLE001
         # 走到这里一定是本模块的 bug(所有字段级异常都已在下游吃掉),必须留痕
         logger.exception("消息渲染失败,降级为最简文本 | event_id={} | {}", getattr(ev, "event_id", "?"), e)
@@ -682,6 +722,8 @@ def _render(
     holders: int | None,
     baseline_pending: bool,
     starred: bool = False,
+    pool_quote_symbol: str | None = None,
+    pool_quote_name: str | None = None,
 ) -> str:
     # 行序固定,缺失的行整行消失。这个顺序逐条对齐设计文档 §10.2 的七个场景
     candidates = [
@@ -700,6 +742,9 @@ def _render(
         _trade_count_line(ev),
         _market_cap_line(ev),
         _token_age_line(ev),
+        # 底池对手排在币本身那几行(市值/币龄)之后、"人"那几行(共识)之前 ——
+        # 它回答的是"这个币是什么",不是"谁在买"
+        _pool_quote_line(pool_quote_symbol, pool_quote_name),
         _consensus_line(buyers, watchlist, holders),
         _network_line(ev),
         _links_line(ev),                         # 链接在 CA 之前 —— CA 必须独占最后一行
@@ -1418,6 +1463,8 @@ def render_pump_trade(
     chain_display: str | None = None,
     tx: str | None = None,
     now: float | None = None,
+    pool_quote_symbol: str | None = None,
+    pool_quote_name: str | None = None,
 ) -> str:
     """
     「被盯的人在 pump.fun 上成交了一笔」的推送。
@@ -1442,6 +1489,9 @@ def render_pump_trade(
         chain_display  链展示名的兜底(pump 只给数字 chainId,没有链名字段)
         traded_at      成交时刻 ISO;解析不出来 → 那一行整行消失
         now            渲染时刻(unix 秒),只用来算"多久之前"
+        pool_quote_*   底池对手资产的符号与全名(见 _pool_quote_line)。
+                       ⚠️ 与 FOMO 那条推送同一套:调用方只在对手**不是常见计价资产**
+                       时才传;判断落在 dexscreener.notable,不在这里
 
     ⚠️⚠️ **措辞铁律:只摆可证的事实,一个字都不许替用户下结论。**
        这里的数据是 swap-api 的逐笔成交(签名/时刻/方向/价格/金额),
@@ -1482,6 +1532,8 @@ def render_pump_trade(
                   _pump_pnl_line(is_cleared, unrealized_pnl_usd, unrealized_pnl_pct,
                                  realized_pnl_usd, realized_pnl_pct),
                   _pump_mcap_line(market_cap_usd, ath_market_cap_usd),
+                  # 与 FOMO 那条同样的位置:币本身的事实之后、人的事实之前
+                  _pool_quote_line(pool_quote_symbol, pool_quote_name),
                   _pump_holders_line(holders_in_list)):
         if extra is not None:
             lines.append(extra)

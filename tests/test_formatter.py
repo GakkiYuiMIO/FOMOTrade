@@ -982,3 +982,116 @@ def test_特别关注的人转入推送也带星标():
     starred = render_transfer_in_watch(ev, starred=True, now=_NOW_TIN)
     assert "⭐" not in plain and "⭐" in starred
     assert starred[0] == plain[0] == "📥", "星标绝不能顶掉行首的事件锚点"
+
+
+# ============================================================
+# 底池对手资产(🌊 底池 · NVDA · NVIDIA • Robinhood Token)
+# ============================================================
+# 真实字面量,写死不从被测模块取
+_POOL_SYM = "NVDA"
+_POOL_NAME = "NVIDIA • Robinhood Token"
+
+
+def _pool(**kw) -> str:
+    """一条带底池对手的买入推送"""
+    base = dict(pool_quote_symbol=_POOL_SYM, pool_quote_name=_POOL_NAME)
+    base.update(kw)
+    return render(make_event(event_type=EVENT_BUY, badge=BADGE_FIRST), **base)
+
+
+def test_底池对手的符号和全名都要出现():
+    """
+    「NVDA · NVIDIA • Robinhood Token」比光一个 NVDA 有用得多 ——
+    光看符号读者分不清这是不是又一个 meme。
+    """
+    msg = _pool()
+    line = [ln for ln in msg.split("\n") if ln.startswith("🌊")]
+    assert len(line) == 1, "底池行没出来,或出了不止一行"
+    assert "NVDA" in line[0]
+    assert "NVIDIA" in line[0] and "Robinhood Token" in line[0]
+
+
+def test_不传底池对手时整行消失():
+    """⚠️ 缺失整行消失,绝不打 '--' / 'N/A'(铁律 2)"""
+    msg = render(make_event(event_type=EVENT_BUY, badge=BADGE_FIRST))
+    assert "🌊" not in msg
+    assert "底池" not in msg
+
+
+def test_符号和全名都空时整行消失():
+    for kw in ({"pool_quote_symbol": None, "pool_quote_name": None},
+               {"pool_quote_symbol": "", "pool_quote_name": "   "}):
+        assert "🌊" not in _pool(**kw)
+
+
+def test_底池对手全名必须转义():
+    """
+    ⚠️⚠️ 全名是**第三方(DexScreener)返回的任意字符串**。
+       一个裸的 '<' 就让整条消息 400,用户什么都收不到(铁律 4)。
+    """
+    msg = _pool(pool_quote_symbol="<b>X", pool_quote_name="<script>alert(1)</script>")
+    assert "<script>" not in msg and "<b>X" not in msg
+    assert "&lt;script&gt;" in msg
+    assert _html_ok(msg), "标签必须全部配对闭合,残缺实体 = 整条 400"
+
+
+def test_底池对手全名必须截断():
+    """
+    ⚠️ 全名长度不受任何天然约束。不截断的话一个几千字符的 name
+       就能把整条消息顶破预算 / 刷屏。
+    """
+    line = [ln for ln in _pool(pool_quote_name="N" * 5000).split("\n")
+            if ln.startswith("🌊")][0]
+    assert len(line) < 120, f"底池行没截断,长 {len(line)}"
+    assert "…" in line, "截断了却没有省略号 —— 读者不知道被截了"
+
+
+def test_底池对手符号也要截断():
+    line = [ln for ln in _pool(pool_quote_symbol="S" * 5000).split("\n")
+            if ln.startswith("🌊")][0]
+    assert len(line) < 120
+
+
+def test_截断先叠平空白再转义():
+    """⚠️ 顺序错了会在截断点切断一个 &amp;,残缺实体照样 400。"""
+    msg = _pool(pool_quote_name="A&B\n\nC" + "z" * 200)
+    assert "&amp;amp;" not in msg, "被转义了两次"
+    assert "\n\n" not in msg
+    assert _html_ok(msg)
+
+
+def test_全名与符号相同时只出一次():
+    """「NVDA · NVDA」是纯重复,占一行却什么都没多说。"""
+    line = [ln for ln in _pool(pool_quote_symbol="WIF", pool_quote_name="wif").split("\n")
+            if ln.startswith("🌊")][0]
+    assert line.lower().count("wif") == 1, f"重复了:{line}"
+    assert line == "🌊 底池 · WIF", "重复时该留下的是符号那一份"
+
+
+def test_只有全名没有符号时照样出这一行():
+    line = [ln for ln in _pool(pool_quote_symbol=None).split("\n") if ln.startswith("🌊")]
+    assert len(line) == 1 and "NVIDIA" in line[0]
+
+
+def test_底池行排在币的事实之后人的事实之前():
+    """行序:市值/币龄(币是什么)→ 底池 → 共识(谁在买)→ 链 → 链接 → CA"""
+    msg = render(make_event(event_type=EVENT_BUY, badge=BADGE_FIRST, market_cap=1_000_000),
+                 buyers=3, watchlist=12, pool_quote_symbol=_POOL_SYM,
+                 pool_quote_name=_POOL_NAME)
+    lines = msg.split("\n")
+    idx = {ln[0]: i for i, ln in enumerate(lines)}
+    assert idx["💎"] < idx["🌊"] < idx["👥"] < idx["🧬"]
+    assert lines[-1].startswith("<code>"), "CA 仍然必须是最后一行"
+
+
+def test_底池行不影响CA独占最后一行():
+    msg = _pool(pool_quote_name="X" * 500)
+    assert msg.split("\n")[-1] == f"<code>{CA_TOAD}</code>"
+
+
+def test_底池行的emoji锚点与已有的都不重样():
+    """⚠️ 行首 emoji 是扫描锚点,重样就分不清是哪一类事实。"""
+    used = {"🌱", "🟢", "🔴", "💭", "📥", "📤", "💰", "💸", "📦", "📊", "🔄",
+            "💎", "🕐", "👥", "🧬", "👤", "⚠️", "⏳", "📈", "📉", "🔗", "🚨",
+            "🆕", "🏷", "🧾", "📮", "🟩", "🟥", "📣", "💬", "👍", "👀"}
+    assert "🌊" not in used

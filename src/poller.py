@@ -39,6 +39,7 @@ from src.client import (
 )
 from src.config import get_settings
 from src.copytrade import Candidate, decide
+from src.dexscreener import PoolQuoteLookup, notable
 from src.formatter import (
     render,
     render_copy_signal,
@@ -686,6 +687,10 @@ class Poller:
         self.client = client
         self.notifier = notifier
         self.settings = get_settings()
+        # 底池对手资产。⚠️ 自带 6 小时 TTL 缓存,挂在 poller 上才跨得了轮;
+        #    它走的是 DexScreener(公开免鉴权),与 FOMO 的登录态完全无关,
+        #    失败一律自己吞掉 —— 绝不允许它有能力影响任何一条推送的发出。
+        self._pool_lookup = PoolQuoteLookup()
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
@@ -1526,6 +1531,7 @@ class Poller:
         worker, self._copy_worker = self._copy_worker, None
         if worker is not None:
             worker.close()
+        self._pool_lookup.close()
 
     def _start_thesis(self, batch: list[tuple]):
         """
@@ -1866,6 +1872,35 @@ class Poller:
             return False
         return ev.amount_usd >= self.settings.fomo_transfer_watch_min_usd
 
+    def _pool_quotes(self, pending: list[FomoEvent]) -> dict[str, dict]:
+        """
+        本轮要推的这些币的底池对手资产 → {链: {归一化地址: PoolQuote}}。
+
+        ⚠️⚠️ **一条链一个请求**(地址批量合并),不是一个币一个请求。
+           峰值 = 本轮出现的链数(映射表里只有 4 条),而不是本轮的事件数。
+        ⚠️ 只问**买卖**推送要用的币:转入走的是另一套渲染(render_transfer_in_watch,
+           这次不动它),观点/转出也不带这一行 —— 问了也没人看,白挨限流。
+           计价币本身(ev.is_quote)同样跳过:它的对手必然也是计价币,永远显示不出来。
+        ⚠️⚠️ 整段包在 try 里,失败一律降级为空 dict。
+           与共识计算同一条铁律:**绝不能出现"因为查不到底池对手所以整条推送没发出去"**。
+        """
+        by_net: dict[str, list[str]] = {}
+        for ev in pending:
+            if ev.event_type not in (EVENT_BUY, EVENT_SELL) or ev.is_quote:
+                continue
+            net = (ev.network_id or "").strip()
+            ca = (ev.token_address or "").strip()
+            if not net or not ca:
+                continue
+            by_net.setdefault(net, []).append(ca)
+        out: dict[str, dict] = {}
+        for net, addrs in by_net.items():
+            try:
+                out[net] = self._pool_lookup.lookup(net, addrs)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("底池对手查询失败,本轮这条链不显示该行 | {} | {}", net, e)
+        return out
+
     def _dispatch(self, conn, snapshots: dict, new_events: list[FomoEvent], dry_run: bool) -> None:
         """
         第二循环:此时 stats 已是一致快照,所有消息共用同一个共识时点值。
@@ -1900,6 +1935,7 @@ class Poller:
         except Exception as e:  # noqa: BLE001
             logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
             starred = set()
+        pool_quotes = self._pool_quotes(pending)
         for ev in pending:
             # ---- /tin:被点名的人的转入,走另一套渲染 ----
             # ⚠️⚠️ 这道门必须在这里**再判一次**:上面的补发队列捞的是"库里所有
@@ -1930,6 +1966,9 @@ class Poller:
                     logger.warning("共识计算失败,降级为不显示 | {} | {}", ev.event_id, e)
                     buyers = watchlist = holders = None
 
+            # ⚠️ 只有对手**不是常见计价资产**时 notable 才给东西 ——
+            #    「底池 · WBNB」是噪音,「底池 · NVDA」才是信号(见 dexscreener.notable)
+            pq = notable(pool_quotes.get(ev.network_id or "", {}), ev.token_address)
             try:
                 text = (
                     render_transfer_in_watch(ev, starred=ev.user_id in starred)
@@ -1941,6 +1980,8 @@ class Poller:
                         holders=holders,
                         baseline_pending=baseline_pending,
                         starred=ev.user_id in starred,
+                        pool_quote_symbol=None if pq is None else pq.symbol,
+                        pool_quote_name=None if pq is None else pq.name,
                     )
                 )
             except Exception as e:  # noqa: BLE001
