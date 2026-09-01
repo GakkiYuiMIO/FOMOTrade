@@ -3419,3 +3419,161 @@ def test_点名十二个人时每轮多打十二个请求(db):
         peaks.append(len(client.transfer_calls) - before)
     assert max(peaks) <= 3 + 12, f"单轮转账请求峰值 {max(peaks)},超过 ⌈60/20⌉ + 12"
     assert min(peaks) >= 12, f"被点名的 12 个人每轮都该被拉到,实际最少的一轮只有 {min(peaks)} 个"
+
+
+# ============================================================
+# 底池对手资产(🌊 底池 · NVDA · …)
+# ============================================================
+# 真实字面量,写死不从被测模块取
+_CA_AI = "0x2e8c31162b855a2ffa90f6f8634643ad6f111e18"
+_CA_AI_CHECKSUM = "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18"
+_CA_NVDA = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
+_CA_WETH_RH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+_CA_CASHCAT = "0x020bfc650a365f8bb26819deaabf3e21291018b4"
+
+
+class _FakeDex:
+    """离线的 DexScreener 客户端。契约:不抛、失败返回 None。"""
+
+    def __init__(self, responses=None, *, boom=None):
+        self._responses = list(responses or [])
+        self.boom = boom
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fetch_pairs(self, slug, addresses):
+        self.calls.append((slug, tuple(addresses)))
+        if self.boom is not None:
+            raise self.boom
+        return self._responses.pop(0) if self._responses else None
+
+    def close(self):
+        pass
+
+
+def _rh_pair(base_ca: str, quote_ca: str, sym: str, name: str) -> dict:
+    return {"chainId": "robinhood",
+            "baseToken": {"address": base_ca, "name": "Artificial Inu", "symbol": "AI"},
+            "quoteToken": {"address": quote_ca, "name": name, "symbol": sym},
+            "liquidity": {"usd": 4_549_110.53}}
+
+
+def _rh_swap(sid: str, *, ca: str = _CA_AI, sym: str = "AI") -> dict:
+    """一条 Robinhood 链上的买入 swap"""
+    return {"id": sid, "networkId": "robinhood", "tokenAddress": ca, "symbol": sym,
+            "side": "buy", "timestamp": _FUTURE_MS, "amountUsd": 2500.0,
+            "txHash": f"tx-{sid}", "holdingUsd": 2500.0}
+
+
+def _poller_with_dex(client, notifier, fake_dex):
+    from src.dexscreener import PoolQuoteLookup
+
+    p = Poller(client, notifier)
+    p._pool_lookup = PoolQuoteLookup(client=fake_dex)
+    return p
+
+
+def test_买入推送带上底池对手资产(db):
+    """
+    可证伪的验收标准:$AI 的底池对手是代币化的英伟达股票,推送里必须出现 NVDA。
+
+    这条信息决定这个币的命运绑在谁身上 —— NVDA 一跌它就跟着跌,
+    与一个对着 BNB / SOL 的币是**两种风险**。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_rh_swap("a1")],
+                                            transfers=[], thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    dex = _FakeDex([[_rh_pair(_CA_AI_CHECKSUM, _CA_NVDA, "NVDA", "NVIDIA • Robinhood Token")]])
+    _poller_with_dex(client, notifier, dex).tick()
+
+    assert len(notifier.sent) == 1
+    assert "NVDA" in notifier.sent[0], "底池对手没进推送"
+    assert "NVIDIA • Robinhood Token" in notifier.sent[0]
+    assert "🌊" in notifier.sent[0]
+
+
+def test_对手是常见计价资产时那一行不出现(db):
+    """
+    ⚠️⚠️ 绝大多数币的对手就是原生币/稳定币。每条推送都挂一行「底池 · WETH」
+       是纯噪音,而且会真的挤掉有用的行 —— 这一行只有在"对手不寻常"时才有价值。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_rh_swap("a1", ca=_CA_CASHCAT,
+                                                                  sym="CASHCAT")],
+                                            transfers=[], thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    dex = _FakeDex([[_rh_pair(_CA_CASHCAT, _CA_WETH_RH, "WETH", "WETH")]])
+    _poller_with_dex(client, notifier, dex).tick()
+
+    assert len(notifier.sent) == 1
+    assert "🌊" not in notifier.sent[0]
+    assert "WETH" not in notifier.sent[0]
+
+
+def test_一轮多个币合并成一个请求(db):
+    """⚠️ 一条链一个请求(地址批量合并),不是一个币一个请求。"""
+    _add_ready("uA", "alice")
+    _add_ready("uB", "bob")
+    client = FakeClient({
+        "uA": UserSnapshot("uA", swaps=[_rh_swap("a1"),
+                                        _rh_swap("a2", ca=_CA_CASHCAT, sym="CASHCAT")],
+                           transfers=[], thesis=[], balances=[]),
+        "uB": UserSnapshot("uB", swaps=[_rh_swap("b1")], transfers=[], thesis=[],
+                           balances=[]),
+    })
+    dex = _FakeDex([[_rh_pair(_CA_AI_CHECKSUM, _CA_NVDA, "NVDA", "NVIDIA • Robinhood Token")]])
+    _poller_with_dex(client, FakeNotifier(), dex).tick()
+
+    assert len(dex.calls) == 1, f"三条事件打了 {len(dex.calls)} 个请求"
+    assert dex.calls[0][0] == "robinhood"
+    assert set(dex.calls[0][1]) == {_CA_AI, _CA_CASHCAT}, "同一个币被问了不止一次"
+
+
+def test_链没映射到DexScreener时一个请求都不发(db):
+    """⚠️ 硬拼一个 slug 只会换来 200 + 空数组,白挨一次限流。"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_swap("a1")], transfers=[],
+                                            thesis=[], balances=[])})
+    # 把这条 swap 挪到一条 DexScreener slug 表里没有的链上
+    client.snaps["uA"].swaps[0]["networkId"] = "monad"
+    notifier = FakeNotifier()
+    dex = _FakeDex()
+    _poller_with_dex(client, notifier, dex).tick()
+
+    assert dex.calls == []
+    assert len(notifier.sent) == 1 and "🌊" not in notifier.sent[0]
+
+
+def test_底池查询失败也照发推送(db):
+    """⚠️⚠️ 绝不能出现"因为查不到底池对手所以整条推送没发出去"。"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_rh_swap("a1")], transfers=[],
+                                            thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    _poller_with_dex(client, notifier, _FakeDex([None])).tick()
+    assert len(notifier.sent) == 1
+    assert "🌊" not in notifier.sent[0]
+
+
+def test_底池查询抛异常也照发推送(db):
+    """假 client 故意违约(真 client 契约是不抛)—— poller 必须顶得住。"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_rh_swap("a1")], transfers=[],
+                                            thesis=[], balances=[])})
+    notifier = FakeNotifier()
+    _poller_with_dex(client, notifier, _FakeDex(boom=RuntimeError("boom"))).tick()
+    assert len(notifier.sent) == 1, "一个第三方接口抖了一下就把推送吃掉了"
+    assert "🌊" not in notifier.sent[0]
+
+
+def test_跨轮命中缓存不再重复发请求(db):
+    """底池对手是这个币的"出身",不该每轮重问一次。"""
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_rh_swap("a1")], transfers=[],
+                                            thesis=[], balances=[])})
+    dex = _FakeDex([[_rh_pair(_CA_AI_CHECKSUM, _CA_NVDA, "NVDA", "NVIDIA • Robinhood Token")]])
+    p = _poller_with_dex(client, FakeNotifier(), dex)
+    p.tick()
+    client.snaps["uA"].swaps[:] = [_rh_swap("a2")]
+    p.tick()
+    assert len(dex.calls) == 1, "第二轮又问了一次同一个币"

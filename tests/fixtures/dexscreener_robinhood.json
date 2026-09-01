@@ -1,0 +1,238 @@
+[
+  {
+    "chainId": "robinhood",
+    "dexId": "uniswap",
+    "url": "https://dexscreener.com/robinhood/0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27",
+    "pairAddress": "0xcbdfea90430a30ee4469c9902e120a77e7c7e4711d5643671c1d1957f2f1ce27",
+    "labels": [
+      "v4"
+    ],
+    "baseToken": {
+      "address": "0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18",
+      "name": "Artificial Inu",
+      "symbol": "AI"
+    },
+    "quoteToken": {
+      "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+      "name": "NVIDIA • Robinhood Token",
+      "symbol": "NVDA"
+    },
+    "priceNative": "0.0007042",
+    "priceUsd": "0.1574",
+    "txns": {
+      "m5": {
+        "buys": 9,
+        "sells": 16
+      },
+      "h1": {
+        "buys": 340,
+        "sells": 527
+      },
+      "h6": {
+        "buys": 1132,
+        "sells": 1784
+      },
+      "h24": {
+        "buys": 2523,
+        "sells": 4595
+      }
+    },
+    "volume": {
+      "h24": 4309669.06,
+      "h6": 1437576.55,
+      "h1": 352030.28,
+      "m5": 12081.52
+    },
+    "priceChange": {
+      "m5": -1.21,
+      "h1": 9.69,
+      "h6": 21.25,
+      "h24": 94.36
+    },
+    "liquidity": {
+      "usd": 4403727.18,
+      "base": 16561146,
+      "quote": 8036.385
+    },
+    "fdv": 155789643,
+    "marketCap": 157405398,
+    "pairCreatedAt": 1784051311000,
+    "info": {
+      "imageUrl": "https://cdn.dexscreener.com/cms/images/U6RIzs8Fm7Jar6GE?width=800&height=800&quality=95&format=auto",
+      "header": "https://cdn.dexscreener.com/cms/images/gwos4je2c8JZxM-p?width=1500&height=500&quality=95&format=auto",
+      "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x2e8c31162b855a2ffa90f6f8634643ad6f111e18?timestamp=1788231600000",
+      "websites": [
+        {
+          "url": "https://artificialinu.com/",
+          "label": "Website"
+        }
+      ],
+      "socials": [
+        {
+          "url": "https://x.com/artificiallyinu",
+          "type": "twitter"
+        }
+      ]
+    }
+  },
+  {
+    "chainId": "robinhood",
+    "dexId": "uniswap",
+    "url": "https://dexscreener.com/robinhood/0xa70fc67c9f69da90b63a0e4c05d229954574e313",
+    "pairAddress": "0xA70fc67C9F69da90B63a0e4C05D229954574E313",
+    "labels": [
+      "v3"
+    ],
+    "baseToken": {
+      "address": "0x020bfC650A365f8BB26819deAAbF3E21291018b4",
+      "name": "Cash Cat",
+      "symbol": "CASHCAT"
+    },
+    "quoteToken": {
+      "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+      "name": "WETH",
+      "symbol": "WETH"
+    },
+    "priceNative": "0.00009147",
+    "priceUsd": "0.2254",
+    "txns": {
+      "m5": {
+        "buys": 101,
+        "sells": 2
+      },
+      "h1": {
+        "buys": 188,
+        "sells": 44
+      },
+      "h6": {
+        "buys": 1125,
+        "sells": 968
+      },
+      "h24": {
+        "buys": 3768,
+        "sells": 3097
+      }
+    },
+    "volume": {
+      "h24": 4240457.94,
+      "h6": 1621436.88,
+      "h1": 150844.9,
+      "m5": 59102.89
+    },
+    "priceChange": {
+      "m5": 2.25,
+      "h1": 3.6,
+      "h6": 9.51,
+      "h24": 19.93
+    },
+    "liquidity": {
+      "usd": 4492143.11,
+      "base": 10289832,
+      "quote": 881.1683
+    },
+    "fdv": 222822161,
+    "marketCap": 222822161,
+    "pairCreatedAt": 1781812885000,
+    "info": {
+      "imageUrl": "https://cdn.dexscreener.com/cms/images/Lq7a3pS9Wn8EuGp0?width=800&height=800&quality=95&format=auto",
+      "header": "https://cdn.dexscreener.com/cms/images/PfcMZWxAGU7_TDa8?width=1500&height=500&quality=95&format=auto",
+      "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x020bfc650a365f8bb26819deaabf3e21291018b4?timestamp=1788231600000",
+      "websites": [
+        {
+          "url": "https://cashcat.cc/",
+          "label": "Website"
+        }
+      ],
+      "socials": [
+        {
+          "url": "https://x.com/cashcat_token",
+          "type": "twitter"
+        },
+        {
+          "url": "https://t.me/cashcat_robinhood",
+          "type": "telegram"
+        },
+        {
+          "url": "https://www.reddit.com/r/cashcattoken/s/L8GOOuy9Ch",
+          "type": "reddit"
+        }
+      ]
+    }
+  },
+  {
+    "chainId": "robinhood",
+    "dexId": "uniswap",
+    "url": "https://dexscreener.com/robinhood/0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92",
+    "pairAddress": "0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92",
+    "labels": [
+      "v4"
+    ],
+    "baseToken": {
+      "address": "0xe934e36A439C94017B64a3FecE66AF12099aBF50",
+      "name": "StonkBroker",
+      "symbol": "STONKBROKER"
+    },
+    "quoteToken": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "name": "Ether",
+      "symbol": "ETH"
+    },
+    "priceNative": "0.00001198",
+    "priceUsd": "0.02953",
+    "txns": {
+      "m5": {
+        "buys": 1,
+        "sells": 7
+      },
+      "h1": {
+        "buys": 30,
+        "sells": 63
+      },
+      "h6": {
+        "buys": 343,
+        "sells": 291
+      },
+      "h24": {
+        "buys": 1655,
+        "sells": 969
+      }
+    },
+    "volume": {
+      "h24": 4994867.47,
+      "h6": 1208369.37,
+      "h1": 257246.63,
+      "m5": 7892.56
+    },
+    "priceChange": {
+      "m5": -0.46,
+      "h1": -6.11,
+      "h6": -5.16,
+      "h24": 39.32
+    },
+    "liquidity": {
+      "usd": 4564710.92,
+      "base": 75109332,
+      "quote": 951.7361
+    },
+    "fdv": 70649118,
+    "marketCap": 45327834,
+    "pairCreatedAt": 1784346603000,
+    "info": {
+      "imageUrl": "https://cdn.dexscreener.com/cms/images/_dQRN4wt4hctn71c?width=800&height=800&quality=95&format=auto",
+      "header": "https://cdn.dexscreener.com/cms/images/VpeGGxbZYDFNTveG?width=1500&height=500&quality=95&format=auto",
+      "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0xe934e36a439c94017b64a3fece66af12099abf50?timestamp=1788231600000",
+      "websites": [
+        {
+          "url": "https://stonkbrokers.cash",
+          "label": "Website"
+        }
+      ],
+      "socials": [
+        {
+          "url": "https://x.com/ClutchMarkets?lang=en",
+          "type": "twitter"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,79 @@
+[
+  {
+    "chainId": "solana",
+    "dexId": "pumpswap",
+    "url": "https://dexscreener.com/solana/hmzvseemtzhhvznw9uwbag85hctmfnkbhzux16cy7ca3",
+    "pairAddress": "HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3",
+    "baseToken": {
+      "address": "Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump",
+      "name": "Catecoin",
+      "symbol": "CATE"
+    },
+    "quoteToken": {
+      "address": "So11111111111111111111111111111111111111112",
+      "name": "Wrapped SOL",
+      "symbol": "SOL"
+    },
+    "priceNative": "0.0003566",
+    "priceUsd": "0.03687",
+    "txns": {
+      "m5": {
+        "buys": 17,
+        "sells": 35
+      },
+      "h1": {
+        "buys": 490,
+        "sells": 243
+      },
+      "h6": {
+        "buys": 4368,
+        "sells": 2596
+      },
+      "h24": {
+        "buys": 11671,
+        "sells": 8675
+      }
+    },
+    "volume": {
+      "h24": 4676639.11,
+      "h6": 1603719.36,
+      "h1": 156827.49,
+      "m5": 18942.12
+    },
+    "priceChange": {
+      "m5": 0.48,
+      "h1": -1.74,
+      "h6": -12.1,
+      "h24": -11.18
+    },
+    "liquidity": {
+      "usd": 1833885.97,
+      "base": 24908095,
+      "quote": 8852.9556
+    },
+    "fdv": 35557095,
+    "marketCap": 35557387,
+    "pairCreatedAt": 1785083563000,
+    "info": {
+      "imageUrl": "https://cdn.dexscreener.com/cms/images/_aILGflqFiJQJ4A-?width=800&height=800&quality=95&format=auto",
+      "header": "https://cdn.dexscreener.com/cms/images/Yrr72dpjEDps-Ciu?width=1500&height=500&quality=95&format=auto",
+      "openGraph": "https://cdn.dexscreener.com/token-images/og/solana/Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump?timestamp=1788231600000",
+      "websites": [
+        {
+          "url": "https://cate.meme/",
+          "label": "Website"
+        }
+      ],
+      "socials": [
+        {
+          "url": "https://x.com/i/communities/2004330768022004131",
+          "type": "twitter"
+        },
+        {
+          "url": "https://t.me/catecoin_telegram",
+          "type": "telegram"
+        }
+      ]
+    }
+  }
+]

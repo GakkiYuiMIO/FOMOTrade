@@ -38,6 +38,28 @@ def _never_touch_production_db(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _no_dexscreener_network(monkeypatch):
+    """
+    整场测试的兜底防线之二:**没有任何一条用例可以真的去打 DexScreener**。
+
+    ⚠️⚠️ 为什么需要它:Poller / PumpWatcher 在 __init__ 里各建一个 PoolQuoteLookup,
+       它默认自带一个真实的 DexScreenerClient。任何一条走到 _dispatch / _check 的
+       用例都会**真的发 HTTP 请求出去** —— 这不是假想:这个功能刚接上去、还没加这道
+       防线时跑了一次全量,1024 条用例从 20 秒涨到 **132 秒**,涨的全是真实网络往返,
+       等于每跑一次测试就拿用户的 IP 去挨一遍限流。
+       靠"每条用例记得注入假 client"守不住,这里把地板铺死。
+    ⚠️ 桩成"请求失败"(返回 None)而不是抛异常:None 是这个功能的正常降级路径
+       (那一行整行消失),于是**没显式关心底池的用例行为与改造前完全一致**。
+       要测这条路的用例自己注入 PoolQuoteLookup(client=假 client)。
+    """
+    from src import dexscreener as _d
+
+    monkeypatch.setattr(_d.DexScreenerClient, "fetch_pairs",
+                        lambda self, slug, addresses: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _clear_stop_flag():
     """
     client 的停机 Event 是**模块级全局**。某个用例设了它而不清,

@@ -62,6 +62,7 @@ from loguru import logger
 
 from src import store
 from src.config import get_settings
+from src.dexscreener import PoolQuoteLookup, notable
 from src.formatter import render_pump_callout, render_pump_trade
 from src.models import NETWORK_DISPLAY
 
@@ -933,6 +934,9 @@ class PumpWatcher:
         #    cli 全程只建一个 watcher,缓存才跨得了轮;而 bot 侧那个 client 是另一个实例,
         #    两边共用一份缓存反而会让"这一轮打了几个请求"变得不可预测。
         self._coin_cache: dict[str, tuple[float, CoinStats]] = {}
+        # 底池对手资产(DexScreener,公开免鉴权)。自带 6 小时 TTL 缓存,
+        # 挂在 watcher 上才跨得了轮;失败一律自己吞掉,绝不影响成交推送本身。
+        self._pool_lookup = PoolQuoteLookup()
 
     # ---- 对外唯一入口 ----------------------------------------------------
     def run_once(self) -> int:
@@ -955,6 +959,7 @@ class PumpWatcher:
             self._client.close()
         except Exception:  # noqa: BLE001
             pass
+        self._pool_lookup.close()
 
     # ---- 内部 ------------------------------------------------------------
     def _check(self) -> int:
@@ -1027,6 +1032,12 @@ class PumpWatcher:
 
         # ⚠️⚠️ budget 是**整轮唯一的一份推送预算**,一路传到 _push 那层做截断。
         #    在这里判一次、下面每层再各判一次自己的 20 = 上限根本不是上限。
+        # 底池对手资产:**按链批量问一次**(整轮 ≤ 链数个请求,而不是每个 mint 一个)。
+        # ⚠️ 与市值那个「只在真要发消息时才求」不同,这里刻意提前问:一次请求最多带
+        #    30 个地址,而本轮的 mint 数被 fomo_pump_max_mints(≤15)钉住 ——
+        #    提前批量问的代价恒定是"每条链 1 个请求",逐个懒查反而更贵。
+        pool_quotes = self._pool_quotes(mints, by_mint)
+
         sent = 0
         budget = MAX_PUSH_PER_ROUND
         for mint in mints:
@@ -1035,10 +1046,37 @@ class PumpWatcher:
                                "快照不前移、下一轮继续", MAX_PUSH_PER_ROUND)
                 break
             n, used = self._handle_mint(mint, by_mint[mint], by_addr, all_addrs,
-                                        cutoff_ts, done, budget, observed)
+                                        cutoff_ts, done, budget, observed, pool_quotes)
             sent += n
             budget -= used
         return sent
+
+    def _pool_quotes(self, mints: list[str],
+                     by_mint: dict[str, list[tuple[_Watched, Position]]]) -> dict[str, dict]:
+        """
+        本轮这些 mint 的底池对手资产 → {内部链标识: {归一化地址: PoolQuote}}。
+
+        ⚠️ 链取自持仓行的 network_id(已由 _CHAIN_ID_TO_NETWORK 归一化)。
+           取不到链的 mint 直接跳过 —— DexScreener 的 URL 里链是必填的,没链就没法问,
+           **绝不拿别的链去试**(实测拿错 slug 会返回 HTTP 200 + 空数组,白挨一次限流)。
+        ⚠️⚠️ 整段包在 try 里,失败一律降级为空。
+           **绝不能出现"因为查不到底池对手所以成交没推出去"**。
+        """
+        by_net: dict[str, list[str]] = {}
+        for mint in mints:
+            rows = by_mint.get(mint) or []
+            if not rows:
+                continue
+            net = (rows[0][1].network_id or "").strip()
+            if net:
+                by_net.setdefault(net, []).append(mint)
+        out: dict[str, dict] = {}
+        for net, addrs in by_net.items():
+            try:
+                out[net] = self._pool_lookup.lookup(net, addrs)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("pump.fun 底池对手查询失败,本轮这条链不显示该行 | {} | {}", net, e)
+        return out
 
     def _scan(self, w: _Watched) -> tuple[list[Position], list[Position]]:
         """
@@ -1075,7 +1113,8 @@ class PumpWatcher:
     def _handle_mint(self, mint: str, holders: list[tuple[_Watched, Position]],
                      by_addr: dict[str, list[_Watched]], all_addrs: list[str],
                      cutoff_ts: float, done: set, budget: int,
-                     observed: dict[tuple[str, str], set[str]]) -> tuple[int, int]:
+                     observed: dict[tuple[str, str], set[str]],
+                     pool_quotes: dict[str, dict] | None = None) -> tuple[int, int]:
         """
         一个变动的 mint:问逐笔成交 → 过滤 → 推送 → 只对**推干净了**的人前移快照。
 
@@ -1130,7 +1169,10 @@ class PumpWatcher:
             need = bool(fresh) and room > 0
             stats = self._coin_stats(mint) if need else None
             n_holders = len(observed.get(rows[0].key, ())) if need else None
-            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders)
+            # ⚠️ 只有对手**不是常见计价资产**时 notable 才给东西 ——
+            #    绝大多数 pump 币对着 SOL,那一行是噪音(见 dexscreener.notable)
+            pq = notable((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq)
             sent += n
             used += tried
             if ok:
@@ -1176,15 +1218,17 @@ class PumpWatcher:
 
     def _push(self, w: _Watched, pos: Position, fresh: list[Trade], budget: int,
               stats: CoinStats | None = None,
-              holders_in_list: int | None = None) -> tuple[bool, int, int]:
+              holders_in_list: int | None = None,
+              pool_quote=None) -> tuple[bool, int, int]:
         """
         逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
 
         budget 是**本轮剩下的全局额度**(不是这个人这个币的额度)——
         超出的部分本轮不发,靠 all_ok=False 让快照不前移、下一轮接着推。
 
-        stats / holders_in_list 允许为 None(市值问不到 / 没算)——
-        对应的行整行消失,成交本身照推。**市值绝不是推送的前置条件。**
+        stats / holders_in_list / pool_quote 允许为 None(市值问不到 / 没算 /
+        对手是常见计价资产)—— 对应的行整行消失,成交本身照推。
+        **它们没有一个是推送的前置条件。**
 
         ⚠️⚠️ **推送成功才记台账**(与 poller._dispatch 的 `ok = notifier.send(...)`
            / `if ok:` 同一条铁律)。反过来写的话,一次 TG 400 或网络抖动
@@ -1223,6 +1267,8 @@ class PumpWatcher:
                 network_id=pos.network_id,
                 chain_display=pos.chain_display,
                 tx=t.tx,
+                pool_quote_symbol=None if pool_quote is None else pool_quote.symbol,
+                pool_quote_name=None if pool_quote is None else pool_quote.name,
             )
             if not self._notifier.send(text):
                 logger.error("pump.fun 成交推送失败(下一轮重试) | user={} mint={} tx={}",
