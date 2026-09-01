@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS watch_users (
     --    它存在的理由:有些人在别处成交、币是转进来的,对这些人来说「收到」
     --    才是他动手的那一刻。是不是这种情况由用户自己判断,我们只推可证的事实。
     watch_transfer_in INTEGER NOT NULL DEFAULT 0,
+    -- 这个人**自己**的转入门槛(美元)。⚠️ 可空,**NULL = 跟着全局
+    --    fomo_transfer_watch_min_usd 走**,不是 0 —— 0 是"这个人全推"这个真实意图。
+    -- ⚠️⚠️ 刻意另起一列,**绝不把 watch_transfer_in 改成存金额**:
+    --    1. `watch_transfer_in = 1` 是 transfer_watch_user_ids / remove_watch_user
+    --       / poller._refresh_watched_index 一路在用的谓词,改成存金额之后这些查询
+    --       的语义当场变掉(只有门槛恰好 1 美元的人才算"开着"),而且一声不吭。
+    --    2. 「门槛 0」与「关掉」会撞成同一个值 —— 用户要的"这个人全推"
+    --       会被静默解释成"这个人不推"。
+    --    开关归开关、门槛归门槛,两件事就是两列。
+    transfer_in_min_usd REAL,
     note         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_watch_users_active ON watch_users(active);
@@ -470,6 +480,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE watch_users ADD COLUMN watch_transfer_in INTEGER NOT NULL DEFAULT 0")
         logger.info("迁移:watch_users 补列 watch_transfer_in(转入逐条推送)")
 
+    if wcols and "transfer_in_min_usd" not in wcols:
+        # ⚠️ **可空、无 DEFAULT** —— 老库里已经开着 /tin 的那个人补列之后拿到 NULL,
+        #    NULL 落回全局 fomo_transfer_watch_min_usd(默认 $100),也就是他升级前后的
+        #    推送**逐字节相同**。写成 `NOT NULL DEFAULT 0` 就是把他静默改成"全推"
+        #    (实测 1.1 条/天 → 8.1 条/天);写成 `DEFAULT 100` 则是把当时的全局值
+        #    **冻结**进库,以后改 .env 对他不再生效 —— 两种都是没人下过的指令。
+        conn.execute("ALTER TABLE watch_users ADD COLUMN transfer_in_min_usd REAL")
+        logger.info("迁移:watch_users 补列 transfer_in_min_usd(每人各自的转入门槛,NULL=跟全局)")
+
     pcols = {r["name"] for r in conn.execute("PRAGMA table_info(pump_watch_users)").fetchall()}
     if pcols and "callout_seeded" not in pcols:
         # ⚠️ 默认 0 —— 老库升级后行为与升级前**逐字节相同**:名单里的人一律当成
@@ -658,49 +677,122 @@ def transfer_watch_user_ids(conn) -> set[str]:
     return {r["user_id"] for r in rows}
 
 
-def set_transfer_watch(conn, handle_or_id: str, on: bool | None = None,
-                       *, max_on: int | None = None) -> tuple[bool, str]:
-    """
-    开/关一个人的「转入逐条推送」。返回 (是否改动了, 回执文案)。
+# set_transfer_watch 的 min_usd 哨兵:这次**不动门槛**。
+# ⚠️ 不能拿 None 当"没传":None 是这一列的**合法取值**(= 清回全局默认),
+#    两者撞在一起之后"别动它"和"把它清掉"就再也分不开了。
+KEEP_MIN_USD = object()
 
-    on = None 时是**开关**(已开就关),这是 /tin 的默认用法;传显式 True/False
+
+def resolve_transfer_min_usd(row_min_usd: float | None, default_min_usd: float) -> float:
+    """
+    这个人的这一笔按多少钱判。**门槛语义的唯一出处**,poller(判定)与 bot(回执/清单)
+    共用同一个函数 —— 两处各写一遍迟早漂移,而漂移出来的是"该推的没推"。
+
+    ⚠️⚠️ 必须 `is None`,**绝不能写 `row_min_usd or default_min_usd`**:
+       0 是用户显式设过的合法门槛(= 这个人的转入全推),真值判断会把它当成"没设过"
+       而悄悄换回全局默认 —— 用户在清单里看到 $0.00,实际却按 $100 在筛,一声不吭。
+    """
+    return default_min_usd if row_min_usd is None else float(row_min_usd)
+
+
+def fmt_transfer_min_usd(row_min_usd: float | None,
+                         default_min_usd: float | None = None) -> str:
+    """
+    门槛的展示文案。
+
+    ⚠️ 「没设过、跟着全局走」与「显式设成了同一个数」必须**看得出区别**:
+       前者会随 .env 里的 FOMO_TRANSFER_WATCH_MIN_USD 一起变,后者不会。
+       两个都印成 `$100.00` 的话,用户没法判断改 .env 会不会影响到这个人。
+    ⚠️ default_min_usd 由调用方注入(与 max_on 同一条理由,见下)。没注入时只写
+       「默认」两个字 —— 它只影响回执好不好看,**判定永远不经过这里**。
+    """
+    if row_min_usd is None:
+        return "默认" if default_min_usd is None else f"${default_min_usd:,.2f}(默认)"
+    return f"${float(row_min_usd):,.2f}"
+
+
+def _min_usd_differs(a: float | None, b: float | None) -> bool:
+    """两个门槛是不是不一样。⚠️ NULL 与 0.0 是**不同的两件事**,不能靠真值判断合并"""
+    if a is None or b is None:
+        return (a is None) != (b is None)
+    return float(a) != float(b)
+
+
+def set_transfer_watch(conn, handle_or_id: str, on: bool | None = None,
+                       *, min_usd=KEEP_MIN_USD, default_min_usd: float | None = None,
+                       max_on: int | None = None) -> tuple[bool, str]:
+    """
+    开/关一个人的「转入逐条推送」,并可同时设定**他自己的**金额门槛。
+    返回 (是否改动了, 回执文案)。
+
+    on = None 时是**开关**(已开就关),这是 /tin 不带金额时的用法;传显式 True/False
     则是幂等设置,此时"本来就是这样"会如实回执 —— 开关命令唯一的反馈就是回执,
     含糊的回执会让用户分不清自己刚才是开了还是关了。
 
+    ⚠️⚠️ **带金额时调用方传 on=True(只开不切),不带金额才传 on=None(切换)。**
+       这个歧义只有这一种解法:
+         - 带金额时也切换 → 「已开在 $30000,再发 /tin alice 200」既可以读成
+           "关掉他"也可以读成"改成 200",用户无从预期;
+         - 不带金额时也当成"设置" → 就再也没有任何写法能**关掉**了。
+    ⚠️ min_usd 三态:KEEP_MIN_USD = 不动门槛;float = 设成这个数(**0 合法** = 全推);
+       None = 清回 NULL(重新跟着全局默认走)。
     ⚠️ 与 set_starred 同一套找人规矩(handle 或 user_id,**只认 active 的**):
        给已经移出名单的人开这个开关没有意义 —— poller 根本不会去拉他的转账。
     ⚠️ max_on 是"最多同时开几个人"的上限,**由调用方注入**:上限的依据是 poller
        的单轮请求预算(见 poller.TRANSFER_WATCH_MAX 那段算式),而 poller 依赖
        本模块 —— 在这里 import 它就是循环依赖。传 None 表示不限。
+    ⚠️ 门槛**不做上下限校验**(负数在调用方就被拦掉了):这里只负责存,
+       "什么样的数算合法"是命令语法的事,两处都判会各判各的。
     """
     key = (handle_or_id or "").strip()
     if not key:
-        return False, "❓ 用法:/tin <handle>"
+        return False, "❓ 用法:/tin <handle> [金额]"
     row = conn.execute(
-        "SELECT user_id, handle, display_name, watch_transfer_in FROM watch_users "
-        "WHERE active = 1 AND (lower(handle) = ? OR user_id = ?)",
+        "SELECT user_id, handle, display_name, watch_transfer_in, transfer_in_min_usd "
+        "FROM watch_users WHERE active = 1 AND (lower(handle) = ? OR user_id = ?)",
         (normalize_handle(key), key),
     ).fetchone()
     if row is None:
         return False, f"❓ 名单里没有 {clean_handle(key)}(先 /add 加进来)"
 
     who = row["display_name"] or row["handle"]
-    cur = bool(row["watch_transfer_in"])
-    target = (not cur) if on is None else bool(on)
-    if cur == target:
-        return False, f"ℹ️ {who} 的转入推送本来就是{'开' if target else '关'}着的"
-    if target and max_on is not None:
+    cur_on = bool(row["watch_transfer_in"])
+    cur_min = row["transfer_in_min_usd"]
+    target_on = (not cur_on) if on is None else bool(on)
+    # ⚠️ 没传 min_usd 时目标就是**现在这个值**,而不是 None —— 写成 None 等于
+    #    每次开关都顺手把用户设过的门槛清掉,而他并没有下过这个指令。
+    target_min = cur_min if min_usd is KEEP_MIN_USD else min_usd
+
+    if target_on == cur_on and not _min_usd_differs(cur_min, target_min):
+        if not target_on:
+            return False, f"ℹ️ {who} 的转入推送本来就是关着的"
+        return False, (f"ℹ️ {who} 的转入推送本来就是开着的 · 门槛 "
+                       f"{fmt_transfer_min_usd(cur_min, default_min_usd)}")
+    if target_on and not cur_on and max_on is not None:
         # ⚠️ 上限在**开之前**拦,而不是让 poller 事后降级:poller 那边超限只会
         #    退回轮转 + 刷日志,用户在 TG 里什么都看不到,还以为开成功了。
+        # ⚠️ 拦下来时门槛也一并不写:半开半设的状态比什么都没发生更难解释。
         n = len(transfer_watch_user_ids(conn))
         if n >= max_on:
             return False, (f"❗ 转入推送最多同时开 {max_on} 人(现在已开 {n} 人)—— "
                            f"每多一个人,每轮就多一个请求。先 /tin 关掉一个再来")
     with tx(conn):
-        conn.execute("UPDATE watch_users SET watch_transfer_in = ? WHERE user_id = ?",
-                     (1 if target else 0, row["user_id"]))
-    return True, (f"📥 已开启 {who} 的转入逐条推送" if target
-                  else f"🔕 已关闭 {who} 的转入逐条推送")
+        conn.execute(
+            "UPDATE watch_users SET watch_transfer_in = ?, transfer_in_min_usd = ? "
+            "WHERE user_id = ?",
+            (1 if target_on else 0, target_min, row["user_id"]),
+        )
+    shown = fmt_transfer_min_usd(target_min, default_min_usd)
+    if not target_on:
+        # ⚠️ 关掉时**门槛留着**(与 remove_watch_user 清零 watch_transfer_in 的决定
+        #    并不矛盾,理由见那里)。留着这件事必须写进回执,否则就是暗的。
+        if target_min is None:
+            return True, f"🔕 已关闭 {who} 的转入逐条推送"
+        return True, f"🔕 已关闭 {who} 的转入逐条推送 · 门槛 {shown} 留着,下次打开还是它"
+    if cur_on:
+        return True, (f"🎚 {who} 的转入门槛已改为 {shown}"
+                      f"(之前 {fmt_transfer_min_usd(cur_min, default_min_usd)})")
+    return True, f"📥 已开启 {who} 的转入逐条推送 · 门槛 {shown}"
 
 
 def add_watch_user(conn, user_id: str, handle: str, display_name: str | None) -> tuple[bool, str]:
@@ -774,6 +866,13 @@ def remove_watch_user(conn, handle_or_id: str) -> tuple[bool, str]:
        代价是回归后要重新 /tin 一次 —— 与「默认全员关闭、必须一个个开」是同一条规矩。
        清零之后 `watch_transfer_in = 1 ⟹ active = 1` 成为库上恒真的不变式,
        set_transfer_watch 那道人数上限才真的兜得住。
+    ⚠️⚠️ **但 transfer_in_min_usd 反过来:留着,不清。** 上面两条理由对它一条都不成立 ——
+       开关关着时这一列**完全不参与判定**,既不花请求也不发消息,留着是惰性的。
+       清掉它才是那种"用户没下指令、行为自己变了":他把某人设成 $30000 之后 /del、
+       再 /add 回来 /tin 打开,推送量会从 0.5 条/天静默涨回 $100 的 1.1 条/天。
+       两条决定其实是同一条原则——**往推送变多的方向永远不许静默发生**——
+       作用在语义不同的两列上,所以结论相反。
+       而且它并不是暗的:回执与 /tin 清单永远写明当前门槛是多少。
     """
     row = get_watch_user(conn, handle_or_id) or find_user_by_handle(conn, handle_or_id)
     if not row or not row["active"]:

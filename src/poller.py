@@ -698,6 +698,10 @@ class Poller:
         # ⚠️ 默认空集 = 谁都不推、转账采集也一切照旧 —— 没调用过 _refresh_watched_index
         #    的调用方(单测直接调 _fetch_snapshots)因此拿到与改造前完全一致的行为。
         self._tx_watch_ids: set[str] = set()
+        # 这批人**各自**的转入门槛(美元),与 _tx_watch_ids 在同一处、同一批行上重建。
+        # ⚠️ 存进来的已经是**解析完的**数(NULL / 老库缺列都已落回全局默认),
+        #    所以判定那边拿到的永远是个真数 —— "落回默认"这件事只做一次、只在一处。
+        self._tx_watch_min: dict[str, float] = {}
         # 每 tick 从 balances 重建(见 _build_token_index)
         self._token_meta: dict[tuple, dict] = {}    # (net, ca)        → symbol/市值/现价
         self._positions: dict[tuple, dict] = {}     # (uid, net, ca)   → 持仓/均价/盈亏
@@ -903,6 +907,15 @@ class Poller:
         # ⚠️ 走 _row_get:老库/单测里的行可能压根没有这一列,缺列时它给 None(= 没开)。
         self._tx_watch_ids = {
             u["user_id"] for u in users if _row_get(u, "watch_transfer_in")
+        }
+        # 每人各自的门槛。⚠️ transfer_in_min_usd 为 NULL(没单独设过)**和**老库里
+        #    根本没有这一列,_row_get 都给 None,再由 resolve_transfer_min_usd 落回
+        #    全局默认 —— 两种情况本来就该是同一个结果:与改造前逐字节相同的行为。
+        default_min = self.settings.fomo_transfer_watch_min_usd
+        self._tx_watch_min = {
+            u["user_id"]: store.resolve_transfer_min_usd(
+                _row_get(u, "transfer_in_min_usd"), default_min)
+            for u in users if u["user_id"] in self._tx_watch_ids
         }
 
     def _fetch_snapshots(self, users) -> dict:
@@ -1852,11 +1865,14 @@ class Poller:
           4. 方向判得出、且不是计价币:方向不明时"收到"这个说法本身就没依据;
              USDC/WSOL 到账是在给自己充钱,不是"他拿到了某个币"。
              (与 _check_transfer_in 的候选过滤同口径。)
-          5. 金额够门槛。⚠️ 门槛是 **fomo_transfer_watch_min_usd**,不是
-             fomo_transfer_alert_min_usd —— 后者是"几个人收到同一个币"那个聚合信号的
-             阈值,语义与量级都不同,复用它就是让两个功能互相改灵敏度。
+          5. 金额够**这个人自己的**门槛(/tin <handle> <金额> 设的那个);他没单独
+             设过就落回全局 fomo_transfer_watch_min_usd。⚠️ 一个人一个数是刻意的:
+             名单里既有一动就是六位数的巨鲸,也有几百美金一笔的人,一个全局值
+             要么把后者整个筛没、要么被前者的日常搬仓淹掉。
+             ⚠️ 门槛绝不是 fomo_transfer_alert_min_usd —— 后者是"几个人收到同一个币"
+             那个聚合信号的阈值,语义与量级都不同,复用它就是让两个功能互相改灵敏度。
         ⚠️ amount_usd is None 一律不推:证不出它够门槛。判据必须是 is None 而不是
-           真值判断 —— 配置允许门槛为 0,那时 $0.00 的到账是"确实是 0"、该推,
+           真值判断 —— 门槛允许为 0,那时 $0.00 的到账是"确实是 0"、该推,
            而 None 是"不知道多少"、不该推。(实测本地库 15254 条 TRANSFER_IN 里
            amount_usd 缺失 0 条,所以这一支是纯防御。)
         """
@@ -1870,7 +1886,11 @@ class Poller:
             return False
         if ev.amount_usd is None:
             return False
-        return ev.amount_usd >= self.settings.fomo_transfer_watch_min_usd
+        # ⚠️ _tx_watch_min 与 _tx_watch_ids 同生同灭,上面那道门过了这里必然有值;
+        #    .get 的兜底只为"有人绕过 _refresh_watched_index 直接塞了 ids"的将来,
+        #    落回全局默认(= 改造前的行为),而不是放行。
+        return ev.amount_usd >= self._tx_watch_min.get(
+            ev.user_id, self.settings.fomo_transfer_watch_min_usd)
 
     def _pool_quotes(self, pending: list[FomoEvent]) -> dict[str, dict]:
         """

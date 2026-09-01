@@ -2882,6 +2882,13 @@ def _mark_tin(handle: str, on: bool = True) -> None:
     assert ok, f"前提不成立,开关没拨动:{msg}"
 
 
+def _tin_min(handle: str, usd: float | None) -> None:
+    """开启并设定**这个人自己**的门槛(usd=None = 清回跟随全局默认)"""
+    with store.get_conn() as c:
+        ok, msg = store.set_transfer_watch(c, handle, True, min_usd=usd)
+    assert ok, f"前提不成立,门槛没设上:{msg}"
+
+
 def _deposit(i: int = 0, usd: float = 2439.09, minutes_ago: float = 0.0, **kw) -> dict:
     """一笔**刚刚到账**的转入,形态取真实报文;默认金额就是真实那笔 $2,439.09"""
     ts = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
@@ -3057,6 +3064,114 @@ def test_门槛取的是转入推送那项配置_不是聚合告警那项(db, mo
     _, notifier = _tick_transfers([_deposit(2)], uid="uB")
     assert notifier.sent == [], \
         "$2,439.09 < 转入推送门槛 $5000,不该推 —— 拿去比聚合告警的 $100 就会漏出来"
+
+
+# ---- 每人各自的门槛(/tin <handle> <金额>)--------------------------------
+def test_判定用的是这个人自己的门槛_不是那个全局值(db, monkeypatch):
+    """
+    ⚠️⚠️ 本次改动最核心的一条,而且**判据继续读全局值的话全量测试一条都不红**
+       (老用例全都只开一个人、且不设各自门槛,读哪个数结果一样)。
+       所以这里必须让两个人的门槛**一高一低地跨过同一笔金额**:
+         A 设 $30,000 → $2,439.09 不该推(读全局 $100 就会推出去)
+         B 设 $200    → $2,439.09 该推  (读 A 的 $30,000 就会推不出来)
+    ⚠️ 100 / 200 / 30000 全是写死的字面量,不从 config / store import。
+    """
+    _tin_env(monkeypatch, watch_usd=100)
+    _add_ready("uA", "Whale")
+    _add_ready("uB", "Shrimp")
+    _tin_min("Whale", 30000.0)
+    _tin_min("Shrimp", 200.0)
+
+    _, notifier = _tick_transfers([_deposit(1)], uid="uA")       # $2,439.09
+    assert notifier.sent == [], \
+        f"A 的门槛是 $30,000,$2,439.09 不该推 —— 判定还在读全局 $100:{notifier.sent}"
+
+    _, notifier = _tick_transfers([_deposit(2)], uid="uB")       # 同一笔金额
+    assert len(notifier.sent) == 1, \
+        f"B 的门槛是 $200,同一笔 $2,439.09 必须推 —— 门槛没按人取:{notifier.sent}"
+    assert "Shrimp" in notifier.sent[0], notifier.sent[0]
+
+
+def test_某个人的门槛设成零时零元到账要推_哪怕全局门槛不是零(db, monkeypatch):
+    """
+    ⚠️⚠️ 铁律的直接落点:0 是有意义的真实值(= 这个人的转入全推)。
+       任何一处把「这个人的门槛」写成 `row_min or 全局默认` / `if row_min:`,
+       0 都会被当成"没设过"而悄悄换回全局 $100 —— 用户在清单里看到 $0.00,
+       实际却按 $100 在筛,一声不吭。
+    ⚠️ 全局门槛刻意配成 100(不是 0):配成 0 的话读错了值也照样推,这条就是假绿。
+    ⚠️ 两个方向都测:$0.00 要推、金额缺失(None)要不推 —— 只测一半的话
+       把判据改成真值判断仍然全绿。
+    """
+    _tin_env(monkeypatch, watch_usd=100)
+    _add_ready("uA", "PoorGoat_")
+    _tin_min("PoorGoat_", 0.0)
+
+    _, notifier = _tick_transfers([_deposit(1, usd=0.0)])
+    assert len(notifier.sent) == 1, \
+        f"他的门槛是 0,$0.00 是「确实是 0」、该推 —— 0 被真值判断吃掉了:{notifier.sent}"
+
+    missing = _deposit(2)
+    missing.pop("usdAmount")                             # 金额字段整个没有 → None
+    _, notifier = _tick_transfers([missing])
+    assert notifier.sent == [], "金额不知道多少时证不出它够门槛,门槛 0 也不能推"
+
+
+def test_没单独设过门槛的人跟着全局值走_而不是被冻结或归零(db, monkeypatch):
+    """
+    NULL = 跟着 .env 变。两个方向都测才钉得住:
+      - NULL 被当成 0 → 全局 $5000 那一支会漏推;
+      - NULL 被冻结成某个常数 → 全局 $100 那一支会推不出来。
+    """
+    _tin_env(monkeypatch, watch_usd=5000)
+    _add_ready("uA", "PoorGoat_")
+    _mark_tin("PoorGoat_")                               # 只开开关,不设门槛
+    _, notifier = _tick_transfers([_deposit(1)])         # $2,439.09
+    assert notifier.sent == [], \
+        f"他没设过门槛,就该按全局 $5000 判、不推 —— NULL 被当成 0 了:{notifier.sent}"
+
+    _tin_env(monkeypatch, watch_usd=100)
+    _add_ready("uB", "Holder2")
+    _mark_tin("Holder2")
+    _, notifier = _tick_transfers([_deposit(2)], uid="uB")
+    assert len(notifier.sent) == 1, \
+        f"同样没设过门槛,全局降到 $100 就必须推 —— NULL 被冻结成了别的数:{notifier.sent}"
+
+
+def test_补发侧用的也是这个人自己的门槛_不许出现两份判据(db, monkeypatch):
+    """
+    ⚠️⚠️ 补发队列捞的是"库里所有 10 分钟内没发出去的行",它并不知道这条转入
+       当初为什么留在那里。判据必须**同一个函数**,否则改一处漏一处 ——
+       而漏的方向恰恰是"不该推的推了出去"。
+       这里用最自然的方式造出这种行:推送失败 → 用户随后把门槛调高。
+    """
+    _tin_env(monkeypatch, watch_usd=100)
+    _add_ready("uA", "PoorGoat_")
+    _tin_min("PoorGoat_", 200.0)
+    p, _ = _tick_transfers([_deposit(usd=2439.09)], ok=False)     # ≥ $200,该推但 TG 挂了
+    assert _sent_flags() == [0], "前提不成立:库里没有待补发的转入"
+
+    _tin_min("PoorGoat_", 30000.0)                                # 用户改主意,门槛调高
+    p, notifier = _tick_transfers([], poller=p)
+
+    assert notifier.sent == [], \
+        f"补发侧还在按旧门槛(或全局 $100)判 —— 判据成了两份:{notifier.sent}"
+    assert _sent_flags() == [1], "不推的必须就地排掉,否则它会每轮被捞一次、连捞 10 分钟"
+
+
+def test_名单行里没有门槛列时落回全局默认(db, monkeypatch):
+    """
+    老库补列之前、以及单测里手搓的行,都可能压根没有 transfer_in_min_usd 这一列。
+    缺列必须与 NULL 得到**同一个**结果(落回全局默认),而不是 KeyError / 0。
+    ⚠️ 直接打在 _refresh_watched_index 上:它是这两种缺失唯一的收敛点。
+    """
+    _tin_env(monkeypatch, watch_usd=100)
+    p = Poller(FakeClient(), FakeNotifier())
+    p._refresh_watched_index([{"user_id": "uA", "handle": "PoorGoat_",
+                               "watch_transfer_in": 1}])          # 没有门槛这一列
+
+    assert p._tx_watch_ids == {"uA"}
+    assert p._tx_watch_min == {"uA": 100.0}, \
+        f"缺列没落回全局默认 $100:{p._tx_watch_min}"
 
 
 def test_转入推送的默认门槛(monkeypatch):

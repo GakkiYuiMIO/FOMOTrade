@@ -102,7 +102,7 @@ _COMMAND_MENU = [
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
     ("unstar", "取消特别关注:/unstar <handle>"),
-    ("tin", "转入推送:/tin <handle> 开关 · /tin 看当前开着谁"),
+    ("tin", "转入推送:/tin <handle> <金额> 设他自己的门槛 · /tin 看名单"),
     ("pump", "pump.fun 名单:/pump 看名单 · /pump add|del <名字或钱包>"),
     ("del", "移出监控:/del <handle>"),
     ("rebuild", "重建全部历史基线(回填逻辑改动后用)"),
@@ -136,8 +136,9 @@ _HELP = (
     "/paper — 跟单台账:每一单现在赚亏多少\n"
     "/star &lt;handle&gt; — 特别关注:他的推送带 ⭐、币名加【】\n"
     "/unstar &lt;handle&gt; — 取消特别关注\n"
-    "/tin &lt;handle&gt; — 开/关这个人的<b>转入逐条推送</b>(再发一次即关闭);"
-    "/tin 不带参数=看当前开着谁\n"
+    "/tin &lt;handle&gt; &lt;金额&gt; — 开这个人的<b>转入逐条推送</b>并设"
+    "<b>他自己的</b>门槛(已开着就只改门槛,每人可以完全不同);"
+    "不带金额=开/关切换;/tin 不带参数=看名单与各自门槛\n"
     "/pump — <b>pump.fun</b> 买卖监控名单;/pump add|del &lt;名字或钱包&gt;\n"
     "/del &lt;handle&gt; — 移出监控(软删除,历史数据保留)\n"
     "/list — 查看监控名单与基线状态(⭐ 的排最前)\n"
@@ -268,6 +269,70 @@ def _num(v) -> float:
 def _day_str(iso: str | None) -> str:
     """ISO 时间取日期部分;缺失显示"时间未知"(绝不显示 None / N/A)"""
     return (iso or "")[:10] or "时间未知"
+
+
+# ============================================================
+# /tin <handle> <金额> —— 每人各自的转入门槛
+# ============================================================
+# 金额的**白名单**正则。⚠️ 刻意不用裸 float():float("nan") / float("inf") /
+#    float("1e999") 全都不报错,写进库之后 `amount_usd >= nan` 恒为 False ——
+#    这个人的推送从此一条都不来,而且没有任何报错(与 poller._f 是同一条教训)。
+#    白名单只放行"人真的会在聊天框里敲出来的写法",其余一律回用法。
+# ⚠️ 数字位刻意写成 [0-9] 而不是 \d:re 的 \d 连全角「５」和各种 Unicode 数字都收,
+#    而 float("５") 也照收不误 —— 一个看不出区别的字符就能悄悄变成另一个门槛。
+_TIN_MIN_RE = re.compile(
+    r"^\$?\s*(?P<int>[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+    r"(?:\.(?P<frac>[0-9]+))?\s*(?P<unit>[kKwW万])?$"
+)
+# k = 千,w / 万 = 万。⚠️ **刻意不收 m**:金融里 M 既被写成 million 也被写成
+#    千(罗马数字 M,"$5MM" 才是五百万),这个歧义猜错一次就是差 1000 倍的门槛,
+#    而错的方向是"从此一条都不推"。宁可让用户把零打全。
+_TIN_UNITS = {"k": 1000.0, "w": 10000.0, "万": 10000.0}
+# 清回「跟着全局默认走」的写法。没有它的话,门槛一旦显式设过就再也回不到
+# 「跟着 .env 变」——而这两种状态在清单上是分开显示的,回不去就是个死角。
+_TIN_RESET_WORDS = {"默认", "default", "auto", "全局"}
+_TIN_USAGE = (
+    "❓ 用法:/tin &lt;handle&gt; &lt;金额&gt;"
+    "(开启并设<b>他自己的</b>门槛,已经开着就只改门槛)\n"
+    "· /tin &lt;handle&gt; 不带金额 = 开/关切换 · /tin 看名单与各自门槛\n"
+    "· 金额认:30000 · 30,000 · $200 · 99.99 · 30k(千)· 3w / 3万 · "
+    "0(这个人全推)· 默认(清回跟随全局)"
+)
+# 帮助里必须带上这张表:门槛是个"调了才知道"的数字,不给参照系的话用户只能瞎试。
+# 本地库 20 天真实数据复核,单人、条/天。⚠️ 这是**量级**参照,不是承诺值 ——
+#    每个人的活跃度差得远,写成两位小数反而假。
+_TIN_FREQ_HINT = ("📊 单人推送量(本地库 20 天实测 · 条/天):不设 8.1 · ≥$100 1.1 · "
+                  "≥$500 0.8 · ≥$1000 0.7 · ≥$5000 0.5")
+
+
+def _parse_tin_min_usd(raw: str) -> tuple[bool, float | None, str]:
+    """
+    解析 /tin 的金额参数。返回 (是否合法, 门槛, 错误回执)。
+
+    ⚠️ **三态**,不是"失败返回 None":None 是合法结果(= 清回全局默认),
+       与"解析失败"撞在一起就再也分不出来了(与铁律「空用 is None 判断」同一条)。
+    ⚠️ 0 合法(= 这个人的转入全推);负数拒绝 —— 但回执必须把 0 那条路指出来,
+       因为敲负数的人多半想表达的就是"别筛了,全给我"。
+    """
+    s = (raw or "").strip()
+    if s.casefold() in _TIN_RESET_WORDS:
+        return True, None, ""
+    if s.startswith("-"):
+        return False, None, (f"❌ 门槛不能是负数({_esc(s)})。想让这个人的转入"
+                             f"<b>全推</b>就写 0:/tin &lt;handle&gt; 0")
+    m = _TIN_MIN_RE.match(s)
+    if m is None:
+        return False, None, _TIN_USAGE
+    val = float(m.group("int").replace(",", ""))
+    if m.group("frac"):
+        val += float("0." + m.group("frac"))
+    unit = m.group("unit")
+    if unit:
+        val *= _TIN_UNITS[unit.casefold()]
+    if not math.isfinite(val):
+        # 正则挡不住 "9" * 400 这种纯数字溢出成 inf 的写法
+        return False, None, f"❌ 门槛太大了({_esc(s)})—— 换一个能真的比出大小的数"
+    return True, val, ""
 
 
 # ============================================================
@@ -1177,28 +1242,52 @@ class CommandBot:
            **绝不替用户断言这是买入、也不猜他用的什么工具** —— 报文里没有任何证据。
         ⚠️ 默认全员关闭,而且必须一个个开:全名单打开实测约 807 条/天,
            那会把真正要看的买卖推送整个淹掉(见 poller._persist 里的实测数)。
+
+        三种写法,**语法上互不重叠**(理由见 store.set_transfer_watch):
+          /tin <handle> <金额>   开启并设成这个金额;已经开着就**只改门槛**
+          /tin <handle>          不带金额 = 开/关切换
+          /tin                   清单,每人显示各自的门槛
         """
         key = (arg or "").strip()
-        min_usd = self._settings.fomo_transfer_watch_min_usd
+        default_min = self._settings.fomo_transfer_watch_min_usd
+        parts = key.split()
+        if len(parts) > 2:
+            return _TIN_USAGE
         with store.get_conn() as conn:
-            if key:
-                # 不带 on/off 参数 = 开关:已开就关。上限由 poller 的请求预算决定
-                _, msg = store.set_transfer_watch(conn, key, max_on=TRANSFER_WATCH_MAX)
+            if len(parts) == 2:
+                ok, min_usd, err = _parse_tin_min_usd(parts[1])
+                if not ok:
+                    return err
+                # ⚠️ on=True 而不是 None:带金额时**只开不切**。写成切换的话
+                #    「已开在 $30000、再发 /tin alice 200」就分不出是关掉还是改门槛了。
+                _, msg = store.set_transfer_watch(
+                    conn, parts[0], True, min_usd=min_usd,
+                    default_min_usd=default_min, max_on=TRANSFER_WATCH_MAX)
+                return _esc(msg)
+            if parts:
+                # 不带金额 = 开关:已开就关。上限由 poller 的请求预算决定
+                _, msg = store.set_transfer_watch(
+                    conn, parts[0], default_min_usd=default_min, max_on=TRANSFER_WATCH_MAX)
                 return _esc(msg)
             rows = [r for r in store.list_active_users(conn) if r["watch_transfer_in"]]
 
         if not rows:
             return (
                 "📥 <b>转入逐条推送</b>:当前一个人都没开\n"
-                f"/tin &lt;handle&gt; 打开 —— 他每收到一笔 ≥ ${min_usd:,.2f} 的币就单独推一条。\n"
-                f"最多同时开 {TRANSFER_WATCH_MAX} 人(每多一人,每轮多一个请求)。"
+                f"/tin &lt;handle&gt; &lt;金额&gt; 打开 —— 他每收到一笔 ≥ 这个数的币就单独推一条"
+                f"(不写金额就用全局默认 ${default_min:,.2f})。\n"
+                f"最多同时开 {TRANSFER_WATCH_MAX} 人(每多一人,每轮多一个请求)。\n"
+                f"{_TIN_FREQ_HINT}"
             )
-        lines = [f"📥 <b>转入逐条推送</b>({len(rows)}/{TRANSFER_WATCH_MAX} 人)"
-                 f" · 门槛 ${min_usd:,.2f}"]
+        lines = [f"📥 <b>转入逐条推送</b>({len(rows)}/{TRANSFER_WATCH_MAX} 人)"]
         for i, r in enumerate(rows, 1):
             name = r["display_name"] or r["handle"]
-            lines.append(f"{i}. <b>{_esc(name)}</b> @{_esc(r['handle'])}")
-        lines.append("再发一次 /tin &lt;handle&gt; 即可关闭。")
+            # ⚠️ 门槛逐人显示,而且「(默认)」这三个字不能省:它标的是"这个人跟着
+            #    .env 走",与"显式设成了同一个数"是两回事 —— 后者改 .env 不会动他。
+            shown = store.fmt_transfer_min_usd(r["transfer_in_min_usd"], default_min)
+            lines.append(f"{i}. <b>{_esc(name)}</b> @{_esc(r['handle'])} · 门槛 {_esc(shown)}")
+        lines.append("/tin &lt;handle&gt; &lt;金额&gt; 改门槛 · /tin &lt;handle&gt; 关闭。")
+        lines.append(_TIN_FREQ_HINT)
         return "\n".join(lines)
 
     def _cmd_pump(self, arg: str) -> str:
