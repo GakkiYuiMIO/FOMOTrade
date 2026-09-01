@@ -844,6 +844,198 @@ def test_老库升级后自动补转入推送列(conn):
 
 
 # ============================================================
+# 每人各自的转入门槛(/tin <handle> <金额>)
+# ⚠️ 门槛一律**写死字面量**,不从 config / store import —— 从被测模块取一个数
+#    再拿它断言,等于用被测代码给自己打分。
+# ============================================================
+def _min_col(conn, uid: str):
+    """直接读列,绕开所有读取函数 —— 只有这样才能证明"真的落库了"而不是活在内存里"""
+    return conn.execute(
+        "SELECT transfer_in_min_usd FROM watch_users WHERE user_id = ?", (uid,)
+    ).fetchone()["transfer_in_min_usd"]
+
+
+def test_两个人的门槛各存各的_互不影响(conn):
+    """
+    用户原话就是这个:「人物A 我可以设置 30000,人物B 我可以设置 200」。
+    一个全局值做不到 —— 名单里既有一动就六位数的巨鲸,也有几百块一笔的人。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.add_watch_user(conn, "uB", "Bob", "Bob")
+
+    ok_a, msg_a = store.set_transfer_watch(conn, "alice", True, min_usd=30000.0)
+    ok_b, msg_b = store.set_transfer_watch(conn, "bob", True, min_usd=200.0)
+
+    assert ok_a and ok_b, (msg_a, msg_b)
+    assert _min_col(conn, "uA") == 30000.0, f"A 的门槛没落库:{_min_col(conn, 'uA')}"
+    assert _min_col(conn, "uB") == 200.0, "B 的门槛被 A 覆盖了 —— 那就还是全局值"
+    assert store.transfer_watch_user_ids(conn) == {"uA", "uB"}, "门槛不该影响开关本身"
+
+
+def test_门槛零要真的落成零_不能被真值判断吃掉(conn):
+    """
+    ⚠️ 铁律:0 是有意义的真实值。「这个人的转入全推」用 0 表达,
+       写成 `min_usd or None` / `if min_usd:` 会把它悄悄变成 NULL(= 跟着全局 $100 走),
+       用户以为设成了全推,实际每天少收 7 条。
+    ⚠️ 必须同时钉死 **列是 0.0 而不是 NULL** 和 **解析结果是 0.0 而不是全局默认**:
+       只测一个的话另一处被真值判断吃掉仍然全绿。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    ok, msg = store.set_transfer_watch(conn, "alice", True, min_usd=0.0)
+
+    assert ok, msg
+    got = _min_col(conn, "uA")
+    assert got is not None, "门槛 0 被当成「没设过」写成了 NULL —— 那就是回到全局门槛了"
+    assert got == 0.0
+    assert store.resolve_transfer_min_usd(got, 100.0) == 0.0, \
+        "0 被真值判断吃掉、落回了全局默认 100"
+
+
+def test_没单独设过门槛的人是NULL_判定时落回全局默认(conn):
+    """NULL 才是「跟着全局走」。写成 0 的话这个人立刻变成全推(8.1 条/天)"""
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True)
+
+    assert _min_col(conn, "uA") is None, "没设过门槛的人不许被写上任何数"
+    assert store.resolve_transfer_min_usd(None, 100.0) == 100.0
+    assert store.resolve_transfer_min_usd(None, 5000.0) == 5000.0, \
+        "NULL 必须**跟着**全局值走,而不是被冻结成某个数"
+
+
+def test_带金额时已经开着的人只改门槛_绝不被关掉(conn):
+    """
+    ⚠️ 语法上的关键决定:带金额 = 只开不切。
+       写成"带金额也切换"的话,「已开在 $30000、再发 /tin alice 200」既能读成关掉
+       也能读成改门槛,用户无从预期 —— 而关掉的后果是从此一条都收不到。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True, min_usd=30000.0)
+
+    ok, msg = store.set_transfer_watch(conn, "alice", True, min_usd=200.0)
+
+    assert ok, msg
+    assert store.transfer_watch_user_ids(conn) == {"uA"}, f"人被关掉了:{msg}"
+    assert _min_col(conn, "uA") == 200.0
+    assert "200" in msg and "30,000" in msg, f"回执要说清「现在是多少、之前是多少」:{msg}"
+
+
+def test_不带金额仍然是开关_而且不动已经设好的门槛(conn):
+    """
+    不带金额时若也当成"设置",就再也没有任何写法能关掉了。
+    ⚠️ 同时钉死:切换开关**不许顺手把用户设过的门槛清掉** —— 他没下过这个指令。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True, min_usd=30000.0)
+
+    ok, off = store.set_transfer_watch(conn, "alice")
+    assert ok and "已关闭" in off, off
+    assert store.transfer_watch_user_ids(conn) == set()
+    assert _min_col(conn, "uA") == 30000.0, "关掉时把门槛清了 —— 下次打开推送量会静默涨回去"
+    assert "30,000" in off, f"「门槛留着」必须写进回执,否则就是暗的:{off}"
+
+    ok, on = store.set_transfer_watch(conn, "alice")
+    assert ok and "已开启" in on, on
+    assert _min_col(conn, "uA") == 30000.0, "重新打开必须还是他自己设的那个数"
+    assert "30,000" in on, f"重新打开的回执要写清现在按多少判:{on}"
+
+
+def test_门槛可以清回跟随全局(conn):
+    """
+    显式设过之后必须有路回到「跟着 .env 变」—— 否则那是个单向的死角。
+    ⚠️ min_usd=None 是**合法取值**(清回 NULL),不是"没传"。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True, min_usd=30000.0)
+
+    ok, msg = store.set_transfer_watch(conn, "alice", True, min_usd=None,
+                                       default_min_usd=100.0)
+
+    assert ok, msg
+    assert _min_col(conn, "uA") is None, "没清成 NULL 就还是被冻结在某个数上"
+    assert "默认" in msg, f"回执要说清它现在跟着全局走:{msg}"
+
+
+def test_清单文案要分得出默认与显式设成同一个值(conn):
+    """
+    ⚠️⚠️ 两者语义**不同**:跟着全局的那个会随 .env 里的
+       FOMO_TRANSFER_WATCH_MIN_USD 一起变,显式设成 100 的那个不会。
+       都印成 `$100.00` 的话,用户没法判断改 .env 会不会影响到这个人。
+    """
+    followed = store.fmt_transfer_min_usd(None, 100.0)
+    explicit = store.fmt_transfer_min_usd(100.0, 100.0)
+
+    assert "100.00" in followed and "100.00" in explicit, (followed, explicit)
+    assert followed != explicit, \
+        f"「跟着全局」与「显式设成同一个数」印成了同一行字:{followed}"
+    assert "默认" in followed and "默认" not in explicit, (followed, explicit)
+
+
+def test_人数上限拦下来时门槛也不许写进去(conn):
+    """半开半设的状态比"什么都没发生"更难解释:清单上看不到他,库里却留着一个数"""
+    for i in range(3):
+        store.add_watch_user(conn, f"u{i}", f"H{i}", f"H{i}")
+        store.set_transfer_watch(conn, f"u{i}", True, max_on=3)
+    store.add_watch_user(conn, "u9", "H9", "H9")
+
+    ok, msg = store.set_transfer_watch(conn, "u9", True, min_usd=30000.0, max_on=3)
+
+    assert not ok and "最多" in msg, msg
+    assert _min_col(conn, "u9") is None, "被上限拦住的人不许留下半截设置"
+
+
+def test_软删除清开关但留门槛_两条相反的结论出自同一条原则(conn):
+    """
+    ⚠️⚠️ 这两列在 /del 时的处置**刻意相反**,不是漏改:
+      - watch_transfer_in 清零:留着会绕过人数上限,而且 /add 回归的那一刻采集频率
+        与推送量会在用户没下指令的情况下自己变回去(既有决定,见 remove_watch_user)。
+      - transfer_in_min_usd 留着:开关关着时它完全不参与判定,既不花请求也不发消息;
+        清掉它才是那种静默变化 —— 回归后推送量会从 $30000 的量级涨回全局 $100。
+    同一条原则(往推送变多的方向永远不许静默发生)作用在语义不同的两列上,
+    所以结论相反。改任何一边之前先读懂这条。
+    """
+    store.add_watch_user(conn, "uA", "Alice", "Alice")
+    store.set_transfer_watch(conn, "alice", True, min_usd=30000.0)
+
+    store.remove_watch_user(conn, "alice")               # /del —— 软删除
+
+    assert store.transfer_watch_user_ids(conn) == set(), "开关必须清零(既有决定)"
+    assert _min_col(conn, "uA") == 30000.0, \
+        "门槛被一并清了 —— 回归后推送量会静默涨回全局默认,而用户没下过这个指令"
+
+    store.add_watch_user(conn, "uA", "Alice", "Alice")   # /add —— 加回来
+    ok, msg = store.set_transfer_watch(conn, "alice")    # 必须重新 /tin(开关那条规矩)
+    assert ok and "已开启" in msg, msg
+    assert "30,000" in msg, f"重新打开的回执要写清现在按多少判:{msg}"
+
+
+def test_老库升级补门槛列_已经开着的那个人行为逐字节不变(conn):
+    """
+    ⚠️⚠️ 生产库现在**真的有一个人**开着 watch_transfer_in=1。补列写成
+       `NOT NULL DEFAULT 0` 就是把他静默改成全推(1.1 → 8.1 条/天);
+       写成 `DEFAULT 100` 则是把当时的全局值**冻结**进库,以后改 .env 对他不再生效。
+       两种都是没人下过的指令。正确的是 NULL —— 落回全局默认 = 升级前后一模一样。
+    ⚠️ 100 / 5000 都是写死的字面量,不从 config import。
+    """
+    conn.execute("ALTER TABLE watch_users DROP COLUMN transfer_in_min_usd")
+    cols = lambda: {r["name"] for r in conn.execute("PRAGMA table_info(watch_users)")}  # noqa: E731
+    assert "transfer_in_min_usd" not in cols(), "前提不成立"
+    # 老库里那个已经开着的人
+    conn.execute("INSERT INTO watch_users (user_id, handle, added_at, active, watch_transfer_in) "
+                 "VALUES ('kitty','RoaringKittyy','x',1,1)")
+
+    store.init_db(conn)
+
+    assert "transfer_in_min_usd" in cols(), "补列没补上,升级后第一条 /tin 直接 no such column"
+    assert store.transfer_watch_user_ids(conn) == {"kitty"}, "迁移把已经开着的人弄丢了"
+    assert _min_col(conn, "kitty") is None, \
+        "迁移给他写上了一个具体的数 —— 这是没人下过的指令(冻结 or 改成全推)"
+    assert store.resolve_transfer_min_usd(_min_col(conn, "kitty"), 100.0) == 100.0, \
+        "迁移后他的判定门槛变了 —— 行为不再与升级前相同"
+    assert store.resolve_transfer_min_usd(_min_col(conn, "kitty"), 5000.0) == 5000.0, \
+        "他必须仍然**跟着**全局值走,而不是被冻结在 100"
+
+
+# ============================================================
 # /hot 买入榜:按倍数排序 + 首买人 + 基准市值
 # ============================================================
 def _hot_buy(conn, uid, ca, ts, mcap=None, usd=100.0, handle=None):

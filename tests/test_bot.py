@@ -1739,3 +1739,239 @@ def test_tin的回执与清单都要转义(monkeypatch, tmp_path):
     listed = b._dispatch("/tin", "")
     assert "&lt;b&gt;boom" in listed and "<b>boom</b>" not in listed
     assert _tag_fault(listed) == "", listed
+
+
+# ============================================================
+# /tin <handle> <金额> —— 每人各自的门槛
+# ⚠️ 金额一律**写死字面量**,不从 config / store / bot import 任何门槛值。
+# ============================================================
+def _tin_two(monkeypatch, tmp_path):
+    """两个人的名单:巨鲸 Alice + 小额 Bob。⚠️ 全局门槛显式钉成 100 —— 不钉的话
+    断言的是"这台机器的 .env 怎么配的",而不是代码行为"""
+    from src.config import get_settings
+
+    monkeypatch.setenv("FOMO_TRANSFER_WATCH_MIN_USD", "100")
+    get_settings.cache_clear()
+    b, store = _bot(monkeypatch, tmp_path)
+    with store.get_conn() as c:
+        store.add_watch_user(c, "uA", "alice", "Alice")
+        store.add_watch_user(c, "uB", "bob", "Bob")
+    return b, store
+
+
+def _line_of(listed: str, name: str) -> str:
+    return next(ln for ln in listed.split("\n") if name in ln)
+
+
+def test_tin可以给每个人设不同的门槛_清单上各是各的(monkeypatch, tmp_path):
+    """
+    用户原话:「人物A 我可以设置 30000,人物B 我可以设置 200」。
+    ⚠️ 清单必须**逐人**显示门槛:只在抬头写一个全局值的话,用户永远看不出
+       自己刚才那条 /tin 到底生效在谁身上。
+    """
+    b, _ = _tin_two(monkeypatch, tmp_path)
+
+    a = b._dispatch("/tin", "alice 30000")
+    bb = b._dispatch("/tin", "bob 200")
+    listed = b._dispatch("/tin", "")
+
+    assert "已开启" in a and "$30,000.00" in a, f"回执要说清现在是多少:{a}"
+    assert "已开启" in bb and "$200.00" in bb, bb
+    assert "2/12" in listed, f"两个人都该在清单里:{listed}"
+    a_line, b_line = _line_of(listed, "Alice"), _line_of(listed, "Bob")
+    assert "$30,000.00" in a_line, f"A 那一行的门槛不对:{a_line}"
+    assert "$200.00" in b_line, f"B 那一行的门槛不对:{b_line}"
+    assert "$30,000.00" not in b_line, f"两个人共用了同一个门槛:{b_line}"
+    assert _tag_fault(listed) == "", listed
+
+
+def test_tin带金额时只改门槛_绝不把已经开着的人关掉(monkeypatch, tmp_path):
+    """
+    ⚠️⚠️ 语法上的关键决定。写成"带金额也切换"的话,
+       「已开在 $30000、再发 /tin alice 200」就分不出是关掉还是改门槛,
+       而关掉的后果是从此一条推送都收不到 —— 用户不会立刻发现。
+    """
+    b, store_ = _tin_two(monkeypatch, tmp_path)
+    b._dispatch("/tin", "alice 30000")
+
+    out = b._dispatch("/tin", "alice 200")
+
+    assert "已关闭" not in out, f"带金额被当成开关、把人关掉了:{out}"
+    assert "$200.00" in out and "$30,000.00" in out, \
+        f"回执要说清「现在多少、之前多少」:{out}"
+    with store_.get_conn() as c:
+        assert store_.transfer_watch_user_ids(c) == {"uA"}, "人被关掉了"
+    assert "$200.00" in _line_of(b._dispatch("/tin", ""), "Alice")
+
+
+def test_tin不带金额仍然是开关_而且门槛留着(monkeypatch, tmp_path):
+    """
+    不带金额时若也当成"设置",就再也没有写法能关掉了。
+    ⚠️ 关掉时门槛**留着**:它在开关关着时完全不参与判定,清掉反而会让下次打开的
+       推送量静默涨回全局默认($30000 的 0.5 条/天 → $100 的 1.1 条/天)。
+       但"留着"必须写进回执,否则就是暗的。
+    """
+    b, _ = _tin_two(monkeypatch, tmp_path)
+    b._dispatch("/tin", "alice 30000")
+
+    off = b._dispatch("/tin", "alice")
+    assert "已关闭" in off, f"不带金额必须能关掉:{off}"
+    assert "$30,000.00" in off, f"门槛留着这件事要写明:{off}"
+    assert "一个人都没开" in b._dispatch("/tin", "")
+
+    on = b._dispatch("/tin", "alice")
+    assert "已开启" in on and "$30,000.00" in on, f"重新打开必须还是他自己设的数:{on}"
+
+
+def test_tin清单能分出跟随默认与显式设成同一个值(monkeypatch, tmp_path):
+    """
+    ⚠️⚠️ 两者语义**不同**:跟随的那个会随 .env 里的 FOMO_TRANSFER_WATCH_MIN_USD
+       一起变,显式设成 100 的那个不会。清单上都印成 `$100.00` 的话,
+       用户没法判断改 .env 会不会影响到这个人。
+    """
+    b, _ = _tin_two(monkeypatch, tmp_path)
+    b._dispatch("/tin", "alice")          # 不带金额 → 跟随全局默认($100)
+    b._dispatch("/tin", "bob 100")        # 显式设成同一个数
+
+    listed = b._dispatch("/tin", "")
+    a_line, b_line = _line_of(listed, "Alice"), _line_of(listed, "Bob")
+
+    assert "$100.00" in a_line and "$100.00" in b_line, (a_line, b_line)
+    assert "默认" in a_line, f"跟随全局的那个必须标出来:{a_line}"
+    assert "默认" not in b_line, f"显式设过的不许标成默认:{b_line}"
+
+
+def test_tin门槛可以清回跟随全局(monkeypatch, tmp_path):
+    """显式设过之后必须有路回到「跟着 .env 变」,否则那是个单向的死角"""
+    b, _ = _tin_two(monkeypatch, tmp_path)
+    b._dispatch("/tin", "alice 30000")
+
+    out = b._dispatch("/tin", "alice 默认")
+
+    assert "默认" in out and "$100.00" in out, f"要说清它现在跟着全局的多少走:{out}"
+    a_line = _line_of(b._dispatch("/tin", ""), "Alice")
+    assert "默认" in a_line and "$30,000.00" not in a_line, a_line
+
+
+def test_tin门槛零合法_而且不会被当成关掉(monkeypatch, tmp_path):
+    """
+    ⚠️ 铁律:0 是有意义的真实值(= 这个人的转入全推)。
+       它既不能被解析器当成"没填",也不能在库里与"关掉"撞成同一个状态。
+    """
+    b, store_ = _tin_two(monkeypatch, tmp_path)
+
+    out = b._dispatch("/tin", "alice 0")
+
+    assert "已开启" in out, f"门槛 0 被当成关掉了:{out}"
+    assert "$0.00" in out, f"回执要写明现在是 0:{out}"
+    with store_.get_conn() as c:
+        assert store_.transfer_watch_user_ids(c) == {"uA"}, "开关必须是开着的"
+    a_line = _line_of(b._dispatch("/tin", ""), "Alice")
+    assert "$0.00" in a_line and "默认" not in a_line, \
+        f"0 在清单里被显示成了「跟随默认」:{a_line}"
+
+
+def test_tin拒绝负数并把零那条路指出来(monkeypatch, tmp_path):
+    """
+    负数没有任何可执行的含义。⚠️ 但光说"不行"没用:敲负数的人多半想表达的
+    就是"别筛了全给我",回执必须把 0 指出来,否则他只能瞎试。
+    """
+    b, store_ = _tin_two(monkeypatch, tmp_path)
+
+    for bad in ("-1", "-0.01", "-30000", "-inf"):
+        out = b._dispatch("/tin", f"alice {bad}")
+        assert "已开启" not in out and "已关闭" not in out, f"{bad!r} 被接受了:{out}"
+        assert "负数" in out and "写 0" in out, f"回执要给出可操作的下一步:{out}"
+        assert _tag_fault(out) == "", out
+    with store_.get_conn() as c:
+        assert store_.transfer_watch_user_ids(c) == set(), "被拒绝的命令不许改库"
+
+
+def test_tin拒绝非数字并说清正确用法(monkeypatch, tmp_path):
+    """
+    ⚠️ 一个都不许猜:猜错的方向是"门槛变成了别的数",而用户看到的是"已开启"。
+    ⚠️ nan / inf 单独钉死 —— 裸 float() 全都收,而 `x >= nan` 恒为 False,
+       这个人的推送从此一条都不来,且没有任何报错。
+    ⚠️ 全角「５」也要拒:re 的 \\d 和 float() 都收它,一个看不出区别的字符
+       就能让人以为自己设的是别的数。
+    """
+    b, store_ = _tin_two(monkeypatch, tmp_path)
+
+    for bad in ("abc", "30元", "nan", "inf", "1e5", "0x10", "3.1.4", "$",
+                "1m", "５", "30,00", "1234,567", "999999999" * 45):
+        out = b._dispatch("/tin", f"alice {bad}")
+        assert "已开启" not in out and "已关闭" not in out, f"{bad!r} 被接受了:{out}"
+        assert "用法" in out or "太大" in out, f"{bad!r} 的回执没说清怎么办:{out}"
+        assert _tag_fault(out) == "", f"{bad!r} 的回执标签坏了:{out}"
+    with store_.get_conn() as c:
+        assert store_.transfer_watch_user_ids(c) == set(), "被拒绝的命令一条都不许改库"
+
+
+def test_tin接受的每一种金额写法都要对(monkeypatch, tmp_path):
+    """
+    ⚠️ 每一种写法各测一次:只测 `30000` 的话,k / w / 万 / 千分位随便哪个
+       算错 1000 倍都不会红,而算错的后果是"从此一条都不推"。
+    ⚠️ 期望值全部手算写死,不复用解析器里的任何常量。
+    ⚠️ 每个用例一个独立库:同一个库里第二次设同一个数会走"本来就是"那一支。
+    """
+    cases = [
+        ("30000", "$30,000.00"),
+        ("30,000", "$30,000.00"),
+        ("$200", "$200.00"),
+        ("$1,234.50", "$1,234.50"),
+        ("99.99", "$99.99"),
+        ("30k", "$30,000.00"),
+        ("30K", "$30,000.00"),
+        ("3w", "$30,000.00"),
+        ("3W", "$30,000.00"),
+        ("3万", "$30,000.00"),
+        ("0.5k", "$500.00"),
+        ("0", "$0.00"),
+    ]
+    for i, (raw, want) in enumerate(cases):
+        b, _ = _tin_two(monkeypatch, tmp_path / f"case{i}")
+        out = b._dispatch("/tin", f"alice {raw}")
+        assert "已开启" in out, f"{raw!r} 没被接受:{out}"
+        assert want in out, f"{raw!r} 应解析成 {want},实际回执:{out}"
+
+
+def test_tin参数多于两个要给用法而不是猜(monkeypatch, tmp_path):
+    """`/tin alice 30 000`(拿空格当千分位)必须回用法 —— 猜成 30 就差 1000 倍"""
+    b, store_ = _tin_two(monkeypatch, tmp_path)
+    out = b._dispatch("/tin", "alice 30 000")
+    assert "已开启" not in out and "用法" in out, out
+    with store_.get_conn() as c:
+        assert store_.transfer_watch_user_ids(c) == set()
+
+
+def test_tin帮助里带上推送频率参照(monkeypatch, tmp_path):
+    """
+    门槛是个"调了才知道"的数字。不给参照系的话用户只能瞎试 ——
+    而每试一次的反馈周期是**一天**(推送量按天计)。
+    """
+    b, _ = _tin_two(monkeypatch, tmp_path)
+    empty = b._dispatch("/tin", "")
+    b._dispatch("/tin", "alice 30000")
+    listed = b._dispatch("/tin", "")
+
+    for out in (empty, listed):
+        assert "条/天" in out, f"没给推送频率参照:{out}"
+        assert "8.1" in out and "1.1" in out, f"频率表的关键几行要在:{out}"
+        assert "≥$5000" in out, f"高门槛那一端也要有,否则 $30000 无从参照:{out}"
+        assert _tag_fault(out) == "", out
+
+
+def test_tin带金额的回执与错误文案都要转义(monkeypatch, tmp_path):
+    """昵称带 '<' 并不罕见;错误回执还会把**用户原样输入**回显,更要转义"""
+    b, store_ = _bot(monkeypatch, tmp_path)
+    with store_.get_conn() as c:
+        store_.add_watch_user(c, "u1", "ev<il", "<b>boom</b>")
+
+    ok = b._dispatch("/tin", "ev<il 30000")
+    assert "<b>boom</b>" not in ok and "&lt;b&gt;boom" in ok, f"回执没转义:{ok}"
+    assert _tag_fault(ok) == "", ok
+
+    bad = b._dispatch("/tin", "ev<il -<i>x</i>")     # 负数那一支会回显用户输入
+    assert "<i>x</i>" not in bad, f"用户输入被原样回显进 HTML 了:{bad}"
+    assert "&lt;i&gt;x" in bad, f"回显必须转义后出现:{bad}"
+    assert _tag_fault(bad) == "", bad
