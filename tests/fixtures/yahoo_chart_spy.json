@@ -1,0 +1,99 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "SPY",
+     "exchangeName": "PCX",
+     "fullExchangeName": "NYSEArca",
+     "instrumentType": "ETF",
+     "firstTradeDate": 728317800,
+     "regularMarketTime": 1788292800,
+     "hasPrePostMarketData": true,
+     "gmtoffset": -14400,
+     "timezone": "EDT",
+     "exchangeTimezoneName": "America/New_York",
+     "regularMarketPrice": 761.78,
+     "regularMarketChangePercent": -0.687,
+     "fiftyTwoWeekHigh": 779.37,
+     "fiftyTwoWeekLow": 629.28,
+     "regularMarketDayHigh": 764.67,
+     "regularMarketDayLow": 759.48,
+     "regularMarketVolume": 40112421,
+     "longName": "State Street SPDR S&P 500 ETF Trust",
+     "shortName": "State Street SPDR S&P 500 ETF T",
+     "chartPreviousClose": 767.05,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "EDT",
+       "end": 1788355800,
+       "start": 1788336000,
+       "gmtoffset": -14400
+      },
+      "regular": {
+       "timezone": "EDT",
+       "end": 1788379200,
+       "start": 1788355800,
+       "gmtoffset": -14400
+      },
+      "post": {
+       "timezone": "EDT",
+       "end": 1788393600,
+       "start": 1788379200,
+       "gmtoffset": -14400
+      }
+     },
+     "dataGranularity": "1d",
+     "range": "1d",
+     "validRanges": [
+      "1d",
+      "5d",
+      "1mo",
+      "3mo",
+      "6mo",
+      "1y",
+      "2y",
+      "5y",
+      "10y",
+      "ytd",
+      "max"
+     ]
+    },
+    "timestamp": [
+     1788269400
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "open": [
+        762.010009765625
+       ],
+       "high": [
+        764.6699829101562
+       ],
+       "low": [
+        759.47998046875
+       ],
+       "volume": [
+        41054800
+       ],
+       "close": [
+        761.780029296875
+       ]
+      }
+     ],
+     "adjclose": [
+      {
+       "adjclose": [
+        761.780029296875
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}

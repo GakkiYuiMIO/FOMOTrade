@@ -1,5 +1,7 @@
 """
 底池对手资产 —— 这个币最深的那个池子,对面摆的是什么(**只在对手是币股时才报**)。
+顺带取**这个币自己的全名**(同一份响应里 baseToken/quoteToken 的 name),给推送标题
+与中文名那两行用(见 src/namecn.py)—— 不另开请求。
 
 ============ 为什么值得单独做一个模块 ============
 底池对着什么,决定这个币的命运绑在谁身上。绝大多数币对着原生币或稳定币
@@ -114,8 +116,9 @@ _CACHE_MAX = 2000
 #    里面 bsc 映射成 `bnb`,而 DexScreener 的 chainId 是 `bsc`。
 # ⚠️ 映射不到的链(ethereum / monad / hyperliquid,以及将来出现的新链)
 #    **整行消失,绝不硬拼一个 slug 去试**。
-# ⚠️ 四条链都留着,而 lookup 只会给 STOCK_NAME_MARKERS 里有判据的链发请求 ——
-#    留着是为了将来给某条链补上判据时,不必把 chainId 再实测一遍。
+# ⚠️ 四条链都发请求:币股判定只对 STOCK_NAME_MARKERS 里有判据的链做,
+#    但**币名**(token_name)四条链都要 —— 没判据的链拿不到 🌊 那一行,
+#    标题尾巴的英文全名与中文名照常。
 DEX_CHAIN_SLUG = {
     "solana": "solana",       # 实测 CATE/fone/CYBERLEEK → chainId=solana
     "bsc": "bsc",             # 实测 MarsCoin/XAUt/WBNB   → chainId=bsc
@@ -184,7 +187,13 @@ class PoolQuote:
                ⚠️ 剥不出来是 None(名字就是一个光秃秃的后缀),那就**只显示符号**;
                   绝不回退去编一个名字,也绝不打占位符。
 
-    ⚠️ 两个新字段带默认值是为了让 `PoolQuote(addr, sym, name, is_common)` 这种
+    token_symbol / token_name
+               **我们问的那个币自己**的符号与全名(同一条 pair 的另一侧),
+               如 "CUM" / "Cummingtonite"。FOMO 的 swap 载荷里没有币名,
+               这是它唯一的来源;给标题尾巴与中文名行用(formatter / namecn)。
+               ⚠️ 它们与"对手"无关,四条链都取;拿不到是 None(标题不加尾巴)。
+
+    ⚠️ 后加的字段全带默认值,是为了让 `PoolQuote(addr, sym, name, is_common)` 这种
        四参数构造继续成立(测试里造样本用)。
     """
 
@@ -194,6 +203,8 @@ class PoolQuote:
     is_common: bool
     is_stock: bool = False
     issuer: str | None = None
+    token_symbol: str | None = None
+    token_name: str | None = None
 
 
 # ============================================================
@@ -323,9 +334,9 @@ def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | Non
     base_key, base = _side_key(pair, "baseToken")
     quote_key, quote = _side_key(pair, "quoteToken")
     if our_key == base_key:
-        other_key, other = quote_key, quote
+        other_key, other, ours = quote_key, quote, base
     elif our_key == quote_key:
-        other_key, other = base_key, base
+        other_key, other, ours = base_key, base, quote
     else:
         # 这条 pair 两侧都不是我们问的那个币 —— 上游串了数据,丢弃并留痕
         return None
@@ -340,6 +351,9 @@ def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | Non
         is_common=_is_common(network_id, other_key),
         is_stock=is_stock,
         issuer=issuer,
+        # 我方一侧:这个币自己的符号与全名。⚠️ 仍是第三方字符串,渲染前必须 _clip
+        token_symbol=_text(ours.get("symbol")),
+        token_name=_text(ours.get("name")),
     )
 
 
@@ -522,11 +536,14 @@ class PoolQuoteLookup:
         """
         {归一化地址: 对手资产}。查不到的地址**不出现在返回值里**(调用方据此整行消失)。
 
-        ⚠️⚠️ 这条链没有币股判据(STOCK_NAME_MARKERS)或映射不到 chainId →
-           **一个请求都不发、直接返回空**。理由不是省事:那条链上这一行
-           **永远显示不出来**(notable 会一律判 None),为一个必然不显示的东西
-           打一轮请求是纯浪费。加判据的那天,请求会自动跟着回来 ——
-           两件事共用同一张表,不会 drift。
+        ⚠️⚠️ 映射不到 chainId 的链 → **一个请求都不发、直接返回空**:
+           响应按 chainId 过滤,没有 slug 就没法判哪条 pair 是本链的,硬拼只会
+           拿到别的链的池子。
+        ⚠️⚠️ **没有币股判据(STOCK_NAME_MARKERS)的链照样发请求。** 这里曾经是
+           "没判据就不发"(那时这份响应只为 🌊 那一行服务,永远显示不出来的东西
+           不值得打请求);现在同一份响应还承担**币名**(token_name)——
+           四条链的推送标题都要它。所以闸门改成:没判据的链**不做币股判定**
+           (_classify_stock 一律 (False, None),🌊 行照旧不出现)但**仍取币名**。
         ⚠️ 同一轮同一个币只查一次:入参先归一化去重,再扣掉缓存命中的,
            剩下的才发请求。
         ⚠️⚠️ **失败绝不入缓存**:client 返回 None 时这一片的地址一个都不写缓存,
@@ -551,7 +568,7 @@ class PoolQuoteLookup:
             k = normalize_token_address(a)
             if k is not None and k not in keys:
                 keys.append(k)
-        if not keys or net not in DEX_CHAIN_SLUG or not STOCK_NAME_MARKERS.get(net):
+        if not keys or net not in DEX_CHAIN_SLUG:
             return {}
 
         now = time.time()
@@ -592,6 +609,20 @@ class PoolQuoteLookup:
         self._prune(now)
         return out
 
+    def cached(self, network_id: str | None, address) -> PoolQuote | None:
+        """
+        **只读缓存、绝不发请求**。给转入(/tin、转入聚合)推送用:那两条路径不为币名
+        新开请求,有缓存就带上英文全名,没有就没有。
+        """
+        net = (network_id or "").strip()
+        key = normalize_token_address(address)
+        if key is None:
+            return None
+        hit = self._cache.get((net, key))
+        if hit is None or time.time() - hit[0] >= self._ttl:
+            return None
+        return hit[1]
+
     def _prune(self, now: float) -> None:
         """先清过期,还超上限就按取到的时刻丢最旧的 —— TTL 长,不设上限它只增不减。"""
         for k, (ts, _v) in list(self._cache.items()):
@@ -630,3 +661,19 @@ def notable(quotes: dict[str, PoolQuote], token_address) -> PoolQuote | None:
     if pq is None or pq.is_common or not pq.is_stock:
         return None
     return replace(pq, name=pq.issuer)
+
+
+def token_name(quotes: dict[str, PoolQuote], token_address) -> str | None:
+    """
+    这个币**自己**的英文全名(来自最深池那条 pair 的我方一侧);拿不到 None。
+
+    ⚠️ 与 notable 分开:notable 只在对手是币股时给东西,而币名与对手是谁无关 ——
+       $CASHCAT 对着 WETH 没有 🌊 行,但标题尾巴照样要 "Cash Cat"。
+    ⚠️ 这里不做任何清洗:它是陌生人可控的字符串,叠平/限长/转义在 formatter,
+       送不送去翻译的过滤在 namecn。
+    """
+    key = normalize_token_address(token_address)
+    if key is None:
+        return None
+    pq = quotes.get(key)
+    return None if pq is None else pq.token_name

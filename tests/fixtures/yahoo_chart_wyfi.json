@@ -1,0 +1,97 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "WYFI",
+     "exchangeName": "NCM",
+     "fullExchangeName": "NasdaqCM",
+     "instrumentType": "EQUITY",
+     "firstTradeDate": 1754573400,
+     "regularMarketTime": 1788292800,
+     "hasPrePostMarketData": true,
+     "gmtoffset": -14400,
+     "timezone": "EDT",
+     "exchangeTimezoneName": "America/New_York",
+     "regularMarketPrice": 17.5,
+     "regularMarketChangePercent": -7.505,
+     "fiftyTwoWeekHigh": 46.87,
+     "fiftyTwoWeekLow": 10.51,
+     "regularMarketDayHigh": 18.34,
+     "regularMarketDayLow": 17.23,
+     "regularMarketVolume": 2072605,
+     "longName": "WhiteFiber, Inc.",
+     "shortName": "WhiteFiber, Inc.",
+     "chartPreviousClose": 18.92,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "EDT",
+       "start": 1788336000,
+       "end": 1788355800,
+       "gmtoffset": -14400
+      },
+      "regular": {
+       "timezone": "EDT",
+       "start": 1788355800,
+       "end": 1788379200,
+       "gmtoffset": -14400
+      },
+      "post": {
+       "timezone": "EDT",
+       "start": 1788379200,
+       "end": 1788393600,
+       "gmtoffset": -14400
+      }
+     },
+     "dataGranularity": "1d",
+     "range": "1d",
+     "validRanges": [
+      "1d",
+      "5d",
+      "1mo",
+      "3mo",
+      "6mo",
+      "1y",
+      "2y",
+      "ytd",
+      "max"
+     ]
+    },
+    "timestamp": [
+     1788269400
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "high": [
+        18.34000015258789
+       ],
+       "volume": [
+        2076100
+       ],
+       "close": [
+        17.5
+       ],
+       "low": [
+        17.219999313354492
+       ],
+       "open": [
+        18.270000457763672
+       ]
+      }
+     ],
+     "adjclose": [
+      {
+       "adjclose": [
+        17.5
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}

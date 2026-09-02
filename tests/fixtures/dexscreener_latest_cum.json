@@ -1,0 +1,1202 @@
+{
+ "schemaVersion": "1.0.0",
+ "pairs": [
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x126bc1113f7f521074efe36c47878517628365d1144c9e26dec9347e8040f2e6",
+   "pairAddress": "0x126bc1113f7f521074efe36c47878517628365d1144c9e26dec9347e8040f2e6",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0xd917B029C761D264c6A312BBbcDA868658eF86a6",
+    "name": "USA Rare Earth • Robinhood Token",
+    "symbol": "USAR"
+   },
+   "priceNative": "0.00004958",
+   "priceUsd": "0.0009028",
+   "txns": {
+    "m5": {
+     "buys": 53,
+     "sells": 55
+    },
+    "h1": {
+     "buys": 2274,
+     "sells": 2358
+    },
+    "h6": {
+     "buys": 6361,
+     "sells": 6857
+    },
+    "h24": {
+     "buys": 13175,
+     "sells": 13999
+    }
+   },
+   "volume": {
+    "h24": 2025119.11,
+    "h6": 1208284.14,
+    "h1": 550738.59,
+    "m5": 8764.53
+   },
+   "priceChange": {
+    "m5": -8.77,
+    "h1": -14.43,
+    "h6": 933,
+    "h24": 4336
+   },
+   "liquidity": {
+    "usd": 268178.37,
+    "base": 162639127,
+    "quote": 6664.2844
+   },
+   "fdv": 902833,
+   "marketCap": 902833,
+   "pairCreatedAt": 1788301335000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xdda786af5da2edda329e2814d770b32ed1760952d60200bbec6ff29fb30522a9",
+   "pairAddress": "0xdda786af5da2edda329e2814d770b32ed1760952d60200bbec6ff29fb30522a9",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0008712",
+   "priceUsd": "0.0008718",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 13
+    },
+    "h1": {
+     "buys": 212,
+     "sells": 162
+    },
+    "h6": {
+     "buys": 395,
+     "sells": 305
+    },
+    "h24": {
+     "buys": 463,
+     "sells": 356
+    }
+   },
+   "volume": {
+    "h24": 36084,
+    "h6": 35527.78,
+    "h1": 24555.22,
+    "m5": 344.76
+   },
+   "priceChange": {
+    "m5": -4.31,
+    "h1": -11.88,
+    "h6": 842,
+    "h24": 150
+   },
+   "liquidity": {
+    "usd": 9624.46,
+    "base": 6137090,
+    "quote": 4270.8371
+   },
+   "fdv": 871862,
+   "marketCap": 871862,
+   "pairCreatedAt": 1788303308000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x90040564117e24fe334f9580473136f4cb685e2691b9aec41979796c02f2c248",
+   "pairAddress": "0x90040564117e24fe334f9580473136f4cb685e2691b9aec41979796c02f2c248",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.001362",
+   "priceUsd": "0.001362",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 8,
+     "sells": 3
+    },
+    "h6": {
+     "buys": 8,
+     "sells": 3
+    },
+    "h24": {
+     "buys": 8,
+     "sells": 3
+    }
+   },
+   "volume": {
+    "h24": 126.93,
+    "h6": 126.93,
+    "h1": 126.93,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 1.17,
+    "h6": 1.17,
+    "h24": 1.17
+   },
+   "liquidity": {
+    "usd": 1000.68,
+    "base": 58.8639,
+    "quote": 999.9198
+   },
+   "fdv": 1362982,
+   "marketCap": 1362982,
+   "pairCreatedAt": 1788327134000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x8a0b07753a1f324bc69cddb3838ed31f059e3af773bfed9c1ba0593b33fc100b",
+   "pairAddress": "0x8a0b07753a1f324bc69cddb3838ed31f059e3af773bfed9c1ba0593b33fc100b",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0009273",
+   "priceUsd": "0.0009279",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 3,
+     "sells": 15
+    },
+    "h6": {
+     "buys": 23,
+     "sells": 17
+    },
+    "h24": {
+     "buys": 131,
+     "sells": 103
+    }
+   },
+   "volume": {
+    "h24": 2207.61,
+    "h6": 146.18,
+    "h1": 110.61,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": -8.51,
+    "h6": 943,
+    "h24": 1338
+   },
+   "liquidity": {
+    "usd": 436.54,
+    "base": 316782,
+    "quote": 142.4725
+   },
+   "fdv": 927992,
+   "marketCap": 927992,
+   "pairCreatedAt": 1788301921000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x72e93cc88958191992283b470b55921a0ae69db05bda26576fa22565732efb20",
+   "pairAddress": "0x72e93cc88958191992283b470b55921a0ae69db05bda26576fa22565732efb20",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0008525",
+   "priceUsd": "0.0008531",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 19,
+     "sells": 13
+    },
+    "h6": {
+     "buys": 72,
+     "sells": 43
+    },
+    "h24": {
+     "buys": 79,
+     "sells": 51
+    }
+   },
+   "volume": {
+    "h24": 791.64,
+    "h6": 762.77,
+    "h1": 156.62,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": -21.15,
+    "h6": 824,
+    "h24": 278
+   },
+   "liquidity": {
+    "usd": 104.9,
+    "base": 42326,
+    "quote": 68.7476
+   },
+   "fdv": 853145,
+   "marketCap": 853145,
+   "pairCreatedAt": 1788303512000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x270dad2756c3a8dd66175d24f7e1824419015942196e86e47877ac99b8333faa",
+   "pairAddress": "0x270dad2756c3a8dd66175d24f7e1824419015942196e86e47877ac99b8333faa",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0008835",
+   "priceUsd": "0.0008841",
+   "txns": {
+    "m5": {
+     "buys": 2,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 34,
+     "sells": 51
+    },
+    "h6": {
+     "buys": 34,
+     "sells": 51
+    },
+    "h24": {
+     "buys": 34,
+     "sells": 51
+    }
+   },
+   "volume": {
+    "h24": 1613.31,
+    "h6": 1613.31,
+    "h1": 1613.31,
+    "m5": 27.79
+   },
+   "priceChange": {
+    "m5": 4.08,
+    "h1": -43.91,
+    "h6": -43.91,
+    "h24": -43.91
+   },
+   "liquidity": {
+    "usd": 886.77,
+    "base": 380997,
+    "quote": 549.5435
+   },
+   "fdv": 884126,
+   "marketCap": 884126,
+   "pairCreatedAt": 1788327336000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xdfa5ff27a4c7f96f8a62247b227e59167814432e6f4e773e0c062ef9211a7f78",
+   "pairAddress": "0xdfa5ff27a4c7f96f8a62247b227e59167814432e6f4e773e0c062ef9211a7f78",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.0000003643",
+   "priceUsd": "0.0008804",
+   "txns": {
+    "m5": {
+     "buys": 2,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 36,
+     "sells": 32
+    },
+    "h6": {
+     "buys": 36,
+     "sells": 32
+    },
+    "h24": {
+     "buys": 36,
+     "sells": 32
+    }
+   },
+   "volume": {
+    "h24": 1344.96,
+    "h6": 1344.96,
+    "h1": 1344.96,
+    "m5": 12.53
+   },
+   "priceChange": {
+    "m5": 2.06,
+    "h1": 22.69,
+    "h6": 22.69,
+    "h24": 22.69
+   },
+   "liquidity": {
+    "usd": 358.68,
+    "base": 271557,
+    "quote": 0.04948
+   },
+   "fdv": 880429,
+   "marketCap": 880429,
+   "pairCreatedAt": 1788326918000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x661bd33c850f09146f40d7fe58dc598144ca6ae4dc4ecaa1e52102a3711f8559",
+   "pairAddress": "0x661bd33c850f09146f40d7fe58dc598144ca6ae4dc4ecaa1e52102a3711f8559",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0008889",
+   "priceUsd": "0.0008895",
+   "txns": {
+    "m5": {
+     "buys": 3,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 14,
+     "sells": 19
+    },
+    "h6": {
+     "buys": 14,
+     "sells": 19
+    },
+    "h24": {
+     "buys": 14,
+     "sells": 19
+    }
+   },
+   "volume": {
+    "h24": 255.24,
+    "h6": 255.24,
+    "h1": 255.24,
+    "m5": 9.55
+   },
+   "priceChange": {
+    "m5": 5.72,
+    "h1": -36.15,
+    "h6": -36.15,
+    "h24": -36.15
+   },
+   "liquidity": {
+    "usd": 271.85,
+    "base": 94199,
+    "quote": 187.9346
+   },
+   "fdv": 889538,
+   "marketCap": 889538,
+   "pairCreatedAt": 1788327611000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x9171da7174b1a43c2b64c43f27a62509771cf4714dcb42be7c24483d8d6b60c4",
+   "pairAddress": "0x9171da7174b1a43c2b64c43f27a62509771cf4714dcb42be7c24483d8d6b60c4",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.0007981",
+   "priceUsd": "0.0007986",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 84,
+     "sells": 85
+    },
+    "h24": {
+     "buys": 84,
+     "sells": 85
+    }
+   },
+   "volume": {
+    "h24": 3014.93,
+    "h6": 3014.93,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": 8.55,
+    "h24": 8.55
+   },
+   "fdv": 798648,
+   "marketCap": 798648,
+   "pairCreatedAt": 1788326139000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0xbe4f4121431434ddcda21d71e3f31b687590394bbbc42a0c4cb9196df563fda7",
+   "pairAddress": "0xbe4f4121431434ddcda21d71e3f31b687590394bbbc42a0c4cb9196df563fda7",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.001090",
+   "priceUsd": "0.001091",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 2,
+     "sells": 2
+    },
+    "h6": {
+     "buys": 13,
+     "sells": 2
+    },
+    "h24": {
+     "buys": 29,
+     "sells": 12
+    }
+   },
+   "volume": {
+    "h24": 61.89,
+    "h6": 17.87,
+    "h1": 4.44,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 3.21,
+    "h6": 1145,
+    "h24": 694
+   },
+   "liquidity": {
+    "usd": 22.93,
+    "base": 10505,
+    "quote": 11.4576
+   },
+   "fdv": 1091384,
+   "marketCap": 1091384,
+   "pairCreatedAt": 1788302195000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x95a543be180acfdf6796667ad760dd232709dc3abd04d7ea9e0305ab09f62620",
+   "pairAddress": "0x95a543be180acfdf6796667ad760dd232709dc3abd04d7ea9e0305ab09f62620",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00000006909",
+   "priceUsd": "0.0001672",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 5,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 10,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 21,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 104.03,
+    "h6": 41.77,
+    "h1": 18.75,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 30.05,
+    "h6": 90.14,
+    "h24": 766
+   },
+   "liquidity": {
+    "usd": 33.54,
+    "base": 100318,
+    "quote": 0.006931
+   },
+   "fdv": 167217,
+   "marketCap": 167217,
+   "pairCreatedAt": 1788301534000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x5da6de486e89c7abc656895f93023e20e533541410cf9f43360da3b8a73dd134",
+   "pairAddress": "0x5da6de486e89c7abc656895f93023e20e533541410cf9f43360da3b8a73dd134",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.0000001045",
+   "priceUsd": "0.0002529",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 1,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 8,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 11,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 31.08,
+    "h6": 23.67,
+    "h1": 4.62,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 18.22,
+    "h6": 189,
+    "h24": 313
+   },
+   "liquidity": {
+    "usd": 17.84,
+    "base": 35279,
+    "quote": 0.003687
+   },
+   "fdv": 252943,
+   "marketCap": 252943,
+   "pairCreatedAt": 1788301538000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x4f601c308eb4c278a1b7f1871fce0380cffedab95f56f780505d0390f5be5d6a",
+   "pairAddress": "0x4f601c308eb4c278a1b7f1871fce0380cffedab95f56f780505d0390f5be5d6a",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.00000002341",
+   "priceUsd": "0.00005663",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 4,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 8,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 15.39,
+    "h6": 9.58,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": 132,
+    "h24": 311
+   },
+   "liquidity": {
+    "usd": 2.23,
+    "base": 19770,
+    "quote": 0.0004628
+   },
+   "fdv": 56637,
+   "marketCap": 56637,
+   "pairCreatedAt": 1788302179000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x744c7e1decb893982351a8dd265f29b5be5e5d1ffb861f541d7f92e8daabfd3d",
+   "pairAddress": "0x744c7e1decb893982351a8dd265f29b5be5e5d1ffb861f541d7f92e8daabfd3d",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "name": "Global Dollar",
+    "symbol": "USDG"
+   },
+   "priceNative": "0.00008999",
+   "priceUsd": "0.00009005",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 4,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 13,
+     "sells": 0
+    },
+    "h24": {
+     "buys": 13,
+     "sells": 0
+    }
+   },
+   "volume": {
+    "h24": 38.97,
+    "h6": 38.97,
+    "h1": 8.98,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": 19.22,
+    "h6": 125,
+    "h24": 125
+   },
+   "liquidity": {
+    "usd": 12.6,
+    "base": 69985,
+    "quote": 6.298
+   },
+   "fdv": 90052,
+   "marketCap": 90052,
+   "pairCreatedAt": 1788301424000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x259c449b02247a78d78a35d07ae9404dba5b4de93f4da30e02c0885ca584b7c0",
+   "pairAddress": "0x259c449b02247a78d78a35d07ae9404dba5b4de93f4da30e02c0885ca584b7c0",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.0000004143",
+   "priceUsd": "0.001002",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 1,
+     "sells": 5
+    },
+    "h6": {
+     "buys": 1,
+     "sells": 5
+    },
+    "h24": {
+     "buys": 1,
+     "sells": 5
+    }
+   },
+   "volume": {
+    "h24": 15.74,
+    "h6": 15.74,
+    "h1": 15.74,
+    "m5": 0
+   },
+   "priceChange": {
+    "h1": -36.28,
+    "h6": -36.28,
+    "h24": -36.28
+   },
+   "liquidity": {
+    "usd": 19.43,
+    "base": 19329,
+    "quote": 2.744e-05
+   },
+   "fdv": 1002224,
+   "marketCap": 1002224,
+   "pairCreatedAt": 1788327366000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  },
+  {
+   "chainId": "robinhood",
+   "dexId": "uniswap",
+   "url": "https://dexscreener.com/robinhood/0x91e10388d371020409cd404e825d370f780f7dc753dec3d56e29d2fa3241448f",
+   "pairAddress": "0x91e10388d371020409cd404e825d370f780f7dc753dec3d56e29d2fa3241448f",
+   "labels": [
+    "v4"
+   ],
+   "baseToken": {
+    "address": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+    "name": "Cummingtonite",
+    "symbol": "CUM"
+   },
+   "quoteToken": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ether",
+    "symbol": "ETH"
+   },
+   "priceNative": "0.0000004367",
+   "priceUsd": "0.001056",
+   "txns": {
+    "m5": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h1": {
+     "buys": 0,
+     "sells": 0
+    },
+    "h6": {
+     "buys": 3,
+     "sells": 2
+    },
+    "h24": {
+     "buys": 3,
+     "sells": 2
+    }
+   },
+   "volume": {
+    "h24": 4.67,
+    "h6": 4.67,
+    "h1": 0,
+    "m5": 0
+   },
+   "priceChange": {
+    "h6": -41.87,
+    "h24": -41.87
+   },
+   "liquidity": {
+    "usd": 2.85,
+    "base": 1349.5851,
+    "quote": 0.0005894
+   },
+   "fdv": 1056592,
+   "marketCap": 1056592,
+   "pairCreatedAt": 1788304028000,
+   "info": {
+    "imageUrl": "https://cdn.dexscreener.com/cms/images/qxJ-BPrdIZ89DLHj?width=800&height=800&quality=95&format=auto",
+    "header": "https://cdn.dexscreener.com/cms/images/AUHDFD7DCsUjgAe7?width=1500&height=500&quality=95&format=auto",
+    "openGraph": "https://cdn.dexscreener.com/token-images/og/robinhood/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18?timestamp=1788330300000",
+    "websites": [
+     {
+      "url": "https://app.long.xyz/tokens/0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+      "label": "Website"
+     }
+    ],
+    "socials": [
+     {
+      "url": "https://x.com/cumonrh",
+      "type": "twitter"
+     }
+    ]
+   }
+  }
+ ]
+}

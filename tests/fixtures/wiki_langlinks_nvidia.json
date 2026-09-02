@@ -1,0 +1,24 @@
+{
+ "batchcomplete": "",
+ "query": {
+  "redirects": [
+   {
+    "from": "NVIDIA",
+    "to": "Nvidia"
+   }
+  ],
+  "pages": {
+   "39120": {
+    "pageid": 39120,
+    "ns": 0,
+    "title": "Nvidia",
+    "langlinks": [
+     {
+      "lang": "zh",
+      "*": "英伟达"
+     }
+    ]
+   }
+  }
+ }
+}

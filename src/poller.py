@@ -39,7 +39,7 @@ from src.client import (
 )
 from src.config import get_settings
 from src.copytrade import Candidate, decide
-from src.dexscreener import PoolQuoteLookup, notable
+from src.dexscreener import PoolQuoteLookup, notable, token_name
 from src.formatter import (
     render,
     render_copy_signal,
@@ -64,6 +64,7 @@ from src.models import (
     pick,
     to_iso,
 )
+from src.namecn import NameGlossary
 
 # ============================================================
 # 候选字段名 —— 全部来自逆向推测,probe 确认后可以收窄但保留兜底不会有坏处
@@ -691,6 +692,10 @@ class Poller:
         #    它走的是 DexScreener(公开免鉴权),与 FOMO 的登录态完全无关,
         #    失败一律自己吞掉 —— 绝不允许它有能力影响任何一条推送的发出。
         self._pool_lookup = PoolQuoteLookup()
+        # 币名中文译名 + 底池对手股票事实(维基 / Google / Yahoo,公开免 key)。
+        # 自带 SQLite 缓存与每 tick 预算;与 _pool_lookup 同一条铁律:失败一律自己吞掉,
+        # 绝不允许它有能力影响任何一条推送的发出。
+        self._names = NameGlossary()
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
@@ -1921,6 +1926,46 @@ class Poller:
                 logger.warning("底池对手查询失败,本轮这条链不显示该行 | {} | {}", net, e)
         return out
 
+    def _name_extras(self, pool_quotes: dict, network_id, token_address, token_symbol,
+                     pq, *, cached_only: bool) -> dict:
+        """
+        A/B/C 三段的数据 → render 的关键字参数。缺哪段就没哪个键(那一行整行消失)。
+
+          token_name        英文全名(DexScreener 同一份响应里我方一侧的 name)
+          token_name_zh     它的中文译名(namecn:维基优先、Google 兜底)
+          stock_company_zh / stock_exchange
+                            底池对手是**币股**(pq 非 None)时,Yahoo 的事实 + 公司名中文
+
+        ⚠️ cached_only(转入推送 /tin、转入聚合):**只读缓存、绝不发请求** ——
+           那两条路径不为币名新开请求,有缓存就带上,没有就没有;股票说明也不查。
+        ⚠️⚠️ 整段包在 try 里,任何失败一律返回已经拿到的部分。
+           与底池/共识同一条铁律:**绝不能出现"因为翻不出中文名所以整条推送没发出去"**。
+        """
+        out: dict = {}
+        try:
+            net = (network_id or "").strip()
+            if cached_only:
+                pq_self = self._pool_lookup.cached(net, token_address)
+                name = None if pq_self is None else pq_self.token_name
+            else:
+                name = token_name(pool_quotes.get(net, {}), token_address)
+            if name is not None:
+                out["token_name"] = name
+                zh = self._names.token_zh(name, token_symbol, network=not cached_only)
+                if zh is not None:
+                    out["token_name_zh"] = zh
+            if pq is not None and pq.symbol and not cached_only:
+                info = self._names.stock_info(pq.symbol)
+                if info is not None:
+                    if info.company_zh is not None:
+                        out["stock_company_zh"] = info.company_zh
+                    if info.exchange is not None:
+                        out["stock_exchange"] = info.exchange
+        except Exception as e:  # noqa: BLE001
+            logger.warning("币名/股票说明获取失败,相关行不显示 | {} {} | {}",
+                           network_id, token_address, e)
+        return out
+
     def _dispatch(self, conn, snapshots: dict, new_events: list[FomoEvent], dry_run: bool) -> None:
         """
         第二循环:此时 stats 已是一致快照,所有消息共用同一个共识时点值。
@@ -1956,6 +2001,9 @@ class Poller:
             logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
             starred = set()
         pool_quotes = self._pool_quotes(pending)
+        # 币名/股票说明的每 tick 预算从这里起算(见 namecn.NameGlossary)
+        with suppress(Exception):
+            self._names.begin_round()
         for ev in pending:
             # ---- /tin:被点名的人的转入,走另一套渲染 ----
             # ⚠️⚠️ 这道门必须在这里**再判一次**:上面的补发队列捞的是"库里所有
@@ -1989,9 +2037,14 @@ class Poller:
             # ⚠️ 只有对手**不是常见计价资产**时 notable 才给东西 ——
             #    「底池 · WBNB」是噪音,「底池 · NVDA」才是信号(见 dexscreener.notable)
             pq = notable(pool_quotes.get(ev.network_id or "", {}), ev.token_address)
+            # 英文全名(A)/ 中文名(C)/ 股票说明(B)。转入推送只读缓存、不发请求
+            names = self._name_extras(pool_quotes, ev.network_id, ev.token_address,
+                                      ev.token_symbol, pq, cached_only=is_transfer_in)
             try:
                 text = (
-                    render_transfer_in_watch(ev, starred=ev.user_id in starred)
+                    render_transfer_in_watch(ev, starred=ev.user_id in starred,
+                                             token_name=names.get("token_name"),
+                                             token_name_zh=names.get("token_name_zh"))
                     if is_transfer_in else
                     render(
                         ev,
@@ -2002,6 +2055,7 @@ class Poller:
                         starred=ev.user_id in starred,
                         pool_quote_symbol=None if pq is None else pq.symbol,
                         pool_quote_name=None if pq is None else pq.name,
+                        **names,
                     )
                 )
             except Exception as e:  # noqa: BLE001
@@ -2151,10 +2205,13 @@ class Poller:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("转入告警:买家查询失败,该行不显示 | {} {} | {}", net, ca, e)
                     buyers = None
+                names = self._name_extras({}, net, ca, sym, None, cached_only=True)
                 text = render_transfer_in_signal(
                     network_id=net, token_address=ca, token_symbol=sym,
                     receiver_count=n, receivers=recv,
                     window_hours=window_h, buyers=buyers, senders=senders,
+                    token_name=names.get("token_name"),
+                    token_name_zh=names.get("token_name_zh"),
                 )
                 logger.info("转入告警 | {} 人收到 ${} | {} {}", n, sym or "?", net, ca)
                 if dry_run:

@@ -1,0 +1,99 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "BTC-USD",
+     "exchangeName": "CCC",
+     "fullExchangeName": "CCC",
+     "instrumentType": "CRYPTOCURRENCY",
+     "firstTradeDate": 1410912000,
+     "regularMarketTime": 1788330400,
+     "hasPrePostMarketData": false,
+     "gmtoffset": 0,
+     "timezone": "UTC",
+     "exchangeTimezoneName": "UTC",
+     "regularMarketPrice": 77587.21,
+     "regularMarketChangePercent": -1.424,
+     "fiftyTwoWeekHigh": 126198.07,
+     "fiftyTwoWeekLow": 57747.766,
+     "regularMarketDayHigh": 77719.54,
+     "regularMarketDayLow": 76777.59,
+     "regularMarketVolume": 30563432448,
+     "longName": "Bitcoin USD",
+     "shortName": "Bitcoin USD",
+     "chartPreviousClose": 77395.89,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "UTC",
+       "start": 1788307200,
+       "end": 1788307200,
+       "gmtoffset": 0
+      },
+      "regular": {
+       "timezone": "UTC",
+       "start": 1788307200,
+       "end": 1788393540,
+       "gmtoffset": 0
+      },
+      "post": {
+       "timezone": "UTC",
+       "start": 1788393540,
+       "end": 1788393540,
+       "gmtoffset": 0
+      }
+     },
+     "dataGranularity": "1d",
+     "range": "1d",
+     "validRanges": [
+      "1d",
+      "5d",
+      "1mo",
+      "3mo",
+      "6mo",
+      "1y",
+      "2y",
+      "5y",
+      "10y",
+      "ytd",
+      "max"
+     ]
+    },
+    "timestamp": [
+     1788330400
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "volume": [
+        30563432448
+       ],
+       "open": [
+        77395.890625
+       ],
+       "high": [
+        77719.5390625
+       ],
+       "low": [
+        76777.59375
+       ],
+       "close": [
+        77587.2109375
+       ]
+      }
+     ],
+     "adjclose": [
+      {
+       "adjclose": [
+        77587.2109375
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}

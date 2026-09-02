@@ -405,6 +405,22 @@ CREATE TABLE IF NOT EXISTS user_pnl_snapshot (
     num_trades     INTEGER,
     updated_at     TEXT NOT NULL
 );
+
+-- 币名 / 公司名的中文译名与股票事实(src/namecn.py)。
+-- kind ∈ {token_zh, company_zh, stock_fact};key 已归一化(lower + strip + 叠平空白)。
+-- ⚠️ value 为 NULL = 「查过了,没有」(负缓存),与"没查过"(无行)是两回事:
+--    负缓存也占一行,否则每个 tick 都会为同一个查不到的名字重打一轮请求。
+-- ⚠️ expires_at 为 NULL = 永久(名字/公司名不会变);负缓存与失败各有自己的 TTL,
+--    由 namecn 决定并写进来 —— 本表不理解这些语义,只按 expires_at 判过期。
+CREATE TABLE IF NOT EXISTS name_glossary (
+    kind        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT,
+    source      TEXT NOT NULL,   -- wiki / google / yahoo / miss / error …(排查用)
+    expires_at  INTEGER,         -- unix 秒;NULL = 永久
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
 """
 
 
@@ -2373,3 +2389,35 @@ def list_buyers(conn, network_id: str, token_address: str) -> list[sqlite3.Row]:
         """,
         (network_id, token_address),
     ).fetchall()
+
+
+# ============================================================
+# 币名 / 公司名词汇表(name_glossary)—— src/namecn.py 的缓存
+# ============================================================
+def glossary_get(conn, kind: str, key: str, now: float) -> sqlite3.Row | None:
+    """
+    读一条缓存。过期的当没有(返回 None),由调用方重新查。
+
+    ⚠️ 返回的是**整行**(value 可能是 NULL = 负缓存),调用方必须区分
+       "没有行"(该去查)与 "有行但 value 为 NULL"(查过了、确认没有、别再查)。
+    ⚠️ expires_at 为 NULL = 永久,这里用 `expires_at IS NULL OR expires_at > ?` 一起判。
+    """
+    return conn.execute(
+        """
+        SELECT value, source, expires_at FROM name_glossary
+        WHERE kind = ? AND key = ? AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (kind, key, int(now)),
+    ).fetchone()
+
+
+def glossary_put(conn, kind: str, key: str, value: str | None, source: str,
+                 expires_at: int | None) -> None:
+    """写(覆盖)一条缓存。value=None 是负缓存,expires_at=None 是永久。"""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO name_glossary (kind, key, value, source, expires_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (kind, key, value, source, None if expires_at is None else int(expires_at), now_iso()),
+    )

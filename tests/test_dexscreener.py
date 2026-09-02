@@ -615,16 +615,20 @@ class Test地址大小写:
 # 发不发请求
 # ============================================================
 class Test请求闸门:
-    def test_没有币股判据的链一个请求都不发(self):
+    def test_没有币股判据的链照发请求取币名但不做币股判定(self):
         """
-        ⚠️⚠️ 那条链上这一行**永远显示不出来**(notable 一律给 None),
-           为一个必然不显示的东西打一轮请求是纯浪费。
-           加判据的那天请求会自动跟着回来 —— 两件事共用同一张表,不会 drift。
+        ⚠️⚠️ **闸门语义变了,如实记在这里**:这里曾经是"没判据的链一个请求都不发"
+           (那时这份响应只为 🌊 行服务)。现在同一份响应还承担**币名**(token_name),
+           四条链的推送标题都要它 —— 所以没判据的链**照发请求**,但对手一律
+           **不判成币股**(is_stock=False,🌊 行照旧不出现)。
         """
         for net in ("solana", "bsc", "base"):
-            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
-            assert dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI]) == {}
-            assert fake.calls == [], f"{net} 上白打了请求"
+            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH, chain=net)]])
+            got = dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI])
+            assert fake.calls == [(CA_AI,)], f"{net} 上没发请求,币名就拿不到"
+            assert got[CA_AI].token_name == "Artificial Inu", f"{net} 上没取到币名"
+            assert got[CA_AI].is_stock is False, f"{net} 上没判据却判成了币股"
+            assert dx.notable(got, CA_AI) is None, f"{net} 上 🌊 行不该出现"
 
     def test_映射不到的链一个请求都不发(self):
         fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
@@ -845,3 +849,59 @@ class Test故障隔离:
         fake = FakeDex()
         dx.PoolQuoteLookup(client=fake).close()
         assert fake.closed == 1
+
+
+# ============================================================
+# 币自己的名字(token_name)—— 真实响应:$CUM(2026-09-02 录)
+# ============================================================
+CA_CUM = "0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18"
+
+
+class Test币名:
+    def test_真实响应里取到CUM的全名与对手(self):
+        """同一份响应:我方一侧是 CUM · Cummingtonite,最深池对手是 USAR(币股)。"""
+        quotes = dx.parse_pool_quotes(_load("dexscreener_latest_cum.json"), "robinhood", {CA_CUM})
+        pq = quotes[CA_CUM]
+        assert pq.token_symbol == "CUM"
+        assert pq.token_name == "Cummingtonite"
+        assert pq.symbol == "USAR" and pq.is_stock is True and pq.issuer == "USA Rare Earth"
+        assert dx.token_name(quotes, CA_CUM) == "Cummingtonite"
+        assert dx.token_name(quotes, CA_CUM.upper().replace("0X", "0x")) == "Cummingtonite", "入参要归一化"
+
+    def test_我方在quote一侧时也取对(self):
+        """base/quote 方向不固定:我们是 quoteToken 时,币名取 quote 那一侧,不能拿对手的名字。"""
+        pair = _pair(CA_NVDA_RH, CA_AI_CHECKSUM, base_sym="NVDA", base_name="NVIDIA • Robinhood Token",
+                     quote_sym="AI", quote_name="Artificial Inu")
+        pq = dx.parse_pool_quote(pair, "robinhood", CA_AI)
+        assert pq.token_name == "Artificial Inu" and pq.token_symbol == "AI"
+        assert pq.symbol == "NVDA"
+
+    def test_四条链都取币名(self):
+        for net in ("solana", "bsc", "base", "robinhood"):
+            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH, chain=net)]])
+            got = dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI])
+            assert dx.token_name(got, CA_AI) == "Artificial Inu", net
+
+    def test_没有名字整段消失(self):
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH)
+        pair["baseToken"].pop("name")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name is None
+        assert dx.token_name({}, CA_AI) is None
+        assert dx.token_name({}, None) is None
+
+    def test_只读缓存不发请求(self):
+        fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
+        lk = dx.PoolQuoteLookup(client=fake)
+        assert lk.cached("robinhood", CA_AI) is None
+        assert fake.calls == []
+        lk.lookup("robinhood", [CA_AI])
+        assert lk.cached("robinhood", CA_AI_CHECKSUM).token_name == "Artificial Inu"
+        assert lk.cached("robinhood", CA_CASHCAT) is None
+        assert lk.cached("solana", CA_AI) is None
+        assert len(fake.calls) == 1
+
+    def test_只读缓存尊重TTL(self):
+        fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
+        lk = dx.PoolQuoteLookup(client=fake, ttl=0.0)
+        lk.lookup("robinhood", [CA_AI])
+        assert lk.cached("robinhood", CA_AI) is None, "过期的缓存不能再给出去"

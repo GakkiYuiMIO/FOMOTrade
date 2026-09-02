@@ -1353,3 +1353,16 @@ hexiecs 的 80 个持仓：**Solana 40 · BSC 32 · Robinhood 7 · Base 1**。
 - 名单另存（`watch_users` 是 FOMO 的 UUID+handle，pump.fun 是钱包地址）
 - 命令另起一组（add/del/list/who/ca/chips/tin/hot/top/copy/paper/star/unstar/
   following/status/rebuild/help 已占用）
+
+---
+
+## 推送里的币名 / 中文名 / 底池股票说明(2026-09-02,分支 feat/token-name-cn)
+
+- [x] `src/dexscreener.py`:PoolQuote 多带我方一侧 `token_symbol / token_name`;闸门改成"没币股判据的链不做币股判定但仍取币名";`token_name()` / `PoolQuoteLookup.cached()`
+- [x] `src/namecn.py`(新):维基跨语言链接(繁→简)→ Google 免费通道两级翻译;Yahoo chart 取股票事实;输入/输出两道过滤;SQLite 缓存(永久 / 30 天 / 1 小时);每 tick 预算 5+5
+- [x] `src/store.py`:`name_glossary` 表 + `glossary_get / glossary_put`
+- [x] `src/formatter.py`:标题尾巴英文全名(A)、📝 中文名(C)、🏢 股票说明(B);render / render_pump_trade / render_transfer_in_watch / render_transfer_in_signal 接入
+- [x] `src/poller.py` / `src/pumpfun.py`:`_name_extras` 接进买入 / pump 成交推送;转入推送只读缓存
+- [x] 测试:tests/test_namecn*.py(离线真实夹具),conftest 第三道防线(namecn 不许外呼)
+- [x] README 新增「币名、中文名与底池股票说明」
+- [ ] 观察线上 Google 通道对 meme 名的音译质量(apeonfone → 阿彭丰 这种没信息量,但也无害)

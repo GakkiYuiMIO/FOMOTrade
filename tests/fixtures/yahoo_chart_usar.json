@@ -1,0 +1,98 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "USAR",
+     "exchangeName": "NGM",
+     "fullExchangeName": "NasdaqGM",
+     "instrumentType": "EQUITY",
+     "firstTradeDate": 1689600600,
+     "regularMarketTime": 1788292800,
+     "hasPrePostMarketData": true,
+     "gmtoffset": -14400,
+     "timezone": "EDT",
+     "exchangeTimezoneName": "America/New_York",
+     "regularMarketPrice": 17.26,
+     "regularMarketChangePercent": -3.143,
+     "fiftyTwoWeekHigh": 43.98,
+     "fiftyTwoWeekLow": 11.45,
+     "regularMarketDayHigh": 17.795,
+     "regularMarketDayLow": 16.96,
+     "regularMarketVolume": 9837157,
+     "longName": "USA Rare Earth, Inc.",
+     "shortName": "USA Rare Earth, Inc.",
+     "chartPreviousClose": 17.82,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "EDT",
+       "end": 1788355800,
+       "start": 1788336000,
+       "gmtoffset": -14400
+      },
+      "regular": {
+       "timezone": "EDT",
+       "end": 1788379200,
+       "start": 1788355800,
+       "gmtoffset": -14400
+      },
+      "post": {
+       "timezone": "EDT",
+       "end": 1788393600,
+       "start": 1788379200,
+       "gmtoffset": -14400
+      }
+     },
+     "dataGranularity": "1d",
+     "range": "1d",
+     "validRanges": [
+      "1d",
+      "5d",
+      "1mo",
+      "3mo",
+      "6mo",
+      "1y",
+      "2y",
+      "5y",
+      "ytd",
+      "max"
+     ]
+    },
+    "timestamp": [
+     1788269400
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "volume": [
+        9843100
+       ],
+       "open": [
+        17.135000228881836
+       ],
+       "low": [
+        16.959999084472656
+       ],
+       "high": [
+        17.795000076293945
+       ],
+       "close": [
+        17.260000228881836
+       ]
+      }
+     ],
+     "adjclose": [
+      {
+       "adjclose": [
+        17.260000228881836
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}
