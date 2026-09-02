@@ -49,10 +49,33 @@
 · **`#` `$` `+` 不在白名单里。** 它们各是一条**可达通道**:Telegram 会把
   `#freeairdrop` 渲染成可点 hashtag、`$SCAM` 渲染成 cashtag、`+79001234567`
   在移动端渲染成可拨号链接 —— 攻击者不需要域名也能拿到一个可点击的出口。
-· **`·` `•` `|` 不在白名单里。** 它们是本项目的字段分隔符(formatter.SEP),
-  放行等于把"造一个假字段"的能力直接交出去。这一条**不许松**。
-· **`「` `」` 不在白名单里。** 它们是视觉容器本身;名字里带它就能把自己"移出"容器。
+· **分隔符按"有没有容器"分两套口径**(见下面一节),不再一刀切。
+· **`「` `」` 在名字侧与 ident 侧**都**直接丢弃。** 它们是视觉容器本身;
+  名字里带它就能把自己"移出"容器。
   ⚠️ 不许"转义后放行" —— 转义破坏不了 HTML,但破坏了容器的视觉不变量。
+
+============ 分隔符:名字侧放行、ident 侧严禁(本轮的核心修正)============
+上一轮把"分隔符"这一类漏在了两套规则之外,于是同一个字符串 `已清仓 · 亏损 99%`
+在一个测试文件里是"必拦"、在另一个里被断言"必放行" —— safe_display 把它当形状规则
+拦掉了,safe_ident 把它当形状规则放行了。而 **ident 恰恰是唯一不套「」容器的槽位**:
+最需要拦分隔符的地方反而最松。
+
+真正的判据不是"这个字符危不危险",而是**它印在容器里还是容器外**:
+
+  · 币名 / 译名 / 公司名 一律印在 `「」`**里面** → 伪造出来的分隔符被容器困住,
+    读者一眼看得出那是一段数据 → `·`(U+00B7)`•`(U+2022)`・`(U+30FB)**放行**。
+    ⇒ 顺带修好一大批真误杀:`Costco • Robinhood Token`(币股原名)、
+      `DOG•GO•TO•THE•MOON`、`尼基塔·比尔`、`南希·佩洛西`(音译人名的间隔号)。
+  · symbol / handle / 昵称 **不套容器**,直接和推送自己的 SEP(' · ')平级 →
+    任何分隔符类字符 **一律严禁**(safe_ident,判据见 is_separator_char)。
+    ⇒ 就分隔符这一类而言,**ident 的规则集是名字规则集的严格超集**。
+    这条关系写成了可执行测试(tests/test_nameguard_sep.py),两份规则不可能再互相矛盾。
+
+  ⚠️ 名字侧仍留一条**形状**规则:含中日韩文字时,分隔符两侧不许有空格(见
+     _cjk_spaced_separator)。理由是实测 —— 中文排版里音译人名的间隔号**紧贴两侧**
+     (`南希·佩洛西`),而 `已清仓 · 亏损 99%` / `官方认证 · 已审计` 带空格,
+     是在**模仿 SEP 的形态**。纯 ASCII 那侧不能加这条:`Costco • Robinhood Token`
+     就是一个带空格的**真币股原名**,拦掉它等于把整批币股名打回上一轮的状态。
 
 ⚠️ 本模块是**纯函数、零依赖**。收口点在 formatter(渲染入口统一过一遍,
    见 formatter.UNTRUSTED_FIELDS);namecn 送翻译前 / 收译文时另外各调一次,
@@ -206,14 +229,78 @@ def has_cjk(s) -> bool:
     return any(is_cjk_char(ch) for ch in str(s or ""))
 
 
-# 允许的标点。⚠️ 全角标点(,。、;:!?"")**不在**里面:名字不带全角标点,
-#    带全角标点的是句子 —— 而推送里不需要显示任何人写给读者的句子。
-#    ⚠️ `#` `$` `+`(Telegram 可点通道)、`·` `•`(字段分隔符)、`「` `」`(视觉容器)
-#       与 `;` 都**刻意不在**里面,理由见模块头。
-#    ⚠️ 半角冒号 `:` 也**已经拿掉**:scheme 那条只认"冒号后紧跟非空白"的 ASCII 形态,
-#       CJK 打头的 `加我微信:abcd` 从它下面漏过去(ASCII 串 4 位也够不着 ≥5 那条)。
-#       实测 247 个真实币名 + 85 个 Yahoo longName 里带 `:` 的是 **0** 个,拿掉零成本。
-_ALLOWED_PUNCT = frozenset(" .,'\"-&()!?/%~")
+# ---- 分隔符类字符:**类别 + 字符名查询**,不是手写码点表 ---------------------
+# ⚠️⚠️ 与 E2(CJK 判定)同一条教训:手写一张 `·•|` 的表**必然**漏同形字 ——
+#    U+30FB(片假名中点)、U+FF5C(全角竖线)、U+0387(希腊分隔号)、U+2219(点运算符)、
+#    U+2502(制表竖线)…… 每一个都能原样重造 `已清仓 ・ 亏损 99%`。
+#    所以这里用**查询**:类别是 P*/S*(标点或符号,字母天然排除),且 Unicode **字符名**
+#    里含下面这几个词(中点、圆点、竖线、竖排制表符那几族)。
+#    这把"视觉上可作分隔"表达成了可枚举、可逐码点自测的东西 ——
+#    tests/test_nameguard_sep.py 把整个 0x110000 空间遍历一遍(命中 249 个码点),
+#    断言每一个命中的字符在 safe_ident 那侧都被拦住。
+# ⚠️⚠️ 这里**曾经**还有一条"NFKC 折叠到 `·` `•` `・` `|` 四个基准字符之一"的规则
+#    与那张四字符基准表 —— 两者都是**死规则**:逐码点跑完 0x110000,
+#    "只有 NFKC 抓得到、字符名抓不到"的码点是 **0** 个(把 NFKC 那条打掉全量测试 0 红,
+#    实测过)。原因是全角/半角同形字的 Unicode 名字里本来就带着基准字符的名字
+#    (U+FF5C 叫 FULLWIDTH VERTICAL LINE、U+FF65 叫 HALFWIDTH KATAKANA MIDDLE DOT)。
+#    死规则 + 空转测试是最糟的组合,一并删掉。
+# ⚠️ 下面每一个 marker 都有**独占样本**钉在 tests/test_nameguard_sep.py 的
+#    _MUST_BE_SEPARATOR 里:删掉任意一个,那条当场红。
+_SEP_NAME_MARKERS = (
+    "MIDDLE DOT",          # U+00B7 · / U+30FB ・ / U+16EB ᛫
+    "BULLET",              # U+2022 • / U+2043 ⁃ / U+2219 ∙ / U+25E6 ◦
+    "VERTICAL",            # U+007C | / U+2502 │ / U+FF5C ｜ / U+2016 ‖ / U+22EE ⋮
+    "DOT OPERATOR",        # U+22C5 ⋅
+    "ONE DOT LEADER",      # U+2024 ․
+    "HYPHENATION POINT",   # U+2027 ‧
+    "DIVIDES",             # U+2223 ∣
+    "ANO TELEIA",          # U+0387 ·(希腊分隔号)
+)
+
+
+def is_separator_char(ch: str) -> bool:
+    """
+    这个字符视觉上能不能当**字段分隔符**用。⚠️ ident 侧一律严禁,理由见模块头。
+
+    ⚠️ 判据是"Unicode 类别 + 字符名",**不是**手写码点表 —— 手写表必然漏同形字。
+    """
+    if unicodedata.category(ch)[0] not in "PS":
+        return False
+    name = _char_name(ch)
+    return any(m in name for m in _SEP_NAME_MARKERS)
+
+
+# 名字侧(有 `「」` 容器)放行的那三个分隔符。⚠️ **只有这三个** ——
+#   它们是实测真名字里真实出现的("Costco • Robinhood Token" / "尼基塔·比尔" /
+#   日文名里的 U+30FB),别的分隔符没有任何真实样本,留在集合外。
+# ⚠️ 它们**不计入** _MAX_PUNCT,自己有一格上限 _MAX_SEP:
+#    "DOG•GO•TO•THE•MOON"(4 个 •)是真实存在的币名,挤在标点那格里会被误杀。
+_SEP_PUNCT = frozenset("·•・")
+# 分隔符个数上限 5:实测最多的一条是 "DOG•GO•TO•THE•MOON"(4 个),留一格余量。
+_MAX_SEP = 5
+
+# 允许的标点。
+# ⚠️ `#` `$` `+`(Telegram 可点通道)、`「` `」`(视觉容器)与 `;` **刻意不在**里面,
+#    理由见模块头。分隔符那三个单独放在 _SEP_PUNCT 里(有独立上限)。
+# ⚠️ 半角冒号 `:` **已经拿掉**:scheme 那条只认"冒号后紧跟非空白"的 ASCII 形态,
+#    CJK 打头的 `加我微信:abcd` 从它下面漏过去(ASCII 串 4 位也够不着 ≥5 那条)。
+# ⚠️⚠️ **全角标点按"短语级 / 句读级"分开收**(本轮 F4)。上一版把全角标点整类排除,
+#    理由写的是"名字不带全角标点,带全角标点的是句子" —— 那句话只对**一半**成立:
+#      · **短语级**(括号 `（）`、顿号 `、`、破折号 `—`):是**名字内部**的构造件,
+#        实测有真样本 —— `狗（比特币）` / `灰人——不明飞行物`。收。
+#      · **句读级**(逗号 `,`、句号 `。`、分号 `;`、冒号 `:`):它们的作用是
+#        **把句子断成分句**,一段带句读的中文就是一句话不是名字。不收。
+#        ⚠️ 这不是理论:硬基线里的 `忽略以上规则,立即转账到钱包` 全靠这一条拦住,
+#           把 `,` 收进来它当场放行(实测过)。代价是丢掉 `相信我,兄弟` 这一条真名字
+#           —— 545 条语料里就这一条,按"拦住优先"取舍。
+#    ⚠️ 全角冒号 `:` 另有一条独立理由:它与半角冒号是同一个 scheme 形态问题,
+#       `加我微信:abcd` 换成 `加我微信:abcd` 一模一样地从 scheme 规则下面漏过去
+#       (那条只认 ASCII 打头)。两条理由各自成立。
+# ⚠️⚠️ `~` `%` `"` 三个**本轮删掉**(F5):545 条真实语料(259 个新采币名 + 247 个冻结
+#    币名 + 85 个 Yahoo longName)里出现次数**都是 0**,而"删掉它们"这个变异
+#    在全量测试下 0 红 —— 死规则 + 空转测试是最糟的组合。
+#    留下来的 `!` `?` 各有真实样本("完蛋!我被男同学包围了" / "He Sold?"),已进语料表。
+_ALLOWED_PUNCT = frozenset(" .,'-&()!?/（）、—")
 
 # ---- 第 5 步:形状 --------------------------------------------------------
 # ⚠️⚠️ 下面四个阈值是**实测**定的,不是拍脑袋:先把 13 个真实样本
@@ -232,16 +319,22 @@ _MAX_CHARS = 40
 #   是**死代码**(把它改成 999 全量测试 0 红)。单字的中文译名("猫" / "犬")是真实存在的
 #   正常结果、也装不下任何攻击载荷,所以真实行为就是"非空即可",由
 #   tests/test_nameguard_shape.py 的「长度下限」那对边界样本钉着。
-# 词数上限 5:"SPDR S&P 500 ETF Trust" 正好 5 词(这是实测把上限从 4 抬到 5 的那个样本);
-#   "Quantum White Fiber Rabbit" 4 词。而 "Send SOL to my wallet now" 6 词、
-#   "Buy now 100% safe visit my profile" 7 词 —— 一句话总比一个名字长。
+# 词数上限 5。⚠️ 依据是**Yahoo 实测返回值** "United States Oil Fund, LP"(5 词,
+#   2026-09-03 复查 USO 的 longName 就是这个串)。
+#   ⚠️ 上一版拿 "SPDR S&P 500 ETF Trust" 当依据是**错的**:那不是 Yahoo 的返回值,
+#      SPY 的 longName 实测是 "State Street SPDR S&P 500 ETF Trust"(7 词,过不了)。
+#   而 "Send SOL to my wallet now" 6 词、"Buy now safe airdrop visit my profile" 7 词
+#   —— 一句话总比一个名字长。
+# ⚠️⚠️ 数的是**有内容的**词(至少含一个字母 / 数字 / 中日韩文字),孤立的分隔符不算:
+#   "Circle Internet Group • Robinhood Token" 是 5 词不是 6 词 —— 它是一个真币股的
+#   **上游原名**(🌊 那行排查时看的就是它),中间那个 `•` 不该白吃掉一格词数预算。
 _MAX_WORDS = 5
 # 标点上限 3:2026-09-02 实测 248 个真实币名的标点数分布是 {0: 235, 1: 11, 2: 2},
 #   实测上界只有 2("USA Rare Earth, Inc." / "WhiteFiber, Inc.":`,` 与 `.`);
 #   抬到 3 是为了放行**缩写式**的名字 —— "U.S.A. Token" 光点就有 3 个,
 #   而它是一个正常名字(2 上限时它被误杀,这是本轮实测发现的唯一一条真误杀)。
-#   代价评估:抬这一格不会多放行任何一条攻击基线(伪造字段靠的是 `·`/全角标点,
-#   那两类根本不在字符白名单里;话术类靠词数与长数字拦),所以是零成本。
+#   代价评估:抬这一格不会多放行任何一条攻击基线(话术类靠词数与长数字拦)。
+# ⚠️ 分隔符那三个(`·` `•` `・`)**不计入这一格**,它们在 _MAX_SEP 里另算。
 _MAX_PUNCT = 3
 # ⚠️⚠️ 数字规则判的是**整段里的数字总个数**,不是"连续几位"。
 #   上一版写的是 `[0-9]{6,}`(连续 ≥6 位),而 `-` `.` 空格都在字符白名单里、
@@ -256,6 +349,11 @@ _MAX_PUNCT = 3
 #   85 个 Yahoo longName 的上界也是 4('iShares Russell 2000 ETF')。
 #   留一格余量取 5,于是 '1000X'(4)、'Web3'(1)、'SPDR S&P 500 ETF Trust'(3)放行,
 #   而手机号(11)、QQ 号(10)、'138-0013-8000'(11)一律拦下。**这一条不许松。**
+# ⚠️⚠️ 数的**不只是 ASCII 数字**(本轮 F6):上一版写的是 `ch.isascii() and ch.isdigit()`,
+#   于是全角数字 '１３８００１３８０００' 与中文数字 '一三八〇〇一三八〇〇〇' 平凡绕过 ——
+#   两者在 Telegram 里读者一眼仍读得出是一个手机号。改判"数值字符"(见 _is_digit_like):
+#   `str.isdigit()`(覆盖 ASCII + 全角 + 各文种数字)加上**有数值的汉字**(一二三…十百千万)。
+#   ⚠️ 代价实测为 0:545 条真实语料里含数值汉字最多的一条是 '八重'(1 个),离 5 很远。
 _MAX_DIGITS = 5
 # 含 CJK 时允许的 ASCII 字母串上限 4 位。中文译名不会夹带长英文单词;
 #   4 位是为了放行 "SPDR" / "ETF" / "AI" 这类代号(与 has_new_ascii_word 的 ≥4 同源判断)。
@@ -358,7 +456,7 @@ def flatten(s) -> str:
 
 
 def _char_ok(ch: str) -> bool:
-    if ch in _ALLOWED_PUNCT:
+    if ch in _ALLOWED_PUNCT or ch in _SEP_PUNCT:
         return True
     if ch.isascii() and (ch.isalpha() or ch.isdigit()):
         return True
@@ -369,12 +467,54 @@ def _has_content(text: str) -> bool:
     """
     整段里至少要有**一个**字母 / 数字 / 中日韩文字。
 
-    ⚠️ 少了这一条,一个纯标点的"名字"("..." / "---" / '""')能全程放行 ——
+    ⚠️ 少了这一条,一个纯标点的"名字"("..." / "---" / '・')能全程放行 ——
        每个字符都在标点白名单里、长度词数标点数全在上限内。它不是名字,
        印出来只会在标题里长出一段读不懂的东西。实测 247 个真实币名全部满足这一条。
+    ⚠️ 它同时是**词数**那条的判据:孤立的分隔符不算一个词(见 _content_words)。
     """
     return any(ch.isascii() and (ch.isalpha() or ch.isdigit()) or is_cjk_char(ch)
                for ch in text)
+
+
+def _content_words(text: str) -> int:
+    """
+    有内容的词数。⚠️ 孤立的分隔符**不算词**:"Circle Internet Group • Robinhood Token"
+       是 5 词不是 6 词 —— 它是一个真币股的上游原名,`•` 不该吃掉一格词数预算。
+    """
+    return sum(1 for w in text.split() if _has_content(w))
+
+
+def _is_digit_like(ch: str) -> bool:
+    """
+    这个字符算不算"一位数字"。⚠️ 不只是 ASCII —— 理由见 _MAX_DIGITS 上面那段。
+
+    `str.isdigit()` 覆盖 ASCII 与全角(０-９)以及各文种的数字;
+    再加上**有数值的汉字**(一二三四五六七八九十百千万),中文数字写的手机号才拦得住。
+    """
+    if ch.isdigit():
+        return True
+    return is_cjk_char(ch) and unicodedata.numeric(ch, None) is not None
+
+
+def _cjk_spaced_separator(text: str) -> bool:
+    """
+    含中日韩文字时,分隔符两侧带空格(或顶在首尾)→ 视为**模仿 SEP 的形态**。
+
+    ⚠️⚠️ 这是名字侧唯一保留的分隔符规则,理由见模块头那一节:
+       中文排版里音译人名的间隔号**紧贴两侧**(`南希·佩洛西` / `尼基塔·比尔`),
+       而 `已清仓 · 亏损 99%` / `官方认证 · 已审计` / `已清仓 ・ 亏损 99%`
+       全都带空格 —— 那不是名字的写法,是在造一个假字段。
+    ⚠️ 纯 ASCII 那侧**刻意不加**这条:`Costco • Robinhood Token` 是带空格的真名字。
+    """
+    if not has_cjk(text):
+        return False
+    n = len(text)
+    for i, ch in enumerate(text):
+        if ch not in _SEP_PUNCT:
+            continue
+        if i == 0 or i == n - 1 or text[i - 1] == " " or text[i + 1] == " ":
+            return True
+    return False
 
 
 def _shape_ok(text: str, source=None) -> bool:
@@ -386,13 +526,17 @@ def _shape_ok(text: str, source=None) -> bool:
     """
     if len(text) > _MAX_CHARS:
         return False
-    if len(text.split()) > _MAX_WORDS:
+    if _content_words(text) > _MAX_WORDS:
         return False
     if sum(1 for ch in text if ch in _ALLOWED_PUNCT and ch != " ") > _MAX_PUNCT:
         return False
-    if sum(1 for ch in text if ch.isascii() and ch.isdigit()) > _MAX_DIGITS:
+    if sum(1 for ch in text if ch in _SEP_PUNCT) > _MAX_SEP:
+        return False
+    if sum(1 for ch in text if _is_digit_like(ch)) > _MAX_DIGITS:
         return False
     if not _has_content(text):
+        return False
+    if _cjk_spaced_separator(text):
         return False
     if has_cjk(text):
         src = flatten(source).lower()
@@ -449,20 +593,47 @@ def safe_display(s, source=None) -> str | None:
 #    `www.evil-airdrop.com`(真 TLD)则两者都占。
 #    ⚠️ `.eth` / `.sol` 从 ident 的 TLD 表里**去掉**,正因为它们是这个圈子的人名后缀。
 # ⚠️ 命中 → 返回 None,调用方按既有"字段缺失"规矩办(那一段或那一行消失,绝不打占位符)。
-# ⚠️ 通过 → 返回**原串**(不清洗):昵称里的 emoji、符号里的大小写都必须原样保留,
-#    清洗与限长是下游 _clip 的既有职责,这道门只回答"给不给显示"。
+# ⚠️⚠️ **分隔符与容器字符在这一侧一律严禁**(本轮 F1b/F2):ident 不套 `「」`,
+#    它与推送自己的 SEP(' · ')平级 —— `token_symbol='已清仓 · 亏损 99%'` 上一轮
+#    原样进了标题。就分隔符这一类而言,ident 的规则集是名字规则集的**严格超集**。
+# ⚠️⚠️ 通过 → 返回**叠平后**的串(本轮 F2 改)。上一版返回原串,理由写的是
+#    "清洗与限长是下游 _clip 的既有职责" —— 那句话对 render_pump_trade /
+#    render_transfer_in_signal / render_alpha_listing 成立,对 **render() 不成立**:
+#    _display_name / _symbol_plain 只 _esc 不 _clip,于是
+#        token_symbol = 'CUM\n💰 买入 $999,999.00'
+#    在标题里**凭空造出一整行伪造字段**。把清洗责任推给下游 = 赌四条路都记得,
+#    而实测漏了一条。现在这道门自己叠平,四条路都不用记。
+#    ⚠️ 叠平用的是**保留 emoji 的**那个版本(strip_controls_keep_emoji):
+#       昵称里的 👨‍💻 / 🏴󠁧󠁢󠁳󠁣󠁴󠁿 靠 ZWJ 与 tag 字符粘合,全删会把它们拆成另一个东西。
+#       判断仍在**全删版本**(flatten)上做 —— 零宽空格不许用来拆域名。
 _RE_DOMAIN_WITH_PATH = re.compile(r"[A-Za-z0-9-]+\.[A-Za-z]{2,}/")
 _IDENT_TLDS = _SPLIT_DOMAIN_TLDS - {"eth", "sol"}
-_IDENT_BAD_PATTERNS = (_RE_SCHEME, _RE_MENTION, _RE_EVM, _RE_BARE_HEX, _RE_BASE58, _RE_IPV4)
+# Telegram 的**可点通道**在 ident 侧也要堵:
+#   · `#` 会被渲染成可点 hashtag。实测 4064 个真实 symbol + 208 个 handle 里带 `#` 的
+#     是 **0** 个,整个字符禁掉零成本。
+#   · `+` 后面紧跟一串数字会在移动端被渲染成**可拨号**链接。这里只禁"电话形态"
+#     不禁字符本身:实测里 'GTA+' 是一个真实符号(1/4064),禁整个字符会误杀它。
+_RE_TEL = re.compile(r"\+[0-9]{7,}")
+_IDENT_BAD_PATTERNS = (_RE_SCHEME, _RE_MENTION, _RE_EVM, _RE_BARE_HEX, _RE_BASE58,
+                       _RE_IPV4, _RE_TEL)
+# ⚠️ 与 QUOTE_CHARS 一起在字符层面直接丢弃的那几个(见 safe_ident)。
+_IDENT_BAD_CHARS = frozenset("#")
+# 视觉容器本身。⚠️ 名字侧靠字符白名单挡(它俩不在里面),ident 侧没有白名单,单列一条。
+QUOTE_CHARS = frozenset("「」")
 
 
 def safe_ident(s) -> str | None:
     """
-    symbol / handle / 昵称的轻门禁:命中形态类规则 → None,否则**原样**返回。
+    symbol / handle / 昵称的轻门禁:命中形态 / 分隔符 / 容器字符 → None,
+    否则返回**叠平后**的串(单行、空白归一、去首尾;emoji 原样保留)。
 
-    ⚠️ 实测丢弃率(2026-09-02,生产库只读):
-       token_symbol 1/2434 = 0.04%(被丢的那条是 '@everyone');
-       handle + 昵称 0/208 = 0.00%。
+    ⚠️ 实测丢弃率(2026-09-03,生产库只读):
+       token_symbol 2/4064 = 0.05%(fomo_events ∪ token_snapshot,被丢的是
+         '@everyone' 与 'LEMON.FUN');
+       handle + 昵称 2/208 = 0.96%(两条都是含分隔符的昵称,刻意的取舍 ——
+         '血手人屠·厉飞雨' U+00B7 与 '六子｜Funny Six' U+FF5C)。
+    ⚠️ 本轮新加的三条(分隔符 / 容器字符 / Telegram 可点通道)在真实 symbol 上的代价是
+       **0**:4064 个真实符号里带 `#` 的 0 个、带分隔符的 0 个、带 `「」` 的 0 个。
     """
     raw = str(s or "")
     if any(ch in _BIDI_CONTROLS for ch in raw):
@@ -478,7 +649,40 @@ def safe_ident(s) -> str | None:
         return None
     if any(m.group(1).lower() in _IDENT_TLDS for m in _RE_SPLIT_DOMAIN.finditer(compact)):
         return None
-    return raw
+    if any(ch in QUOTE_CHARS or ch in _IDENT_BAD_CHARS or is_separator_char(ch)
+           for ch in text):
+        return None
+    return " ".join(strip_controls_keep_emoji(raw).split())
+
+
+# ---- 合约地址的门禁:**形状封闭**,不是模式匹配 ------------------------------
+# ⚠️⚠️ 地址这一类字段不能走 safe_ident —— 那道的裸 hex / base58 / 0x 三条规则
+#    本来就是拿来拦地址的,把它套在"这里就该是一个地址"的槽位上等于全丢。
+#    但它同样是**上游给的任意字符串**(币安 Alpha 的 contractAddress),
+#    而它会被拼进 fomo.family / gmgn 的 URL、再印成 `<code>` 锚点。
+# ⚠️ 判据是一个**封闭形状**:一段 ASCII 字母数字,后面可以跟若干个 `::段`。
+#    · EVM `0x8ac7…`(42)与 Solana base58(32–44)是前半段;
+#    · **Sui 的类型标签**是 `0xADDR::module::TYPE`(实测币安 Alpha 真的会给这种),
+#      所以 `::` 必须收 —— 但只收**成对**的冒号,单个冒号一律不许:
+#      单冒号正是 scheme 的形态(`javascript:alert` / `tg:resolve`),
+#      而这个字段会被印成 `<code>` 锚点、还会被拼进代币页 URL。
+#    · `../../x`、带引号、带空格、带 `?a=b` 的一律不在 —— 那些不是地址。
+_RE_ADDRESS = re.compile(r"[0-9A-Za-z]{1,80}(?:::[0-9A-Za-z_]{1,40}){0,4}\Z")
+# 地址总长上限。EVM 42 / Solana 44 / Sui 类型标签实测 68 —— 128 绰绰有余。
+_MAX_ADDRESS_CHARS = 128
+
+
+def safe_address(s) -> str | None:
+    """
+    合约地址的形状门禁:上面那个封闭形状 + 长度 ≤128;不合格 → None(那一行消失)。
+
+    ⚠️ 它**不能**走 safe_ident:那道的 0x / 裸 hex / base58 三条规则本来就是拿来
+       拦地址的,套在"这里就该是一个地址"的槽位上等于把每一条都丢掉。
+    """
+    text = flatten(s)
+    if not text or len(text) > _MAX_ADDRESS_CHARS or not _RE_ADDRESS.match(text):
+        return None
+    return text
 
 
 def safe_exchange(s) -> str | None:

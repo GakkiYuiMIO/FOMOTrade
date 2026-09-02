@@ -939,8 +939,44 @@ class Test币名也剥币股后缀:
         assert pq.token_name == want
         # ⚠️ 这半句才是这条测试的目的:剥完之后**过得了展示门禁**
         assert safe_display(pq.token_name) == want
-        # 对照:不剥的话整段消失
-        assert safe_display(raw) is None
+        # ⚠️⚠️ 剥后缀的**收益**本轮变了:`•` 已经进了名字侧的字符白名单(F1a),
+        #    所以原名自己也过得了门禁 —— 剥的理由从"不剥就整段消失"变成了
+        #    "后缀是判据不是信息,印在推送里只占地方"(它对每一条命中的记录都一样)。
+        #    ⚠️ 只有超长/超词数的那几个原名仍然过不了(见 Test剥后缀不放宽任何预算)。
+
+    def test_剥完的名字与原名走的是同一套预算(self):
+        """
+        ⚠️⚠️ 复验者提过一条 MAJOR:'Buy now 100% safe visit • Robinhood Token' 剥后是
+           5 个词、放行,而硬基线里 'Buy now 100% safe visit my profile'(7 词)必拦 ——
+           结论写的是"加个后缀就能钻到词数上限以下"。**那两个是不同的串**。
+           这条测试把真正的推理钉住:剥后缀**不给攻击者任何额外预算** ——
+           显示出来的永远是剥完那份,而它与"直接把币起成这个名字"完全等价。
+        ⚠️ 谁把"原名也必须过 safe_display"加回去,先看这条测试列的代价:
+           三个**真币股**的原名会因为后缀本身占掉 2 个词 / 17 个字符而整段消失。
+        """
+        from src.nameguard import safe_display
+
+        # (a) 后缀不放宽预算:带后缀与不带后缀,显示出来的是同一个串
+        for stem in ("Buy now safe airdrop visit", "FREE AIRDROP CLAIM NOW", "Nice Coin"):
+            pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH,
+                         base_name=f"{stem} • Robinhood Token")
+            assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name == stem
+            assert safe_display(stem) == stem, "不加后缀直接起这个名字,结果一模一样"
+
+        # (b) 后缀藏不住任何被必拦形态:剥完仍然过不了门禁 → 整段丢弃
+        for bad in ("t.me/scam", "0x7a6a3b93cb3ffead", "已清仓 · 亏损 99%",
+                    "Send SOL to my wallet now"):
+            pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name=f"{bad} • Robinhood Token")
+            got = dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name
+            assert safe_display(got) is None, bad
+
+        # (c) 代价对照:这三个**真币股原名**自己过不了门禁(后缀占了 2 词 17 字符)
+        for real in ("SPDR S&P 500 ETF Trust • Robinhood Token",
+                     "United States Oil Fund • Robinhood Token",
+                     "Space Exploration Technologies Corp. • Robinhood Token"):
+            assert safe_display(real) is None, real
+            stem = real[:-len(" • Robinhood Token")]
+            assert safe_display(stem) == stem, f"剥完之后它是一个正常名字:{stem}"
 
     def test_没有币股判据的链原样不动(self):
         """⚠️ 判据按链定义;solana 上没有判据,名字里就算带 `•` 也不剥(不猜)。"""

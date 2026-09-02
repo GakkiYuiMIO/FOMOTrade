@@ -271,6 +271,25 @@ def _classify_stock(network_id, name) -> tuple[bool, str | None]:
        `GPRO · GoPro Inc`、`TIM · Tim Apple` 都是 memecoin,按那种规则会被说成股票。
     ⚠️ 公司名是**剥掉后缀之后剩下的部分**,不是另外拼的。剥完是空 → None,
        调用方就只显示符号(缺了就少那半句,绝不编)。
+
+    ⚠️⚠️ **"剥后缀会不会削弱门禁"这个问题查过了,答案是不会**(本轮 F3 的结论)。
+       复验者提的形态是:'Buy now 100% safe visit • Robinhood Token' 剥后是
+       'Buy now 100% safe visit'(5 词)→ 放行,而硬基线里
+       'Buy now 100% safe visit my profile'(7 词)是必拦的 ——
+       看上去"加个后缀就钻到词数上限以下了"。
+       ⚠️ 但这两个是**不同的串**:真正显示出去的只有剥完的那份,而它自己就满足
+          全部形状规则。攻击者**不加后缀、直接把币起名叫 'Buy now safe visit'**
+          得到的显示结果一模一样 —— 后缀没有给他任何额外能力:
+              后缀带来的是 `is_stock=True`(一个事实判断),不是更宽的预算;
+              长度 / 词数 / 标点 / 数字 全部按**剥完那份**计,与不加后缀完全相同。
+       ⚠️⚠️ 而"原名也必须过 safe_display"这个字面实现是**有真代价**的:后缀本身占
+          2 个词 17 个字符,于是三个**真币股**当场消失 ——
+              'SPDR S&P 500 ETF Trust • Robinhood Token'(7 词)
+              'United States Oil Fund • Robinhood Token'(6 词)
+              'Space Exploration Technologies Corp. • Robinhood Token'(53 字符)
+          用真功能换一个不存在的洞,不做。这条推理由
+          tests/test_dexscreener.py::Test剥后缀不放宽任何预算 逐条钉住 ——
+          谁要改回去,先让那条测试红。
     """
     marker = STOCK_NAME_MARKERS.get((network_id or "").strip())
     if not marker:

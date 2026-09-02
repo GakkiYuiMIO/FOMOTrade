@@ -167,23 +167,62 @@ class Test股票说明:
         assert "🏢" not in msg and "🌊" not in msg
 
     def test_交易所映射(self):
-        """⚠️ 左边这些是 2026-09-02 **实测** Yahoo 真实返回的 fullExchangeName。"""
+        """
+        ⚠️ 左边这些是 2026-09-02 **实测** Yahoo 真实返回的 fullExchangeName。
+        ⚠️⚠️ 本轮 F6 改了两件事:
+           1. **场外市场(OTC Markets *)不许印「上市」** —— 那些公司恰恰是**没有**在
+              交易所上市的,印「上市」是一句事实错误的话(§10.3)。改印「场外交易」。
+           2. **同一家交易所的每一种写法必须印成同一个中文**。上一版收了
+              "NYSE American" 与 "AMEX" 却漏了无空格写法 "NYSEAmerican",
+              于是同一家交易所一会儿是「美国证券交易所」一会儿是「NYSEAmerican」。
+              Cboe US / BATS 是同一对(BATS 是 Cboe US 的旧名),一并补上。
+        """
         cases = {
             "NasdaqGS": "纳斯达克(NasdaqGS)上市",
             "NasdaqGM": "纳斯达克(NasdaqGM)上市",
             "NasdaqCM": "纳斯达克(NasdaqCM)上市",
+            "NasdaqNMS": "纳斯达克(NasdaqNMS)上市",
             "NYSE": "纽约证券交易所(NYSE)上市",
             "NYSEArca": "纽交所 Arca(NYSEArca)上市",
             "NYSE American": "美国证券交易所(NYSE American)上市",
+            "NYSEAmerican": "美国证券交易所(NYSEAmerican)上市",
             "AMEX": "美国证券交易所(AMEX)上市",
-            # 映射不到中文的**只印原代码**(绝不猜一个中文名)——
-            # 这两个也是实测出现过的真实取值。
-            "Cboe US": "Cboe US 上市",
-            "OTC Markets OTCPK": "OTC Markets OTCPK 上市",
+            "Cboe US": "芝加哥期权交易所美国市场(Cboe US)上市",
+            "BATS": "芝加哥期权交易所美国市场(BATS)上市",
+            # 场外市场三档:**不印「上市」**
+            "OTC Markets OTCPK": "OTC Markets OTCPK 场外交易",
+            "OTC Markets OTCQX": "OTC Markets OTCQX 场外交易",
+            "OTC Markets OTCID": "OTC Markets OTCID 场外交易",
         }
         for code, expect in cases.items():
             lines = self._with_pool(stock_exchange=code)
             assert f"🏢 USAR · {expect}" in lines, (code, lines)
+
+    def test_同一家交易所的两种写法印法一致(self):
+        """
+        ⚠️⚠️ 这条单独存在的理由:上一版 "NYSE American" 印「美国证券交易所」、
+           "NYSEAmerican" 印原代码 —— 同一家交易所两种说法,读者会以为是两个地方。
+           nameguard._EXCHANGES 里的**每一个别名**在展示映射里都必须有一行。
+        ⚠️ 断言比的是"中文那一段相同",代码那一段本来就该各印各的(它是事实)。
+        """
+        def zh(code):
+            line = next(ln for ln in self._with_pool(stock_exchange=code)
+                        if ln.startswith("🏢"))
+            return line.split(" · ")[1].split("(")[0]
+
+        for group in (("NYSE American", "NYSEAmerican", "AMEX"),
+                      ("Cboe US", "BATS"),
+                      ("NasdaqGS", "NasdaqGM", "NasdaqCM", "NasdaqNMS")):
+            names = {zh(c) for c in group}
+            assert len(names) == 1, (group, names)
+
+    def test_场外市场不许说成上市(self):
+        """⚠️ OTC 那三档是**场外报价**,那些公司没有在交易所上市。印「上市」= 假事实。"""
+        for code in ("OTC Markets OTCPK", "OTC Markets OTCQX", "OTC Markets OTCID"):
+            line = next(ln for ln in self._with_pool(stock_exchange=code)
+                        if ln.startswith("🏢"))
+            assert "上市" not in line, line
+            assert "场外交易" in line, line
 
     def test_表外的交易所整段不显示(self):
         """

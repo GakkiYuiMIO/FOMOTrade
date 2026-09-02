@@ -33,6 +33,7 @@ import pytest
 
 from src import formatter
 from src.formatter import (
+    ADDRESS_FIELDS,
     IDENT_FIELDS,
     UNTRUSTED_FIELDS,
     render,
@@ -65,6 +66,15 @@ _EXPECT_IDENT = {
     "pool_quote_symbol": "safe_ident",   # 底池对手符号,同时是 🏢 行的 ticker
     "username": "safe_ident",            # pump 用户名,本人可控
     "symbol": "safe_ident",              # 币安 Alpha 的币符号
+    # ⚠️ 本轮补登记(上一版这两个全程零门禁):它们同样是外部来源的自由文本,
+    #    与被门禁保护的符号印在同一条消息里。
+    "chain_name": "safe_ident",          # 币安给的原始链名(内部映射查不到时的兜底)
+    "sector": "safe_ident",              # 币安运营编排的板块名
+}
+# ⚠️⚠️ **地址类字段**:它不能走 safe_ident(那道的 0x / 裸 hex / base58 三条本来就是
+#    拿来拦地址的,套上去等于全丢),用封闭形状收(只许字母数字与 Sui 的 `::` 段)。
+_EXPECT_ADDRESS = {
+    "contract_address": "safe_address",  # 币安 Alpha 上新那条推送的合约地址
 }
 # 已逐个复核、**不需要**门禁的参数。分三类:
 #   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
@@ -80,7 +90,7 @@ _EXPECT_REVIEWED = {
     "is_cleared", "unrealized_pnl_usd", "unrealized_pnl_pct", "realized_pnl_usd",
     "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
     "traded_at", "chain_display", "tx",
-    "name", "listing_time_ms", "chain_name", "contract_address", "market_cap", "sector",
+    "name", "listing_time_ms", "market_cap",
     "thesis", "multiple", "likes", "view_count", "created_at",
 }
 
@@ -94,7 +104,9 @@ def test_收口表逐字对上():
     """
     assert {n: fn.__name__ for n, fn in UNTRUSTED_FIELDS.items()} == _EXPECT_UNTRUSTED
     assert {n: fn.__name__ for n, fn in IDENT_FIELDS.items()} == _EXPECT_IDENT
-    assert set(UNTRUSTED_FIELDS) & set(IDENT_FIELDS) == set(), "一个字段只能有一道门"
+    assert {n: fn.__name__ for n, fn in ADDRESS_FIELDS.items()} == _EXPECT_ADDRESS
+    tables = (set(UNTRUSTED_FIELDS), set(IDENT_FIELDS), set(ADDRESS_FIELDS))
+    assert len(set().union(*tables)) == sum(len(t) for t in tables), "一个字段只能有一道门"
 
 
 def test_没有任何渲染参数是没登记过的():
@@ -106,7 +118,8 @@ def test_没有任何渲染参数是没登记过的():
        它与它要检查的表在同一个模块,用它当断言等于自己给自己判卷(把它内部条件改成
        `if False and ...` 全量 0 红,这是实测过的);删掉之后不可能有人再退回去用它。
     """
-    known = set(_EXPECT_UNTRUSTED) | set(_EXPECT_IDENT) | _EXPECT_REVIEWED
+    known = (set(_EXPECT_UNTRUSTED) | set(_EXPECT_IDENT) | set(_EXPECT_ADDRESS)
+             | _EXPECT_REVIEWED)
     unknown = {}
     for fn in _RENDERERS:
         extra = sorted(n for n in inspect.signature(fn).parameters if n not in known)
@@ -118,7 +131,7 @@ def test_没有任何渲染参数是没登记过的():
 def test_登记了门禁的字段确实出现在渲染函数里():
     """⚠️ 反方向:表里登记了一个**根本不存在**的参数名,等于一条死规则,同样要红。"""
     params = {n for fn in _RENDERERS for n in inspect.signature(fn).parameters}
-    for name in list(_EXPECT_UNTRUSTED) + list(_EXPECT_IDENT):
+    for name in list(_EXPECT_UNTRUSTED) + list(_EXPECT_IDENT) + list(_EXPECT_ADDRESS):
         assert name in params, f"{name} 登记了门禁,却不是任何渲染函数的参数"
 
 
@@ -141,7 +154,8 @@ def test_每个渲染函数都真的挂了装饰器():
     for fn in _RENDERERS:
         assert hasattr(fn, "__guarded_fields__"), fn.__name__
         for name in fn.__guarded_fields__:
-            assert name in _EXPECT_UNTRUSTED or name in _EXPECT_IDENT, (fn.__name__, name)
+            assert (name in _EXPECT_UNTRUSTED or name in _EXPECT_IDENT
+                    or name in _EXPECT_ADDRESS), (fn.__name__, name)
 
 
 def test_入口过一遍之后下游拿到的就是干净值():

@@ -65,6 +65,28 @@ _IDENT_BLOCK = [
     ("7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18", "裸 hex ≥16"),
     ("192.168.1.1", "IPv4"),
     (f"CU{RLO}M", "bidi 控制符:来过就整段丢弃(与币名那条同一口径)"),
+    # ======== 本轮 F5:_RE_DOMAIN_WITH_PATH 的**独占**样本 ========
+    # ⚠️ 上一轮这条正则是零覆盖的(把它打成永不匹配,全量 1972 条 0 红):语料里每个
+    #    带路径域名的 TLD 恰好都在 _IDENT_TLDS 里,被下面那条"TLD 是真 TLD"捎带拦了。
+    #    下面三条的 TLD(zzz / gift / wtf)**都不在**那张表里,只有带路径那条拦得住。
+    ("evil.zzz/claim", "带路径的域名,TLD 'zzz' 不在 ident 的 TLD 表里"),
+    ("x.gift/free", "带路径的域名,TLD 'gift' 不在表里"),
+    ("claim.wtf/now", "带路径的域名,TLD 'wtf' 不在表里"),
+    # ======== 本轮 F1b:分隔符在 ident 侧**一律严禁**(它不套「」容器)========
+    # ⚠️⚠️ 这一组与 test_nameguard_shape 的必拦基线是**同一批串**:
+    #    名字侧有容器,所以其中几条在那边放行;ident 侧没有容器,这边一条都不许过。
+    #    "同一个串两边判得不一样"从此是**写下来的规则**,不再是两个文件的矛盾。
+    ("已清仓 · 亏损 99%", "U+00B7:直接和推送自己的 SEP 平级,能凭空造两个字段"),
+    ("官方认证 · 已审计", "U+00B7"),
+    ("Coin • Token", "U+2022 —— 这一条在名字侧(有容器)是放行的"),
+    ("已清仓 ・ 亏损 99%", "U+30FB 片假名中点"),
+    ("六子｜Funny Six", "U+FF5C 全角竖线 —— 生产库里的真实昵称,刻意的取舍"),
+    ("血手人屠·厉飞雨", "U+00B7 —— 生产库里的真实昵称,刻意的取舍(理由见文件头)"),
+    ("A|B", "U+007C 半角竖线"),
+    ("A·B", "紧贴两侧也不许:ident 侧没有'两侧有没有空格'这条口径"),
+    # ======== 本轮 F2:视觉容器字符在 ident 侧也整段丢弃 ========
+    ("假「名字」", "`「`『』是视觉容器本身,ident 没有字符白名单,单列一条"),
+    ("CUM」 · 已清仓", "只带一个右括号就能把容器提前关掉 —— 「」配平那条不变量"),
 ]
 
 # ============================================================
@@ -77,8 +99,16 @@ _IDENT_PASS = [
     "Mr.CZ Punks", "WAR.DOCX", "Hungr.AI",
     "eric.eth", "Dylan.Eth", "sol.engineer", "Bull.Path 🫵😹",
     # 昵称里的 emoji / 组合 emoji / 方括号都必须原样留着
-    "血手人屠·厉飞雨", "alice 👨‍💻", "[VIP] trader", "Ω" * 30,
+    "alice 👨‍💻", "[VIP] trader", "Ω" * 30,
+    # 苏格兰旗 = 🏴 + 6 个 tag 字符 + 终止符。⚠️ 叠平那一步用的是**保留 emoji** 的版本,
+    # 全删 Cf 会把它拆成一面光秃秃的黑旗(那是 E5 那条教训)。
+    "🏴󠁧󠁢󠁳󠁣󠁴󠁿 highlander",
 ]
+# ⚠️⚠️ **本轮从必放行里移走的两条**(如实登记,这是刻意的取舍):
+#      '血手人屠·厉飞雨'(U+00B7)与 '六子｜Funny Six'(U+FF5C)是生产库里的真实昵称,
+#      本轮起被 safe_ident 拦下 —— 它们不套「」容器,与推送自己的 SEP 平级。
+#      实测代价:208 个真实 handle/昵称里就这 2 条 = 0.96%(判据线是 2%)。
+#      拦下之后展示名退回 user_id、再退回"未知用户"(既有的缺失规矩,不打占位符)。
 
 
 @pytest.mark.parametrize(("raw", "why"), _IDENT_BLOCK, ids=[b[1] for b in _IDENT_BLOCK])
@@ -91,13 +121,26 @@ def test_必须放行的真实符号与昵称(raw):
     assert safe_ident(raw) == raw, raw
 
 
-def test_通过的原样返回不做任何清洗():
+def test_通过的要叠平成单行():
     """
-    ⚠️ 这道门只回答"给不给显示"。清洗(删控制符)与限长是下游 _clip 的既有职责 ——
-       在这里顺手清洗会让两边各清一次,而 `&` 转义两次就会显示成一串乱码。
+    ⚠️⚠️ 本轮 F2 改的就是这条(上一版断言"原样返回,一个字符都不动")。
+       上一版的理由是"清洗与限长是下游 _clip 的既有职责" —— 那句话对
+       render_pump_trade / render_transfer_in_signal / render_alpha_listing 成立,
+       对 **render() 不成立**:_display_name / _symbol_plain 只 _esc 不 _clip,
+       于是 token_symbol='CUM\n💰 买入 $999,999.00' 在标题里凭空造出一整行伪造字段。
+       把清洗责任推给下游 = 赌四条路都记得,而实测漏了一条。现在这道门自己叠平。
+    ⚠️ 只叠平**空白与控制符**,不做别的清洗:转义与限长仍然是下游 _clip 的事
+       (在这里顺手转义会让 `&` 被转两次,显示成一串乱码)。
     """
-    assert safe_ident(f"ali{ZWSP}ce") == f"ali{ZWSP}ce"
-    assert safe_ident("  CUM  ") == "  CUM  "
+    assert safe_ident("CUM\n💰 买入 $999,999.00") == "CUM 💰 买入 $999,999.00"
+    assert safe_ident("  CUM  ") == "CUM"
+    assert safe_ident("A\r\n\tB") == "A B"
+    assert safe_ident("A B") == "A B", "NBSP 也算空白"
+    # 零宽字符删掉(它能把域名拆开躲过形态判断)
+    assert safe_ident(f"ali{ZWSP}ce") == "alice"
+    # ⚠️ 但**组合 emoji 的粘合剂必须留着**:ZWJ 与 tag 字符的类别同样是 Cf,
+    #    全删会把 👨‍💻 拆成两个 emoji、把苏格兰旗拆成一面黑旗。
+    assert safe_ident("alice 👨‍💻") == "alice 👨‍💻"
 
 
 def test_空与缺失为None():
@@ -114,7 +157,8 @@ def test_不施加形状规则():
     # ⚠️ 长的那条用 "OIl" 三个字母:它们**不在** base58 字母表里,也不是 hex ——
     #    否则测到的是地址形态那条(那条对 ident 仍然生效),不是"没有长度上限"。
     for raw in ("OIl" * 20, "one two three four five six seven", "!!!???...,,,",
-                "13800138000", "🔴🟢🟡", "已清仓 · 亏损 99%"):
+                "13800138000", "🔴🟢🟡", "已清仓 亏损 99%", "官方认证。已审计",
+                "一三八零零一三八零零零", "Buy now safe airdrop visit my profile"):
         assert safe_ident(raw) == raw, raw
 
 

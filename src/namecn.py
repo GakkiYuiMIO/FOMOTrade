@@ -703,7 +703,21 @@ class NameGlossary:
         if fact is None:
             self._cache_put(KIND_STOCK_FACT, key, None, "miss", TTL_MISS_SEC)
         else:
-            self._cache_put(KIND_STOCK_FACT, key, _fact_to_json(fact), "yahoo", None)
+            # ⚠️⚠️ **过不了门禁的 Yahoo 原始值不许永久落库**(本轮 F6)。
+            #    这一行存的是 Yahoo 的原串(longName / fullExchangeName),而 expires_at=NULL
+            #    是"永久"的意思 —— store.glossary_prune 先删过期行,这类行**永远删不到**,
+            #    只能等词汇表撑到 20000 行之后被 updated_at 那条兜底规则慢慢挤出去。
+            #    一个连显示门禁都过不了的值,没有资格占一个永久槽位。
+            #    ⚠️ 判据就是渲染层那两道门(safe_display / safe_exchange),
+            #       不在这里复制第二份规则;两半都过不了 = 这条记录对展示毫无用处。
+            #    ⚠️ 仍然**要**缓存(免得每 tick 重打一次 Yahoo),只是给它 30 天的 TTL,
+            #       让 glossary_prune 有机会把它收回去。
+            usable = ((fact.long_name is not None
+                       and nameguard.safe_display(fact.long_name) is not None)
+                      or (fact.exchange is not None
+                          and nameguard.safe_exchange(fact.exchange) is not None))
+            self._cache_put(KIND_STOCK_FACT, key, _fact_to_json(fact), "yahoo",
+                            None if usable else TTL_MISS_SEC)
         self._memo[memo_key] = fact
         return fact
 

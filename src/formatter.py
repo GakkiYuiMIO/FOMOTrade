@@ -50,7 +50,7 @@ from src.models import (
 #    它服务的是 handle / symbol / 观点正文这些**用户自己写的**字段,而 U+200D 是
 #    组合 emoji(👨‍💻 / 🏳️‍🌈)的粘合剂,全删会把它们拆开。不可信名字那条路走
 #    safe_display,里面用的是全删版本 —— 两条路刻意分开,各自有测试。
-from src.nameguard import safe_display, safe_exchange, safe_ident
+from src.nameguard import safe_address, safe_display, safe_exchange, safe_ident
 from src.nameguard import strip_controls_keep_emoji as _no_controls
 
 # ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
@@ -148,13 +148,27 @@ _TOKEN_NAME_CHARS = 32
 # 这里是第三道:仍按第三方字符串对待,限长 + 转义。
 _TOKEN_ZH_CHARS = 24
 LABEL_LISTED = "上市"
+# ⚠️⚠️ **场外市场不是「上市」**(本轮 F6)。OTC Markets 的 OTCPK / OTCQX / OTCID 三档
+#    都是**场外报价**,那些公司恰恰是没有在交易所上市的 —— 印成「OTC Markets OTCPK 上市」
+#    是一句事实错误的话(§10.3:错的信息比没有信息更糟)。单独一个说法。
+LABEL_OTC = "场外交易"
+# OTC Markets 那三档的共同前缀(小写比对)。⚠️ 它们全在 nameguard._EXCHANGES 的封闭枚举里,
+#    所以这里认前缀是安全的:能走到这一步的串只可能是表里那三个之一。
+_OTC_PREFIX = "otc markets"
 # 交易所代码 → 中文。⚠️ 事实(代码本身)只从 Yahoo 来,这里只是**展示映射**,
-#    映射不到的只印原代码(绝不猜一个中文名)。Nasdaq 有 GS/GM/CM 三个层级,前缀匹配。
+#    映射不到的只印原代码(绝不猜一个中文名)。Nasdaq 有 GS/GM/CM/NMS 四种写法,前缀匹配。
+# ⚠️⚠️ **同一个交易所的每一种写法都必须映射到同一个中文**(本轮 F6):
+#    上一版收了 "nyse american" 与 "amex" 却漏了无空格写法 "nyseamerican",
+#    于是同一家交易所在推送里一会儿是「美国证券交易所」一会儿是「NYSEAmerican」。
+#    nameguard._EXCHANGES 里每一个别名在这里都要有一行,由测试逐条钉住。
 _EXCHANGE_ZH = {
     "nyse": "纽约证券交易所",
     "nysearca": "纽交所 Arca",
     "nyse american": "美国证券交易所",
-    "amex": "美国证券交易所",
+    "nyseamerican": "美国证券交易所",   # 同一家的无空格写法
+    "amex": "美国证券交易所",           # 同一家的旧名
+    "cboe us": "芝加哥期权交易所美国市场",
+    "bats": "芝加哥期权交易所美国市场",  # Cboe US 的旧名
 }
 
 
@@ -206,11 +220,28 @@ IDENT_FIELDS = {
     "pool_quote_symbol": safe_ident,  # 底池对手符号,同时也是 🏢 行的 ticker
     "username": safe_ident,           # pump 用户名,本人可控
     "symbol": safe_ident,             # 币安 Alpha 的币符号
+    # ⚠️ 下面两个是**币安 Alpha 上新**那条推送的字段(本轮 F6 补登记)。它们同样是
+    #    外部来源的自由文本(币安运营编的板块名、上游给的原始链名),与被门禁保护的
+    #    符号印在同一条消息里,上一版**全程零门禁**。用轻门禁而不是 safe_display:
+    #    板块名是"股票 Meme 币"这种带空格的短语,形状规则会把它误伤。
+    "chain_name": safe_ident,         # 币安给的原始链名(内部映射查不到时的兜底)
+    "sector": safe_ident,             # 板块标注
 }
 
-# 渲染入口真正过一遍的全表。⚠️ 两张表**不许有同名键**(一个字段只能有一道门)。
-_GUARDED_FIELDS = {**UNTRUSTED_FIELDS, **IDENT_FIELDS}
-assert len(_GUARDED_FIELDS) == len(UNTRUSTED_FIELDS) + len(IDENT_FIELDS), "同一个字段登记了两道门"
+# ⚠️⚠️ **地址类字段**(本轮 F6 补登记)。它们不能走 safe_ident —— 那道的 0x / 裸 hex /
+#    base58 三条规则本来就是拿来拦地址的,套在"这里就该是一个地址"的槽位上等于全丢。
+#    但它同样是上游给的任意字符串,而且会被拼进 fomo.family / gmgn 的 URL 再印成
+#    `<code>` 锚点。用**封闭形状**收:一段 ASCII 字母数字,后面可以跟若干个 `::段`
+#    (Sui 的类型标签,实测币安真的会给这种),≤128 字符;**单个冒号一律不许** ——
+#    那正是 scheme 的形态。见 nameguard.safe_address。
+ADDRESS_FIELDS = {
+    "contract_address": safe_address,  # 币安 Alpha 上新那条推送的合约地址
+}
+
+# 渲染入口真正过一遍的全表。⚠️ 三张表**不许有同名键**(一个字段只能有一道门)。
+_GUARDED_FIELDS = {**UNTRUSTED_FIELDS, **IDENT_FIELDS, **ADDRESS_FIELDS}
+assert len(_GUARDED_FIELDS) == (len(UNTRUSTED_FIELDS) + len(IDENT_FIELDS)
+                                + len(ADDRESS_FIELDS)), "同一个字段登记了两道门"
 
 # 已逐个复核、**不需要**形状门禁的渲染参数。分三类:
 #   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
@@ -228,11 +259,13 @@ _REVIEWED_PARAMS = frozenset({
     "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
     "traded_at", "chain_display", "tx",
     # 币安 Alpha 上新那条推送的参数。
+    # ⚠️ chain_name / sector 本轮已挪进 IDENT_FIELDS、contract_address 挪进
+    #    ADDRESS_FIELDS(F6:它们同样是外部来源,上一版全程零门禁)。
     # ⚠️ **已知缺口(如实登记,不是遗漏)**:`name` 是币安给的币名,与 token_name 同样
     #    是陌生人可控的文本,但这条推送从一开始走的就是"_clip 转义 + 限长"那条通道,
     #    它自己的测试(带 `<script>` / 5000 个"猫")钉的正是那个行为。给它加形状门禁
     #    是另一件事(会改这条推送的既有行为),本轮不做 —— 见 README「已知取舍」。
-    "name", "listing_time_ms", "chain_name", "contract_address", "market_cap", "sector",
+    "name", "listing_time_ms", "market_cap",
     # pump 喊单那条推送的参数。thesis 是**用户自己写的正文**,走 _clip 不走形状门禁
     # (形状门禁是给"名字"用的,一句话本来就过不了词数上限)。
     "thesis", "multiple", "likes", "view_count", "created_at",
@@ -484,8 +517,18 @@ def _esc(v) -> str:
        能让它后面的字在 Telegram 里反向显示 —— 一个把自己昵称改成
        "ali<U+202E>ecs" 的人,在推送里看起来就是另一个人。这类字符在这些字段里
        没有任何正当用途。
+    ⚠️⚠️ **`「` `」` 也在这里删掉**(本轮 F2 / BLOCKER-3)。它们是本模块自己的
+       **结构标记**(视觉容器 QUOTE_OPEN / QUOTE_CLOSE),地位与 `<` 完全一样 ——
+       `<` 由 html.escape 转义掉,而 `「` 没有转义形式,只能删。少了这一步,任何一个
+       能进 _esc 的字段(symbol / handle / 观点正文 / 对手方名)里塞一个 `」`
+       就能把容器提前关掉:12500 条模糊测试里 3255 条「」不配平,全部来自这里。
+       ⚠️ 删而不是整段丢弃:观点正文是**用户自己写的**,为一对引号丢掉整条观点更糟;
+          名字类字段在上游 nameguard 那道本来就是整段丢弃(它俩不在字符白名单里),
+          symbol / handle 也在 safe_ident 那道整段丢弃,这里是**最后一道**。
+       ⚠️ 顺序:_quoted 是在 _clip / _esc **之后**才把容器贴上去的,所以这一步删的
+          只可能是外部文本自带的那对,绝不会误删我们自己的容器。
     """
-    return html.escape(_no_controls(str(v)))
+    return html.escape(_no_controls(str(v)).replace(QUOTE_OPEN, "").replace(QUOTE_CLOSE, ""))
 
 
 def _display_name(ev: FomoEvent) -> str:
@@ -794,14 +837,21 @@ def _token_zh_line(name, zh) -> str | None:
 
 def _exchange_text(code) -> str | None:
     """
-    交易所代码 → "纳斯达克(NasdaqGM)上市";映射不到 → "XXX 上市"(只印原代码);没有 → None。
+    交易所代码 → "纳斯达克(NasdaqGM)上市";场外市场 → "OTC Markets OTCPK 场外交易";
+    映射不到 → "XXX 上市"(只印原代码);没有 → None。
 
     ⚠️⚠️ 这个字段曾经**全程零门禁**:同一份 Yahoo 响应里 longName / company_zh 都套了
        门禁,唯独 fullExchangeName 漏了 —— 被篡改的代理能把
-       `立即访问 t.me/free-airdrop` 原样送进 🏢 行。现在按交易所代码的**形态**收口
-       (safe_exchange:字母开头、只许字母数字空格点横杠、≤20)。
-    ⚠️ 不套 `「」` 容器:它已经不是自由文本了(形态正则保证里面出不了分隔符),
+       `立即访问 t.me/free-airdrop` 原样送进 🏢 行。现在它走的是
+       **nameguard.safe_exchange 的封闭枚举**(14 个真实交易所写法,表外的值那一段不显示)。
+       ⚠️ 上一版这里的注释还在写"字母开头、只许字母数字空格点横杠、≤20" ——
+          那正是被换掉的**旧正则**,它把所有 ≤20 字符的裸域名整段放行了(上一轮的 BLOCKER)。
+          注释已改,别再照着旧描述改回模式匹配。
+    ⚠️ 返回的是**表里的规范写法**,不是上游原串;大小写也不受上游摆布。
+    ⚠️ 不套 `「」` 容器:它已经不是自由文本了(封闭枚举保证里面出不了分隔符),
        而 `纳斯达克(NasdaqGM)上市` 这句本来就是本模块写的固定文案。
+    ⚠️⚠️ **场外市场(OTC Markets *)不许印「上市」** —— 那些公司恰恰是**没有**在交易所
+       上市的,印「上市」是一句事实错误的话。见 LABEL_OTC。
     """
     c = safe_exchange(code)
     if c is None:
@@ -810,6 +860,8 @@ def _exchange_text(code) -> str | None:
     if not c:
         return None
     low = c.lower()
+    if low.startswith(_OTC_PREFIX):
+        return f"{_esc(c)} {LABEL_OTC}"
     zh = "纳斯达克" if low.startswith("nasdaq") else _EXCHANGE_ZH.get(low)
     if zh is None:
         return f"{_esc(c)} {LABEL_LISTED}"

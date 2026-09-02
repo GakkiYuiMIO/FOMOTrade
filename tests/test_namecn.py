@@ -293,10 +293,22 @@ class Test输出过滤:
            唯一能毙它的就是 4 倍那条。9 丢、8 放行,两侧都钉住。
         ⚠️ 数字 4 写死字面量,不从被测模块 import。
         """
-        assert nc.clean_output("一二三四五六七八九", "AI", "X") is None      # 9 > 4 × 2
-        assert nc.clean_output("一二三四五六七八", "AI", "X") == "一二三四五六七八"  # 8 == 4 × 2
+        # ⚠️ 用的是**没有数值**的汉字:本轮起"一二三四…"这些有数值的汉字算进数字总量
+        #    (中文数字写的手机号靠这条拦),拿它们当样本会测到数字那条、不是 4 倍那条。
+        assert nc.clean_output("猫狗鸡鸭鹅鱼虾蟹龟", "AI", "X") is None      # 9 > 4 × 2
+        assert nc.clean_output("猫狗鸡鸭鹅鱼虾蟹", "AI", "X") == "猫狗鸡鸭鹅鱼虾蟹"  # 8 == 4 × 2
         # 再钉一次"它确实过得了形状门禁",否则这条会悄悄退回空转
-        assert nc.clean_output("一二三四五六七八九", "AI Coin", "X") == "一二三四五六七八九"
+        assert nc.clean_output("猫狗鸡鸭鹅鱼虾蟹龟", "AI Coin", "X") == "猫狗鸡鸭鹅鱼虾蟹龟"
+
+    def test_全角括号的真实译文放行(self):
+        """
+        ⚠️ 这两条是 2026-09-03 真网络实测的**译文原样**(维基/Google 各一条路)。
+           上一版全角标点整类不收,它们连同 📝 那一行整段消失。
+        ⚠️ 必须带上**原文**:译文里的 'Arcus' / 'NVIDIA' 是 ≥5 位 ASCII 串,
+           不传原文时会被"含 CJK 时不许凭空多出英文串"那条毙掉(那条规则本身是对的)。
+        """
+        assert nc.clean_output("Arcus BTC（1x 长）", "Arcus BTC (1x Long)", "X") ==             "Arcus BTC（1x 长）"
+        assert nc.clean_output("NVIDIA（Ondo 代币化）", "NVIDIA (Ondo Tokenized)", "X") ==             "NVIDIA（Ondo 代币化）"
 
     def test_正常译文叠平空白放行(self):
         assert nc.clean_output(" 镁铁\n闪石 ", "Cummingtonite", "CUM") == "镁铁 闪石"
@@ -756,6 +768,26 @@ class Test股票说明:
         assert _glossary(conn, ft).stock_info("USAR") is None
         assert _row(conn, "stock_fact", "usar")["expires_at"] == int(t0 + 3600)
 
+    def test_过不了门禁的Yahoo原始值不许永久落库(self, conn, monkeypatch):
+        """
+        ⚠️⚠️ 这一行存的是 Yahoo 的**原串**(longName / fullExchangeName),而
+           expires_at=NULL 是"永久"的意思 —— store.glossary_prune 先删过期行,
+           这类行**永远删不到**。一个连显示门禁都过不了的值没资格占永久槽位。
+        ⚠️ 仍然要缓存(免得每 tick 重打一次 Yahoo),只是给 30 天 TTL 让 prune 收得回去。
+        """
+        t0 = 1_800_000_000.0
+        monkeypatch.setattr(nc.time, "time", lambda: t0)
+        # longName 是一个域名形态 + exchange 不在封闭枚举里 → 两半都过不了门禁
+        bad = _yahoo("立即访问 www.evil-airdrop.com", exchange="t.me")
+        ft = FakeTransport({"yahoo": [bad], "wiki_en": [WIKI_MISSING]}, boom={"google"})
+        _glossary(conn, ft).stock_info("EVIL")
+        assert _row(conn, "stock_fact", "evil")["expires_at"] == int(t0 + 2592000)
+        # 对照:只要**有一半**过得了门禁,它就仍然是永久行
+        ok = _yahoo("USA Rare Earth, Inc.", exchange="t.me")
+        ft2 = FakeTransport({"yahoo": [ok], "wiki_en": [WIKI_MISSING]}, boom={"google"})
+        _glossary(conn, ft2).stock_info("USAR2")
+        assert _row(conn, "stock_fact", "usar2")["expires_at"] is None
+
     def test_事实永久缓存命中零请求(self, conn):
         ft = FakeTransport({"yahoo": [YAHOO_USAR], "wiki_en": [WIKI_MISSING], "google": [GOOGLE_USAR]})
         _glossary(conn, ft).stock_info("USAR")
@@ -1008,13 +1040,17 @@ class Test译文里原文自带的英文串不算凭空多出:
     def test_大小写不影响比对(self):
         assert nc.clean_output("特斯拉 XSTOCK", "Tesla xStock", "X") == "特斯拉 XSTOCK"
 
-    def test_音译人名仍然被丢弃(self):
+    def test_音译人名本轮起放行(self):
         """
-        ⚠️ 这是**刻意的取舍**,不是漏:中文音译习惯用间隔号 `·`,而 `·` 是本项目的
-           字段分隔符、在字符白名单外。译文虽然在 📝 行、已经在「」容器里,
-           但放行 `·` 就等于给"造一个假字段"留一条随时会被复用的口子。
-           真网络实测 60 条译文里因为这一条丢掉 2 条(3.33%),README 已写明
-           "音译人名可能没有中文行"。
+        ⚠️⚠️ 上一轮这里断言的是"音译人名**仍然被丢弃**",理由是 `·` 在字符白名单外。
+           本轮 F1a 把它翻过来了:译文印在 📝 行的 `「」`**容器里**,伪造出来的分隔符
+           被容器困住 —— 而"音译人名带间隔号"是中文的正常写法,拦它是纯粹的误杀。
+           真网络实测 150 条译文,上一版因为这一条丢掉 5 条(南希·佩洛西 / 尼基塔·比尔 /
+           凯莉·克劳德 / 古奇·莫蒂 / 利尔·芬德盖伊),本轮全部放行。
+        ⚠️ 换来的约束在 ident 那一侧:symbol / handle 不套容器,那边**一律严禁**分隔符
+           (见 tests/test_nameguard_sep.py 的超集关系)。
         """
-        assert nc.clean_output("尼基塔·比尔", "Nikita Bier", "X") is None
-        assert nc.clean_output("约翰·多格", "John Dog", "X") is None
+        assert nc.clean_output("尼基塔·比尔", "Nikita Bier", "X") == "尼基塔·比尔"
+        assert nc.clean_output("南希·佩洛西", "Nancy Pelosi", "X") == "南希·佩洛西"
+        # ⚠️ 但**带空格的**中点仍然拦:那不是名字的写法,是在模仿推送自己的 SEP
+        assert nc.clean_output("已清仓 · 亏损", "Cleared", "X") is None
