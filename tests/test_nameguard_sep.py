@@ -75,7 +75,70 @@ _MUST_BE_SEPARATOR = [
     (0x2016, "DOUBLE VERTICAL LINE"),
     (0x2223, "DIVIDES"),
     (0x22EE, "VERTICAL ELLIPSIS"),
+    # ======== 本轮 G1:被 Unicode 归在**字母类**里的同形字(Lo / Lm / Ll)========
+    # ⚠️⚠️ 上一版 is_separator_char 第一行是 `category(ch)[0] not in "PS" → False`,
+    #    注释写"字母天然排除"。下面这一批全是字母类,当时从闸门下面整批漏过去,
+    #    实测 safe_ident('AB{x}CD') **原样放行**。
+    (0xA78F, "Lo LATIN LETTER SINOLOGICAL DOT ꞏ —— 字面就是中文的间隔号"),
+    (0x1427, "Lo CANADIAN SYLLABICS FINAL MIDDLE DOT ᐧ"),
+    (0x18DF, "Lo CANADIAN SYLLABICS FINAL RAISED DOT ᣟ"),
+    (0x1426, "Lo CANADIAN SYLLABICS FINAL DOUBLE SHORT VERTICAL STROKES ᐦ"),
+    (0x01C0, "Lo LATIN LETTER DENTAL CLICK ǀ —— 与 | 同形"),
+    (0x01C1, "Lo LATIN LETTER LATERAL CLICK ǁ —— 与 ‖ 同形"),
+    (0x01C2, "Lo LATIN LETTER ALVEOLAR CLICK ǂ"),
+    (0x01C3, "Lo LATIN LETTER RETROFLEX CLICK ǃ"),
+    (0x0298, "Ll LATIN LETTER BILABIAL CLICK ʘ"),
+    (0x088E, "Lo ARABIC VERTICAL TAIL ࢎ"),
+    (0x02C8, "Lm MODIFIER LETTER VERTICAL LINE ˈ"),
+    (0x02CC, "Lm MODIFIER LETTER LOW VERTICAL LINE ˌ"),
+    (0xA717, "Lm MODIFIER LETTER DOT VERTICAL BAR ꜗ"),
+    (0x2E2F, "Lm VERTICAL TILDE ⸯ"),
+    (0x3031, "Lm VERTICAL KANA REPEAT MARK 〱"),
+    (0x303B, "Lm VERTICAL IDEOGRAPHIC ITERATION MARK 〻"),
+    (0x107B6, "Lm MODIFIER LETTER DENTAL CLICK 𐞶"),
+    # ======== 本轮 G1:类别是 P*/S* 但上一版 marker 表漏掉的那一批 ========
+    (0x2025, "Po TWO DOT LEADER ‥ —— 上一版只有 ONE DOT LEADER"),
+    (0x2E33, "Po RAISED DOT ⸳"),
+    (0x2E30, "Po RING POINT ⸰"),
+    (0x2E31, "Po WORD SEPARATOR MIDDLE DOT ⸱"),
+    (0x205A, "Po TWO DOT PUNCTUATION ⁚"),
+    (0x2056, "Po THREE DOT PUNCTUATION ⁖"),
+    (0x2058, "Po FOUR DOT PUNCTUATION ⁘"),
+    (0x2059, "Po FIVE DOT PUNCTUATION ⁙"),
+    (0x205D, "Po TRICOLON ⁝"),
+    (0x061E, "Po ARABIC TRIPLE DOT PUNCTUATION MARK ؞"),
+    (0x2E2A, "Po TWO DOTS OVER ONE DOT PUNCTUATION ⸪"),
+    (0xFF61, "Po HALFWIDTH IDEOGRAPHIC FULL STOP ｡ —— 半角句点是个小圆点"),
+    (0x1039F, "Po UGARITIC WORD DIVIDER 𐎟"),
+    (0x103D0, "Po OLD PERSIAN WORD DIVIDER 𐏐"),
+    (0x10100, "Po AEGEAN WORD SEPARATOR LINE 𐄀"),
+    (0x10101, "Po AEGEAN WORD SEPARATOR DOT 𐄁"),
+    (0x1091F, "Po PHOENICIAN WORD SEPARATOR 𐤟"),
+    (0x1123A, "Po KHOJKI WORD SEPARATOR 𑈺"),
+    (0x11C43, "Po BHAIKSUKI WORD SEPARATOR 𑱃"),
+    (0x12470, "Po CUNEIFORM PUNCTUATION SIGN OLD ASSYRIAN WORD DIVIDER 𒑰"),
+    (0x2E40, "Pd DOUBLE HYPHEN ⹀"),
+    (0x30A0, "Pd KATAKANA-HIRAGANA DOUBLE HYPHEN ゠"),
+    (0xFE31, "Pd PRESENTATION FORM FOR VERTICAL EM DASH ︱"),
+    (0xA789, "Sk MODIFIER LETTER COLON ꞉ —— 与 : 同形"),
+    (0xFBBC, "Sk ARABIC SYMBOL DOUBLE VERTICAL BAR BELOW ﮼"),
+    (0x2981, "Sm Z NOTATION SPOT ⦁"),
+    (0x237F, "So VERTICAL LINE WITH MIDDLE DOT ⍿ —— 符号名里的 WITH 不许排除"),
+    (0x23B8, "So LEFT VERTICAL BOX LINE ⎸"),
+    (0x2E20, "Pi LEFT VERTICAL BAR WITH QUILL ⸠"),
+    (0x2E21, "Pf RIGHT VERTICAL BAR WITH QUILL ⸡"),
+    (0xFE33, "Pc PRESENTATION FORM FOR VERTICAL LOW LINE ︳"),
+    (0xFE41, "Ps PRESENTATION FORM FOR VERTICAL LEFT CORNER BRACKET ﹁"),
+    (0xFE42, "Pe PRESENTATION FORM FOR VERTICAL RIGHT CORNER BRACKET ﹂"),
+    (0x030D, "Mn COMBINING VERTICAL LINE ABOVE"),
+    (0x0743, "Mn SYRIAC TWO VERTICAL DOTS ABOVE"),
 ]
+# ⚠️⚠️ 这张表**必须足够大**:上一轮它只有 17 条,而 is_separator_char 实际命中
+#    249 个码点 —— 把函数收窄成"只认这 17 个码点"的变异在全量测试下 **0 红**
+#    (因为下面那条超集断言的枚举也是调它自己算出来的,见 _enumerate_separators)。
+#    现在这张表覆盖 Ll/Lm/Lo/Mn/Pc/Pd/Pe/Pf/Pi/Po/Ps/Sk/Sm/So 十四个类别,
+#    收窄成任意一小撮码点都会当场红。
+assert len(_MUST_BE_SEPARATOR) >= 50, "这张表就是防收窄的护栏,不许缩到 50 条以下"
 # ⚠️ 反向:这一批**绝不许**被认成分隔符 —— 它们是真实符号 / 名字里天天出现的字符,
 #    误收一个,生产库里成片的 symbol 与昵称当场消失。
 _MUST_NOT_BE_SEPARATOR = "AZaz09 .,'\"-&()!?/:;_[]{}#$+=@*^%~、。（）—中文あア"
@@ -84,7 +147,10 @@ _MUST_NOT_BE_SEPARATOR = "AZaz09 .,'\"-&()!?/:;_[]{}#$+=@*^%~、。（）—中�
 @pytest.mark.parametrize(("cp", "why"), _MUST_BE_SEPARATOR,
                          ids=[f"U+{cp:04X}" for cp, _ in _MUST_BE_SEPARATOR])
 def test_这些字符必须被认成分隔符(cp, why):
-    assert is_separator_char(chr(cp)), f"U+{cp:04X} {why}"
+    """⚠️ 两件事一起断言:判定函数认它,**并且** safe_ident 真的拦住它。"""
+    x = chr(cp)
+    assert is_separator_char(x), f"U+{cp:04X} {why}"
+    assert safe_ident(f"AB{x}CD") is None, f"U+{cp:04X} 从 safe_ident 漏过去了({why})"
 
 
 @pytest.mark.parametrize("ch", list(_MUST_NOT_BE_SEPARATOR))
@@ -92,25 +158,83 @@ def test_这些字符绝不许被认成分隔符(ch):
     assert not is_separator_char(ch), f"U+{ord(ch):04X} {unicodedata.name(ch, '?')}"
 
 
-def _all_separators() -> list[str]:
-    """整个 0x110000 码点空间里被认成分隔符的字符。⚠️ 这是 R3 的枚举依据。"""
-    return [chr(cp) for cp in range(0x110000) if is_separator_char(chr(cp))]
+# ============================================================
+# R3 的枚举依据 —— ⚠️⚠️ **测试自己算**,绝不调被测函数
+# ============================================================
+# ⚠️⚠️ 上一版这里写的是
+#       `[chr(cp) for cp in range(0x110000) if is_separator_char(chr(cp))]`
+#    —— 枚举依据**就是被测函数自己**。于是"函数收窄 ⇒ 枚举同步收窄 ⇒ leaked == []
+#    平凡成立":把 is_separator_char 收窄成"只认手写的 17 个码点",全量 3115 条
+#    **0 红**(实测过),而它实际命中 249 个码点、其中 232 个没有任何直接断言。
+#    那是被测模块给自己判卷,与 D1 不变量上一轮栽的是同一个跟头。
+# ⚠️ 现在测试这一侧**手抄**一份判据(marker 表 + 那条"字母名里的 X WITH Y 不算"的
+#    反向规则),自己遍历 0x110000。两份判据从此必须一致,谁动一边这里就红。
+_TEST_SEP_MARKERS = (
+    "MIDDLE DOT", "BULLET", "VERTICAL", "DOT OPERATOR",
+    "ONE DOT LEADER", "TWO DOT LEADER", "HYPHENATION POINT", "DIVIDES",
+    "ANO TELEIA", "RAISED DOT", "RING POINT", "SPOT", "WORD DIVIDER",
+    "WORD SEPARATOR", "TRICOLON", "DOT PUNCTUATION", "MODIFIER LETTER COLON",
+    "DOUBLE HYPHEN", "SINOLOGICAL DOT", "CLICK", "HALFWIDTH IDEOGRAPHIC FULL STOP",
+)
+
+
+def _enumerate_separators() -> list[str]:
+    """
+    ⚠️ 测试自己的枚举:整个 0x110000 里"名字含 marker 且不是带修饰的字母"的字符。
+
+    ⚠️ **Cf(格式控制)整类跳过**:safe_ident 的第一步 flatten 就把 Cf 全删了,
+       它们根本走不到分隔符那一条判断,拿它们去要求"被拦住"是在测一个不存在的路径
+       (U+E007C TAG VERTICAL LINE / U+13430 EGYPTIAN HIEROGLYPH VERTICAL JOINER)。
+       Cf 被删这件事另有测试钉着(test_nameguard_ident 的零宽字符那条)。
+    """
+    out = []
+    for cp in range(0x110000):
+        ch = chr(cp)
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            continue
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        if cat[0] == "L" and " WITH " in name:
+            continue
+        if any(m in name for m in _TEST_SEP_MARKERS):
+            out.append(ch)
+    return out
 
 
 def test_分隔符表的规模是可控的():
     """
-    ⚠️ 表太小 = 漏同形字;表太大 = 误杀真符号。这条只钉"量级合理"这一件事,
-       真正的两侧关系由下面那条负责。⚠️ 上下界写死字面量。
+    ⚠️ 表太小 = 漏同形字;表太大 = 误杀真符号。⚠️ 上下界写死字面量。
+    ⚠️⚠️ 下界本轮从 17 抬到 **250**:17 那个下界正是"把函数收窄成 17 个码点"的
+       变异能过关的原因之一。实测(2026-09-03)命中 320 个码点。
     """
-    n = len(_all_separators())
-    assert 17 <= n <= 400, f"分隔符表有 {n} 个字符,规模不对劲"
+    n = sum(1 for cp in range(0x110000) if is_separator_char(chr(cp)))
+    assert 250 <= n <= 400, f"分隔符表有 {n} 个字符,规模不对劲"
+
+
+def test_测试自己的枚举与被测函数逐码点一致():
+    """
+    ⚠️⚠️ G2 的护栏本身。两份判据(src 一份、测试一份)必须逐码点相等 ——
+       任何一侧被改松或改紧,这条当场红,而不是像上一轮那样两边一起滑走。
+    ⚠️ Cf 那两个不参与比对,理由见 _enumerate_separators 的说明。
+    """
+    mine = {ch for ch in _enumerate_separators()}
+    theirs = {chr(cp) for cp in range(0x110000)
+              if unicodedata.category(chr(cp)) != "Cf" and is_separator_char(chr(cp))}
+    only_src = sorted(f"U+{ord(c):04X}" for c in theirs - mine)
+    only_test = sorted(f"U+{ord(c):04X}" for c in mine - theirs)
+    assert only_src == [], f"src 认、测试不认:{only_src[:20]}"
+    assert only_test == [], f"测试认、src 不认(被测函数被收窄了):{only_test[:20]}"
 
 
 def test_ident的分隔符规则是名字侧的超集():
     """
     ⚠️⚠️ **本文件的核心断言**,也是上一轮那个"两个测试文件互相矛盾"的护栏本身。
 
-    对整个 0x110000 空间里**每一个**分隔符类字符 x:
+    对整个 0x110000 空间里**每一个**分隔符类字符 x(枚举由**测试自己**算出来,
+    见 _enumerate_separators —— 上一版这里调的是被测函数,收窄它就平凡通过):
       · safe_ident 那一侧(无容器)必须拦住 —— 一条都不许漏;
       · 于是"名字侧放行的分隔符" ⊆ "ident 侧拦住的分隔符",超集关系成立。
 
@@ -118,7 +242,7 @@ def test_ident的分隔符规则是名字侧的超集():
       safe_display(f'名字{x}名字') 不为 None,而 safe_ident 的同一个串是 None。
     谁把 safe_ident 改松(或者把某个分隔符从表里拿掉),这条当场红。
     """
-    leaked = [f"U+{ord(x):04X}" for x in _all_separators()
+    leaked = [f"U+{ord(x):04X}" for x in _enumerate_separators()
               if safe_ident(f"AB{x}CD") is not None]
     assert leaked == [], f"这些分隔符从 safe_ident 漏过去了:{leaked[:20]}"
 
@@ -196,11 +320,13 @@ def _ev(**kw):
 # ============================================================
 # 槽位表 —— 每个槽位是一个"把载荷塞进某个渲染函数的某个字段"的注入器
 # ============================================================
-# ⚠️⚠️ **刻意不收**的两个槽位,如实登记(不是遗漏):
-#   · render_alpha_listing 的 `name`(币安给的币名):这条推送从一开始走的就是
-#     "_clip 转义 + 限长"通道,它自己的测试钉的正是那个行为。见 README「已知取舍」。
+# ⚠️⚠️ **刻意不收**的槽位,如实登记(不是遗漏):
 #   · thesis / thesis_text:**用户自己写的正文**,它本来就该原样显示。
 #     它同样在 `「」` 配平那条不变量里(见下面的模糊测试),但不在"必拦"这条里。
+# ⚠️ `alpha.name`(币安给的币名)**本轮 G3 收进来了** —— 它上一版是"刻意不收"的,
+#    理由写的是"这条推送从一开始走的就是 _clip 通道"。那个理由站不住:它与
+#    token_name 是同一类东西,而它是笛卡尔积里唯一一个既无门禁也无容器的名字类槽位,
+#    两个复验者各自打出 39/40 与 40/40 的泄漏。现在它走 safe_display + 「」。
 def _slots():
     """→ ([名字类槽位], [ident 类槽位])。注入函数收载荷、返回渲染结果。"""
     names, idents = [], []
@@ -286,6 +412,7 @@ def _slots():
         return render_alpha_listing(**base)
 
     add("alpha.symbol", lambda p: _al(symbol=p))
+    add("alpha.name", lambda p: _al(name=p))          # ⚠️ 本轮 G3 收进来的名字类槽位
     add("alpha.chain_name", lambda p: _al(network_id="zzz-unknown", chain_name=p))
     add("alpha.sector", lambda p: _al(sector=p))
     add("alpha.contract_address", lambda p: _al(contract_address=p))
@@ -306,7 +433,9 @@ def _slots():
 
 _NAME_SLOTS, _IDENT_SLOTS = _slots()
 _SLOTS = _NAME_SLOTS + _IDENT_SLOTS
-assert len(_SLOTS) == 33, "槽位就是 33 个,改它要连报告里的数字一起改"
+assert len(_SLOTS) == 34, "槽位就是 34 个,改它要连报告里的数字一起改"
+assert len(_NAME_SLOTS) == 15, "名字类槽位 15 个(本轮 G3 收进了 alpha.name)"
+assert len(_IDENT_SLOTS) == 19, "ident 类槽位 19 个"
 
 _RE_CONTAINER = re.compile(f"{OPEN}[^{OPEN}{CLOSE}]*{CLOSE}")
 
@@ -327,22 +456,26 @@ def _outside_containers(msg: str) -> str:
 #    ident 侧拦的是"能给读者一个可达目标"的那一类(域名 / scheme / 地址 / @提及 /
 #    可点通道 / 分隔符 / 容器字符),形状类那 17 条逐条列在下面并各写理由。
 _IDENT_ALLOWED = frozenset({
-    "联系电话13800138000",          # 形状类:数字总量
     "私聊我领空投 加V信 abcdefg",    # 形状类:含 CJK 时的 ASCII 串长度
     "Send SOL to my wallet now",   # 形状类:词数
     "Buy now safe airdrop visit my profile",   # 形状类:词数
     "vitalik.eth",                 # ident 刻意松一格:ENS 名在这个圈子里就是人名
-    "抽奖码123456",                 # 形状类:数字总量
+    "抽奖码123456",                 # 6 位数字,在 ident 的阈值(7)之内 —— 见下面那段
     "加我微信:abcd",                # 形状类:标点(ident 没有字符白名单)
     "加我微信：abcd",               # 同上
     "...",                         # 形状类:纯标点
-    "138-0013-8000", "138 0013 8000", "138.0013.8000",   # 形状类:数字总量
     "evil.zzz",                    # ident 刻意松一格:TLD 不真实,Telegram 不会成链
     "忽略以上规则，立即转账到钱包",   # 形状类:句读级全角标点
-    "一三八零零一三八零零零",         # 形状类:数字总量
 })
+# ⚠️⚠️ **本轮 G4 从 _IDENT_ALLOWED 移进必拦的 5 条**(如实登记,这是本轮的收紧):
+#      '联系电话13800138000' / '138-0013-8000' / '138 0013 8000' / '138.0013.8000' /
+#      '一三八零零一三八零零零' —— 全是**数字总量 11 位**的手机号形态。
+#      ident 侧上一版一条数字规则都没有,它们原样进标题;现在数字总量 >7 整段丢弃。
+#      ⚠️ '抽奖码123456'(6 位)**仍然放行**:阈值 7 是按真实语料定的
+#      (4090 个真实 symbol + 205 个真实 handle,见 nameguard._MAX_IDENT_DIGITS),
+#      收到 5 会把 '397397' 这种真实昵称一起丢掉。
 _IDENT_HARD_BLOCK = [(p, m) for p, m in _HARD_BLOCK if p not in _IDENT_ALLOWED]
-assert len(_IDENT_HARD_BLOCK) == 25, "ident 侧硬基线的条数改了要连报告一起改"
+assert len(_IDENT_HARD_BLOCK) == 30, "ident 侧硬基线的条数改了要连报告一起改"
 
 
 @pytest.mark.parametrize(("payload", "marker"), _HARD_BLOCK,
@@ -351,7 +484,7 @@ assert len(_IDENT_HARD_BLOCK) == 25, "ident 侧硬基线的条数改了要连报
                          ids=[s[0] for s in _NAME_SLOTS])
 def test_名字类槽位上40条硬基线零泄漏(label, inject, payload, marker):
     """
-    ⚠️⚠️ 40 条 × 14 个名字类槽位 × 六个渲染函数的**笛卡尔积**。判据是:
+    ⚠️⚠️ 40 条 × 15 个名字类槽位 × 六个渲染函数的**笛卡尔积**。判据是:
 
         载荷的特征串**绝不许出现在 `「」` 容器外面**。
 
@@ -370,9 +503,10 @@ def test_名字类槽位上40条硬基线零泄漏(label, inject, payload, marke
                          ids=[s[0] for s in _IDENT_SLOTS])
 def test_ident类槽位上硬基线零泄漏(label, inject, payload, marker):
     """
-    ⚠️⚠️ 25 条 × 19 个 ident 类槽位 × 六个渲染函数。ident **不套容器**,
+    ⚠️⚠️ 30 条 × 19 个 ident 类槽位 × 六个渲染函数。ident **不套容器**,
        所以这里的判据就是最强的那个:特征串在整条消息里一个字都不许出现。
-    ⚠️ 这 25 条是 40 条硬基线里"能给读者一个可达目标"的那一类;剩下 15 条是形状类,
+    ⚠️ 这 30 条是 40 条硬基线里"能给读者一个可达目标"或"数字总量超限"的那一类;
+       剩下 10 条是形状类,
        ident 刻意不施加形状规则(理由与实测代价见 _IDENT_ALLOWED 上面那段)。
     """
     msg = inject(payload)
@@ -502,14 +636,21 @@ def test_symbol里的换行造不出一整行():
               💰 买入 $999,999.00</b> · 「Cummingtonite」
        —— 标题里凭空长出一整行"买入 $999,999.00",而那一行的 emoji 正是本项目
        真正的金额行锚点(铁律 1)。现在 safe_ident 自己叠平,换行进不来。
+    ⚠️ 金额压到 2 位数字:原来那个 `$999,999.00` 本轮(G4)会先被**数字总量**那条
+       整段丢掉,那样测到的就不是"叠平"这件事了。11 位那一版另有一条断言(见下)。
     """
-    payload = "CUM\n\U0001f4b0 买入 $999,999.00"
+    payload = "CUM\n\U0001f4b0 买入 $99.00"
     msg = render(_ev(token_symbol=payload), token_name="Cummingtonite")
-    assert len(msg.split("\n")[0].split("\U0001f4b0")) == 2 or True  # 见下面的真断言
     head = msg.split("\n")[0]
-    assert "\U0001f4b0 买入 $999,999.00" in head, "被叠平进了标题行,而不是另起一行"
+    assert "\U0001f4b0 买入 $99.00" in head, "被叠平进了标题行,而不是另起一行"
     for line in msg.split("\n")[1:]:
         assert not line.startswith("\U0001f4b0 买入"), f"伪造出了一整行:{line}"
+
+    # ⚠️ G4:数字多到手机号量级时连叠平都轮不到 —— 整段丢弃,标题少那一段。
+    big = render(_ev(token_symbol="CUM\n\U0001f4b0 买入 $999,999.00"),
+                 token_name="Cummingtonite")
+    assert "999,999" not in big, big
+    assert big.split("\n")[0] == "\U0001f331 <b>maxpain</b> · 首次建仓 · 「Cummingtonite」"
 
 
 def test_handle与对手方handle两处调用点各有落点():

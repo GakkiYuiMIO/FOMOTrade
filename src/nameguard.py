@@ -229,15 +229,33 @@ def has_cjk(s) -> bool:
     return any(is_cjk_char(ch) for ch in str(s or ""))
 
 
-# ---- 分隔符类字符:**类别 + 字符名查询**,不是手写码点表 ---------------------
+# ---- 分隔符类字符:**纯字符名查询**,不是手写码点表,也不再有类别闸门 -----------
 # ⚠️⚠️ 与 E2(CJK 判定)同一条教训:手写一张 `·•|` 的表**必然**漏同形字 ——
 #    U+30FB(片假名中点)、U+FF5C(全角竖线)、U+0387(希腊分隔号)、U+2219(点运算符)、
 #    U+2502(制表竖线)…… 每一个都能原样重造 `已清仓 ・ 亏损 99%`。
-#    所以这里用**查询**:类别是 P*/S*(标点或符号,字母天然排除),且 Unicode **字符名**
-#    里含下面这几个词(中点、圆点、竖线、竖排制表符那几族)。
-#    这把"视觉上可作分隔"表达成了可枚举、可逐码点自测的东西 ——
-#    tests/test_nameguard_sep.py 把整个 0x110000 空间遍历一遍(命中 249 个码点),
-#    断言每一个命中的字符在 safe_ident 那侧都被拦住。
+#    所以这里用**查询**:Unicode **字符名**里含下面这几个词(中点、圆点、竖线、
+#    分词符那几族)。这把"视觉上可作分隔"表达成了可枚举、可逐码点自测的东西。
+# ⚠️⚠️⚠️ **类别闸门(`category(ch)[0] in "PS"`)本轮删掉**。上一版写着它、
+#    并在注释里说"字母天然排除" —— 那句话是**错的**。Unicode 把一批
+#    **视觉上就是中点 / 竖线**的字符放在**字母类**里,它们从闸门下面整批漏过去:
+#        U+A78F Lo LATIN LETTER SINOLOGICAL DOT  ꞏ   ← 字面就是中文的间隔号
+#        U+1427 Lo CANADIAN SYLLABICS FINAL MIDDLE DOT  ᐧ
+#        U+18DF Lo CANADIAN SYLLABICS FINAL RAISED DOT  ᣟ
+#        U+01C0 Lo LATIN LETTER DENTAL CLICK  ǀ   / U+01C1 LATERAL CLICK  ǁ
+#        U+02C8 Lm MODIFIER LETTER VERTICAL LINE  ˈ
+#    实测(2026-09-03)`safe_ident('AB{x}CD')` 对以上全部**原样放行**。
+#    闸门删掉之后命中数 249 → 321,**一个旧命中都没丢**(逐码点比对过)。
+# ⚠️⚠️ 删掉闸门之后唯一需要补的是一条**反向**规则(见 is_separator_char 里那两行):
+#    **字母**的名字里出现 `X WITH Y` 时,那是"带修饰的字母本身"而不是那个修饰 ——
+#        Ŀ / ŀ  LATIN {CAPITAL,SMALL} LETTER L WITH MIDDLE DOT(加泰罗尼亚语的 l·l)
+#        Ҝ / ҹ  CYRILLIC … LETTER … WITH VERTICAL STROKE
+#        ڂ ݟ ݫ  ARABIC LETTER … WITH TWO DOTS VERTICALLY ABOVE
+#        𐼐 𐼗   OLD SOGDIAN LETTER … WITH VERTICAL TAIL
+#    它们读起来仍是一个字母,不是一个分隔符,收进来就是误伤真实文本。
+#    ⚠️ 这条**只对字母类(category 以 L 开头)生效**:符号名字里的 WITH 描述的是
+#       符号自身的构造(`⍿` VERTICAL LINE WITH MIDDLE DOT、`⸠` LEFT VERTICAL BAR
+#       WITH QUILL 都是货真价实的竖线同形字),对符号也排除会**收窄 50 个旧命中**
+#       —— 实测过,那是往回开洞。
 # ⚠️⚠️ 这里**曾经**还有一条"NFKC 折叠到 `·` `•` `・` `|` 四个基准字符之一"的规则
 #    与那张四字符基准表 —— 两者都是**死规则**:逐码点跑完 0x110000,
 #    "只有 NFKC 抓得到、字符名抓不到"的码点是 **0** 个(把 NFKC 那条打掉全量测试 0 红,
@@ -246,15 +264,32 @@ def has_cjk(s) -> bool:
 #    死规则 + 空转测试是最糟的组合,一并删掉。
 # ⚠️ 下面每一个 marker 都有**独占样本**钉在 tests/test_nameguard_sep.py 的
 #    _MUST_BE_SEPARATOR 里:删掉任意一个,那条当场红。
+# ⚠️⚠️ `IDEOGRAPHIC FULL STOP` 这个 marker **刻意只收半角的那一个**
+#    (U+FF61 ｡,写成 "HALFWIDTH IDEOGRAPHIC FULL STOP"):半角句点是一个小圆点,
+#    与 `·` 同形;而全角的 `。`(U+3002)是一个明显的大圈,读者不会把它读成字段分隔,
+#    并且它被 tests/test_nameguard_sep.py 的 _MUST_NOT_BE_SEPARATOR 明确钉成"不是分隔符"。
 _SEP_NAME_MARKERS = (
-    "MIDDLE DOT",          # U+00B7 · / U+30FB ・ / U+16EB ᛫
+    "MIDDLE DOT",          # U+00B7 · / U+30FB ・ / U+16EB ᛫ / U+1427 ᐧ(Lo!)
     "BULLET",              # U+2022 • / U+2043 ⁃ / U+2219 ∙ / U+25E6 ◦
-    "VERTICAL",            # U+007C | / U+2502 │ / U+FF5C ｜ / U+2016 ‖ / U+22EE ⋮
+    "VERTICAL",            # U+007C | / U+2502 │ / U+FF5C ｜ / U+2016 ‖ / U+02C8 ˈ(Lm!)
     "DOT OPERATOR",        # U+22C5 ⋅
     "ONE DOT LEADER",      # U+2024 ․
+    "TWO DOT LEADER",      # U+2025 ‥
     "HYPHENATION POINT",   # U+2027 ‧
     "DIVIDES",             # U+2223 ∣
     "ANO TELEIA",          # U+0387 ·(希腊分隔号)
+    "RAISED DOT",          # U+2E33 ⸳ / U+18DF ᣟ(Lo!)
+    "RING POINT",          # U+2E30 ⸰
+    "SPOT",                # U+2981 ⦁(Z NOTATION SPOT)
+    "WORD DIVIDER",        # U+1039F 𐎟 / U+103D0 𐏐 / U+12470 𒑰
+    "WORD SEPARATOR",      # U+10101 𐄁 / U+1091F 𐤟 / U+1123A 𑈺 / U+2E31 ⸱
+    "TRICOLON",            # U+205D ⁝
+    "DOT PUNCTUATION",     # U+205A ⁚ / U+2056 ⁖ / U+2058 ⁘ / U+2059 ⁙
+    "MODIFIER LETTER COLON",          # U+A789 ꞉(Sk,与 `:` 同形)
+    "DOUBLE HYPHEN",       # U+2E40 ⹀ / U+30A0 ゠(Pd)
+    "SINOLOGICAL DOT",     # U+A78F ꞏ(Lo!字面就是中文间隔号)
+    "CLICK",               # U+01C0 ǀ / U+01C1 ǁ / U+01C2 ǂ / U+01C3 ǃ(全是 Lo!)
+    "HALFWIDTH IDEOGRAPHIC FULL STOP",  # U+FF61 ｡(只收半角,理由见上)
 )
 
 
@@ -262,11 +297,17 @@ def is_separator_char(ch: str) -> bool:
     """
     这个字符视觉上能不能当**字段分隔符**用。⚠️ ident 侧一律严禁,理由见模块头。
 
-    ⚠️ 判据是"Unicode 类别 + 字符名",**不是**手写码点表 —— 手写表必然漏同形字。
+    ⚠️ 判据是 Unicode **字符名**,**不是**手写码点表(手写表必然漏同形字),
+       也**不再有类别闸门** —— 一批中点 / 竖线同形字被 Unicode 归在字母类里,
+       闸门把它们整批放行了(见上面那段)。
     """
-    if unicodedata.category(ch)[0] not in "PS":
-        return False
     name = _char_name(ch)
+    if not name:
+        return False
+    # ⚠️ 字母名字里的 `X WITH Y` = 带修饰的字母本身(Ŀ 是 L 加一点),不是那一点。
+    #    只对字母生效:对符号也排除会收窄 50 个旧命中,理由见上面那段。
+    if unicodedata.category(ch)[0] == "L" and " WITH " in name:
+        return False
     return any(m in name for m in _SEP_NAME_MARKERS)
 
 
@@ -620,20 +661,38 @@ _IDENT_BAD_PATTERNS = (_RE_SCHEME, _RE_MENTION, _RE_EVM, _RE_BARE_HEX, _RE_BASE5
 _IDENT_BAD_CHARS = frozenset("#")
 # 视觉容器本身。⚠️ 名字侧靠字符白名单挡(它俩不在里面),ident 侧没有白名单,单列一条。
 QUOTE_CHARS = frozenset("「」")
+# ---- ident 侧的**唯一一条数量规则**:数字总量 -------------------------------
+# ⚠️⚠️ 上一版 ident 侧**只有形态规则、一条数字规则都没有**,于是
+#     safe_ident('联系电话13800138000') 原样放行,
+#     render(token_symbol='联系电话13800138000') 把手机号直接印进标题行。
+#     形态那几条一条都碰不到它:没有域名、没有 scheme、没有 @、不是 0x/hex/base58、
+#     不是 IPv4、`+电话` 那条要求有 `+`。
+# ⚠️ 判"数字总量"而不是"连续几位":连续规则被一个 `-` 就绕开
+#     ('138-0013-8000'),这与名字侧 _MAX_DIGITS 是同一条教训。
+# ⚠️ 数字的判据与名字侧**同源**,复用 _is_digit_like:全角数字与中文数字一并计入,
+#     否则 '一三八零零一三八零零零' 平凡绕过。
+# ⚠️⚠️ 阈值 7(> 7 才丢),**不与名字侧的 5 相同** —— 符号天生带数字,
+#     实测(2026-09-03,生产库只读)在过完其余 ident 规则的语料上:
+#       4090 个真实 token_symbol 的数字总量分布 {0:3915, 1:94, 2:33, 3:25, 4:19, 5:3, 10:1}
+#         → 阈值 7 丢 1 条('1000000000'),0.024%;
+#       205 个真实 handle/昵称的分布 {0:165,1:16,2:10,3:6,4:4,6:2,7:1,13:1}
+#         → 阈值 7 丢 1 条('HJ8688878987581'),0.488%。
+#     取 5(与名字侧同数)时 handle 要丢 4 条 = 1.95%,连 '397397' 这种纯数字昵称
+#     一起丢 —— 贴着 2% 的红线,没有余量。取 7 的判据是**目标可达性**:
+#     手机号 11 位、QQ 号 9~10 位、微信号里的数字段也在这个量级;7 位以下的数字串
+#     够不着一个"可拨可加"的目标,拦它只有代价没有收益。
+_MAX_IDENT_DIGITS = 7
 
 
 def safe_ident(s) -> str | None:
     """
-    symbol / handle / 昵称的轻门禁:命中形态 / 分隔符 / 容器字符 → None,
+    symbol / handle / 昵称的轻门禁:命中形态 / 分隔符 / 容器字符 / 数字总量超限 → None,
     否则返回**叠平后**的串(单行、空白归一、去首尾;emoji 原样保留)。
 
-    ⚠️ 实测丢弃率(2026-09-03,生产库只读):
-       token_symbol 2/4064 = 0.05%(fomo_events ∪ token_snapshot,被丢的是
-         '@everyone' 与 'LEMON.FUN');
-       handle + 昵称 2/208 = 0.96%(两条都是含分隔符的昵称,刻意的取舍 ——
-         '血手人屠·厉飞雨' U+00B7 与 '六子｜Funny Six' U+FF5C)。
-    ⚠️ 本轮新加的三条(分隔符 / 容器字符 / Telegram 可点通道)在真实 symbol 上的代价是
-       **0**:4064 个真实符号里带 `#` 的 0 个、带分隔符的 0 个、带 `「」` 的 0 个。
+    ⚠️ 实测丢弃率(2026-09-03,生产库只读,含本轮 G1 分隔符扩表与 G4 数字规则):
+       token_symbol 4/4093 = 0.10%;handle + 昵称 3/207 = 1.45%。
+       被丢的逐条见报告 —— 都是含分隔符同形字 / 15 位数字的昵称,刻意的取舍。
+    ⚠️ 分隔符 / 容器字符 / Telegram 可点通道那三条在真实 symbol 上的代价仍是 **0**。
     """
     raw = str(s or "")
     if any(ch in _BIDI_CONTROLS for ch in raw):
@@ -651,6 +710,8 @@ def safe_ident(s) -> str | None:
         return None
     if any(ch in QUOTE_CHARS or ch in _IDENT_BAD_CHARS or is_separator_char(ch)
            for ch in text):
+        return None
+    if sum(1 for ch in text if _is_digit_like(ch)) > _MAX_IDENT_DIGITS:
         return None
     return " ".join(strip_controls_keep_emoji(raw).split())
 

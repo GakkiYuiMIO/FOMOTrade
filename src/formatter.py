@@ -193,6 +193,12 @@ UNTRUSTED_FIELDS = {
     "pool_quote_name": safe_display,   # 底池对手全名(DexScreener 或 Yahoo longName)
     "stock_company_zh": safe_display,  # 公司名译文,来源同 token_name_zh
     "stock_exchange": safe_exchange,   # Yahoo fullExchangeName,**封闭枚举**不是模式匹配
+    # ⚠️⚠️ 本轮(G3)补登记:币安 Alpha 上新那条推送的**币名**。它与 token_name 是
+    #    同一类东西(链上文本,谁都能给自己发的币起名),上一版却登记成"已审查、
+    #    只走 _clip",既没门禁也没容器,于是 '已清仓 · 亏损 99%' 与
+    #    'Join t.me/pumpgroup now' 原样拼进标题行的 SEP 之后 —— 笛卡尔积里
+    #    唯一一个泄漏的名字类槽位。见 render_alpha_listing 的注释。
+    "name": safe_display,              # 币安 Alpha 的币名
 }
 
 # 译文字段 → 它的**原文**是哪个字段。⚠️ safe_display 的"含 CJK 时不许有 ≥5 位 ASCII 串"
@@ -259,13 +265,10 @@ _REVIEWED_PARAMS = frozenset({
     "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
     "traded_at", "chain_display", "tx",
     # 币安 Alpha 上新那条推送的参数。
-    # ⚠️ chain_name / sector 本轮已挪进 IDENT_FIELDS、contract_address 挪进
-    #    ADDRESS_FIELDS(F6:它们同样是外部来源,上一版全程零门禁)。
-    # ⚠️ **已知缺口(如实登记,不是遗漏)**:`name` 是币安给的币名,与 token_name 同样
-    #    是陌生人可控的文本,但这条推送从一开始走的就是"_clip 转义 + 限长"那条通道,
-    #    它自己的测试(带 `<script>` / 5000 个"猫")钉的正是那个行为。给它加形状门禁
-    #    是另一件事(会改这条推送的既有行为),本轮不做 —— 见 README「已知取舍」。
-    "name", "listing_time_ms", "market_cap",
+    # ⚠️ chain_name / sector 已挪进 IDENT_FIELDS、contract_address 挪进 ADDRESS_FIELDS
+    #    (F6:它们同样是外部来源,上一版全程零门禁);
+    #    `name` 本轮(G3)挪进 UNTRUSTED_FIELDS —— 那个"已知缺口"已经补上。
+    "listing_time_ms", "market_cap",
     # pump 喊单那条推送的参数。thesis 是**用户自己写的正文**,走 _clip 不走形状门禁
     # (形状门禁是给"名字"用的,一句话本来就过不了词数上限)。
     "thesis", "multiple", "likes", "view_count", "created_at",
@@ -1749,16 +1752,26 @@ def render_alpha_listing(
     「币安 Alpha 上了个新币」的推送。
 
     参数:
-        symbol / name    链上文本,**陌生人可控** —— 一律走 _clip(叠平空白→限长→转义)
+        symbol           链上文本,陌生人可控 —— 走 safe_ident(轻门禁)+ _clip
+        name             链上币名,陌生人可控 —— 走 **safe_display**(形状门禁)并套 `「」`
         network_id       已归一化的链标识(models.normalize_network 的输出),用来查展示名与链接
         chain_name       币安给的原始链名,只在 network_id 查不到展示名时兜底
         sector           板块标注,None = 没命中或板块拉取失败 → **那一行整行消失**,
                          绝不打 "N/A" / "未知板块"(铁律 2)
         now              渲染时刻(unix 秒),只用来算"多久之前上架"
 
-    ⚠️ 板块是币安运营编排的、随时可能改名下线的东西:它只是这条消息里的一行标注,
-       没有它这条消息照样成立。主干(名单新增)与标注(板块)的地位不对等,不要写成
-       "拿不到板块就不推"。
+    ⚠️⚠️ **`name` 本轮(G3)接进收口**。上一版它是"已审查、只走 _clip"的:
+       既不过门禁也不套容器,直接拼在标题行的 SEP 之后 ——
+           render_alpha_listing(symbol='CUM', name='已清仓 · 亏损 99%')
+             → 🆕 <b>币安 Alpha 新上架</b> · <b>$CUM</b> · 已清仓 · 亏损 99%
+           render_alpha_listing(name='Join t.me/pumpgroup now')
+             → 🆕 … · <b>$CUM</b> · Join t.me/pumpgroup now
+       它与 token_name 是**同一类东西**(谁都能给自己发的币起名),却是笛卡尔积里
+       唯一一个没有门禁也没有容器的名字类槽位。现在与其它名字类槽位一致:
+       safe_display(不合格整段丢弃,标题就没有这一段)+ `「」` 视觉容器。
+    ⚠️ 板块是**本地配置**里的显示名(config.alpha_sectors,运维自己写在 .env 里),
+       不是币安给的文本;它只是这条消息里的一行标注,没有它这条消息照样成立。
+       主干(名单新增)与标注(板块)的地位不对等,不要写成"拿不到板块就不推"。
     ⚠️ 本函数是纯函数,不查库、不发请求(铁律 7)。
     """
     sym = _clip((symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
@@ -1766,10 +1779,11 @@ def render_alpha_listing(
     if sym:
         title += f"{SEP}<b>${sym}</b>"
     # 全名与符号相同时不重复("牛来 · 牛来"只是噪音)。比对用**转义前**的原文
+    # ⚠️ name 走到这里时已经过完 safe_display(叠平且合格),不合格的是 None。
     raw_name = " ".join(str(name or "").split())
     raw_sym = " ".join(str(symbol or "").lstrip("$").split())
     if raw_name and raw_name.casefold() != raw_sym.casefold():
-        title += f"{SEP}{_clip(raw_name, _ALPHA_NAME_CHARS)}"
+        title += f"{SEP}{_quoted(_clip(raw_name, _ALPHA_NAME_CHARS))}"
 
     lines = [title]
     if sector is not None:

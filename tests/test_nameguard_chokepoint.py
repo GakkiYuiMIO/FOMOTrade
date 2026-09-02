@@ -60,6 +60,15 @@ _EXPECT_UNTRUSTED = {
     "pool_quote_name": "safe_display",   # 底池对手全名(DexScreener 或 Yahoo longName)
     "stock_company_zh": "safe_display",  # 公司名译文,来源同 token_name_zh
     "stock_exchange": "safe_exchange",   # Yahoo fullExchangeName,**封闭枚举**
+    # ⚠️⚠️ 本轮 G3 补登记:币安 Alpha 上新那条推送的**币名**。它上一版登记在
+    #    _EXPECT_REVIEWED 里(理由写的是"这条推送从一开始走的就是 _clip 通道"),
+    #    于是它是笛卡尔积里唯一一个既没门禁也没容器的名字类槽位 ——
+    #      render_alpha_listing(symbol='CUM', name='已清仓 · 亏损 99%')
+    #        → 🆕 <b>币安 Alpha 新上架</b> · <b>$CUM</b> · 已清仓 · 亏损 99%
+    #      render_alpha_listing(name='Join t.me/pumpgroup now')
+    #        → 🆕 … · <b>$CUM</b> · Join t.me/pumpgroup now
+    #    两个复验者各自打出 39/40 与 40/40 的泄漏。现在与 token_name 同一道门。
+    "name": "safe_display",              # 币安 Alpha 的币名,链上文本、陌生人可控
 }
 _EXPECT_IDENT = {
     "token_symbol": "safe_ident",        # 币符号,陌生人可控($t.me/pumpgrp 曾原样进标题)
@@ -69,7 +78,11 @@ _EXPECT_IDENT = {
     # ⚠️ 本轮补登记(上一版这两个全程零门禁):它们同样是外部来源的自由文本,
     #    与被门禁保护的符号印在同一条消息里。
     "chain_name": "safe_ident",          # 币安给的原始链名(内部映射查不到时的兜底)
-    "sector": "safe_ident",              # 币安运营编排的板块名
+    # ⚠️ sector 的真实来源本轮查清了:它**不是**币安给的文本,而是运维写在 .env 里的
+    #    显示名(config.alpha_sectors 解析 FOMO_ALPHA_SECTORS,默认 "股票 Meme 幣")。
+    #    仍然留在轻门禁里:它是带空格的短语,套 safe_display 的形状规则会误伤,
+    #    而 safe_ident 对本地配置零代价。
+    "sector": "safe_ident",              # 板块标注(本地配置里的显示名)
 }
 # ⚠️⚠️ **地址类字段**:它不能走 safe_ident(那道的 0x / 裸 hex / base58 三条本来就是
 #    拿来拦地址的,套上去等于全丢),用封闭形状收(只许字母数字与 Sui 的 `::` 段)。
@@ -80,8 +93,8 @@ _EXPECT_ADDRESS = {
 #   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
 #   b. 内部枚举或已归一化的标识(network_id / side / chain_display);
 #   c. 地址 / 正文类字段 —— 外部可控,但走 _clip(叠平空白 → 限长 → 转义)这条既有通道。
-# ⚠️ `name`(币安 Alpha 的币名)是一个**已知缺口**,不是遗漏:见 formatter 里那段注释
-#    与 README「已知取舍」。
+# ⚠️ `name`(币安 Alpha 的币名)曾经是这里的一个**已知缺口**,本轮 G3 已经挪进
+#    _EXPECT_UNTRUSTED(走 safe_display + 「」容器),这份名单里不再有它。
 _EXPECT_REVIEWED = {
     "ev", "buyers", "watchlist", "holders", "baseline_pending", "starred", "now",
     "network_id", "token_address", "receiver_count", "receivers",
@@ -90,7 +103,7 @@ _EXPECT_REVIEWED = {
     "is_cleared", "unrealized_pnl_usd", "unrealized_pnl_pct", "realized_pnl_usd",
     "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
     "traded_at", "chain_display", "tx",
-    "name", "listing_time_ms", "market_cap",
+    "listing_time_ms", "market_cap",
     "thesis", "multiple", "likes", "view_count", "created_at",
 }
 

@@ -87,6 +87,36 @@ _IDENT_BLOCK = [
     # ======== 本轮 F2:视觉容器字符在 ident 侧也整段丢弃 ========
     ("假「名字」", "`「`『』是视觉容器本身,ident 没有字符白名单,单列一条"),
     ("CUM」 · 已清仓", "只带一个右括号就能把容器提前关掉 —— 「」配平那条不变量"),
+    # ======== 本轮 G1:被 Unicode 归在**字母类**里的分隔符同形字 ========
+    # ⚠️⚠️ 上一版 is_separator_char 第一行是 `category(ch)[0] not in "PS" → False`,
+    #    注释写"字母天然排除" —— 那句话是错的,下面这一批全是 Lo/Lm,当时**原样放行**。
+    ("ABꞏCD", "U+A78F Lo LATIN LETTER SINOLOGICAL DOT —— 字面就是中文间隔号"),
+    ("ABᐧCD", "U+1427 Lo CANADIAN SYLLABICS FINAL MIDDLE DOT"),
+    ("ABᣟCD", "U+18DF Lo CANADIAN SYLLABICS FINAL RAISED DOT"),
+    ("ABǀCD", "U+01C0 Lo LATIN LETTER DENTAL CLICK —— 与 | 同形"),
+    ("ABǁCD", "U+01C1 Lo LATIN LETTER LATERAL CLICK —— 与 ‖ 同形"),
+    ("ABˈCD", "U+02C8 Lm MODIFIER LETTER VERTICAL LINE"),
+    # ======== 本轮 G1:类别本身是 P*/S*、但 marker 表漏了的那一批 ========
+    ("AB‥CD", "U+2025 TWO DOT LEADER"),
+    ("AB⸳CD", "U+2E33 RAISED DOT"),
+    ("AB⸰CD", "U+2E30 RING POINT"),
+    ("AB⦁CD", "U+2981 Z NOTATION SPOT"),
+    ("AB꞉CD", "U+A789 Sk MODIFIER LETTER COLON —— 与 : 同形"),
+    ("AB⁚CD", "U+205A TWO DOT PUNCTUATION"),
+    ("AB⁝CD", "U+205D TRICOLON"),
+    ("AB𐎟CD", "U+1039F UGARITIC WORD DIVIDER"),
+    ("AB𐄁CD", "U+10101 AEGEAN WORD SEPARATOR DOT"),
+    ("AB｡CD", "U+FF61 HALFWIDTH IDEOGRAPHIC FULL STOP —— 半角句点是个小圆点"),
+    ("AB⸱CD", "U+2E31 WORD SEPARATOR MIDDLE DOT"),
+    ("AB゠CD", "U+30A0 Pd KATAKANA-HIRAGANA DOUBLE HYPHEN"),
+    # ======== 本轮 G4:ident 侧的数字总量规则 ========
+    # ⚠️ 上一版 ident 侧一条数字规则都没有,手机号原样进标题(见下面那条独立测试)。
+    ("联系电话13800138000", "手机号 11 位 —— 上一版原样放行,直接印进标题行"),
+    ("13800138000", "裸手机号 11 位"),
+    ("138-0013-8000", "插了分隔符的手机号:数字**总量**仍是 11"),
+    ("一三八零零一三八零零零", "中文数字写的手机号,_is_digit_like 一并计入"),
+    ("１３８００１３８０００", "全角数字写的手机号"),
+    ("QQ1234567890", "QQ 号 10 位"),
 ]
 
 # ============================================================
@@ -103,6 +133,9 @@ _IDENT_PASS = [
     # 苏格兰旗 = 🏴 + 6 个 tag 字符 + 终止符。⚠️ 叠平那一步用的是**保留 emoji** 的版本,
     # 全删 Cf 会把它拆成一面光秃秃的黑旗(那是 E5 那条教训)。
     "🏴󠁧󠁢󠁳󠁣󠁴󠁿 highlander",
+    # ⚠️ 本轮 G4 加了数字总量规则,阈值 7 —— 下面这些**真实存在**的多数字符号必须还在。
+    #    ('1000X' 4 位 / 'PEACH64' 2 位已经在上面,这里补纯数字与 7 位边界。)
+    "42", "777", "397397", "1234567",
 ]
 # ⚠️⚠️ **本轮从必放行里移走的两条**(如实登记,这是刻意的取舍):
 #      '血手人屠·厉飞雨'(U+00B7)与 '六子｜Funny Six'(U+FF5C)是生产库里的真实昵称,
@@ -132,7 +165,9 @@ def test_通过的要叠平成单行():
     ⚠️ 只叠平**空白与控制符**,不做别的清洗:转义与限长仍然是下游 _clip 的事
        (在这里顺手转义会让 `&` 被转两次,显示成一串乱码)。
     """
-    assert safe_ident("CUM\n💰 买入 $999,999.00") == "CUM 💰 买入 $999,999.00"
+    # ⚠️ 金额里的数字压到 4 位:11 位那个版本本轮(G4)起被**数字总量**那条整段丢弃,
+    #    那测的是另一件事;这条要测的是"叠平",两条各钉各的(见下面 G4 那条)。
+    assert safe_ident("CUM\n💰 买入 $99.00") == "CUM 💰 买入 $99.00"
     assert safe_ident("  CUM  ") == "CUM"
     assert safe_ident("A\r\n\tB") == "A B"
     assert safe_ident("A B") == "A B", "NBSP 也算空白"
@@ -151,15 +186,43 @@ def test_空与缺失为None():
 def test_不施加形状规则():
     """
     ⚠️⚠️ 这条是"轻"字的可执行形式:下面每一条都过不了 safe_display 的形状白名单
-       (长度 / 词数 / 标点数 / 数字总量 / 表情),但它们是**正常的符号与昵称**。
+       (长度 / 词数 / 标点数 / 表情),但它们是**正常的符号与昵称**。
        谁把 safe_ident 换成 safe_display,这条当场红,而生产库里 4% 的昵称会消失。
+    ⚠️⚠️ **数字总量那两条本轮(G4)移走了** —— '13800138000' 与
+       '一三八零零一三八零零零' 现在必须被拦(见 _IDENT_BLOCK 与
+       test_ident侧的数字总量规则)。ident 侧从此有且只有这**一条**数量规则:
+       形状规则(词数 / 长度 / 标点数)仍然一条都没有,这条继续钉着那件事。
     """
     # ⚠️ 长的那条用 "OIl" 三个字母:它们**不在** base58 字母表里,也不是 hex ——
     #    否则测到的是地址形态那条(那条对 ident 仍然生效),不是"没有长度上限"。
     for raw in ("OIl" * 20, "one two three four five six seven", "!!!???...,,,",
-                "13800138000", "🔴🟢🟡", "已清仓 亏损 99%", "官方认证。已审计",
-                "一三八零零一三八零零零", "Buy now safe airdrop visit my profile"):
+                "🔴🟢🟡", "已清仓 亏损 99%", "官方认证。已审计",
+                "Buy now safe airdrop visit my profile"):
         assert safe_ident(raw) == raw, raw
+
+
+def test_ident侧的数字总量规则():
+    """
+    ⚠️⚠️ G4:上一版 ident 侧**一条数字规则都没有**,于是
+           render(token_symbol='联系电话13800138000')
+             → 🌱 <b>maxpain</b> · 首次建仓 · <b>$联系电话13800138000</b>
+       —— 手机号直接印进标题行。形态那几条一条都碰不到它(没有域名 / scheme /
+       @ / 0x / hex / base58 / IPv4,`+电话` 那条要求有 `+`)。
+    ⚠️ 判的是**数字总量**不是"连续几位":连续规则被一个 `-` 就绕开。
+    ⚠️ 阈值写死在这里(7):≤7 位放行、≥8 位丢弃,两侧各钉一个边界样本。
+       改 src 的阈值 = 改这条,不能反过来。
+    """
+    assert safe_ident("1234567") == "1234567", "7 位:必须放行"
+    assert safe_ident("12345678") is None, "8 位:必须丢弃"
+    # 全角与中文数字**一并计入**(与名字侧 _is_digit_like 同源)
+    assert safe_ident("１２３４５６７８") is None, "全角 8 位"
+    assert safe_ident("一二三四五六七八") is None, "中文 8 位"
+    # 数字被分隔符打散照样算总量
+    assert safe_ident("138-0013-8000") is None
+    assert safe_ident("138 0013 8000") is None
+    # 真实符号里的数字必须容得下
+    for ok in ("1000X", "PEACH64", "Demo3x", "42", "777", "1000000"):
+        assert safe_ident(ok) == ok, ok
 
 
 # ============================================================
