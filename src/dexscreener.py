@@ -212,6 +212,13 @@ class PoolQuote:
     issuer: str | None = None
     token_symbol: str | None = None
     token_name: str | None = None
+    # 这个币自己的社媒:((类别, URL), …),原样透传上游给的顺序与文本。
+    # ⚠️⚠️ 门禁**不在这里**(统一在 formatter 的渲染入口,见 formatter.URL_FIELDS
+    #    与 nameguard.safe_social_links);这里只做一件事:确认这份 info 说的
+    #    确实是**我们问的那个币**(见 _socials 的说明)。
+    # ⚠️ 空元组 = 这个币没填社媒(项目方可填可不填,用户明确说过"可能有 也可能没"),
+    #    渲染层按"整行消失"处理。
+    socials: tuple[tuple[str, str], ...] = ()
 
 
 # ============================================================
@@ -333,6 +340,44 @@ def _is_common(network_id: str, address: str) -> bool:
     return is_quote_token(network_id, address)
 
 
+# 一条 pair 里最多收几条社媒。⚠️ 上游数组没有上限,不封顶就能让一条推送被它顶爆。
+#    6 已经比实测最多的那个(CASHCAT:1 官网 + 3 社媒)宽一倍。
+_MAX_RAW_SOCIALS = 12
+
+
+def _socials(pair, ours_is_base: bool) -> tuple[tuple[str, str], ...]:
+    """
+    这条 pair 的 `info` 里的社媒 → ((类别, URL), …)。原样透传,不做任何清洗。
+
+    ⚠️⚠️ **只有我们问的那个币是 baseToken 时才取。** `pair.info`(图标 / 官网 / 社媒)
+       描述的是这条 pair 的**基础币**,而 base/quote 的方向不固定
+       (实测 $AI 在 AI/NVDA 里是 base、在 CLANKER/AI 这类池里是 quote)。
+       在我方是 quote 的 pair 上照抄 info,印出去的就是**另一个币的官网和推特** ——
+       一条读起来完全正常、错得毫无痕迹的假信息,与 $Rabbit 那个底池 bug 同一种。
+       宁可少显示一行(我方只当 quote 的币拿不到社媒),也不能印错。
+    ⚠️ 官网那一类的 label(上游给的 "Website")**故意不取**:链接文字必须是
+       我们自己的常量(见 nameguard.safe_social_links),上游的 label 是攻击者可控的。
+       这里统一把它标成内部类别 "website"。
+    ⚠️ 门禁(scheme / host / 字符集)全在 nameguard.safe_url,不在这里 ——
+       与"不可信字段统一在渲染入口收口"是同一条规矩。
+    """
+    if not ours_is_base or not isinstance(pair, dict):
+        return ()
+    info = pair.get("info")
+    if not isinstance(info, dict):
+        return ()
+    out: list[tuple[str, str]] = []
+    for item in (info.get("websites") or ()) if isinstance(info.get("websites"), list) else ():
+        if isinstance(item, dict) and item.get("url"):
+            out.append(("website", str(item["url"])))
+    for item in (info.get("socials") or ()) if isinstance(info.get("socials"), list) else ():
+        if isinstance(item, dict) and item.get("url"):
+            out.append((str(item.get("type") or ""), str(item["url"])))
+        if len(out) >= _MAX_RAW_SOCIALS:
+            break
+    return tuple(out[:_MAX_RAW_SOCIALS])
+
+
 def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | None:
     """
     一条 pair → 对手资产。判不出来一律 None(那一行整行消失,绝不猜)。
@@ -384,6 +429,7 @@ def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | Non
         # 我方一侧:这个币自己的符号与全名。⚠️ 仍是第三方字符串,渲染前必须 _clip
         token_symbol=_text(ours.get("symbol")),
         token_name=our_name,
+        socials=_socials(pair, our_key == base_key),
     )
 
 
@@ -707,3 +753,20 @@ def token_name(quotes: dict[str, PoolQuote], token_address) -> str | None:
         return None
     pq = quotes.get(key)
     return None if pq is None else pq.token_name
+
+
+def token_socials(quotes: dict[str, PoolQuote], token_address):
+    """
+    这个币**自己**的社媒 ((类别, URL), …);拿不到或一条都没有 → None(那一行消失)。
+
+    ⚠️ 与 token_name 同一条理由和 notable 分开:社媒与"对手是谁"无关。
+    ⚠️ 这里不做任何清洗与去重 —— 门禁与"同类只取第一个"都在
+       nameguard.safe_social_links(渲染入口那道统一收口)。
+    """
+    key = normalize_token_address(token_address)
+    if key is None:
+        return None
+    pq = quotes.get(key)
+    if pq is None or not pq.socials:
+        return None
+    return pq.socials

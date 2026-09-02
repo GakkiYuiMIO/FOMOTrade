@@ -39,7 +39,7 @@ from src.client import (
 )
 from src.config import get_settings
 from src.copytrade import Candidate, decide
-from src.dexscreener import PoolQuoteLookup, notable, token_name
+from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
 from src.formatter import (
     render,
     render_copy_signal,
@@ -66,6 +66,7 @@ from src.models import (
 )
 from src.namecn import NameGlossary
 from src.nameguard import safe_display
+from src.tokeninfo import TokenExtraLookup
 
 # ============================================================
 # 候选字段名 —— 全部来自逆向推测,probe 确认后可以收窄但保留兜底不会有坏处
@@ -697,6 +698,11 @@ class Poller:
         # 自带 SQLite 缓存与每 tick 预算;与 _pool_lookup 同一条铁律:失败一律自己吞掉,
         # 绝不允许它有能力影响任何一条推送的发出。
         self._names = NameGlossary()
+        # 发射台(🚀)+ 持有人数(🧑‍🤝‍🧑)。⚠️ 自带缓存(发射台永久 / 持有人 90 秒)、
+        #    每 tick 预算与**进程级**限速闸(filterTokens 实测第 10 次连打就 429)。
+        #    与 _pool_lookup / _names 同一条铁律:失败一律自己吞掉,
+        #    绝不允许它有能力影响任何一条推送的发出。
+        self._token_extras = TokenExtraLookup()
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
@@ -1551,6 +1557,7 @@ class Poller:
         if worker is not None:
             worker.close()
         self._pool_lookup.close()
+        self._token_extras.close()
 
     def _start_thesis(self, batch: list[tuple]):
         """
@@ -1927,8 +1934,36 @@ class Poller:
                 logger.warning("底池对手查询失败,本轮这条链不显示该行 | {} | {}", net, e)
         return out
 
+    def _token_extra_map(self, pending: list[FomoEvent]) -> dict:
+        """
+        本轮要推的这些币的发射台与持有人 → {(链, 归一化地址): TokenExtra}。
+
+        ⚠️⚠️ **整轮攒成一个批次、跨链混批、一次请求**(见 tokeninfo:filterTokens
+           实测无间隔连打第 10 次就 429、冷却 203 秒)。这与 _pool_quotes 的
+           "一条链一个请求"不同 —— 那个端点没有这么紧的限速,这个有。
+        ⚠️ 与 _pool_quotes 同一套筛选:只问**买卖**推送要用的币(转入走 cached_only,
+           不新开请求),计价币跳过。
+        ⚠️⚠️ 整段包在 try 里,失败一律降级为空 dict:
+           **绝不能出现"因为查不到发射台所以整条推送没发出去"**。
+        """
+        pairs: list[tuple[str, str]] = []
+        for ev in pending:
+            if ev.event_type not in (EVENT_BUY, EVENT_SELL) or ev.is_quote:
+                continue
+            net = (ev.network_id or "").strip()
+            ca = (ev.token_address or "").strip()
+            if net and ca:
+                pairs.append((net, ca))
+        if not pairs:
+            return {}
+        try:
+            return self._token_extras.lookup(pairs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("发射台/持有人查询失败,本轮这两行不显示 | {}", e)
+            return {}
+
     def _name_extras(self, pool_quotes: dict, network_id, token_address, token_symbol,
-                     pq, *, cached_only: bool) -> dict:
+                     pq, *, cached_only: bool, extras: dict | None = None) -> dict:
         """
         A/B/C 三段的数据 → render 的关键字参数。缺哪段就没哪个键(那一行整行消失)。
 
@@ -1941,8 +1976,16 @@ class Poller:
           stock_company_zh / stock_exchange
                             底池对手是**币股**(pq 非 None)时,Yahoo 的事实 + 公司名中文
 
+          launchpad / token_holders
+                            🚀 与 🧑‍🤝‍🧑 两行(tokeninfo)。extras 是本轮批量查好的那份;
+                            cached_only 时改走 tokeninfo 的**只读缓存**。
+          token_socials     🔗 社媒行。⚠️ 它来自 DexScreener **同一份已经在取的响应**
+                            (pair.info),零新增请求 —— 所以 cached_only 那条路径
+                            也只是去读 PoolQuoteLookup 的缓存,与币名同一份数据。
+
         ⚠️ cached_only(转入推送 /tin、转入聚合):**只读缓存、绝不发请求** ——
            那两条路径不为币名新开请求,有缓存就带上,没有就没有;股票说明也不查。
+        ⚠️⚠️ 三行**各自独立**:任一拿不到只掉那一行,不影响另外两行,更不影响整条推送。
         ⚠️⚠️ 整段包在 try 里,任何失败一律返回已经拿到的部分。
            与底池/共识同一条铁律:**绝不能出现"因为翻不出中文名所以整条推送没发出去"**。
         """
@@ -1954,13 +1997,19 @@ class Poller:
         #       这里原样透传,不合格时 🌊 那行只剩符号。
         if pq is not None:
             out["pool_quote_name"] = pq.name
+        # ⚠️ net 提到 try 外面:下面有**两段独立的 try**(币名/股票 与 发射台/持有人),
+        #    两段都要用它,而"三行各自独立"意味着第一段炸了第二段照样得跑得起来。
+        net = (network_id or "").strip()
         try:
-            net = (network_id or "").strip()
             if cached_only:
                 pq_self = self._pool_lookup.cached(net, token_address)
                 name = None if pq_self is None else pq_self.token_name
+                socials = None if pq_self is None or not pq_self.socials else pq_self.socials
             else:
                 name = token_name(pool_quotes.get(net, {}), token_address)
+                socials = token_socials(pool_quotes.get(net, {}), token_address)
+            if socials:
+                out["token_socials"] = socials
             if name is not None:
                 out["token_name"] = name
                 zh = self._names.token_zh(name, token_symbol, network=not cached_only)
@@ -1981,6 +2030,20 @@ class Poller:
                         out["stock_exchange"] = info.exchange
         except Exception as e:  # noqa: BLE001
             logger.warning("币名/股票说明获取失败,相关行不显示 | {} {} | {}",
+                           network_id, token_address, e)
+        # ⚠️ 发射台/持有人**单独一段 try**:它与币名/股票是两个来源、两条外呼路径,
+        #    合在一起的话上面任何一步抛异常都会把这两行一起带走(三行各自独立的规矩)。
+        try:
+            key = (net, normalize_token_address(token_address))
+            extra = (self._token_extras.cached(net, token_address) if cached_only
+                     else (extras or {}).get(key))
+            if extra is not None:
+                if extra.launchpad is not None:
+                    out["launchpad"] = extra.launchpad
+                if extra.holders is not None:
+                    out["token_holders"] = extra.holders
+        except Exception as e:  # noqa: BLE001
+            logger.warning("发射台/持有人获取失败,这两行不显示 | {} {} | {}",
                            network_id, token_address, e)
         return out
 
@@ -2019,6 +2082,10 @@ class Poller:
             logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
             starred = set()
         pool_quotes = self._pool_quotes(pending)
+        # 发射台/持有人:整轮**一个批次**(跨链混批)。见 _token_extra_map。
+        with suppress(Exception):
+            self._token_extras.begin_round()
+        token_extras = self._token_extra_map(pending)
         # 币名/股票说明的每 tick 预算从这里起算(见 namecn.NameGlossary)
         with suppress(Exception):
             self._names.begin_round()
@@ -2057,12 +2124,18 @@ class Poller:
             pq = notable(pool_quotes.get(ev.network_id or "", {}), ev.token_address)
             # 英文全名(A)/ 中文名(C)/ 股票说明(B)。转入推送只读缓存、不发请求
             names = self._name_extras(pool_quotes, ev.network_id, ev.token_address,
-                                      ev.token_symbol, pq, cached_only=is_transfer_in)
+                                      ev.token_symbol, pq, cached_only=is_transfer_in,
+                                      extras=token_extras)
             try:
                 text = (
+                    # ⚠️ 转入逐条推送同样带三行,但**只读缓存**(cached_only=True):
+                    #    这条路径从不为它们新开请求,与既有的币名口径一致。
                     render_transfer_in_watch(ev, starred=ev.user_id in starred,
                                              token_name=names.get("token_name"),
-                                             token_name_zh=names.get("token_name_zh"))
+                                             token_name_zh=names.get("token_name_zh"),
+                                             launchpad=names.get("launchpad"),
+                                             token_holders=names.get("token_holders"),
+                                             token_socials=names.get("token_socials"))
                     if is_transfer_in else
                     render(
                         ev,
@@ -2231,6 +2304,10 @@ class Poller:
                     window_hours=window_h, buyers=buyers, senders=senders,
                     token_name=names.get("token_name"),
                     token_name_zh=names.get("token_name_zh"),
+                    # ⚠️ 同样只读缓存 —— 分发预警绝不为这三行新开请求
+                    launchpad=names.get("launchpad"),
+                    token_holders=names.get("token_holders"),
+                    token_socials=names.get("token_socials"),
                 )
                 logger.info("转入告警 | {} 人收到 ${} | {} {}", n, sym or "?", net, ca)
                 if dry_run:

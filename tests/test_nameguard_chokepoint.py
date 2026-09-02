@@ -36,6 +36,7 @@ from src.formatter import (
     ADDRESS_FIELDS,
     IDENT_FIELDS,
     UNTRUSTED_FIELDS,
+    URL_FIELDS,
     render,
     render_alpha_listing,
     render_pump_callout,
@@ -69,6 +70,11 @@ _EXPECT_UNTRUSTED = {
     #        → 🆕 … · <b>$CUM</b> · Join t.me/pumpgroup now
     #    两个复验者各自打出 39/40 与 40/40 的泄漏。现在与 token_name 同一道门。
     "name": "safe_display",              # 币安 Alpha 的币名,链上文本、陌生人可控
+    # ⚠️⚠️ 本轮 H1 新增:🚀 那行的发射台名,走 **safe_launchpad(封闭枚举)** ——
+    #    与 stock_exchange 同一套路数,**不是** safe_display。换成 safe_display
+    #    这条当场红,而那正是要防的:实测最常见的发射台名(Pump.fun / o1.exchange /
+    #    Four.meme / Feel.cash)全是域名形态,safe_display 会把 35.6% 的命中打掉。
+    "launchpad": "safe_launchpad",
 }
 _EXPECT_IDENT = {
     "token_symbol": "safe_ident",        # 币符号,陌生人可控($t.me/pumpgrp 曾原样进标题)
@@ -89,6 +95,13 @@ _EXPECT_IDENT = {
 _EXPECT_ADDRESS = {
     "contract_address": "safe_address",  # 币安 Alpha 上新那条推送的合约地址
 }
+# ⚠️⚠️ **URL 类字段**(本轮 H1 新增)。它是本项目第一个进 `<a href>` 的外部字符串,
+#    与前面三张表守的东西不是一个量级:前者最坏是读者读到一句假话,这个是
+#    读者**被带到攻击者的站点**,而链接文字还是我们自己写的「官网」。
+#    ⚠️ 门禁函数按**名字**比对(safe_social_links),换成任何一个别的名字这条当场红。
+_EXPECT_URL = {
+    "token_socials": "safe_social_links",  # DexScreener pair.info 的官网 / 社媒
+}
 # 已逐个复核、**不需要**门禁的参数。分三类:
 #   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
 #   b. 内部枚举或已归一化的标识(network_id / side / chain_display);
@@ -104,6 +117,10 @@ _EXPECT_REVIEWED = {
     "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
     "traded_at", "chain_display", "tx",
     "listing_time_ms", "market_cap",
+    # ⚠️ token_holders 是**数字**:取值层(tokeninfo.parse_holders)已经解析成 int
+    #    并把上游的哨兵 0 归成 None,形状门禁套在 int 上没有意义。
+    #    ⚠️ 它**不叫** holders —— 那个名字已经被两条推送各占一次了。
+    "token_holders",
     "thesis", "multiple", "likes", "view_count", "created_at",
 }
 
@@ -118,7 +135,9 @@ def test_收口表逐字对上():
     assert {n: fn.__name__ for n, fn in UNTRUSTED_FIELDS.items()} == _EXPECT_UNTRUSTED
     assert {n: fn.__name__ for n, fn in IDENT_FIELDS.items()} == _EXPECT_IDENT
     assert {n: fn.__name__ for n, fn in ADDRESS_FIELDS.items()} == _EXPECT_ADDRESS
-    tables = (set(UNTRUSTED_FIELDS), set(IDENT_FIELDS), set(ADDRESS_FIELDS))
+    assert {n: fn.__name__ for n, fn in URL_FIELDS.items()} == _EXPECT_URL
+    tables = (set(UNTRUSTED_FIELDS), set(IDENT_FIELDS), set(ADDRESS_FIELDS),
+              set(URL_FIELDS))
     assert len(set().union(*tables)) == sum(len(t) for t in tables), "一个字段只能有一道门"
 
 
@@ -132,7 +151,7 @@ def test_没有任何渲染参数是没登记过的():
        `if False and ...` 全量 0 红,这是实测过的);删掉之后不可能有人再退回去用它。
     """
     known = (set(_EXPECT_UNTRUSTED) | set(_EXPECT_IDENT) | set(_EXPECT_ADDRESS)
-             | _EXPECT_REVIEWED)
+             | set(_EXPECT_URL) | _EXPECT_REVIEWED)
     unknown = {}
     for fn in _RENDERERS:
         extra = sorted(n for n in inspect.signature(fn).parameters if n not in known)
@@ -144,7 +163,8 @@ def test_没有任何渲染参数是没登记过的():
 def test_登记了门禁的字段确实出现在渲染函数里():
     """⚠️ 反方向:表里登记了一个**根本不存在**的参数名,等于一条死规则,同样要红。"""
     params = {n for fn in _RENDERERS for n in inspect.signature(fn).parameters}
-    for name in list(_EXPECT_UNTRUSTED) + list(_EXPECT_IDENT) + list(_EXPECT_ADDRESS):
+    for name in (list(_EXPECT_UNTRUSTED) + list(_EXPECT_IDENT) + list(_EXPECT_ADDRESS)
+                 + list(_EXPECT_URL)):
         assert name in params, f"{name} 登记了门禁,却不是任何渲染函数的参数"
 
 
@@ -168,7 +188,8 @@ def test_每个渲染函数都真的挂了装饰器():
         assert hasattr(fn, "__guarded_fields__"), fn.__name__
         for name in fn.__guarded_fields__:
             assert (name in _EXPECT_UNTRUSTED or name in _EXPECT_IDENT
-                    or name in _EXPECT_ADDRESS), (fn.__name__, name)
+                    or name in _EXPECT_ADDRESS
+                    or name in _EXPECT_URL), (fn.__name__, name)
 
 
 def test_入口过一遍之后下游拿到的就是干净值():

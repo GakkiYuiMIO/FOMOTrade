@@ -370,6 +370,27 @@ def test_元数据请求绝不带鉴权头(monkeypatch):
     assert "authorization" not in keys, f"匿名端点带上了鉴权头: {keys}"
 
 
+def test_元数据请求必须带X_Supported_Chains头(monkeypatch):
+    """
+    ⚠️⚠️ 这个头**不是可选的优化**。真网络实测(2026-09-03):
+
+        带头   → HTTP 200,responseObject 有 1 条(CUM,robinhood/4663)
+        不带头 → HTTP 200,responseObject = []      ← 成功状态码 + 空数组
+
+    也就是说少了它,EVM 链(robinhood / base / bsc)的元数据**永远查不到**,
+    而且没有任何错误码、没有任何日志会说它错了 —— /chips 的分母静默退化成
+    本地推算,没有人会发现。上一版正是缺这个头。
+    ⚠️ 断言写死字面量,不从被测模块 import SUPPORTED_CHAINS ——
+       把常量改成空串时这条必须红。
+    """
+    box = _wired_post(monkeypatch, json.dumps(_FILTER_TOKENS_ENVELOPE))
+
+    C.fetch_token_meta(_CHIPS_CA, _SOLANA_NET_ID)
+
+    headers = {k.lower(): v for k, v in (box.get("headers") or {}).items()}
+    assert headers.get("x-supported-chains") == "1,56,143,4663,8453,1399811149", headers
+
+
 def test_元数据请求用的是chrome指纹(monkeypatch):
     """⚠️ 同上:匿名 ≠ 随便调。urllib 裸调实测 HTTP 430,指纹是必需品"""
     box = _wired_post(monkeypatch, json.dumps(_FILTER_TOKENS_ENVELOPE))
