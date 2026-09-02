@@ -62,9 +62,11 @@ from loguru import logger
 
 from src import store
 from src.config import get_settings
-from src.dexscreener import PoolQuoteLookup, notable
+from src.dexscreener import PoolQuoteLookup, notable, token_name
 from src.formatter import render_pump_callout, render_pump_trade
 from src.models import NETWORK_DISPLAY
+from src.namecn import NameGlossary
+from src.nameguard import safe_display
 
 # ============================================================
 # 端点
@@ -937,6 +939,9 @@ class PumpWatcher:
         # 底池对手资产(DexScreener,公开免鉴权)。自带 6 小时 TTL 缓存,
         # 挂在 watcher 上才跨得了轮;失败一律自己吞掉,绝不影响成交推送本身。
         self._pool_lookup = PoolQuoteLookup()
+        # 币名中文译名 + 底池对手股票事实(namecn:维基 / Google / Yahoo,公开免 key)。
+        # 自带 SQLite 缓存与每轮预算;同一条铁律:失败一律自己吞掉,绝不影响成交推送本身。
+        self._names = NameGlossary()
 
     # ---- 对外唯一入口 ----------------------------------------------------
     def run_once(self) -> int:
@@ -1037,6 +1042,11 @@ class PumpWatcher:
         #    30 个地址,而本轮的 mint 数被 fomo_pump_max_mints(≤15)钉住 ——
         #    提前批量问的代价恒定是"每条链 1 个请求",逐个懒查反而更贵。
         pool_quotes = self._pool_quotes(mints, by_mint)
+        # 币名/股票说明的每轮预算从这里起算(见 namecn.NameGlossary)
+        try:
+            self._names.begin_round()
+        except Exception:  # noqa: BLE001
+            pass
 
         sent = 0
         budget = MAX_PUSH_PER_ROUND
@@ -1059,9 +1069,9 @@ class PumpWatcher:
         ⚠️ 链取自持仓行的 network_id(已由 _CHAIN_ID_TO_NETWORK 归一化)。
            取不到链的 mint 直接跳过 —— 没链就没法按 chainId 过滤响应,**绝不拿别的链去试**。
         ⚠️⚠️ pump 覆盖的 solana / bsc / base 上都**没有**可靠的币股判据,
-           所以 lookup 在这几条链上一个请求都不发、也不会有这一行
-           (见 dexscreener.STOCK_NAME_MARKERS 里的调研记录)。这里的调用留着 ——
-           判据补上的那天,这一行和请求会一起自动回来。
+           所以这几条链上不会有 🌊 那一行(见 dexscreener.STOCK_NAME_MARKERS 里的调研记录)。
+           但请求**照发**:同一份响应里有这个币自己的全名(PoolQuote.token_name),
+           推送标题的英文全名与 📝 中文名行靠它。判据补上的那天,🌊 行会自动回来。
         ⚠️⚠️ 整段包在 try 里,失败一律降级为空。
            **绝不能出现"因为查不到底池对手所以成交没推出去"**。
         """
@@ -1175,7 +1185,9 @@ class PumpWatcher:
             # ⚠️ 只有对手是**币股**时 notable 才给东西 —— 绝大多数 pump 币对着 SOL,
             #    那一行是噪音;而 pump 覆盖的这几条链目前都没有币股判据(见 dexscreener)
             pq = notable((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
-            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq)
+            # 这个币自己的英文全名(同一份响应,与对手是谁无关)
+            tname = token_name((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname)
             sent += n
             used += tried
             if ok:
@@ -1219,18 +1231,55 @@ class PumpWatcher:
         """市值(带 TTL 缓存)。实现见 _coin_stats_cached —— 观点那个 watcher 共用同一份逻辑。"""
         return _coin_stats_cached(self._client, self._coin_cache, mint)
 
+    def _name_extras(self, symbol, pool_quote, name) -> dict:
+        """
+        A/B/C 三段 → render_pump_trade 的关键字参数;缺哪段没哪个键(那一行整行消失)。
+        与 poller._name_extras 同一套规矩:整段包在 try 里,**绝不能因为翻不出中文名
+        所以成交没推出去**。
+        ⚠️ pool_quote_name(🌊 那行的对手全名)优先用 Yahoo 的 longName
+           ("USA Rare Earth, Inc."),拿不到才退回 DexScreener 剥完后缀的 issuer。
+           ⚠️⚠️ 展示门禁**不在这里** —— 统一在 formatter 的渲染入口
+           (formatter.UNTRUSTED_FIELDS)。这里只在两个候选之间挑一个。
+        """
+        out: dict = {}
+        # 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名
+        if pool_quote is not None:
+            out["pool_quote_name"] = pool_quote.name
+        try:
+            if name is not None:
+                out["token_name"] = name
+                zh = self._names.token_zh(name, symbol)
+                if zh is not None:
+                    out["token_name_zh"] = zh
+            if pool_quote is not None and pool_quote.symbol:
+                info = self._names.stock_info(pool_quote.symbol)
+                if info is not None:
+                    # ⚠️ 这里调 safe_display **不是**展示门禁(那道统一在 formatter 的
+                    #    渲染入口,见 formatter.UNTRUSTED_FIELDS),而是在两个候选之间挑一个:
+                    #    Yahoo 的 longName 能显示才顶掉 DexScreener 那份,
+                    #    否则保留上一份 —— 而不是把 🌊 那行的全名清空。
+                    if info.long_name is not None and safe_display(info.long_name) is not None:
+                        out["pool_quote_name"] = info.long_name
+                    if info.company_zh is not None:
+                        out["stock_company_zh"] = info.company_zh
+                    if info.exchange is not None:
+                        out["stock_exchange"] = info.exchange
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pump.fun 币名/股票说明获取失败,相关行不显示 | {} | {}", symbol, e)
+        return out
+
     def _push(self, w: _Watched, pos: Position, fresh: list[Trade], budget: int,
               stats: CoinStats | None = None,
               holders_in_list: int | None = None,
-              pool_quote=None) -> tuple[bool, int, int]:
+              pool_quote=None, token_name_en: str | None = None) -> tuple[bool, int, int]:
         """
         逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
 
         budget 是**本轮剩下的全局额度**(不是这个人这个币的额度)——
         超出的部分本轮不发,靠 all_ok=False 让快照不前移、下一轮接着推。
 
-        stats / holders_in_list / pool_quote 允许为 None(市值问不到 / 没算 /
-        对手是常见计价资产)—— 对应的行整行消失,成交本身照推。
+        stats / holders_in_list / pool_quote / token_name_en 允许为 None(市值问不到 / 没算 /
+        对手是常见计价资产 / DexScreener 没这个币)—— 对应的行整行消失,成交本身照推。
         **它们没有一个是推送的前置条件。**
 
         ⚠️⚠️ **推送成功才记台账**(与 poller._dispatch 的 `ok = notifier.send(...)`
@@ -1248,6 +1297,8 @@ class PumpWatcher:
                            w.username or w.user_id, pos.coin_mint, len(fresh),
                            budget, budget)
             fresh, all_ok = fresh[:budget], False
+        # 英文全名(A)/ 中文名(C)/ 股票说明(B):一个币算一次,这几笔共用
+        names = self._name_extras(pos.symbol, pool_quote, token_name_en)
         for t in fresh:
             text = render_pump_trade(
                 username=w.username,
@@ -1271,7 +1322,8 @@ class PumpWatcher:
                 chain_display=pos.chain_display,
                 tx=t.tx,
                 pool_quote_symbol=None if pool_quote is None else pool_quote.symbol,
-                pool_quote_name=None if pool_quote is None else pool_quote.name,
+                # ⚠️ pool_quote_name 在 names 里(Yahoo 的 longName 优先),别再传一份
+                **names,
             )
             if not self._notifier.send(text):
                 logger.error("pump.fun 成交推送失败(下一轮重试) | user={} mint={} tx={}",

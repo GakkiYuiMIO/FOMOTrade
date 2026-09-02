@@ -536,17 +536,40 @@ def test_持有人为0照常显示():
     assert "持有人 0" in _render(holders="0")
 
 
-def test_币名里的尖括号必须转义且只转一次():
+def test_符号里的尖括号必须转义且只转一次():
     """
     ⚠️ name/symbol 来自链上,是**陌生人可控的任意字符串**。一个裸 '<' 就让整条消息
        400 —— 既是稳定性问题,更是"改个币名就让监控静默失效"的攻击面。
+    ⚠️⚠️ **转义这件事本轮改在 symbol 上验**(G3):`name` 从本轮起走 safe_display,
+       而 `<` `&` 都不在那道的字符白名单里 —— 带尖括号的 name 现在是**整段丢弃**,
+       没有"转义后显示"这回事了(下面那条测的就是这个)。symbol 走的是轻门禁
+       safe_ident(只判形态、不判字符集),尖括号照旧进来、照旧由 _clip 转义,
+       所以"转义且只转一次"这条不变量仍然有一个真实的落点钉着。
     """
-    msg = _render(symbol="<b>PWN</b>", name="a & b <script>")
+    msg = _render(symbol="a & b <script>", name="Teller")
     assert "<script>" not in msg
     assert "&lt;script&gt;" in msg
     assert "&amp; b" in msg
     assert "&amp;amp;" not in msg, "转义了两次的话用户会看到 &amp;lt;"
     assert _html_ok(msg)
+
+
+def test_币名带尖括号时整段丢弃而不是转义后显示():
+    """
+    ⚠️⚠️ G3:`name` 从本轮起与 token_name 同一道门(safe_display)+ 同一个 `「」`
+       视觉容器。`<` `&` 不在字符白名单里 → **整段丢弃**,标题就没有币名那一段。
+    ⚠️ 这不是"少显示了一点东西":上一版 name 既不过门禁也不套容器,直接拼在
+       标题行的 SEP 之后,于是 name='已清仓 · 亏损 99%' 能凭空造出两个假字段。
+    """
+    msg = _render(symbol="PWN", name="a & b <script>")
+    head = msg.split("\n")[0]
+    assert head == "🆕 <b>币安 Alpha 新上架</b> · <b>$PWN</b>", head
+    assert _html_ok(msg)
+    # 伪造字段那一条:整段丢弃,标题里连一个字都不剩
+    assert "已清仓" not in _render(symbol="PWN", name="已清仓 · 亏损 99%")
+    assert "t.me" not in _render(symbol="PWN", name="Join t.me/pumpgroup now")
+    # 对照:正常币名照常显示,并且**套在 `「」` 里**
+    assert " · 「Teller」" in _render(symbol="PWN", name="Teller")
 
 
 def test_超长币名不会顶破长度预算也不会破坏HTML():

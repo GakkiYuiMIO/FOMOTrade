@@ -1,0 +1,21 @@
+{
+ "batchcomplete": "",
+ "query": {
+  "pages": {
+   "19007": {
+    "pageid": 19007,
+    "ns": 0,
+    "title": "Mercury",
+    "langlinks": [
+     {
+      "lang": "zh",
+      "*": "Mercury"
+     }
+    ],
+    "pageprops": {
+     "disambiguation": ""
+    }
+   }
+  }
+ }
+}

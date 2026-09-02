@@ -1,0 +1,99 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "NVDA",
+     "exchangeName": "NMS",
+     "fullExchangeName": "NasdaqGS",
+     "instrumentType": "EQUITY",
+     "firstTradeDate": 917015400,
+     "regularMarketTime": 1788292800,
+     "hasPrePostMarketData": true,
+     "gmtoffset": -14400,
+     "timezone": "EDT",
+     "exchangeTimezoneName": "America/New_York",
+     "regularMarketPrice": 217.44,
+     "regularMarketChangePercent": -1.388,
+     "fiftyTwoWeekHigh": 236.54,
+     "fiftyTwoWeekLow": 164.07,
+     "regularMarketDayHigh": 220.41,
+     "regularMarketDayLow": 215.1,
+     "regularMarketVolume": 106942626,
+     "longName": "NVIDIA Corporation",
+     "shortName": "NVIDIA Corporation",
+     "chartPreviousClose": 220.5,
+     "priceHint": 2,
+     "currentTradingPeriod": {
+      "pre": {
+       "timezone": "EDT",
+       "start": 1788336000,
+       "end": 1788355800,
+       "gmtoffset": -14400
+      },
+      "regular": {
+       "timezone": "EDT",
+       "start": 1788355800,
+       "end": 1788379200,
+       "gmtoffset": -14400
+      },
+      "post": {
+       "timezone": "EDT",
+       "start": 1788379200,
+       "end": 1788393600,
+       "gmtoffset": -14400
+      }
+     },
+     "dataGranularity": "1d",
+     "range": "1d",
+     "validRanges": [
+      "1d",
+      "5d",
+      "1mo",
+      "3mo",
+      "6mo",
+      "1y",
+      "2y",
+      "5y",
+      "10y",
+      "ytd",
+      "max"
+     ]
+    },
+    "timestamp": [
+     1788269400
+    ],
+    "indicators": {
+     "quote": [
+      {
+       "low": [
+        215.10000610351562
+       ],
+       "open": [
+        216.75
+       ],
+       "close": [
+        217.44000244140625
+       ],
+       "high": [
+        220.41000366210938
+       ],
+       "volume": [
+        109484400
+       ]
+      }
+     ],
+     "adjclose": [
+      {
+       "adjclose": [
+        217.44000244140625
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}

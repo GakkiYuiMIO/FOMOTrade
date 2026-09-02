@@ -2900,10 +2900,11 @@ class Test底池对手:
         assert _watcher_with_dex(tg, client, dex).run_once() == 1
         assert "🌊" not in tg.sent[0]
 
-    def test_没有币股判据的链一个请求都不发(self, db, cfg):
+    def test_没有币股判据的链照发请求取币名(self, db, cfg):
         """
-        ⚠️⚠️ 那条链上这一行**永远显示不出来**,为它打一轮请求是纯浪费。
-           实测口径:pump 侧因此从"每轮每条链一个请求"变成 **0 个请求**。
+        ⚠️⚠️ **闸门语义变了,如实记在这里**:曾经是"没判据的链 0 个请求"(那份响应只为
+           🌊 行服务)。现在同一份响应还承担币名 —— 推送标题的英文全名与 📝 中文名行,
+           所以 solana / bsc 照发请求(每个 mint 一个),🌊 行仍不出现(见上一条)。
         """
         seeded_user()
         client = FakeClient(
@@ -2913,7 +2914,7 @@ class Test底池对手:
             trades={MINT_SOL: trade_payload(), MINT_BSC: trade_payload()})
         dex = _FakeDex([[], []])
         _watcher_with_dex(FakeNotifier(), client, dex).run_once()
-        assert dex.calls == [], "在没有币股判据的链上白打了请求"
+        assert sorted(dex.calls) == sorted([(MINT_SOL,), (MINT_BSC,)]),             "没判据的链上没发请求,币名就拿不到"
 
     def test_底池查询失败也照推成交(self, db, cfg):
         """⚠️⚠️ 绝不能出现"因为查不到底池对手所以成交没推出去"。"""

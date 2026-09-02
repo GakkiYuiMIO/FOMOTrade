@@ -165,3 +165,24 @@ def force_stats(conn, user_id: str, network_id: str, token_address: str,
         "VALUES (?, ?, ?, ?, ?, '2026-08-01T00:00:00+00:00')",
         (user_id, network_id, token_address, buy_count, first_buy_at),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_namecn_network(monkeypatch):
+    """
+    整场测试的兜底防线之三:**没有任何一条用例可以真的去打维基 / Google / Yahoo**。
+
+    ⚠️⚠️ 与 _no_dexscreener_network 同一条理由:Poller / PumpWatcher 在 __init__ 里各建一个
+       NameGlossary,它默认自带真实的 curl_cffi 传输层。一条给了 DexScreener 假响应的用例
+       (币名因此有了)会顺着 token_zh → 维基/Google 真的发请求出去。
+    ⚠️ 桩成"网络失败"(抛 UnavailableError)而不是返回假数据:那是这个功能的正常降级路径
+       (中文名 / 股票说明那几行整行消失),于是**没显式关心它们的用例行为与改造前完全一致**。
+       要测这条路的用例自己注入 NameGlossary(client=NameClient(transport=假传输层))。
+    """
+    from src import namecn as _n
+
+    def _boom(self, url, params=None, headers=None):
+        raise _n.UnavailableError("测试环境禁止外呼")
+
+    monkeypatch.setattr(_n.CurlTransport, "get_json", _boom)
+    yield

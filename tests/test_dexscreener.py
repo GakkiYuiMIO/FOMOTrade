@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from src import dexscreener as dx
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -615,16 +617,20 @@ class Test地址大小写:
 # 发不发请求
 # ============================================================
 class Test请求闸门:
-    def test_没有币股判据的链一个请求都不发(self):
+    def test_没有币股判据的链照发请求取币名但不做币股判定(self):
         """
-        ⚠️⚠️ 那条链上这一行**永远显示不出来**(notable 一律给 None),
-           为一个必然不显示的东西打一轮请求是纯浪费。
-           加判据的那天请求会自动跟着回来 —— 两件事共用同一张表,不会 drift。
+        ⚠️⚠️ **闸门语义变了,如实记在这里**:这里曾经是"没判据的链一个请求都不发"
+           (那时这份响应只为 🌊 行服务)。现在同一份响应还承担**币名**(token_name),
+           四条链的推送标题都要它 —— 所以没判据的链**照发请求**,但对手一律
+           **不判成币股**(is_stock=False,🌊 行照旧不出现)。
         """
         for net in ("solana", "bsc", "base"):
-            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
-            assert dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI]) == {}
-            assert fake.calls == [], f"{net} 上白打了请求"
+            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH, chain=net)]])
+            got = dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI])
+            assert fake.calls == [(CA_AI,)], f"{net} 上没发请求,币名就拿不到"
+            assert got[CA_AI].token_name == "Artificial Inu", f"{net} 上没取到币名"
+            assert got[CA_AI].is_stock is False, f"{net} 上没判据却判成了币股"
+            assert dx.notable(got, CA_AI) is None, f"{net} 上 🌊 行不该出现"
 
     def test_映射不到的链一个请求都不发(self):
         fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
@@ -845,3 +851,144 @@ class Test故障隔离:
         fake = FakeDex()
         dx.PoolQuoteLookup(client=fake).close()
         assert fake.closed == 1
+
+
+# ============================================================
+# 币自己的名字(token_name)—— 真实响应:$CUM(2026-09-02 录)
+# ============================================================
+CA_CUM = "0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18"
+
+
+class Test币名:
+    def test_真实响应里取到CUM的全名与对手(self):
+        """同一份响应:我方一侧是 CUM · Cummingtonite,最深池对手是 USAR(币股)。"""
+        quotes = dx.parse_pool_quotes(_load("dexscreener_latest_cum.json"), "robinhood", {CA_CUM})
+        pq = quotes[CA_CUM]
+        assert pq.token_symbol == "CUM"
+        assert pq.token_name == "Cummingtonite"
+        assert pq.symbol == "USAR" and pq.is_stock is True and pq.issuer == "USA Rare Earth"
+        assert dx.token_name(quotes, CA_CUM) == "Cummingtonite"
+        assert dx.token_name(quotes, CA_CUM.upper().replace("0X", "0x")) == "Cummingtonite", "入参要归一化"
+
+    def test_我方在quote一侧时也取对(self):
+        """base/quote 方向不固定:我们是 quoteToken 时,币名取 quote 那一侧,不能拿对手的名字。"""
+        pair = _pair(CA_NVDA_RH, CA_AI_CHECKSUM, base_sym="NVDA", base_name="NVIDIA • Robinhood Token",
+                     quote_sym="AI", quote_name="Artificial Inu")
+        pq = dx.parse_pool_quote(pair, "robinhood", CA_AI)
+        assert pq.token_name == "Artificial Inu" and pq.token_symbol == "AI"
+        assert pq.symbol == "NVDA"
+
+    def test_四条链都取币名(self):
+        for net in ("solana", "bsc", "base", "robinhood"):
+            fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH, chain=net)]])
+            got = dx.PoolQuoteLookup(client=fake).lookup(net, [CA_AI])
+            assert dx.token_name(got, CA_AI) == "Artificial Inu", net
+
+    def test_没有名字整段消失(self):
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH)
+        pair["baseToken"].pop("name")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name is None
+        assert dx.token_name({}, CA_AI) is None
+        assert dx.token_name({}, None) is None
+
+    def test_只读缓存不发请求(self):
+        fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
+        lk = dx.PoolQuoteLookup(client=fake)
+        assert lk.cached("robinhood", CA_AI) is None
+        assert fake.calls == []
+        lk.lookup("robinhood", [CA_AI])
+        assert lk.cached("robinhood", CA_AI_CHECKSUM).token_name == "Artificial Inu"
+        assert lk.cached("robinhood", CA_CASHCAT) is None
+        assert lk.cached("solana", CA_AI) is None
+        assert len(fake.calls) == 1
+
+    def test_只读缓存尊重TTL(self):
+        fake = FakeDex([[_pair(CA_AI_CHECKSUM, CA_NVDA_RH)]])
+        lk = dx.PoolQuoteLookup(client=fake, ttl=0.0)
+        lk.lookup("robinhood", [CA_AI])
+        assert lk.cached("robinhood", CA_AI) is None, "过期的缓存不能再给出去"
+
+
+# ============================================================
+# 币股后缀:**币名**也走同一张表剥掉后缀(与 issuer 复用同一份逻辑)
+# ============================================================
+class Test币名也剥币股后缀:
+    """
+    ⚠️⚠️ 上一轮 robinhood 链实测 80 个币名,其中带 " • Robinhood Token" 后缀的 5 个
+       **全部**过不了展示门禁(`•` 不在字符白名单里),名字连同 📝 行一起消失 ——
+       6.25% 的币白白丢掉名字。而 `•` 恰恰是本模块用来**识别币股**的判据
+       (STOCK_NAME_MARKERS),后缀是判据不是信息,剥掉再送门禁就行。
+    ⚠️ 剥后缀**复用 _classify_stock**(对手那一侧本来就在用),不复制第二份 ——
+       一份表放两个地方早晚走岔。
+    """
+
+    _CASES = [
+        ("Circle Internet Group • Robinhood Token", "Circle Internet Group"),
+        ("AMC Entertainment • Robinhood Token", "AMC Entertainment"),
+        ("Meta Platforms • Robinhood Token", "Meta Platforms"),
+        ("United States Oil Fund • Robinhood Token", "United States Oil Fund"),
+        ("ASML Holding NV • Robinhood Token", "ASML Holding NV"),
+    ]
+
+    @pytest.mark.parametrize(("raw", "want"), _CASES, ids=[c[1] for c in _CASES])
+    def test_五个真实币股名剥完后缀就能显示了(self, raw, want):
+        from src.nameguard import safe_display
+
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name=raw)
+        pq = dx.parse_pool_quote(pair, "robinhood", CA_AI)
+        assert pq.token_name == want
+        # ⚠️ 这半句才是这条测试的目的:剥完之后**过得了展示门禁**
+        assert safe_display(pq.token_name) == want
+        # ⚠️⚠️ 剥后缀的**收益**本轮变了:`•` 已经进了名字侧的字符白名单(F1a),
+        #    所以原名自己也过得了门禁 —— 剥的理由从"不剥就整段消失"变成了
+        #    "后缀是判据不是信息,印在推送里只占地方"(它对每一条命中的记录都一样)。
+        #    ⚠️ 只有超长/超词数的那几个原名仍然过不了(见 Test剥后缀不放宽任何预算)。
+
+    def test_剥完的名字与原名走的是同一套预算(self):
+        """
+        ⚠️⚠️ 复验者提过一条 MAJOR:'Buy now 100% safe visit • Robinhood Token' 剥后是
+           5 个词、放行,而硬基线里 'Buy now 100% safe visit my profile'(7 词)必拦 ——
+           结论写的是"加个后缀就能钻到词数上限以下"。**那两个是不同的串**。
+           这条测试把真正的推理钉住:剥后缀**不给攻击者任何额外预算** ——
+           显示出来的永远是剥完那份,而它与"直接把币起成这个名字"完全等价。
+        ⚠️ 谁把"原名也必须过 safe_display"加回去,先看这条测试列的代价:
+           三个**真币股**的原名会因为后缀本身占掉 2 个词 / 17 个字符而整段消失。
+        """
+        from src.nameguard import safe_display
+
+        # (a) 后缀不放宽预算:带后缀与不带后缀,显示出来的是同一个串
+        for stem in ("Buy now safe airdrop visit", "FREE AIRDROP CLAIM NOW", "Nice Coin"):
+            pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH,
+                         base_name=f"{stem} • Robinhood Token")
+            assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name == stem
+            assert safe_display(stem) == stem, "不加后缀直接起这个名字,结果一模一样"
+
+        # (b) 后缀藏不住任何被必拦形态:剥完仍然过不了门禁 → 整段丢弃
+        for bad in ("t.me/scam", "0x7a6a3b93cb3ffead", "已清仓 · 亏损 99%",
+                    "Send SOL to my wallet now"):
+            pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name=f"{bad} • Robinhood Token")
+            got = dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name
+            assert safe_display(got) is None, bad
+
+        # (c) 代价对照:这三个**真币股原名**自己过不了门禁(后缀占了 2 词 17 字符)
+        for real in ("SPDR S&P 500 ETF Trust • Robinhood Token",
+                     "United States Oil Fund • Robinhood Token",
+                     "Space Exploration Technologies Corp. • Robinhood Token"):
+            assert safe_display(real) is None, real
+            stem = real[:-len(" • Robinhood Token")]
+            assert safe_display(stem) == stem, f"剥完之后它是一个正常名字:{stem}"
+
+    def test_没有币股判据的链原样不动(self):
+        """⚠️ 判据按链定义;solana 上没有判据,名字里就算带 `•` 也不剥(不猜)。"""
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="Foo • Robinhood Token",
+                     chain="solana")
+        assert dx.parse_pool_quote(pair, "solana", CA_AI).token_name == "Foo • Robinhood Token"
+
+    def test_名字只剩一个光秃秃的后缀就没有名字(self):
+        """⚠️ 剥完是空 → None,标题不加尾巴。绝不回退去印那个后缀,也绝不打占位符。"""
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="• Robinhood Token")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name is None
+
+    def test_普通币名不受影响(self):
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="Artificial Inu")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name == "Artificial Inu"
