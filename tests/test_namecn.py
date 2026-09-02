@@ -131,6 +131,18 @@ YAHOO_BTC = _load("yahoo_chart_btcusd.json")
 YAHOO_MISSING = (404, _load("yahoo_chart_missing.json"))
 
 
+def _yahoo(long_name: str, exchange: str = "NasdaqGM", itype: str = "EQUITY") -> dict:
+    """按真实 v8/finance/chart 的形状造一份响应(只保留本模块读的那三个字段)。"""
+    return {"chart": {"result": [{"meta": {"longName": long_name,
+                                           "fullExchangeName": exchange,
+                                           "instrumentType": itype}}], "error": None}}
+
+
+def _yahoo_error(code: str, description: str = "boom") -> dict:
+    """Yahoo 出错时的 body:result 为 null + 一个 error 对象。"""
+    return {"chart": {"result": None, "error": {"code": code, "description": description}}}
+
+
 # ============================================================
 # 解析(纯函数)
 # ============================================================
@@ -464,22 +476,19 @@ class Test缓存:
 # 每 tick 预算
 # ============================================================
 class Test预算:
-    def test_翻译每tick上限5次(self, conn):
-        """6 个名字各走一次维基(查无、不再走 Google):只发 5 个请求,第 6 个这一轮没有。"""
+    def test_币名翻译每tick上限8次(self, conn):
+        """维基查无再走 Google,一个名字吃 2 次 → 4 个新名字用满 8 次,第 5 个这一轮没有。"""
         ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 10, "google": [[[["译", "x"]]]] * 10})
-        g = _glossary(conn, ft, translate_calls=5)
-        # 维基 miss 后会接 Google,每个名字吃 2 次;用 boom 让 Google 失败也照样计数 —— 这里
-        # 直接给 Google 响应,名字 1/2 各吃 2 次、名字 3 吃到第 5 次后 Google 那次没预算
-        names = ["Alpha One", "Beta Two", "Gamma Three", "Delta Four"]
+        g = _glossary(conn, ft, token_calls=8)
+        names = ["Alpha One", "Beta Two", "Gamma Three", "Delta Four", "Echo Five", "Foxtrot Six"]
         got = [g.token_zh(n, "X") for n in names]
-        assert len(ft.calls) == 5, ft.calls
-        assert got[:2] == ["译", "译"]
-        assert got[2] is None and got[3] is None
-        assert ft.calls[-1] == ("wiki_en", "Gamma Three")
+        assert len(ft.calls) == 8, ft.calls
+        assert got[:4] == ["译"] * 4
+        assert got[4] is None and got[5] is None
 
     def test_维基两跳只算一次(self, conn):
         ft = FakeTransport({"wiki_en": [WIKI_CUM, WIKI_NVIDIA], "wiki_zh": [WIKI_CUM_ZH, WIKI_NVIDIA_ZH]})
-        g = _glossary(conn, ft, translate_calls=2)
+        g = _glossary(conn, ft, token_calls=2)
         assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"
         assert g.token_zh("NVIDIA", "NV") == "英伟达"
         assert len(ft.calls) == 4
@@ -487,7 +496,7 @@ class Test预算:
     def test_超预算的不入缓存下一轮重来(self, conn):
         ft = FakeTransport({"wiki_en": [WIKI_MISSING, WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH],
                             "google": [[[["译", "x"]]]]})
-        g = _glossary(conn, ft, translate_calls=2)
+        g = _glossary(conn, ft, token_calls=2)
         assert g.token_zh("Alpha One", "A") == "译"          # 用掉 2 次
         assert g.token_zh("Cummingtonite", "CUM") is None    # 没预算
         assert _row(conn, "token_zh", "cummingtonite") is None
@@ -496,7 +505,7 @@ class Test预算:
 
     def test_缓存命中不计预算(self, conn):
         ft = FakeTransport({"wiki_en": [WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH]})
-        g = _glossary(conn, ft, translate_calls=1)
+        g = _glossary(conn, ft, token_calls=1)
         assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"
         g.begin_round()
         for _ in range(10):
@@ -513,32 +522,111 @@ class Test预算:
 
     def test_Yahoo每tick上限5次(self, conn):
         ft = FakeTransport({"yahoo": [YAHOO_USAR] * 10, "wiki_en": [WIKI_MISSING] * 10}, boom={"google"})
-        g = _glossary(conn, ft, yahoo_calls=5, translate_calls=100)
+        g = _glossary(conn, ft, yahoo_calls=5, company_calls=100)
         got = [g.stock_info(f"T{i}") for i in range(7)]
         assert sum(1 for k, _ in ft.calls if k == "yahoo") == 5
         assert all(x is not None for x in got[:5]) and got[5] is None and got[6] is None
 
-    def test_默认上限就是5和5(self, conn):
+    def test_公司名翻译每tick上限4次(self, conn):
+        """公司名一本账 4 次:维基查无再走 Google 一个吃 2 次 → 2 个新公司名。"""
+        ft = FakeTransport({"yahoo": [_yahoo(f"Company Number {i} Inc.") for i in range(4)],
+                            "wiki_en": [WIKI_MISSING] * 10,
+                            "google": [[[["某某公司", "x"]]]] * 10})
+        g = _glossary(conn, ft, company_calls=4, yahoo_calls=10)
+        got = [g.stock_info(f"TK{i}") for i in range(4)]
+        assert [i.company_zh for i in got] == ["某某公司", "某某公司", None, None]
+        assert sum(1 for k, _ in ft.calls if k in ("wiki_en", "google")) == 4
+
+    def test_币名与公司名的预算互不侵占(self, conn):
+        """
+        ⚠️⚠️ 这是 MAJOR-4 的核心:两者合用一本账时,一个币股底池的公司名
+           (维基查无 + Google = 2 次)就能把币名预算吃掉一半 ——
+           实测空缓存下 3 个新币就耗尽,第 3 个币拿不到中文名。
+        """
+        ft = FakeTransport({"yahoo": [_yahoo("Foo Bar Inc.")],
+                            "wiki_en": [WIKI_MISSING] * 10,
+                            "google": [[[["译文", "x"]]]] * 10})
+        g = _glossary(conn, ft, token_calls=2, company_calls=2, yahoo_calls=1)
+        # 公司名先把自己那本账用光(维基 + Google = 2 次)
+        assert g.stock_info("FOO").company_zh == "译文"
+        # 币名那本账**一点没被动过**:仍然能补一个全新币名
+        assert g.token_zh("Alpha One", "A") == "译文"
+        # 币名那本账用光之后,轮到它自己没有
+        assert g.token_zh("Beta Two", "B") is None
+
+    def test_默认上限是8和4和5(self, conn):
         """不传参数时的默认值 —— 上面那些用例都显式传了上限,这里钉住默认值本身。"""
-        ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 20, "yahoo": [YAHOO_USAR] * 20}, boom={"google"})
+        ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 30,
+                            "yahoo": [_yahoo(f"Company Number {i} Inc.") for i in range(10)]},
+                           boom={"google"})
         g = _glossary(conn, ft)
-        for i in range(8):
+        for i in range(10):
             g.token_zh(f"Name Number {i}", "X")
-        # 名字 0/1 各吃 维基+Google 两次,名字 2 吃到第 5 次(维基)后 Google 没预算:3 + 2 = 5
-        assert [k for k, _ in ft.calls] == ["wiki_en", "google", "wiki_en", "google", "wiki_en"]
-        for i in range(8):
+        assert sum(1 for k, _ in ft.calls if k in ("wiki_en", "google")) == 8
+        n_token = len(ft.calls)
+        for i in range(10):
             g.stock_info(f"TK{i}")
         assert sum(1 for k, _ in ft.calls if k == "yahoo") == 5
+        assert len(ft.calls) - n_token - 5 == 4, "公司名翻译那本账不是 4"
 
     def test_begin_round重置预算(self, conn):
         ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 4}, boom={"google"})
-        g = _glossary(conn, ft, translate_calls=2)
+        g = _glossary(conn, ft, token_calls=2)
         assert g.token_zh("Alpha One", "A") is None
         assert g.token_zh("Beta Two", "B") is None     # 第二次:wiki 用光预算,Google 没预算
         assert len(ft.calls) == 2
         g.begin_round()
         g.token_zh("Gamma Three", "C")             # 维基 + Google(失败)= 2 次
         assert len(ft.calls) == 4
+
+
+# ============================================================
+# 墙钟闸门 —— 真正要防的是"外部接口把 tick 拖慢",次数只是它的代理指标
+# ============================================================
+class Test墙钟预算:
+    @staticmethod
+    def _slow_clock(monkeypatch, step: float):
+        """每次读 monotonic 都往前跳 step 秒 —— 一次外部调用读两次(进/出),即每次 2×step。"""
+        state = {"t": 0.0}
+
+        def _fake():
+            state["t"] += step
+            return state["t"]
+
+        monkeypatch.setattr(nc.time, "monotonic", _fake)
+        return state
+
+    def test_墙钟到了就停不再外呼(self, conn, monkeypatch):
+        self._slow_clock(monkeypatch, 0.6)      # 每次外部调用 1.2s
+        ft = FakeTransport({"wiki_en": [WIKI_CUM, WIKI_NVIDIA], "wiki_zh": [WIKI_CUM_ZH, WIKI_NVIDIA_ZH]})
+        g = _glossary(conn, ft, token_calls=100, wall_clock_sec=1.0)
+        assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"   # 两跳 = 2.4s,已超 2.0
+        assert g.token_zh("NVIDIA", "NV") is None
+        assert len(ft.calls) == 2, ft.calls
+
+    def test_墙钟挡下的不入缓存(self, conn, monkeypatch):
+        self._slow_clock(monkeypatch, 5.0)
+        ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 4, "google": [[[["译", "x"]]]] * 4})
+        g = _glossary(conn, ft, token_calls=100, wall_clock_sec=1.0)
+        assert g.token_zh("Alpha One", "A") is None    # 维基 miss 花掉 10s,Google 那次被墙钟挡住
+        assert _row(conn, "token_zh", "alpha one") is None, "被闸门挡下的 key 不该留下任何缓存"
+
+    def test_begin_round把墙钟也归零(self, conn, monkeypatch):
+        self._slow_clock(monkeypatch, 0.6)
+        ft = FakeTransport({"wiki_en": [WIKI_CUM, WIKI_NVIDIA], "wiki_zh": [WIKI_CUM_ZH, WIKI_NVIDIA_ZH]})
+        g = _glossary(conn, ft, token_calls=100, wall_clock_sec=1.0)
+        assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"
+        g.begin_round()
+        assert g.token_zh("NVIDIA", "NV") == "英伟达"
+        assert len(ft.calls) == 4
+
+    def test_墙钟对Yahoo同样有效(self, conn, monkeypatch):
+        self._slow_clock(monkeypatch, 5.0)
+        ft = FakeTransport({"yahoo": [YAHOO_USAR, _yahoo("Other Co.")]}, boom={"wiki_en", "google"})
+        g = _glossary(conn, ft, yahoo_calls=100, company_calls=0, wall_clock_sec=1.0)
+        assert g.stock_info("USAR") is not None
+        assert g.stock_info("OTHR") is None
+        assert sum(1 for k, _ in ft.calls if k == "yahoo") == 1
 
 
 # ============================================================
@@ -645,3 +733,125 @@ class Test异常不外泄:
         g = nc.NameGlossary(client=Weird(), conn_factory=lambda: _keep(conn))
         assert g.token_zh("Cummingtonite", "CUM") is None
         assert g.stock_info("USAR") is None
+
+
+# ============================================================
+# MINOR-5:Yahoo 非 2xx 但 body 带 chart.error 时,是"失败"不是"查无"
+# ============================================================
+class TestYahoo失败与查无分得开:
+    @pytest.fixture(autouse=True)
+    def _t0(self, monkeypatch):
+        monkeypatch.setattr(nc.time, "time", lambda: 1_800_000_000.0)
+
+    def test_404加NotFound才是查无缓存30天(self, conn):
+        ft = FakeTransport({"yahoo": [(404, _yahoo_error("Not Found", "No data found"))]})
+        assert _glossary(conn, ft).stock_info("ZZZQ") is None
+        row = _row(conn, "stock_fact", "zzzq")
+        assert row["source"] == "miss"
+        assert row["expires_at"] == int(1_800_000_000.0 + 2592000)
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    def test_限流与服务端错误按失败缓存1小时(self, conn, status):
+        """
+        ⚠️⚠️ Yahoo 限流 / 挂掉时**也**回一个带 chart.error 的 body。
+           先看 body 再看状态码 = 把一次限流当成"这个代码不存在",按住整整 30 天。
+        """
+        ft = FakeTransport({"yahoo": [(status, _yahoo_error("Too Many Requests"))]})
+        assert _glossary(conn, ft).stock_info("USAR") is None
+        row = _row(conn, "stock_fact", "usar")
+        assert row["source"] == "error", f"HTTP {status} 被当成查无了"
+        assert row["expires_at"] == int(1_800_000_000.0 + 3600)
+
+    def test_2xx但结构解析不出按失败缓存1小时(self, conn):
+        """与 Google 那条"响应结构变了按失败处理"对齐:接口改了结构不是"代码不存在"。"""
+        for body in ({"oops": 1}, {"chart": {"result": []}}, {"chart": {"result": [{}]}}):
+            c = sqlite3.connect(":memory:", isolation_level=None)
+            c.row_factory = sqlite3.Row
+            store.init_db(c)
+            ft = FakeTransport({"yahoo": [body]})
+            assert nc.NameGlossary(client=nc.NameClient(transport=ft),
+                                   conn_factory=lambda c=c: _keep(c)).stock_info("USAR") is None
+            row = _row(c, "stock_fact", "usar")
+            assert row["source"] == "error" and row["expires_at"] == int(1_800_000_000.0 + 3600), body
+            c.close()
+
+    def test_2xx带error仍算查无(self, conn):
+        """Yahoo 偶尔对未知代码回 200 + error —— 那是真的"没有这个代码"。"""
+        ft = FakeTransport({"yahoo": [_yahoo_error("Not Found")]})
+        assert _glossary(conn, ft).stock_info("ZZZQ") is None
+        assert _row(conn, "stock_fact", "zzzq")["source"] == "miss"
+
+
+# ============================================================
+# MINOR-8:译文与**送去查维基的那个词**相同,也算"正式中文名就是它自己"
+# ============================================================
+class Test译文等于原文:
+    def test_公司名与剥完后缀的词相同也整段不出现(self, conn):
+        """
+        ⚠️ 公司名送维基查的是**剥掉后缀**的词(long_name "Foo Bar Inc." → wiki_term "Foo Bar"),
+           只跟 long_name 比就会漏:zh == wiki_term 时那是英文名本身,不是中文名。
+        """
+        wiki = {"query": {"pages": {"1": {"langlinks": [{"lang": "zh", "*": "Foo Bar"}]}}}}
+        ft = FakeTransport({"yahoo": [_yahoo("Foo Bar Inc.")], "wiki_en": [wiki],
+                            "wiki_zh": [{"parse": {"displaytitle": "Foo Bar"}}],
+                            "google": [[[["富巴", "x"]]]]})
+        info = _glossary(conn, ft).stock_info("FOO")
+        assert info is not None and info.company_zh is None, "英文名被当成中文名收下了"
+        assert [k for k, _ in ft.calls] == ["yahoo", "wiki_en", "wiki_zh"], "不该再去问 Google"
+        row = _row(conn, "company_zh", "foo bar inc.")
+        assert row["value"] is None and row["source"] == "wiki-same" and row["expires_at"] is None
+
+    def test_SPCX那条不再渲染成等于SpaceX(self, conn):
+        """
+        真网络实测过的那条:SPCX → longName "Space Exploration Technologies Corp."
+        → wiki_term "Space Exploration Technologies" → 维基重定向 → zh "SpaceX"。
+        它是**英文**,不该进中文名槽位。
+        """
+        wiki = {"query": {"pages": {"1": {"langlinks": [{"lang": "zh", "*": "SpaceX"}]}}}}
+        ft = FakeTransport({"yahoo": [_yahoo("Space Exploration Technologies Corp.", "NasdaqGS")],
+                            "wiki_en": [wiki], "wiki_zh": [{"parse": {"displaytitle": "SpaceX"}}]})
+        info = _glossary(conn, ft).stock_info("SPCX")
+        assert info == nc.StockInfo("SPCX", "Space Exploration Technologies Corp.",
+                                    "NasdaqGS", None)
+
+
+# ============================================================
+# MINOR-6:词汇表有上限、会裁
+# ============================================================
+class Test词汇表裁剪:
+    def _seed(self, conn, n: int, monkeypatch):
+        """写 n 行,updated_at 逐行递增(同一秒写入的行否则分不出新旧)。"""
+        stamps = iter([f"2026-09-02T00:00:{i:02d}+00:00" for i in range(n)])
+        monkeypatch.setattr(store, "now_iso", lambda: next(stamps))
+        for i in range(n):
+            store.glossary_put(conn, "token_zh", f"name{i}", f"译{i}", "wiki", None)
+
+    def test_超上限时最旧的被裁最新的还在(self, conn, monkeypatch):
+        self._seed(conn, 7, monkeypatch)
+        assert store.glossary_prune(conn, max_rows=5, now=0) == 2
+        keys = {r["key"] for r in conn.execute("SELECT key FROM name_glossary")}
+        assert keys == {"name2", "name3", "name4", "name5", "name6"}
+
+    def test_没超上限一行都不动(self, conn, monkeypatch):
+        self._seed(conn, 5, monkeypatch)
+        assert store.glossary_prune(conn, max_rows=5, now=0) == 0
+        assert conn.execute("SELECT COUNT(*) FROM name_glossary").fetchone()[0] == 5
+
+    def test_过期行先删且不占上限(self, conn):
+        store.glossary_put(conn, "token_zh", "old", None, "miss", 100)
+        store.glossary_put(conn, "token_zh", "live", "甲", "wiki", None)
+        assert store.glossary_prune(conn, max_rows=10, now=200) == 1
+        keys = {r["key"] for r in conn.execute("SELECT key FROM name_glossary")}
+        assert keys == {"live"}
+
+    def test_写入时顺手裁(self, conn, monkeypatch):
+        """⚠️ 成功行是永久的,不裁这张表只增不减 —— 词汇表原先一个 DELETE 都没有。"""
+        monkeypatch.setattr(store, "GLOSSARY_MAX_ROWS", 3)
+        stamps = iter([f"2026-09-02T00:00:{i:02d}+00:00" for i in range(50)])
+        monkeypatch.setattr(store, "now_iso", lambda: next(stamps))
+        for i in range(5):
+            ft = FakeTransport({"wiki_en": [WIKI_MISSING], "google": [[[[f"译{i}", "x"]]]]})
+            assert _glossary(conn, ft).token_zh(f"Name Number {i}", "X") == f"译{i}"
+        assert conn.execute("SELECT COUNT(*) FROM name_glossary").fetchone()[0] == 3
+        keys = {r["key"] for r in conn.execute("SELECT key FROM name_glossary")}
+        assert keys == {"name number 2", "name number 3", "name number 4"}

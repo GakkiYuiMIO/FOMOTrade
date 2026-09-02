@@ -42,6 +42,11 @@ from src.models import (
     FomoEvent,
 )
 
+# 外部文本的展示门禁(白名单)。⚠️ 与 namecn 里"送翻译前"那道是**两道独立的墙**:
+#    译文是另一个来源(代理可篡改),渲染前必须自己再过一遍。nameguard 零依赖,不会成环。
+from src.nameguard import safe_display
+from src.nameguard import strip_format_controls as _no_controls
+
 # ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
 #    转入告警要自己算长度预算,而"上限是多少"必须与真正发消息的那一侧同源 ——
 #    两处各写一个数字,改了一处另一处就变成一颗定时炸弹。
@@ -318,8 +323,13 @@ def _esc(v) -> str:
     ⚠️ handle / symbol / thesis 正文 / 对手方名 全是用户可控内容,
        一个裸 '<' 就让整条消息 400 Bad Request —— 这既是稳定性问题,
        更是一个可被投毒的攻击面(改个昵称就能让监控静默失效)。
+    ⚠️⚠️ 顺手删掉 Unicode Cf(格式控制)字符。放在这里是因为它是**唯一**的必经之路:
+       symbol / handle / 观点正文都只走 _esc、不走 _flatten,而 U+202E(RTL 覆盖)
+       能让它后面的字在 Telegram 里反向显示 —— 一个把自己昵称改成
+       "ali<U+202E>ecs" 的人,在推送里看起来就是另一个人。这类字符在这些字段里
+       没有任何正当用途。
     """
-    return html.escape(str(v))
+    return html.escape(_no_controls(str(v)))
 
 
 def _display_name(ev: FomoEvent) -> str:
@@ -573,10 +583,18 @@ def _name_suffix(symbol, name) -> str | None:
     ⚠️ 与 symbol 相同(忽略大小写、忽略 $ 与首尾空白)→ None,不重复:
        「$WIF · WIF」占了位置什么都没多说。
     ⚠️ 顺序是"叠平空白 → 截 32 → 转义"(_clip),反过来会切开实体。拿不到 → 不加尾巴。
+    ⚠️⚠️ **币名是完全攻击者可控的**(DexScreener 的 baseToken.name,谁都能给自己发的币
+       起任意名字),所以在这里过一道白名单门禁(safe_display):不合格 → 整段丢弃、
+       标题没有尾巴。绝不做"剔掉坏的那部分再显示" —— 剔一半会拼出一个似是而非的假名字。
+       ⚠️ 这道门与 namecn 里"送不送去翻译"那道**互相独立**:那道只管省请求,
+          这道管的是"显不显示"。少了这道,攻击者给币起个名字就能把内容推进用户的标题。
     """
-    if not _bare_name(name) or _bare_name(name) == _bare_name(symbol):
+    safe = safe_display(name)
+    if safe is None:
         return None
-    return _clip(name, _TOKEN_NAME_CHARS)
+    if not _bare_name(safe) or _bare_name(safe) == _bare_name(symbol):
+        return None
+    return _clip(safe, _TOKEN_NAME_CHARS)
 
 
 def _token_zh_line(name, zh) -> str | None:
@@ -584,11 +602,16 @@ def _token_zh_line(name, zh) -> str | None:
     📝 Cummingtonite = 镁铁闪石
 
     左半是 A 那个英文全名,右半是它的中文译名(namecn.token_zh)。两者缺一整行消失。
-    ⚠️ 「翻不翻、译文可不可信」全在数据层(namecn 的输入/输出过滤)判,这里只画 ——
-       但译文仍按第三方字符串对待:限长 + 转义。
+    ⚠️⚠️ 两半**各自**过白名单门禁,任一不合格 → 整行消失。
+       右半尤其必须自己过一遍:译文来自维基 / Google,而外呼走 fomo_proxy,
+       代理能篡改响应 —— "namecn 那边已经过滤过了"不能成为这里跳过的理由。
     """
-    left = _clip(name, _TOKEN_NAME_CHARS)
-    right = _clip(zh, _TOKEN_ZH_CHARS)
+    safe_name = safe_display(name)
+    safe_zh = safe_display(zh)
+    if safe_name is None or safe_zh is None:
+        return None
+    left = _clip(safe_name, _TOKEN_NAME_CHARS)
+    right = _clip(safe_zh, _TOKEN_ZH_CHARS)
     if not left or not right:
         return None
     return f"{EMOJI_TOKEN_ZH} {left} = {right}"
@@ -614,11 +637,14 @@ def _stock_line(symbol, company_zh, exchange) -> str | None:
     symbol 就是 🌊 那行的对手符号;事实(交易所)来自 Yahoo、中文名来自 namecn。
     ⚠️ 是否显示(对手是不是币股、Yahoo 查没查到、是不是 EQUITY/ETF)都在数据层判;
        这里只在"符号 + 至少一段内容"都有时才画,否则整行消失。
+    ⚠️⚠️ 中文公司名同样过白名单门禁(它是译文,来源与币名一样不可信):
+       不合格 → 只剩交易所那半句,绝不把它剔一半印出去。
     """
     sym = _clip(symbol, _SIG_SYMBOL_CHARS)
     if not sym:
         return None
-    zh = _clip(company_zh, _TOKEN_ZH_CHARS)
+    safe_zh = safe_display(company_zh)
+    zh = "" if safe_zh is None else _clip(safe_zh, _TOKEN_ZH_CHARS)
     ex = _exchange_text(exchange)
     if not zh and not ex:
         return None
@@ -974,8 +1000,14 @@ def _flatten(s, limit: int) -> str:
     ⚠️ 单独拆出来只为一种情况:调用方后面还要把它塞进 `${...}` 之类的模板,
        而那个模板自己会 escape(见 _style_symbol)。先 escape 再 escape 一次,
        `&` 会变成 `&amp;amp;` 显示成一串乱码。除此之外一律用 _clip。
+    ⚠️⚠️ 先删 Unicode Cf(格式控制)字符**再**叠平空白:`str.split()` **不吞** Cf ——
+       零宽空格(U+200B)能把 `t.me` 拆成 `t.<U+200B>me` 绕开任何形态判断,
+       RTL 覆盖(U+202E)能让它后面的字在 Telegram 里反向显示("币<U+202E>pmup"
+       看起来就是 "币pump")。这两类字符在符号 / 名字 / handle 里没有任何正当用途。
+       ⚠️ 这一步对**所有**走 _clip / _flatten 的字段生效(符号、名字、译名、对手全名…);
+          白名单那道(safe_display)只加在名字类字段上,见 _name_suffix。
     """
-    flat = " ".join(str(s or "").split())
+    flat = " ".join(_no_controls(s).split())
     if len(flat) > limit:
         flat = flat[:limit].rstrip() + "…"
     return flat

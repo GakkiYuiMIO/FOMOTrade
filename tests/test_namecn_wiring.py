@@ -105,7 +105,9 @@ class Test买入推送:
         lines = tg.sent[0].split("\n")
         assert lines[0].endswith("<b>$AI</b> · Artificial Inu"), lines[0]
         assert lines[1] == "📝 Artificial Inu = 人工犬"
-        i = lines.index("🌊 底池 · NVDA · NVIDIA")
+        # ⚠️ 🌊 那行的全名用 **Yahoo 的 longName**("NVIDIA Corporation"),
+        #    不是 DexScreener 剥完后缀的 issuer("NVIDIA")—— Yahoo 是更权威的来源。
+        i = lines.index("🌊 底池 · NVDA · NVIDIA Corporation")
         assert lines[i + 1] == "🏢 NVDA = 英伟达 · 纳斯达克(NasdaqGS)上市"
         assert ft.calls == [("wiki_en", "Artificial Inu"), ("google", "Artificial Inu"),
                             ("yahoo", "NVDA"), ("wiki_en", "NVIDIA"), ("wiki_zh", "英伟达")]
@@ -346,3 +348,91 @@ class Test词汇表读写:
     def test_kind隔离(self, conn):
         store.glossary_put(conn, "token_zh", "k", "甲", "wiki", None)
         assert store.glossary_get(conn, "company_zh", "k", now=0) is None
+
+
+# ============================================================
+# 整条:与用户批准的形态逐行对齐 —— **走 Poller 接线**,不是手喂字面量
+# ============================================================
+# ⚠️⚠️ 这条测试原先在 tests/test_namecn_render.py,直接
+#    `render(pool_quote_name="USA Rare Earth, Inc.", …)` 手喂字面量。
+#    它一直绿着,可生产路径给的是 "USA Rare Earth"(poller 传的是剥完后缀的 issuer),
+#    整整差一个 ", Inc."。手喂字面量的"逐行对齐"证明不了任何生产路径上的事。
+_CA_CUM = "0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18"
+_CA_USAR = "0x1DA3B84E8Ab0Ee6dD5B0B1C6A7e5cE5B1a0E8d21"
+YAHOO_USAR_BODY = {"chart": {"result": [{"meta": {
+    "longName": "USA Rare Earth, Inc.", "fullExchangeName": "NasdaqGM",
+    "instrumentType": "EQUITY"}}], "error": None}}
+
+
+def _cum_swap():
+    from tests.test_poller import _rh_swap
+
+    s = _rh_swap("cum1", ca=_CA_CUM, sym="CUM")
+    s.update({"amountUsd": 2089.5, "holdingUsd": 2601.97, "avgPrice": 0.00006718,
+              "unrealizedPnl": 515.43, "unrealizedPnlPct": 24.7, "marketCap": 83770.0})
+    return s
+
+
+def test_整条推送逐行对上批准的形态(db):
+    _add_ready("uA", "inyourwalls")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_cum_swap()], transfers=[],
+                                            thesis=[], balances=[])})
+    tg = FakeNotifier()
+    dex = _FakeDex([[_pair("robinhood", _CA_CUM, "CUM", "Cummingtonite",
+                           _CA_USAR, "USAR", "USA Rare Earth • Robinhood Token")]])
+    ft = FakeTransport({
+        "wiki_en": [WIKI_CUM, WIKI_MISSING],          # 先币名(有条目),再公司名(无条目)
+        "wiki_zh": [WIKI_CUM_ZH],
+        "yahoo": [YAHOO_USAR_BODY],
+        "google": [[[["美国稀土公司", "USA Rare Earth, Inc."]]]],
+    })
+    _poller(client, tg, dex, ft).tick()
+
+    assert len(tg.sent) == 1
+    lines = tg.sent[0].split("\n")
+    assert lines[0] == "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · Cummingtonite"
+    assert lines[1] == "📝 Cummingtonite = 镁铁闪石"
+    assert lines[2].startswith("💰 买入 $2,089.50")
+    assert lines[3].startswith("📦 持仓 $2,601.97")
+    assert lines[4].startswith("📊 均价 $0.00006718")
+    assert lines[5].startswith("📈 未实现盈亏 +$515.43 (+24.70%)")
+    assert lines[6].startswith("💎 市值 $83.77K")
+    # ⚠️⚠️ 这一行就是 MAJOR-3:上游 PoolQuote.name 剥完后缀是 "USA Rare Earth",
+    #    而用户批准的形态带 ", Inc." —— 那个 ", Inc." 只有 Yahoo 的 longName 有。
+    assert lines[7] == "🌊 底池 · USAR · USA Rare Earth, Inc."
+    assert lines[8] == "🏢 USAR = 美国稀土公司 · 纳斯达克(NasdaqGM)上市"
+    assert lines[-1] == f"<code>{_CA_CUM.lower()}</code>"
+
+
+def test_Yahoo没给全名时底池行退回上游的issuer(db):
+    """Yahoo 抖了 / 查无 —— 🌊 那行仍然要有对手全名,只是回到剥完后缀的那一份。"""
+    _add_ready("uA", "inyourwalls")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_cum_swap()], transfers=[],
+                                            thesis=[], balances=[])})
+    tg = FakeNotifier()
+    dex = _FakeDex([[_pair("robinhood", _CA_CUM, "CUM", "Cummingtonite",
+                           _CA_USAR, "USAR", "USA Rare Earth • Robinhood Token")]])
+    ft = FakeTransport({"wiki_en": [WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH]}, boom={"yahoo"})
+    _poller(client, tg, dex, ft).tick()
+
+    lines = tg.sent[0].split("\n")
+    assert "🌊 底池 · USAR · USA Rare Earth" in lines
+    assert "🏢" not in tg.sent[0]
+
+
+def test_对手全名过不了门禁时底池行只剩符号(db):
+    """
+    ⚠️ 对手全名同样是第三方字符串:攻击者能把自己的币起名成
+       "t.me/scam • Robinhood Token",剥完判据后缀就是 "t.me/scam"。
+    """
+    _add_ready("uA", "inyourwalls")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_cum_swap()], transfers=[],
+                                            thesis=[], balances=[])})
+    tg = FakeNotifier()
+    dex = _FakeDex([[_pair("robinhood", _CA_CUM, "CUM", "Cummingtonite",
+                           _CA_USAR, "USAR", "t.me/scam • Robinhood Token")]])
+    ft = FakeTransport({"wiki_en": [WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH]}, boom={"yahoo"})
+    _poller(client, tg, dex, ft).tick()
+
+    assert "t.me" not in tg.sent[0]
+    assert "🌊 底池 · USAR" in tg.sent[0].split("\n")

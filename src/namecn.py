@@ -22,18 +22,30 @@ A 的英文全名不是本模块的事(DexScreener 那份响应里自带),本模
       ⚠️ 它会把 Cummingtonite 译成"铜明石"(错的)—— 这就是维基必须优先的理由。
       ⚠️ 它随时可能失效。失效 = 中文那一段消失,其余照常,**绝不**因它报错影响推送。
 
-============ 安全:币名是攻击者可控的(任何人都能给币起名)============
-翻译是「输入什么翻什么」,所以**输入侧过滤**是主防线(translatable):名字含
-0x 地址 / http / t.me / @ / 连续 ≥26 位 base58 串 / < / > 之一 → 不送翻译,C 行不出现。
-输出侧再兜一层(clean_output):译文含同样形态、或长度 > 输入的 4 倍 → 丢弃并 WARNING
-(带 symbol,不带原文)。渲染前的 html.escape 在 formatter,与这里是三道独立的墙。
+============ 安全:币名与译文**都**是攻击者可控的 ============
+币名:DexScreener 的 baseToken.name,任何人都能给自己发的币起任意名字。
+译文:维基 / Google 的响应,而所有外呼都走 fomo_proxy —— 代理能篡改响应,
+      Google 那条通道本身还是非官方的;而且译文一旦收下就是 source=google、expires NULL,
+      **一次篡改长期生效**。所以两侧都得防,而且都得用白名单。
+门禁本身在 src/nameguard.py(白名单:先删 Unicode Cf,再判必拦形态,再判字符集),
+本模块只是它的两个调用点:
+  · translatable —— 送不送去翻译(省请求)。
+  · clean_output —— 译文收不收(白名单 + 长度 ≤ 原文 4 倍 + 不许凭空长出原文没有的英文串)。
+⚠️⚠️ 「显不显示」**不在这里** —— 那道在 formatter(safe_display),是**独立**的第三道。
+   历史教训:本模块的输入过滤只挡住了"送不送去翻译",没挡"显不显示",于是
+   `t.me/…`、`tg://…`、EVM/Solana 地址原样进了推送标题。
 
 ============ 缓存与预算 ============
 SQLite 表 name_glossary(store.glossary_get / glossary_put):成功**永久**(名字/公司名不会变);
 "查过了没有"缓存 30 天;HTTP/超时失败缓存 1 小时(一次抖动不该按住一整天)。
-每 tick 网络调用**硬上限**:翻译 5 次(维基两跳算 1、Google 算 1)、Yahoo 5 次;
-缓存命中不计;同一 tick 同一 key 只查一次(_memo)。超出的那条推送这一轮就没那一段 ——
-一次性推送,过了就过了,可接受。
+⚠️ 成功行永久 = 只增不减,所以每次写入顺手裁一次(store.glossary_prune):
+   先删过期行,还超 20000 行就按 updated_at 最旧的先删。
+每 tick 网络调用**硬上限**(三本账分开记,互不侵占):币名翻译 8 次、公司名翻译 4 次、
+Yahoo 5 次;维基两跳算 1、Google 算 1,所以"维基查无再走 Google"一个名字吃 2 次。
+再加一道**墙钟**闸门:本 tick 花在名字补全上的累计耗时超过 20 秒就停(time.monotonic)。
+两道任一触发即停。缓存命中不计;同一 tick 同一 key 只查一次(_memo)。
+被闸门挡下的 key **不写缓存**(下轮重来)但记一条 DEBUG —— 事后看频率就知道容量够不够。
+超出的那条推送这一轮就没那一段 —— 一次性推送,过了就过了,可接受。
 ⚠️⚠️ 本模块的任何失败都不许影响推送主路径:public 方法不抛,失败记 WARNING、该段消失。
 
 ============ 为什么不复用 src/client.py ============
@@ -51,7 +63,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from src import store
+from src import nameguard, store
 from src.config import get_settings
 
 # ============================================================
@@ -77,23 +89,27 @@ TTL_MISS_SEC = 30 * 86400
 # 失败缓存 TTL(网络/HTTP/JSON 失败):1 小时。一次抖动不该把这一段按住一个月。
 TTL_ERROR_SEC = 3600
 
-# 每 tick 网络调用上限。翻译(维基两跳算 1 次、Google 算 1 次)与 Yahoo 各自一本账。
-# 5:一个 tick 通常只推几条,热门币又几乎全走缓存;真的一轮来 20 个新币,后面的少一段就少一段。
-ROUND_TRANSLATE_CALLS = 5
+# 每 tick 网络调用上限。⚠️ 币名与公司名**各记一本账**:合用一本时,一个币股底池的
+# 公司名(维基查无再走 Google = 2 次)就能吃掉一半币名预算 —— 实测空缓存下 3 个新币耗尽。
+# 币名 8:维基查无再走 Google 算 2 次,所以最坏情况一轮能补 4 个全新币名(全命中维基则 8 个)。
+# 公司名 4:只在底池对手是**币股**时才查,天然稀少,一轮能补 2 个全新公司名。
+ROUND_TOKEN_TRANSLATE_CALLS = 8
+ROUND_COMPANY_TRANSLATE_CALLS = 4
 ROUND_YAHOO_CALLS = 5
+# 每 tick 花在名字补全上的**墙钟**上限(秒)。⚠️ 真正要防的风险不是"打了几个请求",
+# 而是"外部接口把 tick 拖慢" —— 本项目有过 tick 从 5s 拖到 90s 的教训,调用次数只是它的
+# 代理指标。单请求超时 8s,最坏情况 17 个请求 = 136s,光靠次数闸门挡不住。
+# 20s:两道闸门任一触发即停;用 time.monotonic(),不受系统改时间影响。
+ROUND_WALL_CLOCK_SEC = 20.0
 
 # 送去翻译的名字最长几个字符。再长就是营销文案,翻出来也没人读,还白占预算。
 _MAX_TRANSLATE_CHARS = 64
 # 显示 B 行的 instrumentType。别的(CRYPTOCURRENCY / INDEX / MUTUALFUND …)不是"上市股票"。
 STOCK_TYPES = frozenset({"EQUITY", "ETF"})
+# Yahoo 的 chart.error.code 里,**只有**这些算"这个代码不存在"(负缓存 30 天)。
+# 其余(限流、内部错误)一律按失败缓存 1 小时 —— 实测 404 查无给的就是 "Not Found"。
+_YAHOO_MISS_CODES = frozenset({"not found", "notfound"})
 
-# 可疑成分:地址 / 链接 / 提及 / Solana 地址形态 / 标签。命中即不送翻译、译文命中即丢弃。
-# ⚠️ base58 串 ≥26 位:Solana 地址是 32~44 位,26 是留了余量的下限;英文里没有 26 个字母
-#    连写且不含 0/O/I/l 的常用词。
-# ⚠️ 不能整体加 IGNORECASE:那会让 base58 那段的 [A-HJ-NP-Z] 连小写 l 也收进去,
-#    "Supercalifragilisticexpialidocious" 这种普通长词就被当成地址了。只对 http / t.me 忽略大小写。
-_SUSPICIOUS = re.compile(
-    r"0x[0-9a-fA-F]{6,}|(?i:http|t\.me)|@|[1-9A-HJ-NP-Za-km-z]{26,}|[<>]")
 # 中日韩文字(含假名、谚文):名字本身含 CJK 就不用翻。
 _CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
 # 股票代码形态。ticker 来自 DexScreener 的对手 symbol(第三方字符串),只放行这种形态。
@@ -137,8 +153,14 @@ class UnavailableError(Exception):
 # 纯函数(可脱网完整单测)
 # ============================================================
 def _flat(s) -> str:
-    """叠平空白。"""
-    return " ".join(str(s or "").split())
+    """
+    删 Unicode Cf(格式控制)字符 → 叠平空白。
+
+    ⚠️ `str.split()` **不吞** Cf:零宽空格(U+200B)能把 `t.me` 拆成 `t.<U+200B>me`,
+       在任何形态判断面前隐身,而 Telegram 渲染时它不占位 —— 读者看到的仍是 `t.me`。
+       所以先删再判(实现见 nameguard.flatten)。
+    """
+    return nameguard.flatten(s)
 
 
 def norm_key(s) -> str:
@@ -161,14 +183,14 @@ def same_text(a, b) -> bool:
     return norm_key(a) == norm_key(b)
 
 
-def is_suspicious(text) -> bool:
-    return bool(_SUSPICIOUS.search(str(text or "")))
-
-
 def translatable(name, symbol) -> bool:
     """
-    这个名字能不能送去翻译(输入侧过滤,**主防线**)。以下一律不翻、C 行整行不出现:
-    名字缺失 / 与 symbol 相同 / 含 CJK / 纯数字纯符号 / 长度 < 2 / 太长 / 含可疑成分。
+    这个名字**要不要送去翻译**(输入侧过滤)。以下一律不翻、📝 行不出现:
+    名字缺失 / 与 symbol 相同 / 含 CJK / 纯数字纯符号 / 长度 < 2 / 太长 / 过不了展示门禁。
+
+    ⚠️⚠️ 这道门只管**省请求**,不等于"显不显示" —— 显示那道在 formatter
+       (safe_display),是**独立**的一道。两道用的是同一个白名单函数,但缺了哪一道
+       都有真实后果:缺这道会白打请求,缺那道会让攻击者的名字直接进用户的标题。
     """
     n = _flat(name)
     if len(n) < 2 or len(n) > _MAX_TRANSLATE_CHARS:
@@ -179,18 +201,29 @@ def translatable(name, symbol) -> bool:
         return False
     if not any(ch.isalpha() for ch in n):
         return False
-    return not is_suspicious(n)
+    return nameguard.safe_display(n) is not None
 
 
 def clean_output(zh, source_text, tag) -> str | None:
     """
-    译文的输出侧过滤:含可疑成分、或长度 > 输入的 4 倍 → 丢弃并 WARNING(带 symbol,不带原文)。
+    译文的输出侧过滤 —— 三条,命中任一**整段丢弃**并 WARNING(带 symbol,不带原文):
+
+      1. 过不了展示门禁(白名单:域名 / 协议头 / @提及 / 地址形态 / 集合外字符)。
+      2. 长度 > 原文的 4 倍。译名不会比原文长这么多,长了就是被塞了东西。
+      3. 出现了**原文里没有的** ASCII 字母串(≥4 位)。正常中文译名不会凭空长出英文单词;
+         凭空长出来的要么是代理篡改了响应,要么是维基把条目重定向到了另一个英文名
+         (SPCX 的公司名 → 中文维基条目就叫 "SpaceX",那是英文,不该进"中文名"槽位)。
+         ⚠️ 原文里有的不受影响:token 名 "SpaceX" → 译文 "SpaceX" 不被这条拦。
     """
-    z = _flat(zh)
-    if not z:
+    z = nameguard.safe_display(zh)
+    if z is None:
+        logger.warning("译文被丢弃(过不了展示门禁) | {}", tag)
         return None
-    if is_suspicious(z) or len(z) > 4 * max(1, len(_flat(source_text))):
-        logger.warning("译文被丢弃(含可疑成分或过长) | {}", tag)
+    if len(z) > 4 * max(1, len(_flat(source_text))):
+        logger.warning("译文被丢弃(长度超原文 4 倍) | {}", tag)
+        return None
+    if nameguard.has_new_ascii_word(z, source_text):
+        logger.warning("译文被丢弃(凭空多出原文没有的英文串) | {}", tag)
         return None
     return z
 
@@ -370,20 +403,44 @@ class NameClient:
         return parse_google(body)
 
     def yahoo_chart(self, ticker: str) -> StockFact | None:
+        """
+        → StockFact;**查无** → None(负缓存 30 天);失败 → 抛 Unavailable(1 小时)。
+
+        ⚠️⚠️ **先看 HTTP 状态码,再看 body**。反过来写会把 500 / 429 当成"查无":
+           Yahoo 限流时也回一个带 chart.error 的 body,而"查无"缓存 30 天 ——
+           一次限流就把这个代码的 🏢 行按住一个月。只有 body 明确说 "Not Found"
+           那一类(见 _YAHOO_MISS_CODES)才算真的查无。
+        ⚠️ 2xx 但结构解析不出来 → 也按失败(1 小时),与 Google 那条"响应结构变了
+           按失败处理"对齐:接口改了结构不是"这个代码不存在"。
+        """
         status, body = self._t.get_json(YAHOO_CHART_URL.format(ticker=ticker),
                                         {"range": "1d", "interval": "1d"})
-        # 查无 = 404 + {"chart": {"result": null, "error": {...}}}。别的非 2xx 才是失败。
-        if isinstance(body, dict) and isinstance((body.get("chart") or {}).get("error"), dict):
-            return None
+        err = (body.get("chart") or {}).get("error") if isinstance(body, dict) else None
+        code = _flat(err.get("code")).lower() if isinstance(err, dict) else ""
         if not (200 <= status < 300):
+            if code in _YAHOO_MISS_CODES:
+                return None
             raise UnavailableError(f"HTTP {status} | yahoo {ticker}")
-        return parse_yahoo(body)
+        if isinstance(err, dict):
+            # 2xx + error:Yahoo 对未知代码偶尔这么答,当查无
+            return None
+        fact = parse_yahoo(body)
+        if fact is None:
+            raise UnavailableError(f"yahoo {ticker} 响应结构解析不出")
+        return fact
 
 
 # ============================================================
 # 词汇表 —— 缓存 + 每 tick 预算 + 两级翻译
 # ============================================================
 _NO_BUDGET = object()
+
+# 三本预算账的名字。⚠️ 币名与公司名分开,理由见 ROUND_* 常量。
+BUDGET_TOKEN = "token"
+BUDGET_COMPANY = "company"
+BUDGET_YAHOO = "yahoo"
+# kind → 用哪本账。新增 kind 时必须在这里登记,否则 _take 会 KeyError(而不是悄悄不限量)。
+_KIND_BUDGET = {KIND_TOKEN_ZH: BUDGET_TOKEN, KIND_COMPANY_ZH: BUDGET_COMPANY}
 
 
 class NameGlossary:
@@ -394,14 +451,22 @@ class NameGlossary:
     """
 
     def __init__(self, client: NameClient | None = None, conn_factory=None,
-                 translate_calls: int = ROUND_TRANSLATE_CALLS,
-                 yahoo_calls: int = ROUND_YAHOO_CALLS) -> None:
+                 token_calls: int = ROUND_TOKEN_TRANSLATE_CALLS,
+                 company_calls: int = ROUND_COMPANY_TRANSLATE_CALLS,
+                 yahoo_calls: int = ROUND_YAHOO_CALLS,
+                 wall_clock_sec: float = ROUND_WALL_CLOCK_SEC) -> None:
         self._client = client if client is not None else NameClient()
         # 缓存连接的来源。默认 store.get_conn(每次开一个短连接,与 pumpfun 的用法一致);
         # 测试注入一个复用内存库的上下文管理器。
         self._conn_factory = conn_factory if conn_factory is not None else store.get_conn
-        self._limits = {"translate": int(translate_calls), "yahoo": int(yahoo_calls)}
-        self._used = {"translate": 0, "yahoo": 0}
+        # ⚠️ 三本账**分开记**:合成一本时,一个币股底池的公司名(维基查无再走 Google = 2 次)
+        #    就能吃掉一半币名预算。币名与公司名是两类需求,不该互相饿死。
+        self._limits = {BUDGET_TOKEN: int(token_calls),
+                        BUDGET_COMPANY: int(company_calls),
+                        BUDGET_YAHOO: int(yahoo_calls)}
+        self._used = dict.fromkeys(self._limits, 0)
+        self._wall = float(wall_clock_sec)
+        self._spent = 0.0
         self._memo: dict[tuple[str, str], object] = {}
 
     def close(self) -> None:
@@ -411,8 +476,9 @@ class NameGlossary:
             pass
 
     def begin_round(self) -> None:
-        """每 tick 开头调一次:预算归零、同 tick 的 memo 清空。"""
-        self._used = {"translate": 0, "yahoo": 0}
+        """每 tick 开头调一次:三本预算归零、墙钟归零、同 tick 的 memo 清空。"""
+        self._used = dict.fromkeys(self._limits, 0)
+        self._spent = 0.0
         self._memo = {}
 
     # ---- 对外 --------------------------------------------------------------
@@ -471,15 +537,42 @@ class NameGlossary:
         try:
             with self._conn_factory() as conn:
                 store.glossary_put(conn, kind, key, value, source, expires)
+                # ⚠️ 顺手裁一次:成功行是永久的,不裁这张表只增不减(见 store.glossary_prune)。
+                #    裁在写入之后 —— 刚写的这行 updated_at 最新,永远不会被自己裁掉。
+                store.glossary_prune(conn)
         except Exception as e:  # noqa: BLE001
             logger.warning("词汇表写入失败(下轮重查) | {} | {}", kind, e)
 
-    def _take(self, budget: str) -> bool:
-        """扣一次预算;超了返回 False(这一段这一轮就没有)。"""
+    def _take(self, budget: str, tag: str) -> bool:
+        """
+        扣一次预算;两道闸门**任一**触发就返回 False(这一段这一轮就没有)。
+
+          1. 次数:本 tick 这本账还剩几次。
+          2. 墙钟:本 tick 花在名字补全上的累计耗时。⚠️ 真正要防的风险是
+             "外部接口把 tick 拖慢"(本项目有过 tick 从 5s 拖到 90s 的教训),
+             次数只是它的代理指标 —— 单请求超时 8s,光靠次数挡不住。
+
+        ⚠️ 被闸门挡下的 key **不写任何缓存**(下一 tick 重来),但记一条 DEBUG:
+           事后看这条日志出现的频率,就知道容量够不够。
+        """
+        if self._spent >= self._wall:
+            logger.debug("名字补全墙钟预算用尽({:.1f}s ≥ {:.1f}s),本轮跳过 | {} | {}",
+                         self._spent, self._wall, budget, tag)
+            return False
         if self._used[budget] >= self._limits[budget]:
+            logger.debug("名字补全次数预算用尽({}/{}),本轮跳过 | {} | {}",
+                         self._used[budget], self._limits[budget], budget, tag)
             return False
         self._used[budget] += 1
         return True
+
+    def _timed(self, fn, *args):
+        """调一次外部接口并把耗时记进本 tick 的墙钟账。⚠️ 失败也要记 —— 超时最费时间。"""
+        t0 = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            self._spent += time.monotonic() - t0
 
     # ---- 翻译 --------------------------------------------------------------
     def _translate(self, kind: str, text: str, wiki_term: str, tag: str,
@@ -501,21 +594,26 @@ class NameGlossary:
         return result  # type: ignore[return-value]
 
     def _translate_net(self, kind: str, key: str, text: str, wiki_term: str, tag: str):
+        budget = _KIND_BUDGET[kind]
         # ---- 一级:维基百科跨语言链接(两跳算一次)----
-        if not self._take("translate"):
+        if not self._take(budget, tag):
             return _NO_BUDGET
         try:
-            zh_title = self._client.wiki_langlink(wiki_term)
+            zh_title = self._timed(self._client.wiki_langlink, wiki_term)
             if isinstance(zh_title, str) and zh_title:
                 # 繁→简。这一跳失败(None)就退回用 langlinks 给的标题 —— 仍是真的,只是可能繁体
-                simplified = self._client.wiki_display_title(zh_title)
+                simplified = self._timed(self._client.wiki_display_title, zh_title)
                 zh = simplified if isinstance(simplified, str) and simplified else zh_title
                 zh = clean_output(zh, text, tag)
                 if zh is None:
                     self._cache_put(kind, key, None, "wiki-bad", TTL_MISS_SEC)
                     return None
-                if same_text(zh, text):
-                    # 正式中文名就是它自己(SpaceX)—— 确定的答案,永久缓存,不再问 Google
+                # 正式中文名就是它自己(SpaceX)—— 确定的答案,永久缓存,不再问 Google。
+                # ⚠️ 与 wiki_term **也**要比:公司名走的是剥掉后缀的词
+                #    (long_name "Space Exploration Technologies Corp." → wiki_term
+                #     "Space Exploration Technologies"),只跟 long_name 比就会漏,
+                #    于是一个英文名被当成中文名收下,渲染成 `🏢 SPCX = SpaceX`。
+                if same_text(zh, text) or same_text(zh, wiki_term):
                     self._cache_put(kind, key, None, "wiki-same", None)
                     return None
                 self._cache_put(kind, key, zh, "wiki", None)
@@ -525,10 +623,10 @@ class NameGlossary:
             self._cache_put(kind, key, None, "error", TTL_ERROR_SEC)
             return None
         # ---- 二级:Google 免费通道(非官方,随时可能失效)----
-        if not self._take("translate"):
+        if not self._take(budget, tag):
             return _NO_BUDGET
         try:
-            zh = self._client.google_translate(text)
+            zh = self._timed(self._client.google_translate, text)
         except UnavailableError as e:
             logger.warning("Google 翻译失败,1 小时内不重试 | {} | {}", tag, e)
             self._cache_put(kind, key, None, "error", TTL_ERROR_SEC)
@@ -556,10 +654,10 @@ class NameGlossary:
             fact = None if value is None else _fact_from_json(value)
             self._memo[memo_key] = fact
             return fact
-        if not self._take("yahoo"):
+        if not self._take(BUDGET_YAHOO, ticker):
             return None
         try:
-            fact = self._client.yahoo_chart(ticker)
+            fact = self._timed(self._client.yahoo_chart, ticker)
         except UnavailableError as e:
             logger.warning("Yahoo 查询失败,1 小时内不重试 | {} | {}", ticker, e)
             self._cache_put(KIND_STOCK_FACT, key, None, "error", TTL_ERROR_SEC)

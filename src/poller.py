@@ -65,6 +65,7 @@ from src.models import (
     to_iso,
 )
 from src.namecn import NameGlossary
+from src.nameguard import safe_display
 
 # ============================================================
 # 候选字段名 —— 全部来自逆向推测,probe 确认后可以收窄但保留兜底不会有坏处
@@ -1933,6 +1934,10 @@ class Poller:
 
           token_name        英文全名(DexScreener 同一份响应里我方一侧的 name)
           token_name_zh     它的中文译名(namecn:维基优先、Google 兜底)
+          pool_quote_name   🌊 那行的对手全名。⚠️ **优先用 Yahoo 的 longName**
+                            ("USA Rare Earth, Inc."),拿不到才退回 DexScreener 剥完
+                            后缀的 issuer("USA Rare Earth")—— Yahoo 是更权威的来源,
+                            而且用户批准的形态就是带 ", Inc." 的那个。
           stock_company_zh / stock_exchange
                             底池对手是**币股**(pq 非 None)时,Yahoo 的事实 + 公司名中文
 
@@ -1942,6 +1947,11 @@ class Poller:
            与底池/共识同一条铁律:**绝不能出现"因为翻不出中文名所以整条推送没发出去"**。
         """
         out: dict = {}
+        # ⚠️ 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名。
+        #    对手全名同样是第三方字符串(攻击者能给自己的币起名叫 "t.me/x • Robinhood Token",
+        #    剥完后缀就是 "t.me/x"),所以过一道展示门禁,不合格就只剩符号。
+        if pq is not None:
+            out["pool_quote_name"] = safe_display(pq.name)
         try:
             net = (network_id or "").strip()
             if cached_only:
@@ -1957,6 +1967,10 @@ class Poller:
             if pq is not None and pq.symbol and not cached_only:
                 info = self._names.stock_info(pq.symbol)
                 if info is not None:
+                    if info.long_name is not None:
+                        safe = safe_display(info.long_name)
+                        if safe is not None:
+                            out["pool_quote_name"] = safe
                     if info.company_zh is not None:
                         out["stock_company_zh"] = info.company_zh
                     if info.exchange is not None:
@@ -2054,7 +2068,8 @@ class Poller:
                         baseline_pending=baseline_pending,
                         starred=ev.user_id in starred,
                         pool_quote_symbol=None if pq is None else pq.symbol,
-                        pool_quote_name=None if pq is None else pq.name,
+                        # ⚠️ pool_quote_name 在 names 里(Yahoo 的 longName 优先),
+                        #    别在这里再传一份 —— 重复关键字会当场 TypeError。
                         **names,
                     )
                 )

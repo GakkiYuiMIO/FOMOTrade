@@ -61,16 +61,25 @@ class Test英文全名:
 
     def test_先截到32再转义(self):
         """截断落在实体中间也不会留下残缺实体:先截原文,再转义。"""
-        line = _lines(token_name="A" * 31 + "&lt;xyz")[0]
-        assert line.endswith("· " + "A" * 31 + "&amp;…"), line
+        line = _lines(token_name="Abcd " * 6 + "x&y")[0]
+        assert line.endswith("· Abcd Abcd Abcd Abcd Abcd Abcd x&amp;…"), line
         assert "&lt" not in line
 
-    def test_尾巴要转义(self):
+    def test_尾巴里的和号要转义(self):
+        line = _lines(token_name="Ben & Jerry")[0]
+        assert line.endswith("· Ben &amp; Jerry"), line
+
+    def test_带标签的名字整段丢弃(self):
+        """
+        ⚠️ 白名单门禁:`<` 不在允许字符集里 → **整段丢弃**,标题没有尾巴。
+           不是"转义一下照样显示" —— 显示一个转义过的 `<script>alert(1)</script>`
+           仍然是把攻击者写的文案推进了用户的标题。
+        """
         line = _lines(token_name="<script>alert(1)</script>")[0]
-        assert "<script>" not in line and "&lt;script&gt;" in line
+        assert line == "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b>", line
 
     def test_尾巴叠平空白并限长(self):
-        line = _lines(token_name="Cum\n\n  mington\tite " + "z" * 100)[0]
+        line = _lines(token_name="Cum\n\n  mington\tite " + " zzzz" * 30)[0]
         tail = line.split(" · ")[-1]
         assert "\n" not in tail and tail.startswith("Cum mington ite")
         assert len(tail) <= 33, tail   # 32 + "…"
@@ -95,17 +104,24 @@ class Test中文名:
         assert "📝" not in _msg(token_name="Cummingtonite", token_name_zh="")
         assert "📝" not in _msg(token_name=None, token_name_zh="镁铁闪石")
 
-    def test_译文转义与限长(self):
-        line = [ln for ln in _lines(token_name="X Y", token_name_zh="<b>坏</b>" + "字" * 40) if ln.startswith("📝")][0]
-        assert "<b>" not in line
+    def test_译文限长(self):
+        line = [ln for ln in _lines(token_name="X Y", token_name_zh="坏" + "字" * 40)
+                if ln.startswith("📝")][0]
         right = line.split(" = ", 1)[1]
-        assert right.startswith("&lt;b&gt;坏")
-        assert right.endswith("…") and len(right.replace("&lt;", "<").replace("&gt;", ">")) == 25
+        assert right == "坏" + "字" * 23 + "…", right
+
+    def test_译文里的和号要转义(self):
+        line = [ln for ln in _lines(token_name="X Y", token_name_zh="甲&乙") if ln.startswith("📝")][0]
+        assert line == "📝 X Y = 甲&amp;乙"
+
+    def test_带标签的译文让整行消失(self):
+        """⚠️ 译文是另一个来源(外呼走代理,代理能篡改响应),渲染前这道门禁必须自己再过一遍。"""
+        assert "📝" not in _msg(token_name="X Y", token_name_zh="<b>坏</b>")
 
     def test_左半与标题尾巴同一份(self):
-        """左半就是 A 那个名字:同样截 32、同样转义。"""
-        lines = _lines(token_name="A" * 40 + "<", token_name_zh="甲")
-        assert lines[1] == "📝 " + "A" * 32 + "… = 甲"
+        """左半就是 A 那个名字:同样截 32、同样过门禁。"""
+        lines = _lines(token_name="Abcd " * 10, token_name_zh="甲")
+        assert lines[1] == "📝 Abcd Abcd Abcd Abcd Abcd Abcd Ab… = 甲"
 
 
 # ============================================================
@@ -155,10 +171,15 @@ class Test股票说明:
             assert f"🏢 USAR · {expect}" in lines, (code, lines)
 
     def test_公司名与交易所都要转义(self):
-        lines = self._with_pool(stock_company_zh="<b>x</b>", stock_exchange="<i>y")
+        lines = self._with_pool(stock_company_zh="甲&乙", stock_exchange="<i>y")
         line = [ln for ln in lines if ln.startswith("🏢")][0]
-        assert "<b>" not in line and "<i>" not in line
-        assert line == "🏢 USAR = &lt;b&gt;x&lt;/b&gt; · &lt;i&gt;y 上市"
+        assert "<i>" not in line
+        assert line == "🏢 USAR = 甲&amp;乙 · &lt;i&gt;y 上市"
+
+    def test_公司名过不了门禁时只剩交易所(self):
+        """⚠️ 中文公司名同样是译文 —— 不合格整段丢弃,绝不剔一半再印出去。"""
+        lines = self._with_pool(stock_company_zh="<b>x</b>", stock_exchange="NasdaqGM")
+        assert "🏢 USAR · 纳斯达克(NasdaqGM)上市" in lines
 
     def test_盈亏行的emoji没被撞(self):
         """📈 仍归未实现盈亏,🏢/📝 各自独占。"""
@@ -172,30 +193,12 @@ class Test股票说明:
         assert any(ln.startswith("📈 未实现盈亏") for ln in lines)
 
 
-# ============================================================
-# 整条:与用户批准的形态逐行对齐
-# ============================================================
-def test_整条推送逐行对上批准的形态():
-    ev = make_event(EVENT_BUY, handle="inyourwalls", token_symbol="CUM", token_address=CA_CUM,
-                    network_id="robinhood", badge=BADGE_FIRST,
-                    amount_usd=2089.5, holding_usd=2601.97, avg_price=0.00006718,
-                    unrealized_pnl=515.43, unrealized_pnl_pct=24.7, market_cap=83770.0)
-    msg = render(ev, buyers=3, watchlist=108,
-                 pool_quote_symbol="USAR", pool_quote_name="USA Rare Earth, Inc.",
-                 token_name="Cummingtonite", token_name_zh="镁铁闪石",
-                 stock_company_zh="美国稀土公司", stock_exchange="NasdaqGM")
-    lines = msg.split("\n")
-    assert lines[0] == "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · Cummingtonite"
-    assert lines[1] == "📝 Cummingtonite = 镁铁闪石"
-    assert lines[2].startswith("💰 买入 $2,089.50")
-    assert lines[3].startswith("📦 持仓 $2,601.97")
-    assert lines[4].startswith("📊 均价 $0.00006718")
-    assert lines[5].startswith("📈 未实现盈亏 +$515.43 (+24.70%)")
-    assert lines[6].startswith("💎 市值 $83.77K")
-    assert lines[7] == "🌊 底池 · USAR · USA Rare Earth, Inc."
-    assert lines[8] == "🏢 USAR = 美国稀土公司 · 纳斯达克(NasdaqGM)上市"
-    assert lines[9].startswith("👥 名单内 3/108 人买过")
-    assert lines[-1] == f"<code>{CA_CUM}</code>"
+# ⚠️⚠️ 「整条推送逐行对上用户批准的形态」那条测试**不在这个文件里** ——
+#    它原先是直接 `render(pool_quote_name="USA Rare Earth, Inc.", …)` 手喂字面量的,
+#    于是它绿着,可生产路径给的却是 "USA Rare Earth"(poller 传的是剥完后缀的 issuer),
+#    整整差一个 ", Inc."。手喂字面量的"逐行对齐"证明不了任何生产路径上的事。
+#    现在那条测试在 tests/test_namecn_wiring.py::test_整条推送逐行对上批准的形态,
+#    走 Poller + 假网络层(喂真实响应形状)。
 
 
 # ============================================================
@@ -259,9 +262,16 @@ class Test转入推送:
         msg = render_transfer_in_signal(
             network_id="robinhood", token_address=CA_CUM, token_symbol="CUM",
             receiver_count=3, receivers=[], window_hours=24,
+            token_name="A&B", token_name_zh="甲&乙")
+        assert msg.split("\n")[0].endswith("<b>$CUM</b> · A&amp;B")
+        assert "📝 A&amp;B = 甲&amp;乙" in msg.split("\n")
+        # 过不了门禁的整段丢弃:标题没有尾巴、📝 整行消失
+        msg_bad = render_transfer_in_signal(
+            network_id="robinhood", token_address=CA_CUM, token_symbol="CUM",
+            receiver_count=3, receivers=[], window_hours=24,
             token_name="<b>", token_name_zh="<i>")
-        assert msg.split("\n")[0].endswith("<b>$CUM</b> · &lt;b&gt;")
-        assert "<i>" not in msg and "&lt;i&gt;" in msg
+        assert msg_bad.split("\n")[0].endswith("<b>$CUM</b>")
+        assert "&lt;b&gt;" not in msg_bad and "📝" not in msg_bad
         msg2 = render_transfer_in_signal(
             network_id="robinhood", token_address=CA_CUM, token_symbol="CUM",
             receiver_count=3, receivers=[], window_hours=24, token_name="CUM")

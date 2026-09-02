@@ -66,6 +66,7 @@ from src.dexscreener import PoolQuoteLookup, notable, token_name
 from src.formatter import render_pump_callout, render_pump_trade
 from src.models import NETWORK_DISPLAY
 from src.namecn import NameGlossary
+from src.nameguard import safe_display
 
 # ============================================================
 # 端点
@@ -1235,8 +1236,14 @@ class PumpWatcher:
         A/B/C 三段 → render_pump_trade 的关键字参数;缺哪段没哪个键(那一行整行消失)。
         与 poller._name_extras 同一套规矩:整段包在 try 里,**绝不能因为翻不出中文名
         所以成交没推出去**。
+        ⚠️ pool_quote_name(🌊 那行的对手全名)优先用 Yahoo 的 longName
+           ("USA Rare Earth, Inc."),拿不到才退回 DexScreener 剥完后缀的 issuer;
+           两者都过展示门禁(对手全名同样是第三方字符串)。
         """
         out: dict = {}
+        # 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名
+        if pool_quote is not None:
+            out["pool_quote_name"] = safe_display(pool_quote.name)
         try:
             if name is not None:
                 out["token_name"] = name
@@ -1246,6 +1253,10 @@ class PumpWatcher:
             if pool_quote is not None and pool_quote.symbol:
                 info = self._names.stock_info(pool_quote.symbol)
                 if info is not None:
+                    if info.long_name is not None:
+                        safe = safe_display(info.long_name)
+                        if safe is not None:
+                            out["pool_quote_name"] = safe
                     if info.company_zh is not None:
                         out["stock_company_zh"] = info.company_zh
                     if info.exchange is not None:
@@ -1308,7 +1319,7 @@ class PumpWatcher:
                 chain_display=pos.chain_display,
                 tx=t.tx,
                 pool_quote_symbol=None if pool_quote is None else pool_quote.symbol,
-                pool_quote_name=None if pool_quote is None else pool_quote.name,
+                # ⚠️ pool_quote_name 在 names 里(Yahoo 的 longName 优先),别再传一份
                 **names,
             )
             if not self._notifier.send(text):

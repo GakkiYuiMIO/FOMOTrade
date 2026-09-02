@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 
 from loguru import logger
@@ -2394,6 +2395,11 @@ def list_buyers(conn, network_id: str, token_address: str) -> list[sqlite3.Row]:
 # ============================================================
 # 币名 / 公司名词汇表(name_glossary)—— src/namecn.py 的缓存
 # ============================================================
+# 词汇表行数上限。⚠️ 成功行是永久的(名字不会变),不设上限它只增不减。
+# 20000:一行几十字节,总量 < 2MB;按每天见到 ~1500 个不同币名算,够十几天的滚动窗口,
+# 而热门币早就在缓存里、每次重查又会刷新 updated_at,被裁掉的都是很久没再见过的。
+GLOSSARY_MAX_ROWS = 20000
+
 def glossary_get(conn, kind: str, key: str, now: float) -> sqlite3.Row | None:
     """
     读一条缓存。过期的当没有(返回 None),由调用方重新查。
@@ -2421,3 +2427,36 @@ def glossary_put(conn, kind: str, key: str, value: str | None, source: str,
         """,
         (kind, key, value, source, None if expires_at is None else int(expires_at), now_iso()),
     )
+
+
+def glossary_prune(conn, max_rows: int | None = None, now: float | None = None) -> int:
+    """
+    裁词汇表:先删过期行,还超上限就按 updated_at **最旧的先删**。返回删了几行。
+
+    ⚠️⚠️ 为什么必须有:成功行是**永久**的(expires_at 为 NULL,名字不会变),
+       所以这张表只增不减 —— 1500 个不同的币名就是 1500 行,一年下来是几十万行。
+       对照同一分支的 dexscreener.PoolQuoteLookup:内存缓存有 _CACHE_MAX + _prune,
+       落盘的词汇表反而一个 DELETE 都没有。
+    ⚠️ 按 updated_at 最旧的先删 ≈ 近似 LRU:每次命中不刷新(命中不写库),但每次
+       **重查并写入**都会刷新,所以留下来的是最近查过的那批 —— 正是最可能再被查到的。
+    ⚠️ 同一秒写入的行 updated_at 相同,拿 rowid 兜底做稳定排序,免得删的是哪几行不确定。
+    """
+    # ⚠️ 默认值在**调用时**才取模块常量,不写进签名 —— 写进签名就是定义时求值,
+    #    测试改不动它,于是"上限生效了没有"这件事永远测不到。
+    max_rows = GLOSSARY_MAX_ROWS if max_rows is None else max_rows
+    now = time.time() if now is None else now
+    deleted = conn.execute(
+        "DELETE FROM name_glossary WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        (int(now),),
+    ).rowcount
+    total = conn.execute("SELECT COUNT(*) FROM name_glossary").fetchone()[0]
+    if total > max_rows:
+        deleted += conn.execute(
+            """
+            DELETE FROM name_glossary WHERE rowid IN (
+                SELECT rowid FROM name_glossary ORDER BY updated_at ASC, rowid ASC LIMIT ?
+            )
+            """,
+            (total - max_rows,),
+        ).rowcount
+    return max(0, deleted)
