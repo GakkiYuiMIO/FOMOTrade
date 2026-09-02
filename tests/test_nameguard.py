@@ -84,22 +84,45 @@ class Test门禁本身:
 
     def test_叠平空白并删掉格式控制符(self):
         assert ng.safe_display(f"Cash{ZWSP}  \n Cat") == "Cash Cat"
-        assert ng.safe_display(f"{RLO}pmup 币") == "pmup 币"
+
+    def test_双向控制符整段丢弃而不是删掉了事(self):
+        """
+        ⚠️⚠️ 零宽空格与 bidi 控制符的处理**刻意不同**:
+           前者是"把字拆开躲过形态判断",删掉之后剩下的就是攻击者本来想显示的东西;
+           后者(RTL 覆盖那一类)唯一的用途是**让显示顺序不等于字符顺序** ——
+           `币<U+202E> pmup` 读者看到的是 `币 pump`。删掉之后剩下的 `币 pmup`
+           是一个**作者从没写过**的名字,照样印出去等于"剔掉坏的那部分再显示"。
+        ⚠️ 零误伤:2026-09-02 实测 248 个真实币名里含 Cf 字符的是 0 个。
+        """
+        assert ng.safe_display(f"{RLO}pmup 币") is None
+        assert ng.safe_display(f"币{RLO} pmup") is None
+        assert ng.safe_display("Cash\u200e Cat") is None      # LRM
+        assert ng.safe_display("Cash\u2066Cat") is None       # LRI
+        assert ng.safe_exchange(f"Nasdaq{RLO}GM") is None
 
     @pytest.mark.parametrize(("raw", "marker"), [(a[1], a[2]) for a in _TOKEN_ATTACKS],
                              ids=_TOKEN_IDS)
     def test_攻击样本的特征串一个都出不来(self, raw, marker):
         """
-        ⚠️ 两种合格结果:整段丢弃(None),或者 Cf 被删掉之后**特征串已经不存在**
-           (RTL 覆盖那条:删掉 U+202E 之后剩下的 "pmup 币" 没有任何欺骗性)。
+        ⚠️ 这些样本现在**全部**是整段丢弃(None)。RTL 覆盖那条曾经走的是
+           "删掉 U+202E 之后照常显示",已改成整段丢弃 ——
+           理由见 Test门禁本身::test_双向控制符整段丢弃而不是删掉了事。
         """
         assert marker not in (ng.safe_display(raw) or ""), raw
 
-    def test_公司后缀的点不算域名(self):
-        """⚠️ 域名规则的点后面必须**紧跟** 2 个以上字母;"Inc." 的点在词尾。"""
+    def test_公司后缀与缩写里的点不算域名(self):
+        """
+        ⚠️ 域名规则的点后面必须**紧跟** 2 个以上字母;"Inc." 的点在词尾。
+        ⚠️⚠️ 还有一条更隐蔽的:"抽掉全部空白再判一次"那道(专治 `t. me/scam`)
+           会把 "U.S.A. Token" 拼成 "U.S.A.Token" → 匹配出一个 "A.Token"。
+           所以那一道**额外要求顶级域真实存在**,否则这三个真名字全被误杀。
+        """
         assert ng.safe_display("USA Rare Earth, Inc.") is not None
-        assert ng.safe_display("Space Exploration Technologies Corp. Class A") is not None
+        assert ng.safe_display("Space Exploration Technologies Corp.") is not None
+        assert ng.safe_display("U.S.A. Token") == "U.S.A. Token"
+        assert ng.safe_display("St. Louis Coin") == "St. Louis Coin"
         assert ng.safe_display("t.me") is None
+        assert ng.safe_display("t. me/scam") is None
 
     def test_表情与私用区字符不放行(self):
         """⚠️ 行首 emoji 是聊天列表预览里唯一的扫描锚点,名字里带 emoji 能伪造一条假行。"""
@@ -171,10 +194,9 @@ class Test币名进不了标题:
 def test_标题该有的东西一样不少():
     """⚠️ 门禁不能顺手把正常名字也毙了 —— 这条是上面那批用例的对照组。"""
     assert _render_buy("Cummingtonite").split("\n")[0] == \
-        "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · Cummingtonite"
-    assert _render_pump("Cummingtonite").split("\n")[0].endswith("<b>$CUM</b> · Cummingtonite")
-    assert _render_tin("Cummingtonite").split("\n")[0].endswith("<b>$CUM</b> · Cummingtonite")
-    assert _render_signal("Cummingtonite").split("\n")[0].endswith("<b>$CUM</b> · Cummingtonite")
+        "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · 「Cummingtonite」"
+    for fn in (_render_pump, _render_tin, _render_signal):
+        assert fn("Cummingtonite").split("\n")[0].endswith("<b>$CUM</b> · 「Cummingtonite」")
 
 
 # ============================================================
@@ -194,12 +216,6 @@ class Test恶意译文进不了推送:
                      stock_company_zh=zh, stock_exchange="NasdaqGM")
         assert marker not in msg, f"{label}:{marker!r} 进了推送\n{msg}"
         assert ZWSP not in msg and RLO not in msg
-        if label == "rtl-flip":
-            # ⚠️ 这条与别的不同:它的全部危险就在 U+202E 那一个字符上(视觉反转)。
-            #    删掉之后剩下的 "币 pmup" 只是一段没意义的字,不是链接也不是地址,
-            #    没有再丢弃整行的理由。数据层那道(clean_output 的"凭空多出原文没有的
-            #    英文串")仍然会把它整段毙掉 —— 见下面 test_译文侧过滤不让它落进永久缓存。
-            return
         assert "📝" not in msg, "译文不合格时 📝 应该整行消失"
         assert "🏢 USAR · 纳斯达克(NasdaqGM)上市" in msg.split("\n"), "🏢 该只剩交易所"
 
@@ -239,6 +255,27 @@ def test_symbol与handle与观点正文里的控制符也被删掉():
     assert msg.split("\n")[0] == "🌱 <b>alice</b> · 首次建仓 · <b>$CUM</b>"
 
 
+def test_观点正文里的组合emoji不能被拆开():
+    """
+    ⚠️⚠️ 这是删 Cf 那一刀的**回归护栏**。U+200D(ZWJ)的 unicodedata.category 正是 'Cf',
+       而它是所有组合 emoji 的粘合剂:👨‍💻 = 👨 + ZWJ + 💻、🏳️‍🌈 = 🏳 + FE0F + ZWJ + 🌈。
+       观点正文是**用户自己写的内容**,走的是保留 ZWJ 的那条路(strip_controls_keep_emoji);
+       哪天有人图省事把它换成全删版本,这条当场红 —— 否则用户只会看到
+       "👨💻"(两个 emoji)而没有任何报错。
+    ⚠️ U+FE0F(变体选择符)类别是 'Mn' 不是 'Cf',本来就不会被删,这里一并钉住。
+    ⚠️ 同一条里仍然要证明 RTL 覆盖被删掉:保 ZWJ ≠ 什么都不删。
+    """
+    dev = "👨‍💻"
+    flag = "🏳️‍🌈"
+    ev = make_event(EVENT_BUY, handle="alice", token_symbol="CUM", token_address=CA_CUM,
+                    network_id="robinhood", badge=BADGE_FIRST,
+                    thesis_text=f"{dev} 在写代码 {flag}{RLO} 反转")
+    msg = render(ev)
+    assert dev in msg, "组合 emoji 被拆开了(ZWJ 被当成 Cf 删掉)"
+    assert flag in msg
+    assert RLO not in msg, "保留 ZWJ 不等于什么都不删:RTL 覆盖仍然要删"
+
+
 def test_观点正文的换行不被叠平():
     """⚠️ 删控制符不能顺手把换行也吃掉:观点是多行的,叠平了就成一坨。"""
     ev = make_event(EVENT_BUY, handle="alice", token_symbol="CUM", token_address=CA_CUM,
@@ -248,12 +285,21 @@ def test_观点正文的换行不被叠平():
 
 
 def test_底池行与股票行的控制符也被删掉():
+    """
+    ⚠️ 零宽空格:删掉之后照常显示(symbol / 交易所名都还原成正常形态)。
+    ⚠️ bidi 控制符:**整段丢弃**,所以对手全名那半段消失,🌊 那行只剩符号。
+    """
     ev = make_event(EVENT_BUY, handle="alice", token_symbol="CUM", token_address=CA_CUM,
                     network_id="robinhood", badge=BADGE_FIRST)
-    msg = render(ev, pool_quote_symbol=f"US{ZWSP}AR", pool_quote_name=f"USA{RLO} Rare Earth",
+    msg = render(ev, pool_quote_symbol=f"US{ZWSP}AR", pool_quote_name=f"USA{ZWSP} Rare Earth",
                  stock_exchange=f"Nasdaq{ZWSP}GM")
     assert ZWSP not in msg and RLO not in msg
-    assert "🌊 底池 · USAR · USA Rare Earth" in msg.split("\n")
+    assert "🌊 底池 · USAR · 「USA Rare Earth」" in msg.split("\n")
+    assert "🏢 USAR · 纳斯达克(NasdaqGM)上市" in msg.split("\n")
+
+    msg2 = render(ev, pool_quote_symbol="USAR", pool_quote_name=f"USA{RLO} Rare Earth")
+    assert RLO not in msg2
+    assert "🌊 底池 · USAR" in msg2.split("\n"), msg2
 
 
 def test_控制符不占限长的名额():
@@ -265,5 +311,5 @@ def test_控制符不占限长的名额():
     ev = make_event(EVENT_BUY, handle="alice", token_symbol="CUM", token_address=CA_CUM,
                     network_id="robinhood", badge=BADGE_FIRST)
     msg = render(ev, pool_quote_symbol="USAR", pool_quote_name=ZWSP * 20 + "USA Rare Earth")
-    assert "🌊 底池 · USAR · USA Rare Earth" in msg.split("\n"), msg
+    assert "🌊 底池 · USAR · 「USA Rare Earth」" in msg.split("\n"), msg
     assert "…" not in msg

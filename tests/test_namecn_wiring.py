@@ -103,12 +103,12 @@ class Test买入推送:
 
         assert len(tg.sent) == 1
         lines = tg.sent[0].split("\n")
-        assert lines[0].endswith("<b>$AI</b> · Artificial Inu"), lines[0]
-        assert lines[1] == "📝 Artificial Inu = 人工犬"
+        assert lines[0].endswith("<b>$AI</b> · 「Artificial Inu」"), lines[0]
+        assert lines[1] == "📝 「Artificial Inu」 = 「人工犬」"
         # ⚠️ 🌊 那行的全名用 **Yahoo 的 longName**("NVIDIA Corporation"),
         #    不是 DexScreener 剥完后缀的 issuer("NVIDIA")—— Yahoo 是更权威的来源。
-        i = lines.index("🌊 底池 · NVDA · NVIDIA Corporation")
-        assert lines[i + 1] == "🏢 NVDA = 英伟达 · 纳斯达克(NasdaqGS)上市"
+        i = lines.index("🌊 底池 · NVDA · 「NVIDIA Corporation」")
+        assert lines[i + 1] == "🏢 NVDA = 「英伟达」 · 纳斯达克(NasdaqGS)上市"
         assert ft.calls == [("wiki_en", "Artificial Inu"), ("google", "Artificial Inu"),
                             ("yahoo", "NVDA"), ("wiki_en", "NVIDIA"), ("wiki_zh", "英伟达")]
 
@@ -121,8 +121,8 @@ class Test买入推送:
         _poller(client, tg, dex, ft).tick()
 
         lines = tg.sent[0].split("\n")
-        assert lines[0].endswith("<b>$CASHCAT</b> · Cash Cat"), lines[0]
-        assert lines[1] == "📝 Cash Cat = 现金猫"
+        assert lines[0].endswith("<b>$CASHCAT</b> · 「Cash Cat」"), lines[0]
+        assert lines[1] == "📝 「Cash Cat」 = 「现金猫」"
         assert "🌊" not in tg.sent[0] and "🏢" not in tg.sent[0]
         assert not any(k == "yahoo" for k, _ in ft.calls), "对手不是币股,不该去问 Yahoo"
 
@@ -139,8 +139,8 @@ class Test买入推送:
 
         assert dex.calls == [(CA_TOAD,)]
         lines = tg.sent[0].split("\n")
-        assert lines[0].endswith("<b>$TOAD</b> · Toad Coin"), lines[0]
-        assert lines[1] == "📝 Toad Coin = 蟾蜍币"
+        assert lines[0].endswith("<b>$TOAD</b> · 「Toad Coin」"), lines[0]
+        assert lines[1] == "📝 「Toad Coin」 = 「蟾蜍币」"
         assert "🌊" not in tg.sent[0]
 
     def test_注入式币名不送翻译且地址不出现在推送里(self, db):
@@ -165,8 +165,8 @@ class Test买入推送:
 
         assert len(tg.sent) == 1, "一个第三方接口抖了一下就把推送吃掉了"
         lines = tg.sent[0].split("\n")
-        assert lines[0].endswith("<b>$AI</b> · Artificial Inu")
-        assert "🌊 底池 · NVDA · NVIDIA" in lines
+        assert lines[0].endswith("<b>$AI</b> · 「Artificial Inu」")
+        assert "🌊 底池 · NVDA · 「NVIDIA」" in lines
         assert "📝" not in tg.sent[0] and "🏢" not in tg.sent[0]
 
     def test_词汇表整个坏掉也照发推送(self, db, monkeypatch):
@@ -189,7 +189,7 @@ class Test买入推送:
         p._names = Broken()
         p.tick()
         assert len(tg.sent) == 1
-        assert tg.sent[0].split("\n")[0].endswith("<b>$AI</b> · Artificial Inu")
+        assert tg.sent[0].split("\n")[0].endswith("<b>$AI</b> · 「Artificial Inu」")
 
     def test_跨轮命中缓存不再重复发请求(self, db):
         client = _one_buy(_rh_swap("a1"))
@@ -206,7 +206,7 @@ class Test买入推送:
         p.tick()
         assert len(tg.sent) == 2
         assert len(ft.calls) == n, "第二轮又去问了一遍"
-        assert "🏢 NVDA = 英伟达 · 纳斯达克(NasdaqGS)上市" in tg.sent[1]
+        assert "🏢 NVDA = 「英伟达」 · 纳斯达克(NasdaqGS)上市" in tg.sent[1]
 
     def test_转入推送只读缓存不发请求(self, db):
         """/tin 与转入聚合走 _name_extras(cached_only=True):有缓存就带,没有就没有,绝不外呼。"""
@@ -282,8 +282,8 @@ class Testpump推送:
         w._names = NameGlossary(client=NameClient(transport=ft))
         assert w.run_once() == 1
         lines = tg.sent[0].split("\n")
-        assert lines[0].endswith("<b>$PUNCHMA</b> · Punch Machine"), lines[0]
-        assert lines[1] == "📝 Punch Machine = 拳击机"
+        assert lines[0].endswith("<b>$PUNCHMA</b> · 「Punch Machine」"), lines[0]
+        assert lines[1] == "📝 「Punch Machine」 = 「拳击机」"
         assert "🌊" not in tg.sent[0] and "🏢" not in tg.sent[0]
         assert dex.calls == [(MINT_SOL,)]
 
@@ -310,7 +310,7 @@ class Testpump推送:
         w = _watcher_with_dex(tg, client, dex)
         w._names = NameGlossary(client=NameClient(transport=FakeTransport(crash={"wiki_en", "google"})))
         assert w.run_once() == 1
-        assert tg.sent[0].split("\n")[0].endswith("<b>$PUNCHMA</b> · Punch Machine")
+        assert tg.sent[0].split("\n")[0].endswith("<b>$PUNCHMA</b> · 「Punch Machine」")
         assert "📝" not in tg.sent[0]
 
 
@@ -390,8 +390,8 @@ def test_整条推送逐行对上批准的形态(db):
 
     assert len(tg.sent) == 1
     lines = tg.sent[0].split("\n")
-    assert lines[0] == "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · Cummingtonite"
-    assert lines[1] == "📝 Cummingtonite = 镁铁闪石"
+    assert lines[0] == "🌱 <b>inyourwalls</b> · 首次建仓 · <b>$CUM</b> · 「Cummingtonite」"
+    assert lines[1] == "📝 「Cummingtonite」 = 「镁铁闪石」"
     assert lines[2].startswith("💰 买入 $2,089.50")
     assert lines[3].startswith("📦 持仓 $2,601.97")
     assert lines[4].startswith("📊 均价 $0.00006718")
@@ -399,8 +399,8 @@ def test_整条推送逐行对上批准的形态(db):
     assert lines[6].startswith("💎 市值 $83.77K")
     # ⚠️⚠️ 这一行就是 MAJOR-3:上游 PoolQuote.name 剥完后缀是 "USA Rare Earth",
     #    而用户批准的形态带 ", Inc." —— 那个 ", Inc." 只有 Yahoo 的 longName 有。
-    assert lines[7] == "🌊 底池 · USAR · USA Rare Earth, Inc."
-    assert lines[8] == "🏢 USAR = 美国稀土公司 · 纳斯达克(NasdaqGM)上市"
+    assert lines[7] == "🌊 底池 · USAR · 「USA Rare Earth, Inc.」"
+    assert lines[8] == "🏢 USAR = 「美国稀土公司」 · 纳斯达克(NasdaqGM)上市"
     assert lines[-1] == f"<code>{_CA_CUM.lower()}</code>"
 
 
@@ -416,7 +416,7 @@ def test_Yahoo没给全名时底池行退回上游的issuer(db):
     _poller(client, tg, dex, ft).tick()
 
     lines = tg.sent[0].split("\n")
-    assert "🌊 底池 · USAR · USA Rare Earth" in lines
+    assert "🌊 底池 · USAR · 「USA Rare Earth」" in lines
     assert "🏢" not in tg.sent[0]
 
 

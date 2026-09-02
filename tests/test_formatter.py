@@ -1042,7 +1042,7 @@ def test_最长的那个真实公司名会被截断():
                       pool_quote_name="Space Exploration Technologies Corp.")
     assert "…" in line, "没截断 / 截了却不告诉读者"
     assert len(line) < 60, f"底池行太长:{len(line)}"
-    assert line == "🌊 底池 · SPCX · 「Space Exploration Technologies…」", line
+    assert line == "🌊 底池 · SPCX · 「Space Exploration Technologies C…」", line
 
 
 def test_带上ClassA后缀的超长名整段丢弃():
@@ -1094,8 +1094,8 @@ def test_底池对手全名必须截断():
     line = [ln for ln in _pool(pool_quote_name="N" * 5000).split("\n")
             if ln.startswith("🌊")][0]
     assert line == "🌊 底池 · NVDA", line
-    # 33~40 字符(过得了形状白名单、超过展示限长 32)才走截断那条路
-    line2 = [ln for ln in _pool(pool_quote_name="Nvidia Great Big Company Ltd").split("\n")
+    # 35 字符 5 个词(过得了形状白名单、超过展示限长 32)才走截断那条路
+    line2 = [ln for ln in _pool(pool_quote_name="Nvidia Greatest Big Company Limited").split("\n")
              if ln.startswith("🌊")][0]
     assert len(line2) < 120, f"底池行没截断,长 {len(line2)}"
     assert "…" in line2, "截断了却没有省略号 —— 读者不知道被截了"

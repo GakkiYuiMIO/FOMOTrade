@@ -26,11 +26,13 @@
    ⚠️ 这条路**连 U+200D(ZWJ)一起删** —— 币名里的 emoji 组合没有正当用途,
       而 ZWJ 能拆开域名。用户自己写的观点正文走的是另一条路(formatter._esc),
       那条**必须**保留 ZWJ,否则 👨‍💻 会被拆成两个 emoji。两条路分开,各自有测试。
-2. 空白替身归一:所有 Unicode Z*(Zs/Zl/Zp,含 NBSP U+00A0、表意空格 U+3000)
-   与 \\t \\r \\n 统一换成普通空格,再叠平。少了这一步,`t.<NBSP>me` 在下一步隐身。
+1.5 bidi 控制符(RTL 覆盖那一类)**整段丢弃**,不是删掉了事(见 _BIDI_CONTROLS)。
+2. 叠平**所有**空白:NBSP U+00A0、表意空格 U+3000、行分隔符 U+2028… 一并归一。
+   少了这一层,`t.<NBSP>me` 在下一步隐身。⚠️ 靠的是无参数 `str.split()`(见 flatten)。
 3. 必拦形态(命中任一 → 整段丢弃):scheme 头、域名形态、@提及、0x 地址、
    裸 hex 长串、base58 长串。域名**额外在"抽掉全部空白"的形态上再判一次** ——
-   `t. me/scam` 读者一眼仍读得出,必须抓住。
+   `t. me/scam` 读者一眼仍读得出,必须抓住;那一道额外要求顶级域真实存在
+   (见 _SPLIT_DOMAIN_TLDS),否则 "U.S.A. Token" 这类缩写名字会被误杀。
 4. 字符白名单:CJK + ASCII 字母 + ASCII 数字 + 空格 + 一小撮标点。集合外一律丢弃。
 5. 形状:长度 / 词数 / 标点数 / 连续数字 / 含 CJK 时的 ASCII 串长度。
 6. 通过 → 返回**清洗过**的那段文本(调用方必须用它,不能再用原串)。
@@ -65,6 +67,19 @@ import unicodedata
 # 零宽连接符。emoji 组合(👨‍💻 = 👨 + ZWJ + 💻)全靠它粘合。
 ZWJ = "‍"
 
+# ---- 第 2 步:双向文本控制符 → **整段丢弃**(不是删掉了事)-------------------
+# ⚠️⚠️ 这一条与别的 Cf 处理**刻意不同**。零宽空格是"把字拆开躲过形态判断",
+#    删掉之后剩下的串就是攻击者本来想显示的东西,继续往下判是对的;
+#    但 bidi 控制符(LRM/RLM/LRE/RLE/PDF/LRO/RLO/isolate 那一套)唯一的用途是
+#    **让显示顺序不等于字符顺序** —— `币<U+202E> pmup` 读者看到的是 `币 pump`。
+#    删掉之后剩下的 `币 pmup` 是一个**作者从没写过**的名字,照样印出去等于把
+#    "剔掉坏的那部分再显示"做了一遍(见模块头"整段丢弃"一节),那正是本模块拒绝做的事。
+#    ⚠️ 零误伤:2026-09-02 实测 248 个真实币名(四条链、DexScreener baseToken.name),
+#       含任何 Cf 字符的是 **0** 个。
+_BIDI_CONTROLS = frozenset(
+    "؜‎‏‪‫‬‭‮⁦⁧⁨⁩"
+)
+
 # ---- 第 3 步:必拦形态 ----------------------------------------------------
 # ⚠️ 不整体加 IGNORECASE:base58 那条的 [A-HJ-NP-Z] 一旦忽略大小写就会把小写 l 收进去,
 #    "Supercalifragilisticexpialidocious" 这种普通长词会被当成地址。
@@ -93,12 +108,37 @@ _RE_BASE58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{26,}")
 
 # 在**叠平后的文本**上判的规则。
 _BAD_PATTERNS = (_RE_SCHEME, _RE_DOMAIN, _RE_MENTION, _RE_EVM, _RE_BARE_HEX, _RE_BASE58)
-# 额外在**抽掉全部空白**的形态上再判一次的规则。
-# ⚠️ 只放域名这一条:`t. me/scam`(NBSP / 表意空格 / 换行拆出来的)读者一眼仍读得出,
-#    必须抓住。scheme 那条**不能**放进来 —— "Web3: The Movie" 抽掉空白就成了
-#    "Web3:TheMovie",会把正常名字误杀;base58 / hex 那两条也不放,
-#    抽掉空白后多词名字会被拼成一个长串("Quantum Whitest Fiber Rabbits" 之类)误判。
-_BAD_PATTERNS_COMPACT = (_RE_DOMAIN,)
+
+# ---- 第 3.5 步:被空白拆开的域名 -------------------------------------------
+# `t. me/scam`(NBSP / 表意空格 / 换行拆出来的)读者一眼仍读得出,必须抓住 ——
+# 但**不能**直接把 _RE_DOMAIN 套在"抽掉全部空白"的形态上:那样会误杀一大批真名字,
+# 因为英文里"点 + 空格"是缩写与句点的常态:
+#     "U.S.A. Token"                          → 抽空白成 "U.S.A.Token" → 匹配 "A.Token"
+#     "Space Exploration Technologies Corp. Class A" → 匹配 "Corp.ClassA"
+# 两条都是真实存在的正常名字(前者在硬基线里,后者是实测样本)。
+# ⚠️⚠️ 所以这一道**额外要求顶级域是真实存在的那一小撮**:
+#    一个被空白拆开的"域名"只有在读起来像**真域名**时才骗得到人,而这需要一个真 TLD。
+#    "A.Token" / "Corp.ClassA" / "St.Louis" 的尾巴都不是 TLD,读者也不会去访问它们。
+#    这一层只管"空白拆开"这一种绕过;没被拆开的域名由上面的 _RE_DOMAIN 原样拦住,
+#    与 TLD 是什么无关(`www.evil-airdrop.com` / `vitalik.eth` 都走那条)。
+# ⚠️ 表里是**加密钓鱼实际用的**那些 + 几个通用大户。宁可这张表短:
+#    漏一个冷门 TLD 只意味着"被空白拆开 **且** TLD 冷门"这一种组合逃过第二道;
+#    表长了则开始误杀真名字("Alpha.Studio" 这种)。
+_SPLIT_DOMAIN_TLDS = frozenset({
+    "com", "net", "org", "io", "co", "me", "gg", "xyz", "app", "fun",
+    "link", "live", "vip", "top", "cc", "ru", "cn", "info", "biz", "site",
+    "online", "club", "pro", "tv", "ws", "to", "sh", "gd", "ly", "am",
+    "fm", "at", "st", "eth", "sol", "bio", "one", "pw", "su", "space",
+    "store", "tech", "world", "team", "chat", "cash", "finance", "money",
+})
+# 与 _RE_DOMAIN 同形,只是把顶级域单独抓出来供上面那张表判。
+_RE_SPLIT_DOMAIN = re.compile(r"[A-Za-z0-9-]+\.([A-Za-z]{2,})")
+
+
+def _looks_like_split_domain(compact: str) -> bool:
+    """抽掉空白之后是否长出了一个**真域名**(顶级域在白名单里)。理由见上面。"""
+    return any(m.group(1).lower() in _SPLIT_DOMAIN_TLDS
+               for m in _RE_SPLIT_DOMAIN.finditer(compact))
 
 # ---- 第 4 步:字符白名单 --------------------------------------------------
 # 中日韩(含假名、谚文)。与 namecn._CJK 同一份范围。
@@ -129,9 +169,13 @@ _MIN_CHARS = 1
 #   "Quantum White Fiber Rabbit" 4 词。而 "Send SOL to my wallet now" 6 词、
 #   "Buy now 100% safe visit my profile" 7 词 —— 一句话总比一个名字长。
 _MAX_WORDS = 5
-# 标点上限 2:"USA Rare Earth, Inc." 与 "WhiteFiber, Inc." 各 2 个(`,` 与 `.`),
-#   这是实测的上界。"已清仓 · 亏损 99%" 这类伪造字段的文案标点更多。
-_MAX_PUNCT = 2
+# 标点上限 3:2026-09-02 实测 248 个真实币名的标点数分布是 {0: 235, 1: 11, 2: 2},
+#   实测上界只有 2("USA Rare Earth, Inc." / "WhiteFiber, Inc.":`,` 与 `.`);
+#   抬到 3 是为了放行**缩写式**的名字 —— "U.S.A. Token" 光点就有 3 个,
+#   而它是一个正常名字(2 上限时它被误杀,这是本轮实测发现的唯一一条真误杀)。
+#   代价评估:抬这一格不会多放行任何一条攻击基线(伪造字段靠的是 `·`/全角标点,
+#   那两类根本不在字符白名单里;话术类靠词数与长数字拦),所以是零成本。
+_MAX_PUNCT = 3
 # 连续数字上限 5 位:手机号(13800138000)、QQ 号(3355778899)一律 ≥6 位;
 #   而 "1000X"(4 位)、"SPDR S&P 500"(3 位)是正常的。**这一条不许松。**
 _RE_LONG_DIGITS = re.compile(r"[0-9]{6,}")
@@ -177,21 +221,19 @@ def strip_controls_keep_emoji(s) -> str:
                    if ch == ZWJ or unicodedata.category(ch) != "Cf")
 
 
-def normalize_spaces(s) -> str:
-    """
-    所有"空白替身"→ 普通空格:Unicode Z*(Zs/Zl/Zp,含 NBSP U+00A0、表意空格 U+3000)
-    与 \\t \\r \\n。
-
-    ⚠️ 少了这一步,`t.<NBSP>me` 在域名规则面前隐身,而 Telegram 渲染出来读者一眼
-       仍读得出 `t. me`。归一化之后它变成 `t. me`,再由"抽掉空白"那道形态判断抓住。
-    """
-    return "".join(" " if (ch in "\t\r\n" or unicodedata.category(ch).startswith("Z")) else ch
-                   for ch in str(s or ""))
-
-
 def flatten(s) -> str:
-    """删 Cf → 空白替身归一 → 叠平空白。**不可信文本的所有判断**都在这个结果上做。"""
-    return " ".join(normalize_spaces(strip_format_controls(s)).split())
+    """
+    删 Cf → 叠平**所有**空白。**不可信文本的所有判断**都在这个结果上做。
+
+    ⚠️⚠️ "空白替身"(NBSP U+00A0、表意空格 U+3000、行分隔符 U+2028…)必须一并归一:
+       少了这一层,`t.<NBSP>me` 在域名规则面前隐身,而 Telegram 渲染出来读者一眼
+       仍读得出 `t. me`。
+    ⚠️ 这里**不需要**手写一张 Z* 替换表 —— 无参数的 `str.split()` 按 Unicode 判空白,
+       Zs/Zl/Zp **全体**(以及 \\t \\r \\n)都在内。这条前提由
+       tests/test_nameguard_shape.py::test_每一个Unicode空白都算空白 逐码点验着;
+       ⚠️ 但它只对**无参数**的 split 成立:写成 `split(" ")` 这一层当场失效。
+    """
+    return " ".join(strip_format_controls(s).split())
 
 
 def _char_ok(ch: str) -> bool:
@@ -225,16 +267,18 @@ def safe_display(s) -> str | None:
     ⚠️ 幂等:safe_display(safe_display(x)) == safe_display(x) —— formatter 在入口统一
        过一遍之后,下游单行渲染函数再过一遍不会改变结果(那是刻意保留的第二道)。
     """
+    # ⚠️ 这一条判的是**原串**,必须在 flatten(会把 Cf 删掉)之前:
+    #    删完就看不出它来过了,而"它来过"本身就是丢弃的理由(见 _BIDI_CONTROLS)。
+    if any(ch in _BIDI_CONTROLS for ch in str(s or "")):
+        return None
     text = flatten(s)
     if not text:
         return None
-    compact = text.replace(" ", "")
     for pat in _BAD_PATTERNS:
         if pat.search(text):
             return None
-    for pat in _BAD_PATTERNS_COMPACT:
-        if pat.search(compact):
-            return None
+    if _looks_like_split_domain(text.replace(" ", "")):
+        return None
     if not all(_char_ok(ch) for ch in text):
         return None
     if not _shape_ok(text):
@@ -251,7 +295,10 @@ def safe_exchange(s) -> str | None:
        `立即访问 t.me/free-airdrop` 原样送进 🏢 行。
     ⚠️ 它不是自由文本,所以不套通用的形状白名单,而是按已知形态收:
        字母开头 + 字母/数字/空格/点/横杠,总长 ≤20("NYSE American" 13、"NasdaqGM" 8)。
+    ⚠️ bidi 控制符与 safe_display 同一条口径:来过就整段丢弃,理由见 _BIDI_CONTROLS。
     """
+    if any(ch in _BIDI_CONTROLS for ch in str(s or "")):
+        return None
     text = flatten(s)
     if not text:
         return None

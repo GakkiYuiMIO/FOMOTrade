@@ -123,6 +123,10 @@ WIKI_NVIDIA = _load("wiki_langlinks_nvidia.json")
 WIKI_NVIDIA_ZH = _load("wiki_parse_nvidia_zhcn.json")
 GOOGLE_USAR = _load("google_translate_usar.json")
 GOOGLE_CUM = _load("google_translate_cummingtonite.json")
+# ⚠️ **真的是多段**的一份响应(2026-09-02 实测抓的:两个句子 → json[0] 里两条 seg)。
+#    原先每一份 google 夹具都只有一段,于是 parse_google 里那句 "".join(parts)
+#    改成 parts[0] 也没有任何测试会红 —— 那是零覆盖。
+GOOGLE_MULTI = _load("google_translate_multi_segment.json")
 YAHOO_USAR = _load("yahoo_chart_usar.json")
 YAHOO_WYFI = _load("yahoo_chart_wyfi.json")
 YAHOO_NVDA = _load("yahoo_chart_nvda.json")
@@ -191,9 +195,28 @@ class Test解析:
         assert YAHOO_MISSING[1]["chart"]["result"] is None
         assert nc.parse_yahoo(YAHOO_MISSING[1]) is None
 
+    def test_Google多段译文要拼起来(self):
+        """
+        ⚠️⚠️ 夹具是**真的多段**(实测抓的两句话响应),不是手捏的:
+           translate_a/single 会按句子切段,json[0] 里有几条 seg 就得拼几条。
+           只取 parts[0] 会静默丢掉后半句 —— 读者拿到的是半截译文,看不出被动过。
+        """
+        assert len(GOOGLE_MULTI[0]) == 2, "夹具必须真的是多段,否则这条测不到拼接"
+        assert nc.parse_google(GOOGLE_MULTI) == "太空探索技术公司 A 类普通股。这是一家私营公司。"
+
     def test_Yahoo非股票类型原样带出(self):
         assert nc.parse_yahoo(YAHOO_BTC).instrument_type == "CRYPTOCURRENCY"
         assert nc.parse_yahoo(YAHOO_SPY).instrument_type == "ETF"
+
+    def test_Yahoo的类型统一成大写(self):
+        """
+        ⚠️⚠️ instrumentType 是**拿去和 STOCK_TYPES 比**的判据。Yahoo 实测给大写,
+           但那是上游的当下行为不是契约:哪天回一个小写 'equity',少了 .upper()
+           就会判成"不是上市股票",🏢 整行**静默消失**,而且没有任何日志。
+        """
+        assert nc.parse_yahoo(_yahoo("USA Rare Earth, Inc.", itype="equity")) == \
+            nc.StockFact("USA Rare Earth, Inc.", "NasdaqGM", "EQUITY")
+        assert nc.parse_yahoo(_yahoo("SPDR S&P 500 ETF Trust", itype="etf")).instrument_type == "ETF"
 
 
 # ============================================================
@@ -581,6 +604,43 @@ class Test预算:
         g.begin_round()
         g.token_zh("Gamma Three", "C")             # 维基 + Google(失败)= 2 次
         assert len(ft.calls) == 4
+
+    def test_同一tick同一个名字只查一次(self):
+        """
+        ⚠️⚠️ memo 与缓存是**两件事**。这里刻意让 conn_factory 直接炸 ——
+           缓存读写全废(_cache_get 读失败当未缓存、_cache_put 静默吞掉),
+           于是同一 tick 里"第二次问同一个名字"能不能不再外呼,**只由 memo 决定**。
+           一个 tick 里同一个币出现在好几条事件里是常态(同一批 swap、底池对手重复),
+           少了 memo 就是同样的请求打好几遍,预算白白烧掉。
+        ⚠️ 夹具只准备了**一份**响应:第二次真去外呼就会拿到 UnavailableError → None,
+           断言当场红。
+        """
+        @contextmanager
+        def _boom_conn():
+            raise RuntimeError("词汇表整个坏掉")
+            yield  # pragma: no cover
+
+        ft = FakeTransport({"wiki_en": [WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH]})
+        g = nc.NameGlossary(client=nc.NameClient(transport=ft), conn_factory=_boom_conn)
+        assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"
+        n = len(ft.calls)
+        assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石", "同 tick 第二次又去外呼了"
+        assert len(ft.calls) == n, ft.calls
+
+    def test_begin_round之后同一个名字重新查(self):
+        """⚠️ memo 是**同 tick** 的:跨 tick 必须重新走缓存/外呼,否则一条脏结果会粘住整个进程。"""
+        @contextmanager
+        def _boom_conn():
+            raise RuntimeError("词汇表整个坏掉")
+            yield  # pragma: no cover
+
+        ft = FakeTransport({"wiki_en": [WIKI_CUM], "wiki_zh": [WIKI_CUM_ZH]})
+        g = nc.NameGlossary(client=nc.NameClient(transport=ft), conn_factory=_boom_conn)
+        assert g.token_zh("Cummingtonite", "CUM") == "镁铁闪石"
+        g.begin_round()
+        # 夹具已弹空 → 第二 tick 真的又去外呼了(拿到失败 → None)
+        assert g.token_zh("Cummingtonite", "CUM") is None
+        assert len(ft.calls) == 3
 
 
 # ============================================================

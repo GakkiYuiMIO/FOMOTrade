@@ -3603,7 +3603,7 @@ def test_买入推送带上底池对手资产(db):
     _poller_with_dex(client, notifier, dex).tick()
 
     assert len(notifier.sent) == 1
-    assert "🌊 底池 · NVDA · NVIDIA" in notifier.sent[0], "底池对手没进推送"
+    assert "🌊 底池 · NVDA · 「NVIDIA」" in notifier.sent[0], "底池对手没进推送"
     # ⚠️ 判据后缀不该印出来:它对每一条命中的记录都一样,是判据不是信息
     assert "Robinhood Token" not in notifier.sent[0]
 
