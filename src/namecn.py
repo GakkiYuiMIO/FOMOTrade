@@ -111,19 +111,20 @@ ROUND_YAHOO_CALLS = 5
 # 20s:两道闸门任一触发即停;用 time.monotonic(),不受系统改时间影响。
 ROUND_WALL_CLOCK_SEC = 20.0
 
-# 送去翻译的名字最长几个字符。再长就是营销文案,翻出来也没人读,还白占预算。
-# ⚠️ **实际生效的上限比这个小**:translatable 末尾还要过 nameguard.safe_display,
-#    那道的形状白名单把名字卡在 40 字符以内。这条只是更早、更便宜的一道粗筛,
-#    留着是因为它不需要跑正则;改这个数字不会放宽真正的上限。
-_MAX_TRANSLATE_CHARS = 64
+# ⚠️ **没有"送翻译的长度上限"常量**。上一版写了 `_MAX_TRANSLATE_CHARS = 64` 并在
+#    translatable 里判 `len(n) > 64`,而同一个函数末尾要过 nameguard.safe_display,
+#    那道的形状白名单把名字卡在 **40** 字符 —— 64 那条永远轮不到生效,是**死常量**
+#    (把它改成 6400 全量测试 0 红),配套测试的"太长"那半边也跟着空转。
+#    真实的上限就是 safe_display 的 40,由 tests/test_namecn.py 的长度边界那条钉着。
 # 显示 B 行的 instrumentType。别的(CRYPTOCURRENCY / INDEX / MUTUALFUND …)不是"上市股票"。
 STOCK_TYPES = frozenset({"EQUITY", "ETF"})
 # Yahoo 的 chart.error.code 里,**只有**这些算"这个代码不存在"(负缓存 30 天)。
 # 其余(限流、内部错误)一律按失败缓存 1 小时 —— 实测 404 查无给的就是 "Not Found"。
 _YAHOO_MISS_CODES = frozenset({"not found", "notfound"})
 
-# 中日韩文字(含假名、谚文):名字本身含 CJK 就不用翻。
-_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
+# ⚠️ 中日韩文字的判定**复用 nameguard.has_cjk**,这里不再写第二份码点区间 ——
+#    原先这里和 nameguard 各写一份 `[぀-ヿ...]`,而那份区间里混着 61 个非字母码点
+#    (U+30FB 片假名中点与字段分隔符 `·` 同形)。一份表放两个地方早晚走岔。
 # 股票代码形态。ticker 来自 DexScreener 的对手 symbol(第三方字符串),只放行这种形态。
 _TICKER = re.compile(r"[A-Z0-9][A-Z0-9.\-]{0,11}")
 # 公司名后缀。查维基时先剥掉:维基条目叫 "NVIDIA" 不叫 "NVIDIA Corporation"。
@@ -198,18 +199,22 @@ def same_text(a, b) -> bool:
 def translatable(name, symbol) -> bool:
     """
     这个名字**要不要送去翻译**(输入侧过滤)。以下一律不翻、📝 行不出现:
-    名字缺失 / 与 symbol 相同 / 含 CJK / 纯数字纯符号 / 长度 < 2 / 太长 / 过不了展示门禁。
+    名字缺失 / 与 symbol 相同 / 含 CJK / 纯数字纯符号 / 长度 < 2 / 过不了展示门禁。
+
+    ⚠️ 长度上限**不在这里** —— 它就是 safe_display 的 40 字符(见上面被删掉的
+       _MAX_TRANSLATE_CHARS 那段注释)。这里只留 len < 2 那条:一个字符的英文名
+       翻出来没有信息量,而它过得了 safe_display。
 
     ⚠️⚠️ 这道门只管**省请求**,不等于"显不显示" —— 显示那道在 formatter
        (safe_display),是**独立**的一道。两道用的是同一个白名单函数,但缺了哪一道
        都有真实后果:缺这道会白打请求,缺那道会让攻击者的名字直接进用户的标题。
     """
     n = _flat(name)
-    if len(n) < 2 or len(n) > _MAX_TRANSLATE_CHARS:
+    if len(n) < 2:
         return False
     if same_as_symbol(n, symbol):
         return False
-    if _CJK.search(n):
+    if nameguard.has_cjk(n):
         return False
     if not any(ch.isalpha() for ch in n):
         return False
@@ -221,13 +226,17 @@ def clean_output(zh, source_text, tag) -> str | None:
     译文的输出侧过滤 —— 三条,命中任一**整段丢弃**并 WARNING(带 symbol,不带原文):
 
       1. 过不了展示门禁(白名单:域名 / 协议头 / @提及 / 地址形态 / 集合外字符)。
+         ⚠️ 这里把**原文**一并交给门禁(safe_display 的 source):门禁里"含 CJK 时不许有
+            ≥5 位 ASCII 串"那条本来就是 has_new_ascii_word 的同一个意思 ——
+            "凭空**多出**原文没有的英文串"。不传原文时它把 'Tesla xStock' → '特斯拉 xStock'
+            这类正常译文全毙了(实测 xStock 全家族 100% 丢译名)。
       2. 长度 > 原文的 4 倍。译名不会比原文长这么多,长了就是被塞了东西。
       3. 出现了**原文里没有的** ASCII 字母串(≥4 位)。正常中文译名不会凭空长出英文单词;
          凭空长出来的要么是代理篡改了响应,要么是维基把条目重定向到了另一个英文名
          (SPCX 的公司名 → 中文维基条目就叫 "SpaceX",那是英文,不该进"中文名"槽位)。
          ⚠️ 原文里有的不受影响:token 名 "SpaceX" → 译文 "SpaceX" 不被这条拦。
     """
-    z = nameguard.safe_display(zh)
+    z = nameguard.safe_display(zh, source_text)
     if z is None:
         logger.warning("译文被丢弃(过不了展示门禁) | {}", tag)
         return None

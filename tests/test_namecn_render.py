@@ -167,6 +167,7 @@ class Test股票说明:
         assert "🏢" not in msg and "🌊" not in msg
 
     def test_交易所映射(self):
+        """⚠️ 左边这些是 2026-09-02 **实测** Yahoo 真实返回的 fullExchangeName。"""
         cases = {
             "NasdaqGS": "纳斯达克(NasdaqGS)上市",
             "NasdaqGM": "纳斯达克(NasdaqGM)上市",
@@ -175,12 +176,27 @@ class Test股票说明:
             "NYSEArca": "纽交所 Arca(NYSEArca)上市",
             "NYSE American": "美国证券交易所(NYSE American)上市",
             "AMEX": "美国证券交易所(AMEX)上市",
-            "TSX": "TSX 上市",
-            "Tokyo": "Tokyo 上市",
+            # 映射不到中文的**只印原代码**(绝不猜一个中文名)——
+            # 这两个也是实测出现过的真实取值。
+            "Cboe US": "Cboe US 上市",
+            "OTC Markets OTCPK": "OTC Markets OTCPK 上市",
         }
         for code, expect in cases.items():
             lines = self._with_pool(stock_exchange=code)
             assert f"🏢 USAR · {expect}" in lines, (code, lines)
+
+    def test_表外的交易所整段不显示(self):
+        """
+        ⚠️⚠️ 交易所现在是**封闭枚举**不是模式匹配(上一版那条正则把所有 ≤20 字符的
+           裸域名整段放行了,'t.me' / 'discord.gg' / 'bit.ly' 全过)。
+           不在表里 → 那一段不显示,🏢 整行仍可显示 ticker 与公司名。
+        ⚠️ 'TSX' / 'Tokyo' 是**合法但没实测到**的交易所:同样不显示。
+           要收它们,得先拿到真实响应,补表 + 补测试 —— 不许改回模式匹配。
+        """
+        for code in ("TSX", "Tokyo", "t.me", "bit.ly", "www.evil-airdrop.com", "NYSEX"):
+            lines = self._with_pool(stock_exchange=code, stock_company_zh="美国稀土公司")
+            line = [ln for ln in lines if ln.startswith("🏢")][0]
+            assert line == "🏢 USAR = 「美国稀土公司」", (code, line)
 
     def test_公司名要转义而坏交易所整段消失(self):
         """
@@ -294,3 +310,31 @@ class Test转入推送:
             network_id="robinhood", token_address=CA_CUM, token_symbol="CUM",
             receiver_count=3, receivers=[], window_hours=24, token_name="CUM")
         assert msg2.split("\n")[0].endswith("<b>$CUM</b>")
+
+
+def test_中文名行的第二道门也拿得到原文():
+    """
+    ⚠️⚠️ 收口入口那道过了,**下游单行渲染函数还会再过一道**(刻意保留的第二道)。
+       第二道如果不带原文,'特斯拉 xStock' 会在这里被毙掉 —— 收口做对了、
+       📝 那一行照样消失,而且没有任何报错。
+    ⚠️ 断言写死字面量。
+    """
+    from src.formatter import render
+    from src.models import BADGE_FIRST, EVENT_BUY
+
+    from .conftest import make_event
+
+    ev = make_event(EVENT_BUY, handle="alice", token_symbol="TSLAX",
+                    token_address="0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
+                    network_id="robinhood", badge=BADGE_FIRST)
+    msg = render(ev, token_name="Tesla xStock", token_name_zh="特斯拉 xStock")
+    assert "📝 「Tesla xStock」 = 「特斯拉 xStock」" in msg.split("\n"), msg
+
+    # 🏢 行同理:公司名译文的原文是 🌊 那行的 Yahoo longName
+    msg2 = render(ev, pool_quote_symbol="CRCL", pool_quote_name="Circle Internet Group",
+                  stock_company_zh="Circle 互联网集团", stock_exchange="NYSE")
+    assert "🏢 CRCL = 「Circle 互联网集团」 · 纽约证券交易所(NYSE)上市" in msg2.split("\n"), msg2
+
+    # 对照组:原文里没有的英文串仍然整段丢弃
+    msg3 = render(ev, token_name="Nice Coin", token_name_zh="好币 airdrop")
+    assert "📝" not in msg3, msg3

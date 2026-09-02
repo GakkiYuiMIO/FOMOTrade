@@ -20,7 +20,9 @@
 
 ============ 阈值与理由(⚠️ 改阈值 = 改这个文件,别反过来)============
 _MAX_CHARS = 40   实测最长的"普通"名字 36("Space Exploration Technologies Corp.")。
-_MIN_CHARS = 1    单字中文译名("猫")是正常结果,而 1 个字装不下任何攻击载荷。
+长度下限      **没有常量** —— "非空即可"。单字中文译名("猫")是正常结果,
+                  1 个字也装不下任何攻击载荷。(上一版那个 _MIN_CHARS = 1 是死代码,
+                  safe_display 在它之前已经 `if not text: return None`,已删。)
 _MAX_WORDS = 5    实测最多 5 词;"Send SOL to my wallet now" 6 词、
                   "Buy now 100% safe visit my profile" 7 词 —— 一句话总比一个名字长。
                   ⚠️ 实测里有 2 条 6 词的真名字("One Dollar Is All You Need" /
@@ -28,7 +30,17 @@ _MAX_WORDS = 5    实测最多 5 词;"Send SOL to my wallet now" 6 词、
                      放行它们就等于放行 "Send SOL to my wallet now"。按"拦住优先"取舍。
 _MAX_PUNCT = 3    实测上界只有 2;抬到 3 是为了放行缩写式名字 "U.S.A. Token"(3 个点)。
                   抬这一格不会多放行任何一条攻击基线。
-连续数字 ≥6 → 丢  手机号 / QQ 号一律 ≥6 位。**不许松。**
+_MAX_DIGITS = 5   判的是**数字总个数**不是"连续几位"。上一版写的是"连续 ≥6 位",
+                  而 `-` `.` 空格都在字符白名单里 —— '138-0013-8000' / '138 0013 8000' /
+                  '138.0013.8000' 全部平凡绕过。实测 247 个真实币名的数字总量分布
+                  {0: 214, 1: 20, 2: 8, 3: 3, 4: 2},上界 4('NASDAQ 6900');
+                  85 个 Yahoo longName 上界也是 4。留一格取 5。**不许松。**
+                  ⚠️ 总量规则严格强于连续规则(连续 n 位 ⇒ 总量至少 n),
+                     所以"连续"那条已经删掉,不留被完全覆盖的死规则。
+CJK 判定          用 unicodedata.category(+ 字符名),**不是码点区间**。上一版的
+                  `[぀-ヿ…]` 里混着 61 个非字母码点,其中 U+30FB(片假名中点)
+                  与字段分隔符 `·` 同形 —— "`·` 不许松"那条当时实际已经破了。
+半角冒号 `:`      已从标点白名单拿掉(CJK 打头的 `加我微信:abcd` 从 scheme 规则下面漏过)。
 `·` `•` `#` `$` `+` `「` `」` 不在字符白名单里。**`·` 那条不许松**
                   (它是本项目的字段分隔符,放行等于把"造假字段"的能力交出去)。
 
@@ -45,12 +57,60 @@ from src.nameguard import safe_display
 # ============================================================
 # 硬基线 1:必须放行(已知的真实名字,一个都不许丢)
 # ============================================================
+# ⚠️ "SPDR S&P 500 ETF Trust" **不是 Yahoo 实际返回的字符串**(实测 SPY 的 longName 是
+#    "State Street SPDR S&P 500 ETF Trust",7 个词,过不了词数上限)。它留在这里的身份是
+#    **5 词 + `&` + 3 位数字的边界样本**,不是"Yahoo 会给这个值"的断言 ——
+#    上一轮报告点名说它冒充了实测值,这里改口。真实的 Yahoo longName 见 _REAL_YAHOO_*。
 _MUST_PASS = [
     "Cummingtonite", "Cash Cat", "dogwifhat", "Artificial Inu",
     "Quantum White Fiber Rabbit", "USA Rare Earth, Inc.", "WhiteFiber, Inc.",
     "NVIDIA Corporation", "SPDR S&P 500 ETF Trust",
     "Space Exploration Technologies Corp.", "U.S.A. Token",
     "镁铁闪石", "美国稀土公司", "英伟达", "Tether Gold",
+    # 2026-09-02 实测的**币股名**(剥掉 " • Robinhood Token" 后缀之后的那份,
+    # 剥后缀在 dexscreener 数据层做,见 test_dexscreener 里那条)。
+    # 上一轮它们连同 📝 行整段消失,是这一轮必须放行的东西。
+    "Circle Internet Group", "AMC Entertainment", "Meta Platforms",
+    "United States Oil Fund", "ASML Holding NV",
+]
+
+# ============================================================
+# 硬基线 1.5:真实的 Yahoo longName(2026-09-02 实测 87 个 ticker,85 个有值)
+# ============================================================
+# ⚠️ 这一段是**实话**:Yahoo 的 longName 比币名长得多,门禁会丢掉一部分(实测 13/85 = 15.3%)。
+#    丢掉不等于那一行没了 —— 🌊 那行拿不到 Yahoo 的名字就退回 DexScreener 剥完后缀的
+#    issuer(见 poller._name_extras),所以代价是"名字不是最权威的那份",不是"没有名字"。
+_REAL_YAHOO_PASS = [
+    "NVIDIA Corporation", "Apple Inc.", "Tesla, Inc.", "Microsoft Corporation",
+    "Meta Platforms, Inc.", "Alphabet Inc.", "Circle Internet Group",
+    "GameStop Corp.", "ASML Holding N.V.", "United States Oil Fund, LP",
+    "McDonald's Corporation", "The Coca-Cola Company", "Ford Motor Company",
+    "Invesco QQQ Trust", "iShares Russell 2000 ETF", "ARK Innovation ETF",
+    "Vanguard S&P 500 ETF", "SPDR Gold Shares", "iShares Silver Trust",
+    "Berkshire Hathaway Inc.", "Royal Bank of Canada", "Shopify Inc.",
+    "Rio Tinto Group", "BHP Group Limited", "Imperial Oil Limited",
+    "Chevron Corporation", "JPMorgan Chase & Co.", "Walmart Inc.", "AT&T Inc.",
+    "Pfizer Inc.", "The Walt Disney Company", "NIKE, Inc.", "The Boeing Company",
+    "Trio-Tech International", "Galiano Gold Inc.", "SAP SE", "Comstock Inc.",
+    "i-80 Gold Corp.", "Eni S.p.A.", "Toyota Motor Corporation",
+    "Sony Group Corporation", "Volkswagen AG", "Strategy Inc",
+    "iShares Bitcoin Trust ETF", "ProShares Bitcoin ETF", "ProShares UltraPro QQQ",
+    "iShares MSCI EAFE ETF",
+]
+_REAL_YAHOO_DROPPED = [
+    ("Amazon.com, Inc.", "形态:域名 —— 公司名里真的含一个真域名,这条是**真误伤**"),
+    ("State Street SPDR S&P 500 ETF Trust", "词数 7 > 5"),
+    ("State Street SPDR Dow Jones Industrial Average ETF Trust", "长度 56 > 40"),
+    ("State Street Energy Select Sector SPDR ETF", "词数 7 > 5"),
+    ("iShares 20+ Year Treasury Bond ETF", "字符白名单外的 `+`(Telegram 可拨号通道)"),
+    ("Taiwan Semiconductor Manufacturing Company Limited", "长度 49 > 40"),
+    ("International Business Machines Corporation", "长度 42 > 40"),
+    ("Nestlé S.A.", "非 ASCII 拉丁字母 é(同形字取舍)"),
+    ("Petróleo Brasileiro S.A. - Petrobras", "非 ASCII 拉丁字母 ó"),
+    ("Direxion Daily Semiconductor Bull 3X Shares", "长度 42 > 40"),
+    ("Direxion Daily S&P500 Bull 3X Shares", "词数 6 > 5"),
+    ("ProShares Ultra VIX Short-Term Futures ETF", "词数 6 > 5"),
+    ("iPath Series B S&P 500 VIX Short-Term Futures ETN", "词数 9 > 5"),
 ]
 
 # ============================================================
@@ -89,6 +149,21 @@ _MUST_BLOCK = [
     ("抽奖码123456", "连续数字 6 位刚好踩线"),
     ("假「名字」", "字符白名单:`「`『』是视觉容器本身,名字里带它就能把自己移出容器"),
     ("Coin • Token", "字符白名单:`•` 与 `·` 同属字段分隔符"),
+    # ======== 本轮新增(三个复验者在 50f19ac 上亲手打出来的)========
+    ("已清仓 ・ 亏损 99%", "U+30FB 片假名中点与 `·` 同形 —— 上一版的 CJK 码点区间放行了它"),
+    ("・", "U+30FB 单独一个也不许:它是伪造分隔符的原料"),
+    ("Coin ゛ Token", "U+309B(Sk)也混在上一版那段区间里"),
+    ("Coin ゠ Token", "U+30A0(Pd 连字号)同上"),
+    ("138-0013-8000", "数字总量 11 > 5 —— 连续那条被 `-` 平凡绕过"),
+    ("138 0013 8000", "数字总量 11 > 5 —— 被空格绕过"),
+    ("138.0013.8000", "数字总量 11 > 5 —— 被 `.` 绕过"),
+    ("t.me", "裸域名 —— 它当交易所名时曾被 safe_exchange 整段放行"),
+    ("evil.zzz", "形态:域名。⚠️ TLD 'zzz' **不在** _SPLIT_DOMAIN_TLDS 里,"
+                 "所以只有 _RE_DOMAIN 这一条拦得住它 —— 这是那条规则的**独占**覆盖"),
+    ("t. ME/scam", "NBSP 拆开 + **大写** TLD:靠 _looks_like_split_domain 里的 .lower()"),
+    ("...", "纯标点不是名字:每个字符都在标点白名单里,长度/词数/标点数也都在上限内"),
+    ("1.2.3.4", "IPv4 形态:数字总量只有 4,拦不住,单列一条"),
+    ("加我微信:abcd", "半角冒号已从标点白名单拿掉 —— scheme 那条只认 ASCII 打头的形态"),
 ]
 
 # ============================================================
@@ -349,6 +424,10 @@ _REAL_DROPPED = [
     ('Chó the fish vendor', '字符白名单外的字符 ó'),
 ]
 
+# 2026-09-02 **重测**(本轮改完之后,同一批 247 条):丢弃的仍然是上面这 7 条,
+# 一条不多一条不少 —— 新加的四条规则(数字总量 / IPv4 / 纯标点 / 去掉冒号)
+# 在真实币名上零误伤。这条由 test_实测丢弃率不超过一成 与上面的参数化用例一起钉着。
+
 
 @pytest.mark.parametrize("name", _MUST_PASS)
 def test_必须放行的硬基线(name):
@@ -395,11 +474,17 @@ _BOUNDARIES = [
     #    那样测到的就不是长度上限了。
     ("长度上限 40", "Abcdefg Abcdefg Abcdefg Abcdefg Abcdefgh",
      "Abcdefg Abcdefg Abcdefg Abcdefg Abcdefghi"),
-    ("长度下限 1", "猫", ""),
+    ("长度下限:非空即可", "猫", ""),
     ("词数上限 5", "One Two Three Four Five", "One Two Three Four Five Six"),
     ("标点上限 3", "U.S.A. Token", "U.S.A.B. Token"),
-    ("连续数字 5 位", "Coin 12345", "Coin 123456"),
-    ("裸 hex 16 位", "1a2b3c4d5e6f1a2", "1a2b3c4d5e6f1a2b"),
+    # ⚠️ 数字类的边界样本要**避开对方那条规则**,否则测到的不是自己那一条:
+    #    数字总量 5 的边界必须用连续数字(否则连续那条先命中),而裸 hex 的边界
+    #    必须**一个数字都不带**(1a2b3c… 里有 8 个数字,数字总量那条会抢先拦下)。
+    ("数字总量 5 位", "Coin 12345", "Coin 123456"),
+    # ⚠️ 用 A1B2C3… 而不是 "1-2-3-4-5":后者 4 个横杠会先撞上标点上限 3,
+    #    测到的就不是数字那一条了。这一对里数字是**离散**的,老的"连续 ≥6 位"一条都拦不住。
+    ("数字总量(离散数字)5 位", "A1B2C3D4E5", "A1B2C3D4E5F6"),
+    ("裸 hex 16 位", "abcdefabcdefabc", "abcdefabcdefabcd"),
     ("base58 26 位", "abcdefghjkmnpqrstuvwxyzAB", "abcdefghjkmnpqrstuvwxyzABC"),
     ("含 CJK 时 ASCII 串 5 位", "龙Long", "龙Longg"),
 ]
@@ -432,14 +517,46 @@ def test_每一个Unicode空白都算空白():
 # ============================================================
 # 交易所名:形态正则的边界(它不走形状白名单)
 # ============================================================
-_EXCHANGE_OK = ["NasdaqGM", "NasdaqGS", "NYSE", "NYSEArca", "NYSE American", "AMEX",
-                "A" * 20]
+# ============================================================
+# 交易所名:**封闭枚举**(不是模式匹配)
+# ============================================================
+# ⚠️⚠️ 上一版是正则 `[A-Za-z][A-Za-z0-9 .\-]{0,19}` —— 字符集里有 `.` 和 `-`,
+#    于是**所有 ≤20 字符的裸域名整段 fullmatch**('t.me' / 'discord.gg' /
+#    'www.evil-airdrop.com' / 'bit.ly' / 'vitalik.eth' …),而 stock_exchange 是收口表里
+#    唯一走这道门的字段、还进永久缓存。交易所是有限集合,直接枚举就没有绕过面。
+#
+# 表怎么来的(2026-09-02 实测):87 个真实 ticker → Yahoo v8/finance/chart 的
+# meta.fullExchangeName,85 个有值,实际取值只有 12 种:
+#   NasdaqGS(20) NYSE(28) NasdaqGM(4) NasdaqCM(2) NYSEArca(11) NYSE American(7)
+#   Cboe US(4) OTC Markets OTCPK(2) OTC Markets OTCQX(1) OTC Markets OTCID(1)
+#   CCC(1,BTC-USD) SNP(1,^GSPC)
+# 后两个不是股票交易所(instrumentType 是 CRYPTOCURRENCY / INDEX,数据层的 STOCK_TYPES
+# 本来就不让它们走到 🏢 行)→ **不进表**,这里当"表外的值"钉住。
+_EXCHANGE_OK = [
+    "NasdaqGS", "NasdaqGM", "NasdaqCM", "NYSE", "NYSEArca", "NYSE American",
+    "Cboe US", "OTC Markets OTCPK", "OTC Markets OTCQX", "OTC Markets OTCID",
+    # 同一批交易所的旧写法 / 别名,收进表里零风险
+    "AMEX", "NYSEAmerican", "NasdaqNMS", "BATS",
+]
 _EXCHANGE_BAD = [
-    ("A" * 21, "总长上限 20:21 位就不是交易所代码了"),
-    ("1NYSE", "必须字母开头"),
+    ("t.me", "裸域名 —— 上一版的正则把它整段放行了,这是本轮的 BLOCKER"),
+    ("www.evil-airdrop.com", "裸域名(20 字符,正好在旧上限内)"),
+    ("vitalik.eth", "裸域名"),
+    ("discord.gg", "裸域名"),
+    ("pump.fun", "裸域名"),
+    ("bit.ly", "裸域名"),
+    ("x.gift", "裸域名"),
+    ("tme-scam.io", "裸域名(带横杠)"),
+    ("A" * 20, "长度合规也没用:**不在表里就是不在表里**"),
+    ("A" * 21, "同上"),
+    ("1NYSE", "不在表里"),
+    ("NYSEX", "不在表里 —— 只差一个字母的仿冒也进不来"),
+    ("CCC", "加密货币的伪交易所(BTC-USD),不是股票交易所,刻意不进表"),
+    ("SNP", "指数的伪交易所(^GSPC),同上"),
+    ("TSX", "多伦多 —— 实测没出现过,不在表里就不显示(要收就补表 + 补测试)"),
     ("立即访问 t.me/free-airdrop", "整段不匹配 —— 这个字段曾经全程零门禁"),
-    ("NYSE/AMEX", "`/` 不在允许字符里"),
-    ("NYSE, Inc.", "`,` 不在允许字符里"),
+    ("NYSE/AMEX", "不在表里"),
+    ("NYSE, Inc.", "不在表里"),
     ("", "空 → None"),
 ]
 
@@ -454,3 +571,185 @@ def test_交易所名放行(code):
 def test_交易所名拦住(code, why):
     from src.nameguard import safe_exchange
     assert safe_exchange(code) is None, f"{code!r} 本该被拦({why})"
+
+
+def test_交易所名大小写不同也认但显示用表里的写法():
+    """
+    ⚠️ 上游偶尔大小写不一致;比对不区分大小写,但**返回表里的规范写法** ——
+       🏢 那一行的写法永远是我们自己定的,连大小写都不受上游摆布。
+    """
+    from src.nameguard import safe_exchange
+    assert safe_exchange("nyse american") == "NYSE American"
+    assert safe_exchange("NASDAQGS") == "NasdaqGS"
+    assert safe_exchange("  NYSE\u00a0Arca  ") is None, "空白位置不对就不是同一个值"
+
+
+def test_表是封闭枚举不是模式匹配():
+    """
+    ⚠️⚠️ 这条钉的是"改回模式匹配当场红"。枚举表的大小与内容写死在测试这一侧,
+       谁把 safe_exchange 换回正则,下面这一批(每一条都能 fullmatch 那条老正则)
+       会立刻放行。
+    """
+    from src.nameguard import safe_exchange
+    for bad in ("t.me", "bit.ly", "NYSE-2", "Nasdaq GS", "nasdaq", "Nasdaq"):
+        assert safe_exchange(bad) is None, bad
+
+
+# ============================================================
+# E2:CJK 白名单的**逐码点**自测 —— 防 U+30FB 再混进来的护栏
+# ============================================================
+def test_CJK白名单里没有任何标点空白控制符():
+    """
+    ⚠️⚠️ 这条断言就是 U+30FB 那个洞的护栏本身。枚举**整个 0x110000 码点空间**,
+       把门禁认作"中日韩文字"的每一个码点都拿出来,断言它的 Unicode 类别
+       **一个都不属于** P*(标点)/ S*(符号)/ Z*(空白)/ C*(控制、私用、未分配)。
+       上一版的码点区间在这条下会红 61 次,其中就有与字段分隔符 `·` 同形的 U+30FB。
+    ⚠️ 断言写死类别字母,不从被测模块 import 任何区间 / 前缀表。
+    """
+    import unicodedata
+
+    from src.nameguard import is_cjk_char
+
+    bad = [f"U+{cp:04X}({unicodedata.category(chr(cp))})"
+           for cp in range(0x110000)
+           if is_cjk_char(chr(cp)) and unicodedata.category(chr(cp))[0] in "PSZC"]
+    assert bad == [], f"这些码点被当成了中日韩文字,但它们是标点/符号/空白/控制符:{bad[:20]}"
+
+
+def test_那几个曾经混进来的码点逐个钉住():
+    """⚠️ 上一版把它们当中日韩文字放行,其中 U+30FB 与本项目的字段分隔符同形。"""
+    from src.nameguard import is_cjk_char, safe_display
+    for cp, why in ((0x30FB, "KATAKANA MIDDLE DOT,与 SEP 的 `·` 同形"),
+                    (0x309B, "浊音符 Sk"),
+                    (0x309C, "半浊音符 Sk"),
+                    (0x30A0, "KATAKANA-HIRAGANA DOUBLE HYPHEN,Pd"),
+                    (0x3001, "表意逗号"),
+                    (0x3002, "表意句号")):
+        assert not is_cjk_char(chr(cp)), f"U+{cp:04X} {why}"
+        assert safe_display(f"币{chr(cp)}名") is None, f"U+{cp:04X} {why}"
+
+
+def test_真正需要的假名与汉字一个都不许丢():
+    """⚠️ 收紧 CJK 判定不能顺手把真名字打掉。ー 与 々 是 Lm 不是 Lo,单独钉住。"""
+    from src.nameguard import safe_display
+    for name in ("ナッツ", "コーヒー", "佐々木", "八重", "奶蛙", "镁铁闪石", "가나다", "龍"):
+        assert safe_display(name) == name, name
+
+
+# ============================================================
+# E3:数字规则是**总量**不是"连续"
+# ============================================================
+_DIGIT_CASES = [
+    ("138-0013-8000", None, "手机号插横杠:11 位"),
+    ("138 0013 8000", None, "手机号插空格"),
+    ("138.0013.8000", None, "手机号插点"),
+    ("13800138000", None, "手机号原样"),
+    ("1 2 3 4 5 6", None, "六个孤立数字照样算 6"),
+    ("1000X", "1000X", "4 位,正常"),
+    ("Web3", "Web3", "1 位"),
+    ("SPDR S&P 500 ETF Trust", "SPDR S&P 500 ETF Trust", "3 位"),
+    ("NASDAQ 6900", "NASDAQ 6900", "实测上界 4 位"),
+    ("Coin 12345", "Coin 12345", "5 位,恰好在上限"),
+]
+
+
+@pytest.mark.parametrize(("raw", "want", "why"), _DIGIT_CASES, ids=[c[2] for c in _DIGIT_CASES])
+def test_数字总量规则(raw, want, why):
+    assert safe_display(raw) == want, f"{raw!r}({why})"
+
+
+def test_总量规则严格强于连续规则():
+    """
+    ⚠️⚠️ "连续 ≥6 位"那条已经删掉,理由是它被总量规则**完全覆盖**:
+       连续 n 位数字 ⇒ 数字总量至少 n。这条把那个推理直接验一遍 ——
+       凡是老规则会拦的,新规则也拦;而新规则多拦了一批老规则漏掉的。
+    ⚠️ 阈值 6 写死字面量,不从被测模块 import。
+    """
+    import re
+    old = re.compile(r"[0-9]{6,}")
+    for raw in ("联系电话13800138000", "抽奖码123456", "Coin 999999", "138-0013-8000",
+                "1.3.8.0.0.1.3.8", "Coin 12345", "1000X", "NASDAQ 6900"):
+        if old.search(raw):
+            assert safe_display(raw) is None, f"老规则拦得住的,新规则也必须拦:{raw!r}"
+    # 老规则漏、新规则拦 —— 这就是这次改动的全部价值
+    assert old.search("138-0013-8000") is None
+    assert safe_display("138-0013-8000") is None
+
+
+# ============================================================
+# E8:_RE_DOMAIN 的**独占**覆盖
+# ============================================================
+def test_域名规则有自己独占的样本():
+    """
+    ⚠️⚠️ 上一轮 _RE_DOMAIN 是**零独占覆盖**的:把它打成永不匹配,1768 条测试全绿 ——
+       因为语料里每个域名的 TLD 恰好都在手写的 _SPLIT_DOMAIN_TLDS(48 项)里,
+       被"被空白拆开的域名"那条捎带拦了。
+    ⚠️ 两条规则的分工:
+       · _RE_DOMAIN        —— 判**没被拆开**的域名,与 TLD 是什么无关(冷门 TLD 也拦)。
+       · _looks_like_split_domain —— 只判"抽掉空白之后才长出来"的域名,
+         额外要求 TLD 真实存在,否则 "U.S.A. Token" 这类缩写名字会被误杀。
+       下面这一批的 TLD 全部**不在**那张 48 项表里,所以只有 _RE_DOMAIN 拦得住它们。
+    """
+    for raw in ("evil.zzz", "airdrop.qqq", "claim.bank", "free.rocks", "get.ninja"):
+        assert safe_display(raw) is None, f"{raw!r} 只有 _RE_DOMAIN 拦得住"
+    # 反过来:这一批**没有**域名形态(点后面不是 2 个以上字母),必须放行
+    for raw in ("U.S.A. Token", "Inc. Coin", "Web3.0 Protocol", "St. Louis Coin"):
+        assert safe_display(raw) is not None, raw
+
+
+def test_被空白拆开的域名规则有自己独占的样本():
+    """
+    ⚠️ 这一批**只有** _looks_like_split_domain 拦得住:抽掉空白之前不含域名形态
+       (点后面紧跟的是空白),抽掉之后才长出 t.me / x.com。
+    ⚠️ 其中大写那条钉的是 .lower():少了它 't.<NBSP>ME/scam' 当场漏过去
+       (上一轮那句 .lower() 是零覆盖的)。
+    """
+    for raw in ("t. me/scam", "t.\u00a0me/scam", "t.\u00a0ME/scam", "X. COM/free"):
+        assert safe_display(raw) is None, repr(raw)
+
+
+# ============================================================
+# 真实 Yahoo longName 的实测基线(87 个 ticker,85 个有值)
+# ============================================================
+@pytest.mark.parametrize("name", _REAL_YAHOO_PASS)
+def test_真实Yahoo公司名放行(name):
+    assert safe_display(name) == name, name
+
+
+@pytest.mark.parametrize(("name", "why"), _REAL_YAHOO_DROPPED,
+                         ids=[d[1] for d in _REAL_YAHOO_DROPPED])
+def test_真实Yahoo公司名里被丢弃的就是这几条(name, why):
+    assert safe_display(name) is None, f"{name!r} 现在放行了({why}),丢弃率的账要重算"
+
+
+def test_Yahoo公司名的丢弃率是实测出来的那个数():
+    """
+    ⚠️ 15.3% 比币名的 2.8% 高得多,原因是公司全名天生长、词多。**这不等于那一行没了**:
+       🌊 那行拿不到 Yahoo 的名字就退回 DexScreener 剥完后缀的 issuer
+       (见 poller._name_extras),代价是"名字不是最权威的那份",不是"没有名字"。
+    """
+    total = len(_REAL_YAHOO_PASS) + len(_REAL_YAHOO_DROPPED)
+    assert total == 60, "样本表被改动过,实测结论要重跑"
+    assert len(_REAL_YAHOO_DROPPED) / total <= 0.25
+
+
+def test_别的文字体系不算中日韩():
+    """
+    ⚠️⚠️ CJK 判定用的是 `category(ch) == 'Lo'` **加上字符名前缀**。少了后半句,
+       全世界所有"其他字母"(阿拉伯、希伯来、泰、天城体、埃塞俄比亚…)会一起放行 ——
+       而 M05 那次变异证明:光靠上面那些用例,把前缀限制去掉是**改不红**的等价变异。
+    ⚠️ 这不是"歧视别的文字",是这个功能的边界:推送里的名字只可能是中英日韩,
+       而阿拉伯/希伯来是 RTL 文字,与 bidi 那条(整段丢弃)是同一类视觉风险。
+    """
+    from src.nameguard import is_cjk_char, safe_display
+    for ch, why in (("ا", "阿拉伯字母 ALEF(Lo,RTL)"),
+                    ("א", "希伯来字母 ALEF(Lo,RTL)"),
+                    ("ก", "泰文字母 KO KAI(Lo)"),
+                    ("क", "天城体字母 KA(Lo)"),
+                    ("ሀ", "埃塞俄比亚音节 HA(Lo)"),
+                    ("一", "对照:汉字"),):
+        want = ch == "一"
+        assert is_cjk_char(ch) is want, f"U+{ord(ch):04X} {why}"
+    assert safe_display("العرب") is None, "整段阿拉伯文不许当名字"
+    assert safe_display("币ا名") is None, "混进一个阿拉伯字母也不许"
+    assert safe_display("币ก名") is None, "混进一个泰文字母也不许"

@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from src import dexscreener as dx
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -905,3 +907,52 @@ class Test币名:
         lk = dx.PoolQuoteLookup(client=fake, ttl=0.0)
         lk.lookup("robinhood", [CA_AI])
         assert lk.cached("robinhood", CA_AI) is None, "过期的缓存不能再给出去"
+
+
+# ============================================================
+# 币股后缀:**币名**也走同一张表剥掉后缀(与 issuer 复用同一份逻辑)
+# ============================================================
+class Test币名也剥币股后缀:
+    """
+    ⚠️⚠️ 上一轮 robinhood 链实测 80 个币名,其中带 " • Robinhood Token" 后缀的 5 个
+       **全部**过不了展示门禁(`•` 不在字符白名单里),名字连同 📝 行一起消失 ——
+       6.25% 的币白白丢掉名字。而 `•` 恰恰是本模块用来**识别币股**的判据
+       (STOCK_NAME_MARKERS),后缀是判据不是信息,剥掉再送门禁就行。
+    ⚠️ 剥后缀**复用 _classify_stock**(对手那一侧本来就在用),不复制第二份 ——
+       一份表放两个地方早晚走岔。
+    """
+
+    _CASES = [
+        ("Circle Internet Group • Robinhood Token", "Circle Internet Group"),
+        ("AMC Entertainment • Robinhood Token", "AMC Entertainment"),
+        ("Meta Platforms • Robinhood Token", "Meta Platforms"),
+        ("United States Oil Fund • Robinhood Token", "United States Oil Fund"),
+        ("ASML Holding NV • Robinhood Token", "ASML Holding NV"),
+    ]
+
+    @pytest.mark.parametrize(("raw", "want"), _CASES, ids=[c[1] for c in _CASES])
+    def test_五个真实币股名剥完后缀就能显示了(self, raw, want):
+        from src.nameguard import safe_display
+
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name=raw)
+        pq = dx.parse_pool_quote(pair, "robinhood", CA_AI)
+        assert pq.token_name == want
+        # ⚠️ 这半句才是这条测试的目的:剥完之后**过得了展示门禁**
+        assert safe_display(pq.token_name) == want
+        # 对照:不剥的话整段消失
+        assert safe_display(raw) is None
+
+    def test_没有币股判据的链原样不动(self):
+        """⚠️ 判据按链定义;solana 上没有判据,名字里就算带 `•` 也不剥(不猜)。"""
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="Foo • Robinhood Token",
+                     chain="solana")
+        assert dx.parse_pool_quote(pair, "solana", CA_AI).token_name == "Foo • Robinhood Token"
+
+    def test_名字只剩一个光秃秃的后缀就没有名字(self):
+        """⚠️ 剥完是空 → None,标题不加尾巴。绝不回退去印那个后缀,也绝不打占位符。"""
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="• Robinhood Token")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name is None
+
+    def test_普通币名不受影响(self):
+        pair = _pair(CA_AI_CHECKSUM, CA_NVDA_RH, base_name="Artificial Inu")
+        assert dx.parse_pool_quote(pair, "robinhood", CA_AI).token_name == "Artificial Inu"

@@ -192,6 +192,13 @@ class PoolQuote:
                如 "CUM" / "Cummingtonite"。FOMO 的 swap 载荷里没有币名,
                这是它唯一的来源;给标题尾巴与中文名行用(formatter / namecn)。
                ⚠️ 它们与"对手"无关,四条链都取;拿不到是 None(标题不加尾巴)。
+               ⚠️⚠️ token_name 是**剥掉币股后缀之后**的那份(与 issuer 同一张表、
+                  同一个 _classify_stock,不复制第二份逻辑):
+                  "Meta Platforms • Robinhood Token" → "Meta Platforms"。
+                  理由与 🌊 那行一模一样 —— 后缀是**判据**不是信息,而且 `•` 不在展示门禁的
+                  字符白名单里,不剥的话整段名字连同 📝 行一起消失。实测 robinhood 链
+                  80 个币名里有 5 个带这个后缀,不剥就是 6.25% 白白丢掉名字。
+                  ⚠️ 剥完是空(名字就是一个光秃秃的后缀)→ None,标题不加尾巴。
 
     ⚠️ 后加的字段全带默认值,是为了让 `PoolQuote(addr, sym, name, is_common)` 这种
        四参数构造继续成立(测试里造样本用)。
@@ -344,6 +351,10 @@ def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | Non
         return None
     raw_name = _text(other.get("name"))
     is_stock, issuer = _classify_stock(network_id, raw_name)
+    # ⚠️ 我方一侧的币名同样过 _classify_stock 剥后缀 —— **复用**对手那份逻辑与那张表,
+    #    不复制第二份(一份表放两个地方早晚走岔,项目里已有这条教训)。
+    our_is_stock, our_issuer = _classify_stock(network_id, _text(ours.get("name")))
+    our_name = our_issuer if our_is_stock else _text(ours.get("name"))
     return PoolQuote(
         address=other_key,
         symbol=_text(other.get("symbol")),
@@ -353,7 +364,7 @@ def parse_pool_quote(pair, network_id: str, our_address: str) -> PoolQuote | Non
         issuer=issuer,
         # 我方一侧:这个币自己的符号与全名。⚠️ 仍是第三方字符串,渲染前必须 _clip
         token_symbol=_text(ours.get("symbol")),
-        token_name=_text(ours.get("name")),
+        token_name=our_name,
     )
 
 

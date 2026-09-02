@@ -252,7 +252,13 @@ def test_symbol与handle与观点正文里的控制符也被删掉():
                     thesis_text=f"hi{ZWSP}there")
     msg = render(ev)
     assert ZWSP not in msg and RLO not in msg
-    assert msg.split("\n")[0] == "🌱 <b>alice</b> · 首次建仓 · <b>$CUM</b>"
+    # ⚠️⚠️ symbol 里的 **bidi 控制符**不再是“删掉照常显示”—— 它现在走 safe_ident，
+    #    与币名那条同一口径：**来过就整段丢弃**。理由与 _BIDI_CONTROLS 那段一样：
+    #    删掉 U+202E 之后剩下的是一个**作者从没写过**的符号，而符号是读者认币的主要依据，
+    #    印出去等于把“剔掉坏的那部分再显示”做了一遍。
+    #    → 标题少了 $符号 那一段（既有的“字段缺失”规矩）。
+    #    ⚠️ handle 里那个零宽空格仍然是“删掉照常显示”：两类控制符刻意不同。
+    assert msg.split("\n")[0] == "🌱 <b>alice</b> · 首次建仓"
 
 
 def test_观点正文里的组合emoji不能被拆开():
@@ -313,3 +319,46 @@ def test_控制符不占限长的名额():
     msg = render(ev, pool_quote_symbol="USAR", pool_quote_name=ZWSP * 20 + "USA Rare Earth")
     assert "🌊 底池 · USAR · 「USA Rare Earth」" in msg.split("\n"), msg
     assert "…" not in msg
+
+
+def test_观点正文里的tag序列旗帜不能被拆开():
+    """
+    ⚠️⚠️ 上一轮只保了 ZWJ(U+200D)与 U+FE0F,**漏了 tag 字符**(U+E0020–U+E007F)——
+       它们的 unicodedata.category 同样是 'Cf'。地区旗 = 🏴 + 6 个 tag 字符 + 终止符,
+       全删之后苏格兰旗变成一面**光秃秃的黑旗** 🏴,而且没有任何报错。
+       这是相对 main 的**行为退化**,这条是它的回归护栏。
+    ⚠️ 五类组合 emoji 逐类断言**码点完整**,不只看"字符串在不在里面"。
+    """
+    cases = {
+        "ZWJ 系(男程序员)": "👨‍💻",
+        "ZWJ + VS16(彩虹旗)": "🏳️‍🌈",
+        "多层 ZWJ(一家四口)": "👨‍👩‍👧‍👦",
+        "肤色修饰(招手)": "👋🏽",
+        "tag 序列(苏格兰旗)": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+        "tag 序列(英格兰旗)": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+        "tag 序列(威尔士旗)": "🏴󠁧󠁢󠁷󠁬󠁳󠁿",
+    }
+    for label, emo in cases.items():
+        ev = make_event(EVENT_BUY, handle="alice", token_symbol="CUM", token_address=CA_CUM,
+                        network_id="robinhood", badge=BADGE_FIRST,
+                        thesis_text=f"看这个 {emo} 好看吗")
+        msg = render(ev)
+        assert emo in msg, label
+        for ch in emo:                       # 逐码点:一个都不许丢
+            assert ch in msg, f"{label}:U+{ord(ch):04X} 丢了"
+        tags_in = sum(1 for ch in emo if 0xE0020 <= ord(ch) <= 0xE007F)
+        tags_out = sum(1 for ch in msg if 0xE0020 <= ord(ch) <= 0xE007F)
+        assert tags_out == tags_in, f"{label}:tag 字符 {tags_in} 个 → {tags_out} 个"
+
+
+def test_不可信名字那条路仍然把tag字符删干净():
+    """
+    ⚠️⚠️ **两条路分开,各有测试。** 保 tag 字符只对**用户自己写的内容**那条成立;
+       币名那条(safe_display / strip_format_controls)连 tag 字符一起删 ——
+       币名里的 emoji 本来就不放行,而 tag 字符能把域名拆开躲过形态判断。
+       谁把两条路合成一个函数,这两条断言里必有一条红。
+    """
+    tagged = "t.󠀠me/scam"
+    assert ng.strip_format_controls(tagged) == "t.me/scam", "币名那条路必须删 tag 字符"
+    assert ng.safe_display(tagged) is None
+    assert ng.strip_controls_keep_emoji(tagged) == tagged, "正文那条路必须保 tag 字符"

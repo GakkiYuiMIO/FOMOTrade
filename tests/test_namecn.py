@@ -244,8 +244,9 @@ class Test输入过滤:
         assert nc.translatable("", "X") is False
         assert nc.translatable(None, "X") is False
         assert nc.translatable("Ab", "X") is True
-        # ⚠️ 真正生效的长度上限是**展示门禁的形状白名单**(40 字符),不是 translatable
-        #    自己那个 64 —— translatable 末尾还要过一遍 safe_display。40 放行、41 丢弃。
+        # ⚠️⚠️ 真正生效的长度上限就是**展示门禁的形状白名单**(40 字符)。
+        #    上一版 namecn 里还有一个 _MAX_TRANSLATE_CHARS = 64,它**永远轮不到生效**
+        #    (是死常量,改成 6400 全量 0 红),已删。40 放行、41 丢弃,两侧钉在这里。
         #    (40 是实测定的:最长的真实公司名 "Space Exploration Technologies Corp." 36 字符)
         assert nc.translatable("al" * 20, "X") is True       # 40
         assert nc.translatable("al" * 20 + "a", "X") is False    # 41
@@ -284,8 +285,18 @@ class Test输出过滤:
         assert nc.clean_output("<b>x</b>", "Cummingtonite", "CUM") is None
 
     def test_译文过长被丢弃(self):
-        assert nc.clean_output("字" * 41, "0123456789", "X") is None
-        assert nc.clean_output("字" * 40, "0123456789", "X") == "字" * 40
+        """
+        ⚠️⚠️ 这条上一轮是**空转**的:样本写的是 41 个"字" vs 原文 "0123456789",
+           而 41 字符先被展示门禁的 40 字符形状上限毙掉 —— "4 倍"那条规则**从没被执行到**
+           (把 4 倍改成 400 倍,全量 1768 条测试 0 红,实测过)。
+           重新构造:原文 2 字符 → 上限 8;译文 9 个汉字**过得了**形状门禁(9 < 40),
+           唯一能毙它的就是 4 倍那条。9 丢、8 放行,两侧都钉住。
+        ⚠️ 数字 4 写死字面量,不从被测模块 import。
+        """
+        assert nc.clean_output("一二三四五六七八九", "AI", "X") is None      # 9 > 4 × 2
+        assert nc.clean_output("一二三四五六七八", "AI", "X") == "一二三四五六七八"  # 8 == 4 × 2
+        # 再钉一次"它确实过得了形状门禁",否则这条会悄悄退回空转
+        assert nc.clean_output("一二三四五六七八九", "AI Coin", "X") == "一二三四五六七八九"
 
     def test_正常译文叠平空白放行(self):
         assert nc.clean_output(" 镁铁\n闪石 ", "Cummingtonite", "CUM") == "镁铁 闪石"
@@ -918,3 +929,92 @@ class Test词汇表裁剪:
         assert conn.execute("SELECT COUNT(*) FROM name_glossary").fetchone()[0] == 3
         keys = {r["key"] for r in conn.execute("SELECT key FROM name_glossary")}
         assert keys == {"name number 2", "name number 3", "name number 4"}
+
+
+# ============================================================
+# 默认值:两个闸门常量此前**没有任何测试钉着**
+# ============================================================
+class Test闸门默认值:
+    """
+    ⚠️⚠️ 这几个数字决定"一 tick 最多花多少时间在名字补全上"。上一轮它们
+       **一条测试都没有** —— 谁把 ROUND_WALL_CLOCK_SEC 从 20 改成 2000、
+       把 _TIMEOUT_SEC 从 8 改成 120,全量测试照样全绿,而线上 tick 会被拖垮
+       (本项目有过 tick 从 5s 拖到 90s 的教训)。
+    ⚠️ 断言写死字面量。改默认值 = 改这里,并在报告里说清为什么。
+    """
+
+    def test_每tick的调用次数上限(self):
+        assert nc.ROUND_TOKEN_TRANSLATE_CALLS == 8
+        assert nc.ROUND_COMPANY_TRANSLATE_CALLS == 4
+        assert nc.ROUND_YAHOO_CALLS == 5
+
+    def test_墙钟上限与单请求超时(self):
+        assert nc.ROUND_WALL_CLOCK_SEC == 20.0
+        assert nc._TIMEOUT_SEC == 8.0
+        # ⚠️ 两者的关系本身也是一条约束:单请求超时必须**小于**整轮墙钟,
+        #    否则一个请求就能吃掉整轮预算,墙钟形同虚设。
+        assert nc._TIMEOUT_SEC < nc.ROUND_WALL_CLOCK_SEC
+
+    def test_负缓存与失败缓存的TTL(self):
+        assert nc.TTL_MISS_SEC == 30 * 86400
+        assert nc.TTL_ERROR_SEC == 3600
+        # ⚠️ 失败(可能只是一次抖动)绝不能比"查过了确实没有"缓存得更久
+        assert nc.TTL_ERROR_SEC < nc.TTL_MISS_SEC
+
+    def test_不传参数时用的就是这些默认值(self, conn, monkeypatch):
+        """
+        ⚠️ 光断言常量还不够 —— 常量对不上但构造函数里写死了别的数字,照样绿。
+           这条从**行为**上验:不传 wall_clock_sec 时,墙钟闸门认的就是 20 秒。
+        """
+        ft = FakeTransport({"wiki_en": [WIKI_MISSING] * 9, "google": [[[["甲", "A"]]]] * 9})
+        g = _glossary(conn, ft)              # ⚠️ 一个闸门参数都不传
+        assert g._wall == 20.0
+        assert g._limits == {"token": 8, "company": 4, "yahoo": 5}
+
+
+# ============================================================
+# 译文侧:ASCII 串那条必须**继承**「凭空多出原文没有的英文串」的语义
+# ============================================================
+class Test译文里原文自带的英文串不算凭空多出:
+    """
+    ⚠️⚠️ 上一轮 `clean_output` 把译文单独送进展示门禁,门禁里"含中日韩文字时不许夹
+       ≥5 位 ASCII 串"那条**看不见原文**,于是一批完全正常的译文被整段毙掉 ——
+       真网络实测 40 个真实币名,xStock 全家族(`Tesla xStock` → `特斯拉 xStock`)
+       **100% 丢译名**。现在 clean_output 把原文一并交给门禁。
+    ⚠️ 这几条是**真网络实测**出来的真实译文(2026-09-02 Google 免费通道),不是编的。
+    """
+
+    _KEEP = [
+        ("Tesla xStock", "特斯拉 xStock"),
+        ("Exxon Mobil xStock", "埃克森美孚 xStock"),
+        ("Moderna - Backpack Securities", "Moderna - 背包证券"),
+        ("AMC Entertainment", "AMC娱乐公司"),
+    ]
+
+    @pytest.mark.parametrize(("src_text", "zh"), _KEEP, ids=[k[0] for k in _KEEP])
+    def test_原文里有的英文串照样放行(self, src_text, zh):
+        assert nc.clean_output(zh, src_text, "X") == zh
+
+    _DROP = [
+        ("Nice Coin", "好币 airdrop", "原文里没有 airdrop"),
+        ("Nice Coin", "好币 freegift", "原文里没有 freegift"),
+        ("Cummingtonite", "镁铁 telegram 闪石", "原文里没有 telegram"),
+    ]
+
+    @pytest.mark.parametrize(("src_text", "zh", "why"), _DROP, ids=[d[2] for d in _DROP])
+    def test_原文里没有的英文串照样丢弃(self, src_text, zh, why):
+        assert nc.clean_output(zh, src_text, "X") is None, why
+
+    def test_大小写不影响比对(self):
+        assert nc.clean_output("特斯拉 XSTOCK", "Tesla xStock", "X") == "特斯拉 XSTOCK"
+
+    def test_音译人名仍然被丢弃(self):
+        """
+        ⚠️ 这是**刻意的取舍**,不是漏:中文音译习惯用间隔号 `·`,而 `·` 是本项目的
+           字段分隔符、在字符白名单外。译文虽然在 📝 行、已经在「」容器里,
+           但放行 `·` 就等于给"造一个假字段"留一条随时会被复用的口子。
+           真网络实测 60 条译文里因为这一条丢掉 2 条(3.33%),README 已写明
+           "音译人名可能没有中文行"。
+        """
+        assert nc.clean_output("尼基塔·比尔", "Nikita Bier", "X") is None
+        assert nc.clean_output("约翰·多格", "John Dog", "X") is None
