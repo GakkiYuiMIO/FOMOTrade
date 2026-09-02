@@ -1948,10 +1948,12 @@ class Poller:
         """
         out: dict = {}
         # ⚠️ 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名。
-        #    对手全名同样是第三方字符串(攻击者能给自己的币起名叫 "t.me/x • Robinhood Token",
-        #    剥完后缀就是 "t.me/x"),所以过一道展示门禁,不合格就只剩符号。
+        #    ⚠️⚠️ 对手全名同样是第三方字符串(攻击者能给自己的币起名叫
+        #       "t.me/x • Robinhood Token",剥完后缀就是 "t.me/x"),但**门禁不在这里** ——
+        #       统一在 formatter 的渲染入口(formatter.UNTRUSTED_FIELDS)。
+        #       这里原样透传,不合格时 🌊 那行只剩符号。
         if pq is not None:
-            out["pool_quote_name"] = safe_display(pq.name)
+            out["pool_quote_name"] = pq.name
         try:
             net = (network_id or "").strip()
             if cached_only:
@@ -1967,10 +1969,12 @@ class Poller:
             if pq is not None and pq.symbol and not cached_only:
                 info = self._names.stock_info(pq.symbol)
                 if info is not None:
-                    if info.long_name is not None:
-                        safe = safe_display(info.long_name)
-                        if safe is not None:
-                            out["pool_quote_name"] = safe
+                    # ⚠️ 这里调 safe_display **不是**展示门禁(那道统一在 formatter 的
+                    #    渲染入口,见 formatter.UNTRUSTED_FIELDS),而是在两个候选之间挑一个:
+                    #    Yahoo 的 longName 能显示才顶掉 DexScreener 那份,
+                    #    否则保留上一份 —— 而不是把 🌊 那行的全名清空。
+                    if info.long_name is not None and safe_display(info.long_name) is not None:
+                        out["pool_quote_name"] = info.long_name
                     if info.company_zh is not None:
                         out["stock_company_zh"] = info.company_zh
                     if info.exchange is not None:

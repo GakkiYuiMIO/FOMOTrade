@@ -1013,7 +1013,9 @@ def test_底池对手的符号和公司名都要出现():
     msg = _pool()
     line = [ln for ln in msg.split("\n") if ln.startswith("🌊")]
     assert len(line) == 1, "底池行没出来,或出了不止一行"
-    assert line[0] == "🌊 底池 · NVDA · NVIDIA"
+    # 那对「」是视觉容器:公司名是第三方字符串,套上容器之后,名字里就算伪造出
+    # 一个 " · " 也明显落在容器内部,伪造不出第三个字段。
+    assert line[0] == "🌊 底池 · NVDA · 「NVIDIA」"
 
 
 def test_Rabbit那一行长这样():
@@ -1022,27 +1024,38 @@ def test_Rabbit那一行长这样():
        整行的真实形态钉死在这里 —— 分隔符、顺序、有没有多余的判据后缀,一起钉。
     """
     line = _pool_line(pool_quote_symbol="WYFI", pool_quote_name="WhiteFiber, Inc.")
-    assert line == "🌊 底池 · WYFI · WhiteFiber, Inc.", line
+    assert line == "🌊 底池 · WYFI · 「WhiteFiber, Inc.」", line
 
 
 def test_ETF那一行长这样():
     """ETF 也算币股(用户口径),渲染上没有任何特殊待遇。"""
     line = _pool_line(pool_quote_symbol="SPY", pool_quote_name="SPDR S&P 500 ETF Trust")
-    assert line == "🌊 底池 · SPY · SPDR S&amp;P 500 ETF Trust", line
+    assert line == "🌊 底池 · SPY · 「SPDR S&amp;P 500 ETF Trust」", line
 
 
 def test_最长的那个真实公司名会被截断():
     """
-    ⚠️ 实测最长的公司名是 SPCX 的
-       "Space Exploration Technologies Corp. Class A Common Stock"(54 字符)。
-       不截断的话它一行就能吃掉预算里可观的一块。
+    ⚠️ 实测最长的**能显示**的公司名是 SPCX 的 "Space Exploration Technologies Corp."
+       (36 字符)。它过得了形状白名单(上限 40),但超过展示限长 32 → 截断加省略号。
+    """
+    line = _pool_line(pool_quote_symbol="SPCX",
+                      pool_quote_name="Space Exploration Technologies Corp.")
+    assert "…" in line, "没截断 / 截了却不告诉读者"
+    assert len(line) < 60, f"底池行太长:{len(line)}"
+    assert line == "🌊 底池 · SPCX · 「Space Exploration Technologies…」", line
+
+
+def test_带上ClassA后缀的超长名整段丢弃():
+    """
+    ⚠️⚠️ 形状白名单的长度上限是 40 —— DexScreener 侧见过的
+       "Space Exploration Technologies Corp. Class A Common Stock"(57 字符、8 个词)
+       **整段丢弃**,而不是截成一个似是而非的半截名字。🌊 那行只剩符号。
+       这是刻意的取舍:截一半的名字读者看不出它被动过。
     """
     line = _pool_line(
         pool_quote_symbol="SPCX",
         pool_quote_name="Space Exploration Technologies Corp. Class A Common Stock")
-    assert "…" in line, "没截断 / 截了却不告诉读者"
-    assert len(line) < 60, f"底池行太长:{len(line)}"
-    assert line.startswith("🌊 底池 · SPCX · Space Exploration")
+    assert line == "🌊 底池 · SPCX", line
 
 
 def test_不传底池对手时整行消失():
@@ -1065,7 +1078,10 @@ def test_底池对手全名必须转义():
     """
     msg = _pool(pool_quote_symbol="<b>X", pool_quote_name="<script>alert(1)</script>")
     assert "<script>" not in msg and "<b>X" not in msg
-    assert "&lt;script&gt;" in msg
+    # ⚠️ 全名走形状白名单:`<` 不在允许字符集里 → **整段丢弃**,不是"转义了照样显示"。
+    #    符号那一格没有形状门禁(它是 ticker,走 _clip 转义),所以仍然出现、但已转义。
+    assert "&lt;script&gt;" not in msg, "过不了门禁的全名不许转义后照样印出来"
+    assert "🌊 底池 · &lt;b&gt;X" in msg.split("\n")
     assert _html_ok(msg), "标签必须全部配对闭合,残缺实体 = 整条 400"
 
 
@@ -1074,10 +1090,15 @@ def test_底池对手全名必须截断():
     ⚠️ 全名长度不受任何天然约束。不截断的话一个几千字符的 name
        就能把整条消息顶破预算 / 刷屏。
     """
+    # 5000 字符:先被形状白名单(≤40)整段毙掉,🌊 那行只剩符号
     line = [ln for ln in _pool(pool_quote_name="N" * 5000).split("\n")
             if ln.startswith("🌊")][0]
-    assert len(line) < 120, f"底池行没截断,长 {len(line)}"
-    assert "…" in line, "截断了却没有省略号 —— 读者不知道被截了"
+    assert line == "🌊 底池 · NVDA", line
+    # 33~40 字符(过得了形状白名单、超过展示限长 32)才走截断那条路
+    line2 = [ln for ln in _pool(pool_quote_name="Nvidia Great Big Company Ltd").split("\n")
+             if ln.startswith("🌊")][0]
+    assert len(line2) < 120, f"底池行没截断,长 {len(line2)}"
+    assert "…" in line2, "截断了却没有省略号 —— 读者不知道被截了"
 
 
 def test_底池对手符号也要截断():

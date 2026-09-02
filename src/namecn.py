@@ -2,10 +2,12 @@
 币名 / 公司名的**中文译名**,与底池对手股票的**事实**(公司全名、交易所)。
 
 ============ 这三行长什么样 ============
-    🌱 inyourwalls · 首次建仓 · $CUM · Cummingtonite        ← A. 标题尾巴:英文全名(dexscreener.token_name)
-    📝 Cummingtonite = 镁铁闪石                              ← C. 中文名(本模块 token_zh)
-    🌊 底池 · USAR · USA Rare Earth, Inc.                    ← 既有的底池行(dexscreener.notable)
-    🏢 USAR = 美国稀土公司 · 纳斯达克(NasdaqGM)上市          ← B. 股票说明(本模块 stock_info)
+    🌱 inyourwalls · 首次建仓 · $CUM · 「Cummingtonite」      ← A. 标题尾巴:英文全名(dexscreener.token_name)
+    📝 「Cummingtonite」 = 「镁铁闪石」                        ← C. 中文名(本模块 token_zh)
+    🌊 底池 · USAR · 「USA Rare Earth, Inc.」                 ← 既有的底池行(dexscreener.notable)
+    🏢 USAR = 「美国稀土公司」 · 纳斯达克(NasdaqGM)上市       ← B. 股票说明(本模块 stock_info)
+⚠️ 那对 `「」` 是**视觉容器**(formatter.QUOTE_OPEN):不可信文本一律套一层,
+   伪造的分隔符就明显落在容器内部,伪造不出一个假字段。
 A 的英文全名不是本模块的事(DexScreener 那份响应里自带),本模块只管**翻译**与**股票事实**。
 
 ============ 来源(全部免 key、免鉴权、只读)============
@@ -83,6 +85,13 @@ _TIMEOUT_SEC = 8.0
 KIND_TOKEN_ZH = "token_zh"
 KIND_COMPANY_ZH = "company_zh"
 KIND_STOCK_FACT = "stock_fact"
+# 「维基对这个词查无」这个**中间结果**的缓存 kind。
+# ⚠️⚠️ 它存在的理由是一个真实的浪费:两级翻译是"先维基、再 Google",预算闸门是
+#    **一次一扣**的。维基那次已经打出去、结果是"查无",紧接着 Google 那次被闸门挡下 ——
+#    原先整个 _translate_net 返回 _NO_BUDGET,**什么都不写缓存**,于是下一 tick
+#    连维基那次也要重打。已经花掉的那次外呼白花了。
+#    单独记一行:下一 tick 直接跳过维基、把预算花在 Google 上。
+KIND_WIKI_MISS = "wiki_miss"
 
 # 负缓存 TTL(查过了、两级都没有):30 天。名字不会变,但维基条目会新建,一个月重问一次。
 TTL_MISS_SEC = 30 * 86400
@@ -103,6 +112,9 @@ ROUND_YAHOO_CALLS = 5
 ROUND_WALL_CLOCK_SEC = 20.0
 
 # 送去翻译的名字最长几个字符。再长就是营销文案,翻出来也没人读,还白占预算。
+# ⚠️ **实际生效的上限比这个小**:translatable 末尾还要过 nameguard.safe_display,
+#    那道的形状白名单把名字卡在 40 字符以内。这条只是更早、更便宜的一道粗筛,
+#    留着是因为它不需要跑正则;改这个数字不会放宽真正的上限。
 _MAX_TRANSLATE_CHARS = 64
 # 显示 B 行的 instrumentType。别的(CRYPTOCURRENCY / INDEX / MUTUALFUND …)不是"上市股票"。
 STOCK_TYPES = frozenset({"EQUITY", "ETF"})
@@ -422,8 +434,13 @@ class NameClient:
                 return None
             raise UnavailableError(f"HTTP {status} | yahoo {ticker}")
         if isinstance(err, dict):
-            # 2xx + error:Yahoo 对未知代码偶尔这么答,当查无
-            return None
+            # ⚠️⚠️ 2xx + error **也必须看 code**:Yahoo 限流时同样回 200 + chart.error。
+            #    这一支原先无条件当"查无"(缓存 30 天),只有非 2xx 那一支查了
+            #    _YAHOO_MISS_CODES —— 于是一次限流就把这个代码的 🏢 行按住一个月,
+            #    与 README 里写的"只有 Not Found 那一类才算查无"直接矛盾。
+            if code in _YAHOO_MISS_CODES:
+                return None
+            raise UnavailableError(f"yahoo {ticker} 2xx 但 error={code or '?'}")
         fact = parse_yahoo(body)
         if fact is None:
             raise UnavailableError(f"yahoo {ticker} 响应结构解析不出")
@@ -596,10 +613,15 @@ class NameGlossary:
     def _translate_net(self, kind: str, key: str, text: str, wiki_term: str, tag: str):
         budget = _KIND_BUDGET[kind]
         # ---- 一级:维基百科跨语言链接(两跳算一次)----
-        if not self._take(budget, tag):
+        # ⚠️⚠️ 先看"维基对这个词查过了没有"这个**中间结果**:预算闸门是一次一扣的,
+        #    上一 tick 很可能已经打过维基(查无)、却在 Google 那一步被挡下。
+        #    没有这一步,那次外呼就白花了 —— 每一 tick 重打一次维基,永远走不到 Google。
+        wiki_key = f"{kind}|{norm_key(wiki_term)}"
+        wiki_missed, _ = self._cache_get(KIND_WIKI_MISS, wiki_key)
+        if not wiki_missed and not self._take(budget, tag):
             return _NO_BUDGET
         try:
-            zh_title = self._timed(self._client.wiki_langlink, wiki_term)
+            zh_title = None if wiki_missed else self._timed(self._client.wiki_langlink, wiki_term)
             if isinstance(zh_title, str) and zh_title:
                 # 繁→简。这一跳失败(None)就退回用 langlinks 给的标题 —— 仍是真的,只是可能繁体
                 simplified = self._timed(self._client.wiki_display_title, zh_title)
@@ -624,6 +646,13 @@ class NameGlossary:
             return None
         # ---- 二级:Google 免费通道(非官方,随时可能失效)----
         if not self._take(budget, tag):
+            # ⚠️⚠️ **预算在半途被截断**:维基那次已经打出去了、结果是"查无",
+            #    Google 这次被闸门挡下。把"维基查无"这个**已经拿到的中间结果**落盘,
+            #    下一 tick 直接从 Google 开始 —— 否则每一 tick 重打一次维基,
+            #    永远走不到 Google,那次外呼白花。
+            #    ⚠️ 只在被截断时写,正常路径一行都不多写(不占词汇表容量)。
+            if not wiki_missed:
+                self._cache_put(KIND_WIKI_MISS, wiki_key, None, "wiki-miss", TTL_MISS_SEC)
             return _NO_BUDGET
         try:
             zh = self._timed(self._client.google_translate, text)

@@ -20,7 +20,9 @@ FomoEvent → Telegram HTML 消息渲染(设计文档 §10)
 """
 from __future__ import annotations
 
+import functools
 import html
+import inspect
 import math
 import re
 import time
@@ -42,10 +44,14 @@ from src.models import (
     FomoEvent,
 )
 
-# 外部文本的展示门禁(白名单)。⚠️ 与 namecn 里"送翻译前"那道是**两道独立的墙**:
+# 外部文本的展示门禁。⚠️ 与 namecn 里"送翻译前"那道是**两道独立的墙**:
 #    译文是另一个来源(代理可篡改),渲染前必须自己再过一遍。nameguard 零依赖,不会成环。
-from src.nameguard import safe_display
-from src.nameguard import strip_format_controls as _no_controls
+# ⚠️⚠️ _no_controls 用的是**保留 ZWJ** 的那个版本(strip_controls_keep_emoji):
+#    它服务的是 handle / symbol / 观点正文这些**用户自己写的**字段,而 U+200D 是
+#    组合 emoji(👨‍💻 / 🏳️‍🌈)的粘合剂,全删会把它们拆开。不可信名字那条路走
+#    safe_display,里面用的是全删版本 —— 两条路刻意分开,各自有测试。
+from src.nameguard import safe_display, safe_exchange
+from src.nameguard import strip_controls_keep_emoji as _no_controls
 
 # ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
 #    转入告警要自己算长度预算,而"上限是多少"必须与真正发消息的那一侧同源 ——
@@ -101,6 +107,18 @@ EMOJI_STOCK = "🏢"           # 底池对手股票的说明(紧跟 🌊)。⚠�
 # 固定文案
 # ============================================================
 SEP = " · "                                      # 标题行分隔符(U+00B7)
+# ⚠️⚠️ **视觉容器** —— 所有不可信外部文本(币名 / 译名 / 公司名)渲染时都套这一层。
+#    这是 "`·` 伪造字段" 那个漏洞的**真正解**:标题是 `🌱 alice · 首次建仓 · $CUM · {币名}`,
+#    币名完全攻击者可控,只要它里面能出现分隔符就能凭空长出两个字段
+#    (`已清仓 · 亏损 99%`)。禁掉 `·` 只是治标 —— 用空格、全角标点、纯中文照样能伪造。
+#    套上容器之后,伪造的分隔符明显落在容器**内部**:
+#      🌱 alice · 首次建仓 · $CUM · 「已清仓 · 亏损 99%」
+#    读者一眼看得出后半段是**数据**不是本文。
+#    用 CJK 直角引号:不与 Telegram 的 HTML 子集冲突、中文语境读得顺、辨识度高。
+#    ⚠️ 名字里如果含 「 或 」 → nameguard 直接整段丢弃(不许转义后放行 ——
+#       转义破坏不了 HTML,但破坏了容器的视觉不变量)。
+QUOTE_OPEN = "「"
+QUOTE_CLOSE = "」"
 TEXT_TRANSFER_NOT_BUY = f"{EMOJI_WARN} 转账获得,非市场买入"
 TEXT_INTERNAL_TRANSFER = f"{EMOJI_WARN} 名单内转账"
 TEXT_BASELINE_PENDING = f"{EMOJI_PENDING} 基线建立中,首次/共识暂不可用"
@@ -138,6 +156,102 @@ _EXCHANGE_ZH = {
     "nyse american": "美国证券交易所",
     "amex": "美国证券交易所",
 }
+
+
+# ============================================================
+# 不可信字段的**单一收口**
+# ============================================================
+# ⚠️⚠️ 这张表存在的理由是一个真实的失败模式:过去 poller / pumpfun / formatter
+#    **各自记得**给哪些字段套 safe_display,于是漏了两个 ——
+#      · 🏢 行的交易所名(Yahoo fullExchangeName)全程零门禁;
+#      · 🌊 行的对手全名(pool_quote_name)在渲染层没有门禁。
+#    "记得给新字段加过滤"不是一个能靠人维持的不变量。改成**结构上不可能漏**:
+#    渲染入口(@_guard_untrusted)按这张表统一过一遍,上游传进来的原始值
+#    **一律不直接使用**。新增外部来源字段时只需要在这里登记一行。
+#
+# ⚠️ 配套的测试(tests/test_nameguard_chokepoint.py)做两件事:
+#      1. 断言这张表的内容(改表就得改测试,不能悄悄放行);
+#      2. 反射检查四个渲染函数的**每一个**关键字参数,要么在这张表里(不可信),
+#         要么在 _REVIEWED_PARAMS 里(已逐个复核过)。**新加一个字段两边都不登记 → 测试红。**
+UNTRUSTED_FIELDS = {
+    "token_name": safe_display,        # DexScreener baseToken.name,谁都能给自己的币起名
+    "token_name_zh": safe_display,     # 维基 / Google 译文,外呼走代理,代理能篡改
+    "pool_quote_name": safe_display,   # 底池对手全名(DexScreener 或 Yahoo longName)
+    "stock_company_zh": safe_display,  # 公司名译文,来源同 token_name_zh
+    "stock_exchange": safe_exchange,   # Yahoo fullExchangeName,按交易所代码的形态收
+}
+
+# 已逐个复核、**不需要**形状门禁的渲染参数。分三类:
+#   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
+#   b. 内部枚举或已归一化的标识(network_id / side / chain_display);
+#   c. 符号 / handle / 地址 / 正文类字段 —— 它们**确实是外部可控的**,但走的是
+#      _clip(叠平空白 → 限长 → 转义)这条既有通道,形状门禁会把它们(比如带 emoji 的
+#      昵称、带点的 ticker)大面积误伤。⚠️ 这是**已知的取舍**,不是遗漏:
+#      详见 README「已知取舍」一节。
+_REVIEWED_PARAMS = frozenset({
+    "ev", "buyers", "watchlist", "holders", "baseline_pending", "starred",
+    "pool_quote_symbol", "now",
+    "network_id", "token_address", "token_symbol", "receiver_count", "receivers",
+    "window_hours", "senders",
+    "username", "side", "coin_mint", "amount_usd", "price_usd", "holding_usd",
+    "is_cleared", "unrealized_pnl_usd", "unrealized_pnl_pct", "realized_pnl_usd",
+    "realized_pnl_pct", "market_cap_usd", "ath_market_cap_usd", "holders_in_list",
+    "traded_at", "chain_display", "tx",
+})
+
+
+def _guard_one(name: str, value):
+    """单个不可信字段过门禁。⚠️ 门禁自己炸了也不能让渲染炸 —— 一律当作"不合格"。"""
+    try:
+        return UNTRUSTED_FIELDS[name](value)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("不可信字段门禁异常,该段不显示 | {} | {}", name, e)
+        return None
+
+
+def _guard_untrusted(fn):
+    """
+    渲染入口的装饰器:把签名里出现的**每一个**不可信字段替换成过完门禁的值。
+
+    ⚠️ 用签名绑定而不是只看 kwargs:render() 是可以按位置传参的。
+    ⚠️ 只替换**调用方真正传了的**参数 —— 没传的保持默认(None),不会凭空多出键。
+    """
+    sig = inspect.signature(fn)
+    names = tuple(n for n in sig.parameters if n in UNTRUSTED_FIELDS)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = sig.bind_partial(*args, **kwargs)
+        for n in names:
+            if n in bound.arguments:
+                bound.arguments[n] = _guard_one(n, bound.arguments[n])
+        return fn(*bound.args, **bound.kwargs)
+
+    wrapper.__signature__ = sig      # 让反射检查看到真实签名而不是 (*args, **kwargs)
+    wrapper.__guarded_fields__ = names
+    return wrapper
+
+
+def unclassified_render_params(*fns) -> set[str]:
+    """
+    → 这些渲染函数里**既不在** UNTRUSTED_FIELDS **也不在** _REVIEWED_PARAMS 的参数名。
+
+    ⚠️ 这是 D1 那条不变量的可执行形式:测试断言它是空集,于是下一个人给渲染函数
+       加一个外部来源字段(社媒链接 / 发射台名 / 持有人数 …)而忘了登记时,
+       测试当场红,不会静默绕过门禁。
+    """
+    out: set[str] = set()
+    for fn in fns:
+        for n in inspect.signature(fn).parameters:
+            if n not in UNTRUSTED_FIELDS and n not in _REVIEWED_PARAMS:
+                out.add(n)
+    return out
+
+
+def _quoted(s: str) -> str:
+    """不可信文本 → 套上视觉容器。⚠️ 传进来的必须是**已经过门禁 + 已转义**的那份。"""
+    return f"{QUOTE_OPEN}{s}{QUOTE_CLOSE}"
+
 
 # 代币页链接。⚠️ 链 slug 未收录时**整个链接不出** ——
 # 错的链接比没有链接更糟(§10.3),拼一个平台不支持的链只会得到 404。
@@ -541,7 +655,7 @@ def _market_cap_line(ev: FomoEvent) -> str | None:
 
 def _pool_quote_line(symbol, name) -> str | None:
     """
-    🌊 底池 · WYFI · WhiteFiber, Inc.
+    🌊 底池 · WYFI · 「WhiteFiber, Inc.」
 
     这个币最深的那个池子对面摆的是**哪家公司的股票**。$Rabbit 的底池对着 WYFI
     (代币化的 WhiteFiber 股票),意味着 WYFI 一跌它就跟着跌 —— 与一个对着
@@ -560,12 +674,19 @@ def _pool_quote_line(symbol, name) -> str | None:
        这一行的价值在于"对手是**什么东西**",一串 hex 回答不了这个问题。
     ⚠️ 是否显示(对手够不够格占这一行)**不在这里判** —— 那是数据层的判断,
        落在 dexscreener.notable。
+    ⚠️⚠️ 对手全名**同样要过形状门禁并套视觉容器**:它曾经是"漏记了门禁"的两个字段之一
+       (13 个攻击串原样进过这一行:t.me/scamgroup / tg://resolve / discord.gg/… /
+        0x… / base58 长串)。现在门禁在渲染入口统一做(UNTRUSTED_FIELDS),
+       这里再做一次是刻意保留的第二道(safe_display 幂等)。
     """
     sym = _clip(symbol, _SIG_SYMBOL_CHARS)
-    full = _clip(name, _POOL_NAME_CHARS)
+    safe = safe_display(name)
+    full = "" if safe is None else _clip(safe, _POOL_NAME_CHARS)
     if sym and full and sym.strip().lower() == full.strip().lower():
         full = ""
-    parts = [p for p in (sym, full) if p]
+    parts = [sym] if sym else []
+    if full:
+        parts.append(_quoted(full))
     if not parts:
         return None
     return f"{EMOJI_POOL} {LABEL_POOL}{SEP}{SEP.join(parts)}"
@@ -578,7 +699,10 @@ def _bare_name(s) -> str:
 
 def _name_suffix(symbol, name) -> str | None:
     """
-    标题尾巴的英文全名:`· $CUM · Cummingtonite`。
+    标题尾巴的英文全名:`· $CUM · 「Cummingtonite」`。
+
+    ⚠️⚠️ 外面那对 `「」` 是**视觉容器**(见 QUOTE_OPEN):币名完全攻击者可控,
+       不套容器时一个叫 "已清仓 · 亏损 99%" 的币就能在标题里凭空长出两个假字段。
 
     ⚠️ 与 symbol 相同(忽略大小写、忽略 $ 与首尾空白)→ None,不重复:
        「$WIF · WIF」占了位置什么都没多说。
@@ -594,17 +718,18 @@ def _name_suffix(symbol, name) -> str | None:
         return None
     if not _bare_name(safe) or _bare_name(safe) == _bare_name(symbol):
         return None
-    return _clip(safe, _TOKEN_NAME_CHARS)
+    return _quoted(_clip(safe, _TOKEN_NAME_CHARS))
 
 
 def _token_zh_line(name, zh) -> str | None:
     """
-    📝 Cummingtonite = 镁铁闪石
+    📝 「Cummingtonite」 = 「镁铁闪石」
 
     左半是 A 那个英文全名,右半是它的中文译名(namecn.token_zh)。两者缺一整行消失。
-    ⚠️⚠️ 两半**各自**过白名单门禁,任一不合格 → 整行消失。
+    ⚠️⚠️ 两半**各自**过形状门禁,任一不合格 → 整行消失。
        右半尤其必须自己过一遍:译文来自维基 / Google,而外呼走 fomo_proxy,
        代理能篡改响应 —— "namecn 那边已经过滤过了"不能成为这里跳过的理由。
+    ⚠️ 两半**都**套视觉容器:两边都是不可信文本,只套一半就留下一个没有容器的槽位。
     """
     safe_name = safe_display(name)
     safe_zh = safe_display(zh)
@@ -614,12 +739,24 @@ def _token_zh_line(name, zh) -> str | None:
     right = _clip(safe_zh, _TOKEN_ZH_CHARS)
     if not left or not right:
         return None
-    return f"{EMOJI_TOKEN_ZH} {left} = {right}"
+    return f"{EMOJI_TOKEN_ZH} {_quoted(left)} = {_quoted(right)}"
 
 
 def _exchange_text(code) -> str | None:
-    """交易所代码 → "纳斯达克(NasdaqGM)上市";映射不到 → "XXX 上市"(只印原代码);没有 → None。"""
-    c = _flatten(code, _TOKEN_ZH_CHARS)
+    """
+    交易所代码 → "纳斯达克(NasdaqGM)上市";映射不到 → "XXX 上市"(只印原代码);没有 → None。
+
+    ⚠️⚠️ 这个字段曾经**全程零门禁**:同一份 Yahoo 响应里 longName / company_zh 都套了
+       门禁,唯独 fullExchangeName 漏了 —— 被篡改的代理能把
+       `立即访问 t.me/free-airdrop` 原样送进 🏢 行。现在按交易所代码的**形态**收口
+       (safe_exchange:字母开头、只许字母数字空格点横杠、≤20)。
+    ⚠️ 不套 `「」` 容器:它已经不是自由文本了(形态正则保证里面出不了分隔符),
+       而 `纳斯达克(NasdaqGM)上市` 这句本来就是本模块写的固定文案。
+    """
+    c = safe_exchange(code)
+    if c is None:
+        return None
+    c = _flatten(c, _TOKEN_ZH_CHARS)
     if not c:
         return None
     low = c.lower()
@@ -631,7 +768,7 @@ def _exchange_text(code) -> str | None:
 
 def _stock_line(symbol, company_zh, exchange) -> str | None:
     """
-    🏢 USAR = 美国稀土公司 · 纳斯达克(NasdaqGM)上市
+    🏢 USAR = 「美国稀土公司」 · 纳斯达克(NasdaqGM)上市
     🏢 USAR · 纳斯达克(NasdaqGM)上市                  ← 公司名翻不出时仍显示交易所
 
     symbol 就是 🌊 那行的对手符号;事实(交易所)来自 Yahoo、中文名来自 namecn。
@@ -650,7 +787,7 @@ def _stock_line(symbol, company_zh, exchange) -> str | None:
         return None
     line = f"{EMOJI_STOCK} {sym}"
     if zh:
-        line += f" = {zh}"
+        line += f" = {_quoted(zh)}"
     if ex:
         line += f"{SEP}{ex}"
     return line
@@ -800,6 +937,7 @@ def _ca_line(ev: FomoEvent) -> str | None:
 # ============================================================
 # 对外唯一入口
 # ============================================================
+@_guard_untrusted
 def render(
     ev: FomoEvent,
     buyers: int | None = None,
@@ -1186,6 +1324,7 @@ def _receiver_rows(receivers: list[dict], now: float | None,
     return body, shown
 
 
+@_guard_untrusted
 def render_transfer_in_signal(
     *,
     network_id: str | None,
@@ -1365,6 +1504,7 @@ def _watch_sender_line(ev: FomoEvent) -> str | None:
     return None if addr is None else f"{EMOJI_SENDER} 发货地址 {addr}"
 
 
+@_guard_untrusted
 def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
                              now: float | None = None,
                              token_name: str | None = None,
@@ -1599,6 +1739,7 @@ LABEL_PUMP_CLEARED = "已清仓"
 LABEL_PUMP_DRAWDOWN = "距最高"
 
 
+@_guard_untrusted
 def render_pump_trade(
     *,
     username: str | None,

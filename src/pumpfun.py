@@ -1237,13 +1237,14 @@ class PumpWatcher:
         与 poller._name_extras 同一套规矩:整段包在 try 里,**绝不能因为翻不出中文名
         所以成交没推出去**。
         ⚠️ pool_quote_name(🌊 那行的对手全名)优先用 Yahoo 的 longName
-           ("USA Rare Earth, Inc."),拿不到才退回 DexScreener 剥完后缀的 issuer;
-           两者都过展示门禁(对手全名同样是第三方字符串)。
+           ("USA Rare Earth, Inc."),拿不到才退回 DexScreener 剥完后缀的 issuer。
+           ⚠️⚠️ 展示门禁**不在这里** —— 统一在 formatter 的渲染入口
+           (formatter.UNTRUSTED_FIELDS)。这里只在两个候选之间挑一个。
         """
         out: dict = {}
         # 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名
         if pool_quote is not None:
-            out["pool_quote_name"] = safe_display(pool_quote.name)
+            out["pool_quote_name"] = pool_quote.name
         try:
             if name is not None:
                 out["token_name"] = name
@@ -1253,10 +1254,12 @@ class PumpWatcher:
             if pool_quote is not None and pool_quote.symbol:
                 info = self._names.stock_info(pool_quote.symbol)
                 if info is not None:
-                    if info.long_name is not None:
-                        safe = safe_display(info.long_name)
-                        if safe is not None:
-                            out["pool_quote_name"] = safe
+                    # ⚠️ 这里调 safe_display **不是**展示门禁(那道统一在 formatter 的
+                    #    渲染入口,见 formatter.UNTRUSTED_FIELDS),而是在两个候选之间挑一个:
+                    #    Yahoo 的 longName 能显示才顶掉 DexScreener 那份,
+                    #    否则保留上一份 —— 而不是把 🌊 那行的全名清空。
+                    if info.long_name is not None and safe_display(info.long_name) is not None:
+                        out["pool_quote_name"] = info.long_name
                     if info.company_zh is not None:
                         out["stock_company_zh"] = info.company_zh
                     if info.exchange is not None:

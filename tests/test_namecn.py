@@ -221,8 +221,11 @@ class Test输入过滤:
         assert nc.translatable("", "X") is False
         assert nc.translatable(None, "X") is False
         assert nc.translatable("Ab", "X") is True
-        assert nc.translatable("abcdefghij " * 5 + "abcdefghi", "X") is True     # 64
-        assert nc.translatable("abcdefghij " * 5 + "abcdefghij", "X") is False    # 65
+        # ⚠️ 真正生效的长度上限是**展示门禁的形状白名单**(40 字符),不是 translatable
+        #    自己那个 64 —— translatable 末尾还要过一遍 safe_display。40 放行、41 丢弃。
+        #    (40 是实测定的:最长的真实公司名 "Space Exploration Technologies Corp." 36 字符)
+        assert nc.translatable("al" * 20, "X") is True       # 40
+        assert nc.translatable("al" * 20 + "a", "X") is False    # 41
 
     @pytest.mark.parametrize("name", [
         "send funds to 0xdeadbeefdead",
