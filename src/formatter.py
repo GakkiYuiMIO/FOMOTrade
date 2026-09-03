@@ -247,8 +247,8 @@ UNTRUSTED_FIELDS = {
     # ⚠️⚠️ 本轮(H1)新增:🚀 那一行的发射台名,走 **safe_launchpad** ——
     #    **封闭枚举**,与 stock_exchange 同一套路数,不是 safe_display。
     #    理由是实测:真实的发射台名里最常见的几个恰好是**域名形态**
-    #    (Pump.fun 1139 个 / o1.exchange 44 / Four.meme 27 / Feel.cash 5 …),
-    #    safe_display 的"域名形态整段丢弃"会打掉 35.6% 的命中,包括 Solana 上
+    #    (Pump.fun 3405 个 / Four.meme 171 / o1.exchange 57 / Nad.Fun 11 / Feel.cash 5 …),
+    #    safe_display 的"域名形态整段丢弃"会打掉 46.8% 的命中,包括 Solana 上
     #    唯一重要的那一个。发射台不是"名字"、是**平台标识**,世界上就那么几个,
     #    可以逐个数出来 —— 而"能枚举的一律不许手写模式匹配"是本项目上一轮的血教训。
     #    详见 nameguard._LAUNCHPADS 上面那一大段(含全量实测依据与代价)。
@@ -849,7 +849,7 @@ def _launchpad_line(name) -> str | None:
     ⚠️⚠️ 门禁是 **nameguard.safe_launchpad(封闭枚举)**,不是 safe_display ——
        理由见 UNTRUSTED_FIELDS 里那条注释与 nameguard._LAUNCHPADS(实测:
        Pump.fun / o1.exchange / Four.meme 这些最常见的名字本身就是域名形态,
-       safe_display 会把 35.6% 的命中打掉)。统一在渲染入口做,这里再做一次是
+       safe_display 会把 46.8% 的命中打掉)。统一在渲染入口做,这里再做一次是
        刻意保留的第二道(幂等)。
     ⚠️ **不套 `「」` 容器**:返回值只可能是封闭表里那几个规范写法,不可能含分隔符 ——
        与 _exchange_text 同一条理由。这也正好是用户样例里的形态(`🚀 发射台 · LONG`)。
