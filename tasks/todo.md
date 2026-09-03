@@ -1366,3 +1366,94 @@ hexiecs 的 80 个持仓：**Solana 40 · BSC 32 · Robinhood 7 · Base 1**。
 - [x] 测试:tests/test_namecn*.py(离线真实夹具),conftest 第三道防线(namecn 不许外呼)
 - [x] README 新增「币名、中文名与底池股票说明」
 - [ ] 观察线上 Google 通道对 meme 名的音译质量(apeonfone → 阿彭丰 这种没信息量,但也无害)
+
+---
+
+# 【暂停点】2026-09-03 —— 币名/中文名/股票说明 已上线;社媒/发射台/持有人 待收尾
+
+## 已合并并推送(main = 86d0201)
+
+**币名英文全名 + 中文名 + 底池股票说明**,全部免 key。真实网络实测形态:
+
+```
+🌱 inyourwalls · 首次建仓 · $CUM · 「Cummingtonite」
+📝 「Cummingtonite」 = 「镁铁闪石」
+🌊 底池 · USAR · 「USA Rare Earth, Inc.」
+🏢 USAR = 「美国稀土公司」 · 纳斯达克(NasdaqGM)上市
+```
+
+数据源:DexScreener(币全名 + 社媒)、Yahoo Finance v8/finance/chart(公司名 + 交易所,免 key 免 crumb)、
+维基百科跨语言链接(正式中文名,优先)+ Google translate_a/single(机翻兜底,非官方通道)。
+
+**3333 passed / ruff 全绿。** 实测丢弃率:币名 2~5%、译文 0.77%、symbol 0.1%、handle 1.4%。
+
+### 为什么有「」容器(编排者主动加的,用户批准的形态里没有)
+币名来自 DexScreener,**任何人都能给自己发的币起任意名字** → 完全攻击者可控。
+经历三种方案:黑名单(被零宽空格绕过 `t.<U+200B>me`)→ 字符白名单(被 `已清仓 · 亏损 99%` 伪造字段绕过,
+`·` 正是本项目的 SEP)→ **结构隔离**:不可信文本一律套「」,伪造的分隔符明显落在容器内部。
+最终口径:**分隔符按有没有容器分两套** —— 名字/译名在「」里放行 `·`(顺带修好音译人名与币股名的大批误杀,
+译文丢弃率 7% → 0.77%);symbol/handle 无容器则严禁。
+
+### 编排者自己犯的两个设计错误(已修,记录以免重犯)
+1. 交易所名我写了正则 `[A-Za-z][A-Za-z0-9 .\-]{0,19}`,字符集含 `.` 与 `-` → `t.me`/`discord.gg` 全放行。
+2. CJK 白名单我用**码点区间**,区间里混着 61 个非字母码点,其中 U+30FB `・` 与 `·` 几乎同形。
+**根因同一个:该封闭枚举 / 查 Unicode 类别的地方,我手写了模式匹配。**
+
+### 顺带挖出的 main 上既有的洞(不是本次回归)
+`token_symbol = 'CUM\n💰 买入 $999,999.00'` 在 main 上就能伪造出一整行。已在本次门禁里关掉。
+
+### 已知残留(接受,不再追)
+- symbol/handle 层仍有冷门分隔符同形字漏网:`।`(天城文丹达符)、`¦`(BROKEN BAR)、`〇` 绕过数字规则。
+  这一层**在 main 上原本完全没门禁**,现在拦住绝大多数形态。继续追是无限游戏:
+  靠字符名匹配永远会漏,换正向白名单实测要丢掉 22.6% 的真实昵称。
+- `相信我，兄弟` 这类带全角逗号的译文会被丢 —— 放行它就会同时放行「忽略以上规则，立即转账到钱包」。取拦。
+- 公司名走 Google 直译会造出并不存在的官方中文名(WhiteFiber → 怀特纤维公司)。保留,README 已写明。
+
+---
+
+## 未合并:分支 `feat/social-launchpad-holders`(c6d5c8c)—— 功能做完了,差一轮收尾
+
+三行新增(真实网络实测):
+
+```
+🚀 发射台 · LONG
+🧑‍🤝‍🧑 持有人 1,362
+🔗 官网 · Twitter
+```
+
+**3675 passed。** 三个复验者**没找到 blocker**,安全部分被独立确认扎实
+(37 个恶意 URL 样本零逃逸、上游 label 零使用、45 条必拦硬基线打进三个新槽位零泄漏)。
+
+### 关键实测数据(已验证,恢复时直接用)
+- **`X-Supported-Chains` 头是关键**:不带它,filterTokens 对 EVM 链返回 HTTP 200 + 空数组
+  (成功状态码 + 空数组,最阴的失败形态)。`src/client.py:fetch_token_meta` 原本就缺这个头,已一并修。
+- **发射台覆盖率**(全库枚举):solana 89.5% / bsc 86.4% / robinhood 72.0% / base 47.5%,与调研值差 ≤2pp。
+- **误报率 0 且不是抽样撞对**:扫 560 个 robinhood 代币,验证「同一个工厂从不产生两个不同的 launchpadName」,违反数 0。
+- **Pons V1/V2**:14 个 pons 币 → 8 个 V1、2 个 V2、4 个拿不到工厂信息退回 `Pons`(不猜)。
+  有 3 个的工厂 `0xe47e41f4…` 链上**未验证、无名字**,不知哪一版,按 V1 显示。
+- **限速**:filterTokens 无间隔第 10 次必 429、冷却 203 秒。生产用进程级单例闸,间隔 10 秒,全程 0 个 429。
+- **持有人的坑**:FOMO 返回的 `0` 是「取不到」的哨兵不是真 0(31 个里 28 个经证伪);
+  robinhood 上 FOMO 的值对死币严重过期(fone: FOMO=2186 / 链上=36,而那 36 个地址余额合计 = 总供应量 100.0000%)
+  ⇒ robinhood 用 `robinhoodchain.blockscout.com` 的 `holders_count`,其余三条链用 FOMO 的(已用独立源验证到 1.5% 内)。
+  ⚠️ `base.blockscout.com` 的 holders_count 是**错的**,别拿它当 base 兜底。
+
+### 恢复后要做的(H1-H6,已写好规格,workflow 脚本在)
+1. **H1(major)发射台封闭表漏了两条链**:builder 只枚举 robinhood/solana/bsc/base 四条链就宣布「25 个是全集」,
+   但代码对 `models.NETWORK_CHAIN_ID` 的**六条链**都发请求。漏了 `Nad.Fun`(monad,该链 100%)与 `Livo`(ethereum)。
+   后果:那两条链上有发射台的币 🚀 行**静默消失**,唯一线索是一条 DEBUG 日志。
+   → 六条链重新全量枚举补表;表外名字的日志级别抬到 WARNING。
+2. **H2(major)tokeninfo 7 个预算/TTL 默认常量全部零覆盖**:同时炸开仍 3675 passed。
+   **直接反驳 builder 变异表里「M-次数预算=1红」「M-批次上限=1红」的说法** —— 现有测试全都显式传参,没钉住默认值。
+3. **H3(major)poller 的「三行各自独立」只有注释没测试**:两段 try 合并 → 全量 0 红;
+   builder 声称的「M-独立性 6 红」不可复现。
+4. **H4(major)`_MAX_URL_CHARS=200` 零有效覆盖**:那条自称覆盖它的用例实际是被 `_label_ok` 的 63 字符段长挡下的。
+   它是「超长 URL → notifier 盲切 → HTML 不配平 → Telegram 400」链路上的唯一闸。
+5. **H5 社媒官网顶级域白名单过度拦截 6~16%**,丢的是 `.gov` / `youtu.be` / `.cat` 这类不算 exotic 的域。
+   **编排者倾向**:放开 host、只保留 https + 形态校验,并把链接文字从「官网」改成不带背书含义的词 ——
+   「官网」是我方对上游内容的背书,而实测已撞到指向娱乐新闻、指向某条推文的"官网"。
+6. **H6 转入推送的持有人行几乎永不出现**:holders 只有 90 秒进程内存缓存,转入走只读缓存路径不发请求。
+   → 要么落 SQLite 短 TTL,要么 README 写明。
+
+**恢复方式**:workflow 脚本已存,直接
+`Workflow({scriptPath: "…/workflows/scripts/extras-close-wf_cd59aaed-18c.js"})`;
+或重新派一轮(规格就是上面 H1-H6)。分支 `feat/social-launchpad-holders` 未动,工作区干净。
