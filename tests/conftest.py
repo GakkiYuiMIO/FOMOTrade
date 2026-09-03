@@ -62,6 +62,32 @@ def _no_dexscreener_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_tokeninfo_network(monkeypatch):
+    """
+    整场测试的兜底防线之三:**没有任何一条用例可以真的去打 filterTokens / Blockscout**。
+
+    ⚠️⚠️ 与 _no_dexscreener_network 同一条理由,而且这条更急:filterTokens 的限流
+       实测是"无间隔连打第 10 次就 429、冷却 203 秒"。一次全量测试有上百条用例会
+       走到 _dispatch —— 那等于拿用户的 IP 去撞限流,还会把真实业务按住三分半钟。
+       接上去、还没加这道防线时跑的那一次全量,时长从 53s 涨到 75s,日志里
+       实打实印着「filterTokens 限速闸未就绪」—— 请求真的发出去了。
+    ⚠️ 桩成"请求失败"(返回 None / (None, 0))而不是抛异常:那是这个功能的正常
+       降级路径(那两行整行消失),于是**没显式关心这三行的用例行为与改造前完全一致**。
+       要测这条路的用例自己注入假 client(TokenExtraLookup(filter_client=…))。
+    ⚠️ 连限速闸的 sleep 也一并桩掉:闸是**进程级单例**,一条用例把它推后 10 秒,
+       后面所有用例都要为它等 —— 那是测试之间的隐性耦合。
+    """
+    from src import tokeninfo as _t
+
+    monkeypatch.setattr(_t.FilterTokensClient, "fetch",
+                        lambda self, keys: (None, 0.0))
+    monkeypatch.setattr(_t.BlockscoutClient, "_get", lambda self, path, tag: None)
+    monkeypatch.setattr(_t._GATE, "_next_at", 0.0, raising=False)
+    monkeypatch.setattr(_t._GATE, "_sleep", lambda _s: None, raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _clear_stop_flag():
     """
     client 的停机 Event 是**模块级全局**。某个用例设了它而不清,

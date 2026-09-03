@@ -1,0 +1,19 @@
+{
+ "responseObject": [
+  {
+   "holders": 0,
+   "token": {
+    "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "networkId": 1399811149,
+    "symbol": "USDC",
+    "name": "USDC",
+    "launchpad": {
+     "launchpadName": null,
+     "launchpadIconUrl": "https://metadata.mobula.io/assets/logos/factory_orca.webp",
+     "graduationPercent": 0,
+     "migrated": false
+    }
+   }
+  }
+ ]
+}

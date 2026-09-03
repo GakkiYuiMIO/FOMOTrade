@@ -1,0 +1,15 @@
+{
+ "address_hash": "0x7a6a3B93cb3fFeAD8B180B5f537e0cE7832d1e18",
+ "circulating_market_cap": null,
+ "circulating_supply": null,
+ "decimals": "18",
+ "exchange_rate": null,
+ "holders_count": "1384",
+ "icon_url": null,
+ "name": "Cummingtonite",
+ "reputation": "ok",
+ "symbol": "CUM",
+ "total_supply": "1000000000000000000000000000",
+ "type": "ERC-20",
+ "volume_24h": null
+}

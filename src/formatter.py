@@ -50,7 +50,14 @@ from src.models import (
 #    它服务的是 handle / symbol / 观点正文这些**用户自己写的**字段,而 U+200D 是
 #    组合 emoji(👨‍💻 / 🏳️‍🌈)的粘合剂,全删会把它们拆开。不可信名字那条路走
 #    safe_display,里面用的是全删版本 —— 两条路刻意分开,各自有测试。
-from src.nameguard import safe_address, safe_display, safe_exchange, safe_ident
+from src.nameguard import (
+    safe_address,
+    safe_display,
+    safe_exchange,
+    safe_ident,
+    safe_launchpad,
+    safe_social_links,
+)
 from src.nameguard import strip_controls_keep_emoji as _no_controls
 
 # ⚠️ 只借 MAX_MESSAGE_LEN 这一个常量(与 bot.py 同样的做法):
@@ -102,6 +109,12 @@ EMOJI_LINK = "🔗"
 EMOJI_POOL = "🌊"            # 底池对手资产
 EMOJI_TOKEN_ZH = "📝"        # 币名的中文译名(紧跟标题)
 EMOJI_STOCK = "🏢"           # 底池对手股票的说明(紧跟 🌊)。⚠️ 📈 已被盈亏占用,别撞
+EMOJI_LAUNCHPAD = "🚀"       # 发射台(这个币是从哪个平台发出来的)
+# ⚠️⚠️ 持有人数**必须**用 🧑‍🤝‍🧑 而不是 👥:👥 已经被「名单内 3/108 人买过」占了,
+#    两条含义完全不同的行共用一个 emoji,扫一眼会被读成同一件事(用户亲自定的)。
+#    它由 ZWJ 粘合(U+1F9D1 U+200D U+1F91D U+200D U+1F9D1)—— 是本模块自己的常量,
+#    不经过任何"删 Cf 字符"的通道(那条只作用于外部文本,见 _esc)。
+EMOJI_TOKEN_HOLDERS = "🧑‍🤝‍🧑"
 
 # ============================================================
 # 固定文案
@@ -136,6 +149,38 @@ LABEL_COUNTERPARTY = "对手方"
 LABEL_PNL_REALIZED = "已实现盈亏"
 LABEL_PNL_UNREALIZED = "未实现盈亏"
 LABEL_POOL = "底池"
+LABEL_LAUNCHPAD = "发射台"
+LABEL_TOKEN_HOLDERS = "持有人"
+# 持有人数的**上界**。⚠️ 这不是"防御性编程",它挡的是一个具体的形态:
+#    这个槽位收的是上游给的数,而"一串 10~11 位数字"正是手机号 / QQ 号的形态,
+#    印成「持有人 13,800,138,000」既是假事实、又是一条可拨可加的目标。
+#    现实里的上界差着两个数量级:实测全库最大的是 base 的 USDC(10,967,609)、
+#    bsc 的 BNB(7,118,229)—— 10 亿留了近百倍余量。
+#    ⚠️ 超界 → 整行消失(与 _pump_mcap_line 拒绝 ≤0 的市值同一条理由:
+#       这一行**说不出口**,少一行是"我们没说",印出来是"我们说错了")。
+_MAX_TOKEN_HOLDERS = 1_000_000_000
+# 发射台名的限长。⚠️ 它**只用在那条 WARNING 日志上**(渲染出来的值是封闭表里的规范写法,
+# 不需要限长)。⚠️ 实测(2026-09-03 六条链 9810 个代币全量)最长的上游原值是
+# "Meteora Alpha Vault"(19 字符)—— 上一版这里写的"最长 10 字符"是错的
+# (那时表里就已经有 19 字符的那个了),24 仍然够用,但数字得是真的。
+_LAUNCHPAD_CHARS = 24
+# 社媒链接的**文字**。⚠️⚠️ 这几个字全是我们自己的常量,**永远不用上游给的 label**
+#    (DexScreener 的 `websites[].label` 是发币的人填的自由文本,而链接文字带着
+#     我们的背书 —— 让攻击者写"官方客服"再指向他的站,是这一整块最贵的那个洞)。
+# ⚠️ 键必须与 nameguard.SOCIAL_KINDS 逐字对上;表外的类别在门禁那一侧就已经丢掉了。
+# ⚠️⚠️ website 那一类叫「**网站**」不叫「官网」(H5)。两个字的差别是**背书**:
+#    「官网」是我们替上游作证"这是官方的",而这条 URL 指向哪儿**完全由发币人决定**
+#    (nameguard 对这一类刻意放开 host)。实测样本里就有指向娱乐新闻、指向某条推文的
+#    "官网"。我们没有任何依据说它是官方的 —— 能说的只有"这里有个网站链接"。
+#    与本项目「宁可少说一句,绝不说一句假话」同一条(§10.3)。
+SOCIAL_LABELS = {
+    "website": "网站",
+    "twitter": "Twitter",
+    "telegram": "Telegram",
+    "discord": "Discord",
+    "reddit": "Reddit",
+    "github": "GitHub",
+}
 # 对手全名的限长。⚠️ 它是**第三方(DexScreener)返回的任意字符串**,长度不受任何
 # 天然约束,也可能带 `<`/`&` —— 必须走 _clip(叠平空白 → 截断 → 转义)。
 # 32:实测最长的一个是 "NVIDIA • Robinhood Token"(24 字符),留一点余量即可;
@@ -199,6 +244,15 @@ UNTRUSTED_FIELDS = {
     #    'Join t.me/pumpgroup now' 原样拼进标题行的 SEP 之后 —— 笛卡尔积里
     #    唯一一个泄漏的名字类槽位。见 render_alpha_listing 的注释。
     "name": safe_display,              # 币安 Alpha 的币名
+    # ⚠️⚠️ 本轮(H1)新增:🚀 那一行的发射台名,走 **safe_launchpad** ——
+    #    **封闭枚举**,与 stock_exchange 同一套路数,不是 safe_display。
+    #    理由是实测:真实的发射台名里最常见的几个恰好是**域名形态**
+    #    (Pump.fun 3405 个 / Four.meme 171 / o1.exchange 57 / Nad.Fun 11 / Feel.cash 5 …),
+    #    safe_display 的"域名形态整段丢弃"会打掉 46.8% 的命中,包括 Solana 上
+    #    唯一重要的那一个。发射台不是"名字"、是**平台标识**,世界上就那么几个,
+    #    可以逐个数出来 —— 而"能枚举的一律不许手写模式匹配"是本项目上一轮的血教训。
+    #    详见 nameguard._LAUNCHPADS 上面那一大段(含全量实测依据与代价)。
+    "launchpad": safe_launchpad,
 }
 
 # 译文字段 → 它的**原文**是哪个字段。⚠️ safe_display 的"含 CJK 时不许有 ≥5 位 ASCII 串"
@@ -244,10 +298,23 @@ ADDRESS_FIELDS = {
     "contract_address": safe_address,  # 币安 Alpha 上新那条推送的合约地址
 }
 
-# 渲染入口真正过一遍的全表。⚠️ 三张表**不许有同名键**(一个字段只能有一道门)。
-_GUARDED_FIELDS = {**UNTRUSTED_FIELDS, **IDENT_FIELDS, **ADDRESS_FIELDS}
+# ⚠️⚠️ **URL 类字段**(本轮 H1 新增)。它是本项目**第一个**会被放进 `<a href>` 的
+#    外部字符串,前面三张表守的都是"印出来的字",这一张守的是"点下去会去哪儿" ——
+#    失败后果完全不是一个量级(前者最坏是读者读到一句假话,后者是读者被带到
+#    攻击者的站点,而链接文字还是我们自己写的「网站」「Twitter」)。
+#    所以它单开一张表而不是塞进 UNTRUSTED_FIELDS:表的名字本身就是那句
+#    "这里的门要按 URL 的口径去看"。
+# ⚠️ 门禁函数收的是 ((类别, URL), …) 这个**整体**,返回过完门禁的同形结构或 None ——
+#    单条不合格只丢那一条(见 nameguard.safe_social_links)。
+URL_FIELDS = {
+    "token_socials": safe_social_links,  # DexScreener pair.info 的官网 / 社媒
+}
+
+# 渲染入口真正过一遍的全表。⚠️ 四张表**不许有同名键**(一个字段只能有一道门)。
+_GUARDED_FIELDS = {**UNTRUSTED_FIELDS, **IDENT_FIELDS, **ADDRESS_FIELDS, **URL_FIELDS}
 assert len(_GUARDED_FIELDS) == (len(UNTRUSTED_FIELDS) + len(IDENT_FIELDS)
-                                + len(ADDRESS_FIELDS)), "同一个字段登记了两道门"
+                                + len(ADDRESS_FIELDS)
+                                + len(URL_FIELDS)), "同一个字段登记了两道门"
 
 # 已逐个复核、**不需要**形状门禁的渲染参数。分三类:
 #   a. 不是文本(数字 / 布尔 / 时间戳 / 列表 / 事件对象);
@@ -269,6 +336,12 @@ _REVIEWED_PARAMS = frozenset({
     #    (F6:它们同样是外部来源,上一版全程零门禁);
     #    `name` 本轮(G3)挪进 UNTRUSTED_FIELDS —— 那个"已知缺口"已经补上。
     "listing_time_ms", "market_cap",
+    # ⚠️ token_holders(🧑‍🤝‍🧑 那一行的持有人数)是**数字**:取值层已经把它解析成 int、
+    #    把上游的哨兵 0 归成 None(见 tokeninfo.parse_holders),渲染层只做千分位。
+    #    形状门禁是给"名字"用的,套在一个 int 上没有意义。
+    #    ⚠️ 它**不叫** holders —— 那个名字已经被「名单内 N 人仍持有」与币安 Alpha
+    #       那条推送各占一次了。
+    "token_holders",
     # pump 喊单那条推送的参数。thesis 是**用户自己写的正文**,走 _clip 不走形状门禁
     # (形状门禁是给"名字"用的,一句话本来就过不了词数上限)。
     "thesis", "multiple", "likes", "view_count", "created_at",
@@ -283,10 +356,23 @@ def _guard_one(name: str, value, source=None):
     """
     fn = _GUARDED_FIELDS[name]
     try:
-        return fn(value, source) if source is not None and fn is safe_display else fn(value)
+        out = fn(value, source) if source is not None and fn is safe_display else fn(value)
     except Exception as e:  # noqa: BLE001
         logger.warning("不可信字段门禁异常,该段不显示 | {} | {}", name, e)
         return None
+    # ⚠️⚠️ 发射台名是**封闭枚举**,表外 = "上游出了一个我们还不认识的发射台",
+    #    而不是"这个值有问题" —— 这两件事的处置完全不同:后者就该静悄悄丢掉,
+    #    前者需要有人去把它加进 nameguard._LAUNCHPADS,否则那条链的 🚀 行**永远不显示**。
+    #    这条日志是那件事的**唯一**发现途径。
+    # ⚠️⚠️ 它必须打在**这里**(收口),不能打在 _launchpad_line 里:收口已经把不合格的
+    #    值换成 None 了,渲染函数拿到的是 None,那边的日志**永远打不出来** ——
+    #    上一版就是这样,一条打不出来的 DEBUG 当成了"唯一发现途径"。
+    #    (H1 实测:monad 上的 Nad.Fun 是该链有发射台的币的 100%,整整一版没显示过,
+    #     日志里一个字都没有。)
+    if name == "launchpad" and out is None and value is not None and str(value).strip():
+        logger.warning("发射台名不在封闭表里,那一行不显示(该加进 nameguard._LAUNCHPADS 了) | {}",
+                       _flatten(value, _LAUNCHPAD_CHARS))
+    return out
 
 
 def _guard_untrusted(fn):
@@ -747,6 +833,89 @@ def _market_cap_line(ev: FomoEvent) -> str | None:
     return f"{EMOJI_MARKET_CAP} 市值 {mc}" if mc is not None else None
 
 
+def _launchpad_line(name) -> str | None:
+    """
+    🚀 发射台 · 「LONG」
+
+    这个币是从哪个平台发出来的。robinhood 上 pons=1163 / LONG=95 / Flap=25…,
+    solana 上 Pump.fun=1128 / StonkFun=125…—— 它与市值、币龄同一族,都是**币的出身**。
+
+    ⚠️⚠️ 事实**只从 FOMO 的 launchpadName 来**。拿不到 → 整行消失,
+       **绝不用域名反推**:这条路已经被证伪(CASHCAT 的官网是 cashcat.cc、
+       AI 的是 artificialinu.com,都是项目自己的站,与发射台无关)。
+       猜一个发射台名 = 印一句假事实,比少一行糟得多(§10.3)。
+    ⚠️ Pons 的 V1/V2 在**数据层**分(tokeninfo._pons_version),这里给什么画什么
+       (铁律 7)。分不出来时数据层给的就是 "Pons",不是 "Pons V2"。
+    ⚠️⚠️ 门禁是 **nameguard.safe_launchpad(封闭枚举)**,不是 safe_display ——
+       理由见 UNTRUSTED_FIELDS 里那条注释与 nameguard._LAUNCHPADS(实测:
+       Pump.fun / o1.exchange / Four.meme 这些最常见的名字本身就是域名形态,
+       safe_display 会把 46.8% 的命中打掉)。统一在渲染入口做,这里再做一次是
+       刻意保留的第二道(幂等)。
+    ⚠️ **不套 `「」` 容器**:返回值只可能是封闭表里那几个规范写法,不可能含分隔符 ——
+       与 _exchange_text 同一条理由。这也正好是用户样例里的形态(`🚀 发射台 · LONG`)。
+    ⚠️⚠️ 表外的名字 → 整行消失。"上游出了新发射台"的那条 **WARNING** 打在**收口**
+       (_guard_one),不在这里:收口已经把表外的值换成 None,这个函数拿到的就是 None,
+       在这里判"名字非空"永远判不到 —— 上一版正是如此,那条自称"唯一发现途径"的
+       DEBUG 从来没打出来过(H1:monad 的 Nad.Fun 因此整整一版不显示,日志里没有一个字)。
+    """
+    text = safe_launchpad(name)
+    if text is None:
+        return None
+    return f"{EMOJI_LAUNCHPAD} {LABEL_LAUNCHPAD}{SEP}{_esc(text)}"
+
+
+def _token_holders_line(n) -> str | None:
+    """
+    🧑‍🤝‍🧑 持有人 1,194
+
+    ⚠️⚠️ **0 在这里不可能出现**,因为取值层已经把上游的 0 归成 None
+       (tokeninfo.parse_holders)—— 实测 robinhood 上 31 个 holders=0 里 28 个
+       是错的(有个显示 0 的实际 4302 人),solana 的 USDC 也是 FOMO=0 / 真值 524 万。
+       "0 个持有人"这句话本身就说不出口:同一条消息里紧挨着的是一笔真实成交,
+       成交对手手上必然有货。这里再判一次 `n <= 0 → None` 是第二道,不是主判据。
+    ⚠️ 千分位:33633 这种数不分位读者要数零。
+    ⚠️ 数据来源按链分(robinhood 用 Blockscout、其余用 FOMO),那是数据层的事;
+       本模块是纯展示(铁律 7)。
+    """
+    if n is None or isinstance(n, bool):
+        return None
+    try:
+        v = int(n)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if v <= 0 or v > _MAX_TOKEN_HOLDERS:
+        return None
+    return f"{EMOJI_TOKEN_HOLDERS} {LABEL_TOKEN_HOLDERS} {v:,}"
+
+
+def _socials_line(pairs) -> str | None:
+    """
+    🔗 网站 · Twitter · Telegram
+
+    发币时项目方自己填的链接(**可能有也可能没有** —— 用户原话)。全都没有 → 整行消失。
+
+    ⚠️⚠️ 链接文字是**我们自己的常量**(SOCIAL_LABELS),永远不用上游给的 label。
+       上游的 `websites[].label` 是发币的人填的自由文本,而链接文字带着我们的背书 ——
+       让他写"官方客服"再指向自己的站,是这一整块最贵的那个洞。
+    ⚠️⚠️ href 里的 URL 已经在渲染入口过完 nameguard.safe_url(封闭 scheme + 封闭
+       host 表 + 封闭字符集);这里**仍然**再 escape 一次(quote=True):
+       门禁保证了 `"` 进不来,escape 保证了"万一进来了也闭合不了属性" ——
+       两道各自独立,不互相依赖。
+    ⚠️ 类别不认识的一律跳过(理论上不可能走到:门禁已经按封闭表滤过一遍)。
+    """
+    parts = []
+    for item in pairs or ():
+        try:
+            kind, url = item
+        except (TypeError, ValueError):
+            continue
+        label = SOCIAL_LABELS.get(kind)
+        if label is None or not url:
+            continue
+        parts.append(f'<a href="{html.escape(str(url), quote=True)}">{label}</a>')
+    return f"{EMOJI_LINK} {' · '.join(parts)}" if parts else None
+
+
 def _pool_quote_line(symbol, name) -> str | None:
     """
     🌊 底池 · WYFI · 「WhiteFiber, Inc.」
@@ -1058,6 +1227,9 @@ def render(
     token_name_zh: str | None = None,
     stock_company_zh: str | None = None,
     stock_exchange: str | None = None,
+    launchpad: str | None = None,
+    token_holders: int | None = None,
+    token_socials=None,
 ) -> str:
     """
     渲染一条 Telegram HTML 消息。
@@ -1076,6 +1248,12 @@ def render(
         token_name_zh    它的中文译名(namecn.token_zh)→ 📝 行(C);None 整行消失
         stock_company_zh / stock_exchange
                          底池对手股票的中文公司名与交易所代码(namecn.stock_info)→ 🏢 行(B)
+        launchpad        发射台名(tokeninfo)→ 🚀 行;None 整行消失
+        token_holders    这个币的持有人数(tokeninfo)→ 🧑‍🤝‍🧑 行;None 整行消失
+        token_socials    ((类别, URL), …)(dexscreener 同一份响应)→ 🔗 社媒行;
+                         空/None 整行消失
+        ⚠️ 上面这三个**各自独立**:任一拿不到只掉那一行,不影响另外两行,
+           更不影响整条推送。
 
     ⚠️ 本函数**不得抛异常**。它在 poller 的发送循环里被调用,
        一条脏数据把渲染炸掉会连带整个 tick 停摆 —— 宁可发一条降级消息。
@@ -1083,7 +1261,8 @@ def render(
     try:
         return _render(ev, buyers, watchlist, holders, baseline_pending, starred,
                        pool_quote_symbol, pool_quote_name,
-                       token_name, token_name_zh, stock_company_zh, stock_exchange)
+                       token_name, token_name_zh, stock_company_zh, stock_exchange,
+                       launchpad, token_holders, token_socials)
     except Exception as e:  # noqa: BLE001
         # 走到这里一定是本模块的 bug(所有字段级异常都已在下游吃掉),必须留痕
         logger.exception("消息渲染失败,降级为最简文本 | event_id={} | {}", getattr(ev, "event_id", "?"), e)
@@ -1103,6 +1282,9 @@ def _render(
     token_name_zh: str | None = None,
     stock_company_zh: str | None = None,
     stock_exchange: str | None = None,
+    launchpad: str | None = None,
+    token_holders: int | None = None,
+    token_socials=None,
 ) -> str:
     # 行序固定,缺失的行整行消失。这个顺序逐条对齐设计文档 §10.2 的七个场景
     candidates = [
@@ -1122,6 +1304,10 @@ def _render(
         _trade_count_line(ev),
         _market_cap_line(ev),
         _token_age_line(ev),
+        # ⚠️ 🚀 与 🧑‍🤝‍🧑 排在这里的理由:它们与市值/币龄是同一族 ——
+        #    都在回答"这个币本身是什么样的",而不是"谁在买"。位置与用户给的样例一致。
+        _launchpad_line(launchpad),
+        _token_holders_line(token_holders),
         # 底池对手排在币本身那几行(市值/币龄)之后、"人"那几行(共识)之前 ——
         # 它回答的是"这个币是什么",不是"谁在买"
         _pool_quote_line(pool_quote_symbol, pool_quote_name),
@@ -1129,6 +1315,10 @@ def _render(
                     pool_quote_name),                                       # 🏢 紧跟 🌊
         _consensus_line(buyers, watchlist, holders),
         _network_line(ev),
+        # ⚠️ 社媒排在平台链接(FOMO/GMGN)**之前**:它们是同一族(都是"点出去"),
+        #    而项目自己的链接比平台页更具体。两行都用 🔗 是刻意的 —— 行首 emoji 的
+        #    唯一性铁律说的是**标题锚点**,同族的次级行共用一个 emoji 反而好扫。
+        _socials_line(token_socials),
         _links_line(ev),                         # 链接在 CA 之前 —— CA 必须独占最后一行
         _ca_line(ev),                            # CA 永远是数据部分的最后一行
         TEXT_BASELINE_PENDING if baseline_pending else None,
@@ -1448,6 +1638,9 @@ def render_transfer_in_signal(
     now: float | None = None,
     token_name: str | None = None,
     token_name_zh: str | None = None,
+    launchpad: str | None = None,
+    token_holders: int | None = None,
+    token_socials=None,
 ) -> str:
     """
     「同一个币被 N 个名单成员『收到』」的告警。
@@ -1530,8 +1723,16 @@ def render_transfer_in_signal(
                               f"<b>真金白银</b>买过:{who}")
         else:
             tail_lines.append(f"{EMOJI_AMOUNT_IN} 名单里<b>还没有人</b>真金白银买过这个币")
+    # 🚀 / 🧑‍🤝‍🧑:与买卖推送同一族。⚠️ 这条路径**只读缓存**(poller 传 cached_only=True),
+    #    缓存里没有就没有 —— 分发预警绝不为这两行新开请求。
+    for extra in (_launchpad_line(launchpad), _token_holders_line(token_holders)):
+        if extra is not None:
+            tail_lines.append(extra)
     if net:
         tail_lines.append(f"{EMOJI_NETWORK} {_esc(NETWORK_DISPLAY.get(net, net))}")
+    social = _socials_line(token_socials)
+    if social:
+        tail_lines.append(social)
     link = _links_line(_fake_ev(net, token_address))
     if link:
         tail_lines.append(link)
@@ -1619,7 +1820,10 @@ def _watch_sender_line(ev: FomoEvent) -> str | None:
 def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
                              now: float | None = None,
                              token_name: str | None = None,
-                             token_name_zh: str | None = None) -> str:
+                             token_name_zh: str | None = None,
+                             launchpad: str | None = None,
+                             token_holders: int | None = None,
+                             token_socials=None) -> str:
     """
     被 /tin 点名的人**收到**了一笔币 —— 逐条推送。
 
@@ -1663,10 +1867,15 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
         _token_zh_line(token_name, token_name_zh),   # 📝 中文名紧跟标题
         _amount_line(ev),            # 💰 数量 12,000,000 ≈ $2,439.09
         _watch_mcap_line(ev, now),   # 💎 收到时市值 $198.2K(太旧就整行消失)
+        # 🚀 / 🧑‍🤝‍🧑:与买卖推送同一族、同一位置。⚠️ 这条路径**只读缓存**
+        # (poller 传 cached_only=True),缓存里没有就没有 —— 不为它新开请求
+        _launchpad_line(launchpad),
+        _token_holders_line(token_holders),
         _counterparty_line(ev),      # 👤 来自 someone(名单内转账会自己标出来)
         _watch_sender_line(ev),      # 📮 发货地址 8FtY7n…cZx72
         _watch_ago_line(ev, now),    # ⏱ 3 分 20 秒前到账
         _network_line(ev),           # 🧬 Solana
+        _socials_line(token_socials),  # 🔗 网站 · Twitter(排在平台链接之前)
         _links_line(ev),             # 🔗 FOMO · GMGN(必须排在 CA 之前)
     ]
     anchor = f"<code>{_clip(ev.token_address, _SIG_CA_CHARS)}</code>" if ev.token_address else None
@@ -1892,6 +2101,9 @@ def render_pump_trade(
     token_name_zh: str | None = None,
     stock_company_zh: str | None = None,
     stock_exchange: str | None = None,
+    launchpad: str | None = None,
+    token_holders: int | None = None,
+    token_socials=None,
 ) -> str:
     """
     「被盯的人在 pump.fun 上成交了一笔」的推送。
@@ -1968,6 +2180,10 @@ def render_pump_trade(
                   _pump_pnl_line(is_cleared, unrealized_pnl_usd, unrealized_pnl_pct,
                                  realized_pnl_usd, realized_pnl_pct),
                   _pump_mcap_line(market_cap_usd, ath_market_cap_usd),
+                  # 🚀 / 🧑‍🤝‍🧑 与 FOMO 那条推送同一个位置(市值之后、底池之前),
+                  # 两种推送看着是一家的
+                  _launchpad_line(launchpad),
+                  _token_holders_line(token_holders),
                   # 与 FOMO 那条同样的位置:币本身的事实之后、人的事实之前
                   _pool_quote_line(pool_quote_symbol, pool_quote_name),
                   _stock_line(pool_quote_symbol, stock_company_zh, stock_exchange),
@@ -1989,6 +2205,10 @@ def render_pump_trade(
         # 必须能一键复制粘到浏览器里。⚠️ 排在 CA 之前 —— CA 独占最后一行是硬规则
         lines.append(f"{EMOJI_PUMP_TX} <code>{_clip(txt, _PUMP_TX_CHARS)}</code>")
     ca = " ".join(str(coin_mint or "").split())
+    # 社媒排在平台链接之前(与 render() 同一套行序)
+    social = _socials_line(token_socials)
+    if social:
+        lines.append(social)
     link = _links_line(_fake_ev(net, ca))
     if link:
         lines.append(link)

@@ -1,0 +1,9 @@
+{
+ "hash": "0x2556Ba350F119b613efa3A0d9AAFF8717B87801a",
+ "is_contract": true,
+ "is_verified": true,
+ "name": "PonsV2LauncherToken",
+ "creation_status": "success",
+ "creation_transaction_hash": "0x06503e804373d6a917f43e3eb30aea5b6e2c1c6c88d27d802dda51f914008990",
+ "creator_address_hash": "0x3711ceA4feaDE896C913C68F01Eda97Cb06D1A42"
+}

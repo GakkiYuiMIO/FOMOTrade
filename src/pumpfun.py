@@ -62,11 +62,12 @@ from loguru import logger
 
 from src import store
 from src.config import get_settings
-from src.dexscreener import PoolQuoteLookup, notable, token_name
+from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
 from src.formatter import render_pump_callout, render_pump_trade
-from src.models import NETWORK_DISPLAY
+from src.models import NETWORK_DISPLAY, normalize_token_address
 from src.namecn import NameGlossary
 from src.nameguard import safe_display
+from src.tokeninfo import TokenExtraLookup
 
 # ============================================================
 # 端点
@@ -942,6 +943,10 @@ class PumpWatcher:
         # 币名中文译名 + 底池对手股票事实(namecn:维基 / Google / Yahoo,公开免 key)。
         # 自带 SQLite 缓存与每轮预算;同一条铁律:失败一律自己吞掉,绝不影响成交推送本身。
         self._names = NameGlossary()
+        # 发射台(🚀)+ 持有人数(🧑‍🤝‍🧑)。自带缓存与每轮预算,限速闸是**进程级**的
+        # (与 poller 那个实例共用同一把闸 —— filterTokens 的限流按 IP 算)。
+        # 同一条铁律:失败一律自己吞掉,绝不影响成交推送本身。
+        self._token_extras = TokenExtraLookup()
 
     # ---- 对外唯一入口 ----------------------------------------------------
     def run_once(self) -> int:
@@ -965,6 +970,7 @@ class PumpWatcher:
         except Exception:  # noqa: BLE001
             pass
         self._pool_lookup.close()
+        self._token_extras.close()
 
     # ---- 内部 ------------------------------------------------------------
     def _check(self) -> int:
@@ -1042,6 +1048,12 @@ class PumpWatcher:
         #    30 个地址,而本轮的 mint 数被 fomo_pump_max_mints(≤15)钉住 ——
         #    提前批量问的代价恒定是"每条链 1 个请求",逐个懒查反而更贵。
         pool_quotes = self._pool_quotes(mints, by_mint)
+        # 发射台/持有人:整轮**一个批次**(跨链混批),见 tokeninfo 的限速说明
+        try:
+            self._token_extras.begin_round()
+        except Exception:  # noqa: BLE001
+            pass
+        token_extras = self._token_extra_map(mints, by_mint)
         # 币名/股票说明的每轮预算从这里起算(见 namecn.NameGlossary)
         try:
             self._names.begin_round()
@@ -1056,7 +1068,8 @@ class PumpWatcher:
                                "快照不前移、下一轮继续", MAX_PUSH_PER_ROUND)
                 break
             n, used = self._handle_mint(mint, by_mint[mint], by_addr, all_addrs,
-                                        cutoff_ts, done, budget, observed, pool_quotes)
+                                        cutoff_ts, done, budget, observed, pool_quotes,
+                                        token_extras)
             sent += n
             budget -= used
         return sent
@@ -1090,6 +1103,32 @@ class PumpWatcher:
             except Exception as e:  # noqa: BLE001
                 logger.warning("pump.fun 底池对手查询失败,本轮这条链不显示该行 | {} | {}", net, e)
         return out
+
+    def _token_extra_map(self, mints: list[str],
+                         by_mint: dict[str, list[tuple[_Watched, Position]]]) -> dict:
+        """
+        本轮这些 mint 的发射台与持有人 → {(链, 归一化地址): TokenExtra}。
+
+        ⚠️⚠️ 与 _pool_quotes 的"一条链一个请求"**刻意不同**:filterTokens 的限速
+           紧得多(实测无间隔连打第 10 次就 429、冷却 203 秒),所以整轮攒成
+           **一个**跨链混批的请求。
+        ⚠️⚠️ 整段包在 try 里:**绝不能出现"因为查不到发射台所以成交没推出去"**。
+        """
+        pairs: list[tuple[str, str]] = []
+        for mint in mints:
+            rows = by_mint.get(mint) or []
+            if not rows:
+                continue
+            net = (rows[0][1].network_id or "").strip()
+            if net:
+                pairs.append((net, mint))
+        if not pairs:
+            return {}
+        try:
+            return self._token_extras.lookup(pairs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pump.fun 发射台/持有人查询失败,本轮这两行不显示 | {}", e)
+            return {}
 
     def _scan(self, w: _Watched) -> tuple[list[Position], list[Position]]:
         """
@@ -1127,7 +1166,8 @@ class PumpWatcher:
                      by_addr: dict[str, list[_Watched]], all_addrs: list[str],
                      cutoff_ts: float, done: set, budget: int,
                      observed: dict[tuple[str, str], set[str]],
-                     pool_quotes: dict[str, dict] | None = None) -> tuple[int, int]:
+                     pool_quotes: dict[str, dict] | None = None,
+                     token_extras: dict | None = None) -> tuple[int, int]:
         """
         一个变动的 mint:问逐笔成交 → 过滤 → 推送 → 只对**推干净了**的人前移快照。
 
@@ -1187,7 +1227,13 @@ class PumpWatcher:
             pq = notable((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
             # 这个币自己的英文全名(同一份响应,与对手是谁无关)
             tname = token_name((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
-            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname)
+            # 社媒:**同一份响应**里的 pair.info,零新增请求(见 dexscreener._socials)
+            tsoc = token_socials((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            # 发射台/持有人:本轮批量查好的那份;没有就没有(那两行消失)
+            extra = (token_extras or {}).get(
+                ((rows[0].network_id or "").strip(), normalize_token_address(mint)))
+            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname,
+                                      tsoc, extra)
             sent += n
             used += tried
             if ok:
@@ -1231,7 +1277,7 @@ class PumpWatcher:
         """市值(带 TTL 缓存)。实现见 _coin_stats_cached —— 观点那个 watcher 共用同一份逻辑。"""
         return _coin_stats_cached(self._client, self._coin_cache, mint)
 
-    def _name_extras(self, symbol, pool_quote, name) -> dict:
+    def _name_extras(self, symbol, pool_quote, name, socials=None, extra=None) -> dict:
         """
         A/B/C 三段 → render_pump_trade 的关键字参数;缺哪段没哪个键(那一行整行消失)。
         与 poller._name_extras 同一套规矩:整段包在 try 里,**绝不能因为翻不出中文名
@@ -1245,6 +1291,16 @@ class PumpWatcher:
         # 先落一个安全的回退值再进 try:后面任何一步炸了,🌊 那行仍有对手全名
         if pool_quote is not None:
             out["pool_quote_name"] = pool_quote.name
+        # 🔗 社媒 / 🚀 发射台 / 🧑‍🤝‍🧑 持有人:三行**各自独立**,而且都放在 try 之前 ——
+        # 它们是纯赋值(数据已经在上游取好),没有任何会抛的东西,
+        # 更不该被"翻不出中文名"那条路径的异常带走。
+        if socials:
+            out["token_socials"] = socials
+        if extra is not None:
+            if extra.launchpad is not None:
+                out["launchpad"] = extra.launchpad
+            if extra.holders is not None:
+                out["token_holders"] = extra.holders
         try:
             if name is not None:
                 out["token_name"] = name
@@ -1271,7 +1327,8 @@ class PumpWatcher:
     def _push(self, w: _Watched, pos: Position, fresh: list[Trade], budget: int,
               stats: CoinStats | None = None,
               holders_in_list: int | None = None,
-              pool_quote=None, token_name_en: str | None = None) -> tuple[bool, int, int]:
+              pool_quote=None, token_name_en: str | None = None,
+              token_socials_raw=None, token_extra=None) -> tuple[bool, int, int]:
         """
         逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
 
@@ -1298,7 +1355,8 @@ class PumpWatcher:
                            budget, budget)
             fresh, all_ok = fresh[:budget], False
         # 英文全名(A)/ 中文名(C)/ 股票说明(B):一个币算一次,这几笔共用
-        names = self._name_extras(pos.symbol, pool_quote, token_name_en)
+        names = self._name_extras(pos.symbol, pool_quote, token_name_en,
+                                  token_socials_raw, token_extra)
         for t in fresh:
             text = render_pump_trade(
                 username=w.username,

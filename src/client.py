@@ -391,6 +391,12 @@ def fetch_token_meta(token_address: str, network_id) -> dict:
             headers={
                 "Content-Type": "application/json",
                 "accept": "application/json, text/plain, */*",
+                # ⚠️⚠️ **这个头不许拿掉。** 不带它,EVM 链(robinhood/base/bsc)返回
+                #    **HTTP 200 + responseObject: []** —— 成功状态码配一个空数组,
+                #    最阴的失败形态:没有任何错误码、没有任何日志会说它错了。
+                #    上一版这里就是缺它,于是 /chips 对 robinhood 链的分母**一直**取不到,
+                #    静默退化成本地推算。与 _headers() 里那一份同源(SUPPORTED_CHAINS)。
+                "X-Supported-Chains": SUPPORTED_CHAINS,
                 "origin": FOMO_ORIGIN,
                 "referer": FOMO_ORIGIN + "/",
                 "user-agent": USER_AGENT,

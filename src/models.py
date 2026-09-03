@@ -81,6 +81,22 @@ NETWORK_SLUG = {
     "solana": "solana", "base": "base", "monad": "monad", "bsc": "bnb",
     "ethereum": "ethereum", "hyperliquid": "hyperliquid", "robinhood": "robinhood",
 }
+# FOMO 原生的**数字链 ID**。⚠️ 与 client.SUPPORTED_CHAINS 是同一组数字的两种形态:
+# 那边是请求头里的逗号串(一次性给全),这里是"内部链标识 → 数字"的映射
+# (filterTokens 的 body 要写成 `<address>:<chainId>`)。
+# ⚠️⚠️ 这张表放在这里而不是散在各模块:models 已经是链映射表的唯一落点
+#    (NETWORK_DISPLAY / NETWORK_SLUG / GMGN_SLUG),一份表放两个地方早晚走岔。
+# ⚠️ hyperliquid 没有实测过的数字 ID,**不收录** —— 猜一个只会得到空数组
+#    (filterTokens 对认不出的链是 200 + 空数组,最阴的失败形态)。
+NETWORK_CHAIN_ID = {
+    "ethereum": 1,
+    "bsc": 56,
+    "monad": 143,
+    "robinhood": 4663,
+    "base": 8453,
+    "solana": 1399811149,
+}
+
 # GMGN 的链片段:https://gmgn.ai/{slug}/token/{address}
 # 只收录 GMGN 确实支持的链 —— 拼一个它不支持的链只会得到 404,
 # **错的链接比没有链接更糟**(设计 §10.3),所以未收录的链直接不出这个链接。
