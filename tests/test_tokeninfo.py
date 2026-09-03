@@ -741,3 +741,198 @@ def test_retry_after解析():
     assert tokeninfo.retry_after_seconds({"retry-after": "垃圾"}) >= 200.0
     assert tokeninfo.retry_after_seconds({}) >= 200.0
     assert tokeninfo.retry_after_seconds(None) >= 200.0
+
+
+# ============================================================
+# ⚠️⚠️ 预算 / TTL 的**默认值**(H2)
+# ============================================================
+# 上面那些用例全都**显式传参**(keys_per_request=2 / holders_budget=3 / …),
+# 于是把 tokeninfo 里那 7 个模块常量同时改坏(200→100000、2→100000、2.0→600.0、
+# 12→100000、2→100000、8.0→100000.0、90.0→86400.0)跑全量,**一条都不红**。
+# 而这 7 个数字恰恰是"这个功能会不会把 tick 拖垮 / 会不会把用户 IP 打进 429 冷却"
+# 的全部条件 —— 显式传参的用例证明的是"参数生效",不是"默认值是对的"。
+# 下面每条各钉一个**默认值**:构造时不传那个参数,让它走默认路径。
+# ⚠️ 断言全部写死字面量,不 import 任何常量。
+class _FakeTime:
+    """
+    替掉 tokeninfo 模块里的 `time`(它只用得到 time() 与 monotonic())。
+
+    ⚠️ monotonic 每被调一次就往前走 mono_step —— _timed 一次调两下,
+       于是"一次外呼恰好花掉 mono_step 秒",墙钟预算就能脱网精确到小数点。
+    """
+
+    def __init__(self, now: float = 1_000_000.0, mono_step: float = 0.0) -> None:
+        self.now = now
+        self.mono_step = mono_step
+        self._mono = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        v = self._mono
+        self._mono += self.mono_step
+        return v
+
+
+def _evm(i: int) -> str:
+    return f"0x{i:040x}"
+
+
+def _item(addr: str, launchpad: str | None = "LONG", holders=None, net: int = 4663) -> dict:
+    """一条 filterTokens 响应项。⚠️ 字面量,不从被测模块借结构。"""
+    return {"holders": holders,
+            "token": {"address": addr, "networkId": net, "symbol": "X",
+                      "launchpad": None if launchpad is None else {"launchpadName": launchpad}}}
+
+
+def test_默认一批就是200个地址(glossary):
+    """
+    ⚠️⚠️ 钉 **MAX_KEYS_PER_REQUEST 的默认值**:上面「超过一批的上限」那条显式传了
+       keys_per_request=2,把默认值改成 100000 它照样绿。
+       实测 300 个一次能全返回,200 是留了余量的那个数 —— 调大它等于把
+       "超过 200 要切第二批"这条分支在真实负载下彻底走不到。
+    ⚠️ 不传 keys_per_request,让它走默认;断言写死 200 / 1。
+    """
+    fc = FakeFilter([])
+    lk = TokenExtraLookup(filter_client=fc, blockscout=FakeBS(),
+                          conn_factory=glossary, gate=OpenGate())
+    lk.begin_round()
+    lk.lookup([("bsc", _evm(i)) for i in range(201)])
+    assert [len(c) for c in fc.calls] == [200, 1], f"默认批大小不是 200:{[len(c) for c in fc.calls]}"
+
+
+def test_默认一轮最多两批(glossary):
+    """
+    ⚠️⚠️ 钉 **MAX_BATCHES_PER_ROUND 的默认值**。每一批都要各过一次 10 秒的限速闸,
+       批数放开 = 一个 tick 里连打 N 次 filterTokens ——
+       实测无间隔连打第 10 次就 429、冷却 203 秒。
+    ⚠️ 不传 max_batches;601 个地址按默认 200 一批本该切 4 批,只许发前 2 批。
+    """
+    fc = FakeFilter([])
+    lk = TokenExtraLookup(filter_client=fc, blockscout=FakeBS(),
+                          conn_factory=glossary, gate=OpenGate())
+    lk.begin_round()
+    lk.lookup([("bsc", _evm(i)) for i in range(601)])
+    assert [len(c) for c in fc.calls] == [200, 200], \
+        f"默认批数上限不是 2:{[len(c) for c in fc.calls]}"
+
+
+def test_闸的默认等待上限就是2秒():
+    """
+    ⚠️⚠️ 钉 **_GATE_MAX_WAIT_SEC 的默认值**:上面所有闸的用例都显式传了 max_wait=2.0
+       或 30.0,把默认值改成 600.0 它们照样绿 —— 而这个数字是**直接加在 tick 墙钟上**的,
+       poller 每 15 秒一个 tick,等 600 秒等于整个轮询停摆。
+    ⚠️ 两个方向各钉一次:要等 2.0 秒(正好等于上限)→ 等;要等 2.5 秒 → 不等。
+       于是默认值被夹在 [2.0, 2.5) 里,写死字面量,不 import 常量。
+    """
+    now = {"t": 0.0}
+    slept = []
+    g2 = tokeninfo._RateGate(
+        interval=2.0, clock=lambda: now["t"],
+        sleep=lambda s: (slept.append(s), now.__setitem__("t", now["t"] + s)))
+    assert g2.acquire() is True
+    assert g2.acquire() is True, "要等 2.0 秒就已经放弃 —— 默认上限比 2 秒还小"
+    assert slept == [2.0]
+
+    now2 = {"t": 0.0}
+    slept2 = []
+    g25 = tokeninfo._RateGate(
+        interval=2.5, clock=lambda: now2["t"],
+        sleep=lambda s: (slept2.append(s), now2.__setitem__("t", now2["t"] + s)))
+    assert g25.acquire() is True
+    assert g25.acquire() is False, "要等 2.5 秒还在等 —— 默认上限被放大了"
+    assert slept2 == []
+
+
+def test_默认每轮最多12次Blockscout持有人(glossary):
+    """
+    ⚠️⚠️ 钉 **BLOCKSCOUT_HOLDERS_PER_ROUND 的默认值**:上面那条显式传了 holders_budget=3。
+       Blockscout 实测每个请求 ~860ms,不封顶就是让 tick 被外部接口拖着走。
+    ⚠️ 13 个 robinhood 币,只许打 12 次;断言写死 12。
+    """
+    addrs = [_evm(i) for i in range(1, 14)]
+    bs = FakeBS(holders={a: {"holders_count": "999"} for a in addrs})
+    lk = TokenExtraLookup(filter_client=FakeFilter([_item(a) for a in addrs]),
+                          blockscout=bs, conn_factory=glossary, gate=OpenGate())
+    lk.begin_round()
+    lk.lookup([("robinhood", a) for a in addrs])
+    assert len([c for c in bs.calls if c[0] == "token"]) == 12
+
+
+def test_默认每轮最多判2个pons版本(glossary):
+    """
+    ⚠️⚠️ 钉 **BLOCKSCOUT_PONS_PER_ROUND 的默认值**。判一个版本要**两个** Blockscout
+       请求,而且结果是永久缓存(一个币这辈子只判一次)—— 所以每轮只给 2 个额度,
+       慢慢把库里的 pons 币判完,不跟 tick 抢时间。放开它 = 上线那天一次性把
+       库里上千个 pons 币全判一遍。
+    ⚠️ 3 个 pons 币,只许判 2 个;第 3 个退回 "Pons"(不猜 V2)。断言写死 2。
+    """
+    addrs = [_evm(i) for i in range(1, 4)]
+    bs = FakeBS(addr={a: {"creation_transaction_hash": f"0xtx{i}"}
+                      for i, a in enumerate(addrs)},
+                tx={f"0xtx{i}": {"to": {"hash": "0xe33e9e479df8802cb0866d5d05258bec4cf62948"}}
+                    for i in range(3)})
+    lk = TokenExtraLookup(filter_client=FakeFilter([_item(a, "pons") for a in addrs]),
+                          blockscout=bs, conn_factory=glossary, gate=OpenGate())
+    lk.begin_round()
+    got = lk.lookup([("robinhood", a) for a in addrs])
+    assert len([c for c in bs.calls if c[0] == "address"]) == 2
+    names = sorted(got[("robinhood", a)].launchpad for a in addrs)
+    assert names == ["Pons", "Pons V2", "Pons V2"], names
+
+
+def test_默认每轮墙钟预算就是8秒(glossary, monkeypatch):
+    """
+    ⚠️⚠️ 钉 **ROUND_WALL_CLOCK_SEC 的默认值**:上面那条显式传了 wall_clock_sec=-1.0
+       (只证明"传 -1 就一个都不查"),把默认值改成 100000.0 它照样绿。
+       墙钟闸才是真正要防的那件事 —— 次数没超但每个请求都超时,tick 一样被拖垮。
+    ⚠️ 用假 time:一次外呼恰好花掉 mono_step 秒(_timed 一次调两下 monotonic)。
+       第一次外呼是 filterTokens 本身,之后才是 Blockscout。
+       · 每次 2.0 秒 → 2(FOMO)+2+2+2=8 → 第 4 次 Blockscout 被拦 ⇒ 3 次,证明预算 ≤ 8
+       · 每次 3.5 秒 → 3.5(FOMO)+3.5+3.5=10.5 → 第 3 次被拦 ⇒ 2 次,证明预算 > 7
+       两条夹出 (7, 8]。断言写死次数,不 import 常量。
+    """
+    def _count(step: float, base: int) -> int:
+        # ⚠️ 两次用**不同的地址**:发射台成功是永久缓存,同一批地址第二次跑连
+        #    filterTokens 都不会发,那一次外呼的开销就凭空少了(踩过)。
+        addrs = [_evm(base + i) for i in range(6)]
+        monkeypatch.setattr(tokeninfo, "time", _FakeTime(mono_step=step))
+        bs = FakeBS(holders={a: {"holders_count": "999"} for a in addrs})
+        lk = TokenExtraLookup(filter_client=FakeFilter([_item(a) for a in addrs]),
+                              blockscout=bs, conn_factory=glossary, gate=OpenGate())
+        lk.begin_round()
+        lk.lookup([("robinhood", a) for a in addrs])
+        return len([c for c in bs.calls if c[0] == "token"])
+
+    assert _count(2.0, 100) == 3, "默认墙钟预算大于 8 秒"
+    assert _count(3.5, 200) == 2, "默认墙钟预算不到 7 秒"
+
+
+def test_持有人的默认内存TTL就是90秒(glossary, monkeypatch):
+    """
+    ⚠️⚠️ 钉 **HOLDERS_TTL_SEC 的默认值**:上面那两条 TTL 用例都显式传了 holders_ttl,
+       把默认值改成 86400 它们照样绿 —— 而那意味着一整天不再问一次持有人数,
+       推送里印的是一天前的数字(一句读起来完全正常的假话)。
+    ⚠️ 89 秒仍算命中、90 秒就得重问,于是默认值被夹在 (89, 90] 里。
+       只数 filterTokens 的次数(持有人没过期时整个键都不进批次)。
+    """
+    clock = _FakeTime()
+    monkeypatch.setattr(tokeninfo, "time", clock)
+    addr = "So11111111111111111111111111111111111111112"
+    fc = FakeFilter([_item(addr, "Pump.fun", 4321, net=1399811149)])
+    lk = TokenExtraLookup(filter_client=fc, blockscout=FakeBS(),
+                          conn_factory=glossary, gate=OpenGate())
+    lk.begin_round()
+    assert lk.lookup([("solana", addr)])[("solana", addr)].holders == 4321
+    assert len(fc.calls) == 1
+
+    clock.now += 89.0
+    lk.begin_round()
+    lk.lookup([("solana", addr)])
+    assert len(fc.calls) == 1, "89 秒就把持有人缓存丢了 —— 默认 TTL 比 90 秒短"
+
+    clock.now += 1.0
+    lk.begin_round()
+    lk.lookup([("solana", addr)])
+    assert len(fc.calls) == 2, "满 90 秒还在用旧的持有人数 —— 默认 TTL 被放大了"

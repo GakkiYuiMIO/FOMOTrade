@@ -159,15 +159,22 @@ LABEL_TOKEN_HOLDERS = "持有人"
 #    ⚠️ 超界 → 整行消失(与 _pump_mcap_line 拒绝 ≤0 的市值同一条理由:
 #       这一行**说不出口**,少一行是"我们没说",印出来是"我们说错了")。
 _MAX_TOKEN_HOLDERS = 1_000_000_000
-# 发射台名的限长。⚠️ 它是**上游给的自由文本**(FOMO 的 launchpadName),
-# 实测最长的是 "MeteoraDBC"/"UniswapCCA"(10 字符),24 绰绰有余。
+# 发射台名的限长。⚠️ 它**只用在那条 WARNING 日志上**(渲染出来的值是封闭表里的规范写法,
+# 不需要限长)。⚠️ 实测(2026-09-03 六条链 9810 个代币全量)最长的上游原值是
+# "Meteora Alpha Vault"(19 字符)—— 上一版这里写的"最长 10 字符"是错的
+# (那时表里就已经有 19 字符的那个了),24 仍然够用,但数字得是真的。
 _LAUNCHPAD_CHARS = 24
 # 社媒链接的**文字**。⚠️⚠️ 这几个字全是我们自己的常量,**永远不用上游给的 label**
 #    (DexScreener 的 `websites[].label` 是发币的人填的自由文本,而链接文字带着
 #     我们的背书 —— 让攻击者写"官方客服"再指向他的站,是这一整块最贵的那个洞)。
 # ⚠️ 键必须与 nameguard.SOCIAL_KINDS 逐字对上;表外的类别在门禁那一侧就已经丢掉了。
+# ⚠️⚠️ website 那一类叫「**网站**」不叫「官网」(H5)。两个字的差别是**背书**:
+#    「官网」是我们替上游作证"这是官方的",而这条 URL 指向哪儿**完全由发币人决定**
+#    (nameguard 对这一类刻意放开 host)。实测样本里就有指向娱乐新闻、指向某条推文的
+#    "官网"。我们没有任何依据说它是官方的 —— 能说的只有"这里有个网站链接"。
+#    与本项目「宁可少说一句,绝不说一句假话」同一条(§10.3)。
 SOCIAL_LABELS = {
-    "website": "官网",
+    "website": "网站",
     "twitter": "Twitter",
     "telegram": "Telegram",
     "discord": "Discord",
@@ -294,7 +301,7 @@ ADDRESS_FIELDS = {
 # ⚠️⚠️ **URL 类字段**(本轮 H1 新增)。它是本项目**第一个**会被放进 `<a href>` 的
 #    外部字符串,前面三张表守的都是"印出来的字",这一张守的是"点下去会去哪儿" ——
 #    失败后果完全不是一个量级(前者最坏是读者读到一句假话,后者是读者被带到
-#    攻击者的站点,而链接文字还是我们自己写的「官网」,天然带着我们的背书)。
+#    攻击者的站点,而链接文字还是我们自己写的「网站」「Twitter」)。
 #    所以它单开一张表而不是塞进 UNTRUSTED_FIELDS:表的名字本身就是那句
 #    "这里的门要按 URL 的口径去看"。
 # ⚠️ 门禁函数收的是 ((类别, URL), …) 这个**整体**,返回过完门禁的同形结构或 None ——
@@ -349,10 +356,23 @@ def _guard_one(name: str, value, source=None):
     """
     fn = _GUARDED_FIELDS[name]
     try:
-        return fn(value, source) if source is not None and fn is safe_display else fn(value)
+        out = fn(value, source) if source is not None and fn is safe_display else fn(value)
     except Exception as e:  # noqa: BLE001
         logger.warning("不可信字段门禁异常,该段不显示 | {} | {}", name, e)
         return None
+    # ⚠️⚠️ 发射台名是**封闭枚举**,表外 = "上游出了一个我们还不认识的发射台",
+    #    而不是"这个值有问题" —— 这两件事的处置完全不同:后者就该静悄悄丢掉,
+    #    前者需要有人去把它加进 nameguard._LAUNCHPADS,否则那条链的 🚀 行**永远不显示**。
+    #    这条日志是那件事的**唯一**发现途径。
+    # ⚠️⚠️ 它必须打在**这里**(收口),不能打在 _launchpad_line 里:收口已经把不合格的
+    #    值换成 None 了,渲染函数拿到的是 None,那边的日志**永远打不出来** ——
+    #    上一版就是这样,一条打不出来的 DEBUG 当成了"唯一发现途径"。
+    #    (H1 实测:monad 上的 Nad.Fun 是该链有发射台的币的 100%,整整一版没显示过,
+    #     日志里一个字都没有。)
+    if name == "launchpad" and out is None and value is not None and str(value).strip():
+        logger.warning("发射台名不在封闭表里,那一行不显示(该加进 nameguard._LAUNCHPADS 了) | {}",
+                       _flatten(value, _LAUNCHPAD_CHARS))
+    return out
 
 
 def _guard_untrusted(fn):
@@ -833,14 +853,13 @@ def _launchpad_line(name) -> str | None:
        刻意保留的第二道(幂等)。
     ⚠️ **不套 `「」` 容器**:返回值只可能是封闭表里那几个规范写法,不可能含分隔符 ——
        与 _exchange_text 同一条理由。这也正好是用户样例里的形态(`🚀 发射台 · LONG`)。
-    ⚠️ 表外的名字 → 整行消失 + 一条 DEBUG。那条日志是"上游出了新发射台"的**唯一**
-       发现途径,别删:没有它,这张封闭表会悄悄过期。
+    ⚠️⚠️ 表外的名字 → 整行消失。"上游出了新发射台"的那条 **WARNING** 打在**收口**
+       (_guard_one),不在这里:收口已经把表外的值换成 None,这个函数拿到的就是 None,
+       在这里判"名字非空"永远判不到 —— 上一版正是如此,那条自称"唯一发现途径"的
+       DEBUG 从来没打出来过(H1:monad 的 Nad.Fun 因此整整一版不显示,日志里没有一个字)。
     """
     text = safe_launchpad(name)
     if text is None:
-        if name is not None and str(name).strip():
-            logger.debug("发射台名不在封闭表里,那一行不显示(该加进 nameguard._LAUNCHPADS 了) | {}",
-                         _flatten(name, _LAUNCHPAD_CHARS))
         return None
     return f"{EMOJI_LAUNCHPAD} {LABEL_LAUNCHPAD}{SEP}{_esc(text)}"
 
@@ -871,7 +890,7 @@ def _token_holders_line(n) -> str | None:
 
 def _socials_line(pairs) -> str | None:
     """
-    🔗 官网 · Twitter · Telegram
+    🔗 网站 · Twitter · Telegram
 
     发币时项目方自己填的链接(**可能有也可能没有** —— 用户原话)。全都没有 → 整行消失。
 
@@ -1856,7 +1875,7 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
         _watch_sender_line(ev),      # 📮 发货地址 8FtY7n…cZx72
         _watch_ago_line(ev, now),    # ⏱ 3 分 20 秒前到账
         _network_line(ev),           # 🧬 Solana
-        _socials_line(token_socials),  # 🔗 官网 · Twitter(排在平台链接之前)
+        _socials_line(token_socials),  # 🔗 网站 · Twitter(排在平台链接之前)
         _links_line(ev),             # 🔗 FOMO · GMGN(必须排在 CA 之前)
     ]
     anchor = f"<code>{_clip(ev.token_address, _SIG_CA_CHARS)}</code>" if ev.token_address else None

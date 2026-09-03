@@ -165,8 +165,8 @@ def test_买入推送带全三行(db):
     lines = tg.sent[0].split("\n")
     assert "🚀 发射台 · LONG" in lines
     assert "🧑‍🤝‍🧑 持有人 35,405" in lines
-    soc = next(i for i, ln in enumerate(lines) if "官网" in ln)
-    assert lines[soc] == ('🔗 <a href="https://cashcat.cc/">官网</a> · '
+    soc = next(i for i, ln in enumerate(lines) if "网站" in ln)
+    assert lines[soc] == ('🔗 <a href="https://cashcat.cc/">网站</a> · '
                           '<a href="https://x.com/cashcat_token">Twitter</a> · '
                           '<a href="https://t.me/cashcat_robinhood">Telegram</a>')
     assert lines.index("🚀 发射台 · LONG") < next(i for i, ln in enumerate(lines)
@@ -211,7 +211,7 @@ def test_发射台外呼报错不影响推送(db):
     p.tick()
     assert len(tg.sent) == 1
     assert "🚀" not in tg.sent[0] and "持有人" not in tg.sent[0]
-    assert "官网" in tg.sent[0], "社媒来自另一个来源,不该被它带走"
+    assert "网站" in tg.sent[0], "社媒来自另一个来源,不该被它带走"
 
 
 def test_限速闸关着时那两行消失但社媒还在(db):
@@ -223,7 +223,7 @@ def test_限速闸关着时那两行消失但社媒还在(db):
     p.tick()
     assert len(tg.sent) == 1
     assert "🚀" not in tg.sent[0] and "持有人" not in tg.sent[0]
-    assert "官网" in tg.sent[0]
+    assert "网站" in tg.sent[0]
     assert p._fake_filter.calls == []
 
 
@@ -233,7 +233,7 @@ def test_社媒拿不到时另外两行照常(db):
     p = _poller(_one_buy(), tg, dex, extras_payload=[_extras_item(_CA_AI, "LONG", 35405)],
                 bs=FakeBS(holders={_CA_AI: {"holders_count": "35405"}}))
     p.tick()
-    assert "官网" not in tg.sent[0]
+    assert "网站" not in tg.sent[0]
     assert "🚀 发射台 · LONG" in tg.sent[0]
     assert "🧑‍🤝‍🧑 持有人 35,405" in tg.sent[0]
 
@@ -260,7 +260,7 @@ def test_有官网也绝不用域名反推发射台(db):
     assert "🚀" not in tg.sent[0] and "发射台" not in tg.sent[0], tg.sent[0]
     # 对照:另外两行照常(三行各自独立)
     assert "🧑‍🤝‍🧑 持有人 35,405" in tg.sent[0]
-    assert ">官网</a>" in tg.sent[0]
+    assert ">网站</a>" in tg.sent[0]
 
 
 def test_持有人为0的哨兵一路到不了推送(db):
@@ -358,3 +358,79 @@ def test_pump的三行各自独立():
     assert only_lp == {"launchpad": "LONG"}
     only_ho = w._name_extras("AI", None, None, None, TokenExtra(launchpad=None, holders=7))
     assert only_ho == {"token_holders": 7}
+
+
+# ============================================================
+# ⚠️⚠️ poller 侧的「三行各自独立」(H3)
+# ============================================================
+def test_币名那一段炸了发射台和持有人两行仍在(db, monkeypatch):
+    """
+    ⚠️⚠️ poller._name_extras 里「币名/股票」与「发射台/持有人」是**两段独立的 try**,
+       源码注释写着"合在一起的话上面任何一步抛异常都会把这两行一起带走" ——
+       但在这条用例之前**没有任何测试钉住它**:把两段 try 合成一段跑全量,一条都不红。
+       (formatter 那一侧的独立性是有覆盖的,缺的是 poller 这一侧。)
+    ⚠️ 让第一段的第一步(dexscreener.token_name)真的抛异常:
+       · 币名 / 中文名 / 社媒 三样都没了(它们同属第一段)
+       · 🚀 与 🧑‍🤝‍🧑 两行**必须还在**
+       · 整条推送**必须照样发出去**
+       两段合并 → 这条当场红。
+    """
+    def _boom(quotes, addr):
+        raise RuntimeError("币名那一段炸了")
+
+    monkeypatch.setattr("src.poller.token_name", _boom)
+
+    tg = FakeNotifier()
+    dex = _FakeDex([[_pair(_CA_AI_CHECKSUM, _CA_NVDA, _INFO)]])
+    p = _poller(_one_buy(), tg, dex,
+                extras_payload=[_extras_item(_CA_AI, "LONG", 35405)],
+                bs=FakeBS(holders={_CA_AI: {"holders_count": "35405"}}))
+    p.tick()
+
+    assert len(tg.sent) == 1, "第一段炸了把整条推送带走了"
+    msg = tg.sent[0]
+    assert "🚀 发射台 · LONG" in msg, msg
+    assert "🧑‍🤝‍🧑 持有人 35,405" in msg, msg
+    # 对照:第一段那几样确实没了(证明异常真的抛在了第一段里,不是这条用例空转)
+    # ⚠️ 🌊 那行的「NVIDIA」是**进 try 之前**就落好的回退值,与第一段无关,不在此列。
+    assert "网站" not in msg, msg
+    assert "「" not in msg.split("\n")[0], msg      # 标题尾巴的英文全名没了
+    assert "📝" not in msg, msg                     # 中文名那一行没了
+
+
+# ============================================================
+# ⚠️⚠️ 转入推送为什么几乎永远没有 🧑‍🤝‍🧑 那一行(H6)
+# ============================================================
+def test_转入推送带发射台但过了内存TTL就没有持有人(db, monkeypatch):
+    """
+    ⚠️⚠️ 这条把 H6 那个**如实登记的取舍**钉住,免得下一个人以为是 bug 顺手改掉:
+       · 发射台走 name_glossary,成功是**永久**缓存 ⇒ 转入推送**有** 🚀;
+       · 持有人只有 90 秒的**进程内存**缓存,而转入走 cached()(只读、不发请求)
+         ⇒ 过了 90 秒就**没有** 🧑‍🤝‍🧑,而且不会为它发任何请求。
+    ⚠️ 结论写在 README「已知取舍」里。给 holders 也落 SQLite 的方案被否掉了:
+       短 TTL 照样命中不了,长 TTL 等于在一条刚发生的转账旁边印几小时前的持有人数。
+    """
+    import time as _time
+
+    tg = FakeNotifier()
+    dex = _FakeDex([[_pair(_CA_AI_CHECKSUM, _CA_NVDA, _INFO)]])
+    p = _poller(_one_buy(), tg, dex,
+                extras_payload=[_extras_item(_CA_AI, "LONG", 35405)],
+                bs=FakeBS(holders={_CA_AI: {"holders_count": "35405"}}))
+    p.tick()                                   # 买入推送把两份缓存都填上
+    n_fc = len(p._fake_filter.calls)
+    n_bs = len(p._token_extras._bs.calls)
+
+    # 90 秒之内:两行都在(内存缓存还没过期)
+    fresh = p._name_extras({}, "robinhood", _CA_AI, "AI", None, cached_only=True)
+    assert fresh["launchpad"] == "LONG"
+    assert fresh["token_holders"] == 35405
+
+    # 往后拨 91 秒:发射台还在(永久落库),持有人没了(内存 TTL 90 秒)
+    real = _time.time
+    monkeypatch.setattr(_time, "time", lambda: real() + 91.0)
+    stale = p._name_extras({}, "robinhood", _CA_AI, "AI", None, cached_only=True)
+    assert stale["launchpad"] == "LONG", "发射台是永久缓存,不该跟着掉"
+    assert "token_holders" not in stale, "持有人只有 90 秒内存缓存,过期就该整行消失"
+    assert len(p._fake_filter.calls) == n_fc, "只读缓存路径却发了 filterTokens"
+    assert len(p._token_extras._bs.calls) == n_bs, "只读缓存路径却打了 Blockscout"

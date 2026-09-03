@@ -72,11 +72,18 @@ _URL_MUST_BLOCK = [
     ("https://[::1]/x", "website", "IPv6 字面量"),
     ("https://x.com:8080/a", "twitter", "带端口"),
     ("https://x.com./a", "twitter", "尾随点(DNS 上等价于 x.com,但不等值)"),
-    ("https://evil.zzz/", "website", "顶级域不在封闭表里"),
+    # ⚠️⚠️ H5 之后**没有**顶级域白名单了(实测:那张表误杀 7.58% 的真实官网,
+    #    而它里面本来就有 xyz/top/vip/cc/ws/gd/ly —— 对坏人基本不构成约束)。
+    #    这一道现在只判**形态**:顶级域必须是纯 ASCII 字母且 >= 2 位。
+    ("https://evil.z/", "website", "顶级域只有 1 位"),
+    ("https://evil.123/", "website", "顶级域是数字"),
+    ("https://evil.co-m/", "website", "顶级域带连字符"),
     ("https://x.co​m/a", "twitter", "零宽空格拆域名"),
     ("https://x.com/a b", "twitter", "URL 里有空格"),
     ("https://x.com/a\nb", "twitter", "URL 里有换行(能在消息里造出一整行伪造字段)"),
-    ("https://" + "a" * 300 + ".com/", "website", "超长 URL(顶爆消息预算)"),
+    # ⚠️ 这条其实挡在 **域名段 63 字符**那一道上,**不是**长度上限 ——
+    #    它的 host 只有一段 300 字符的标签。真正钉长度上限的在文件末尾(H4)。
+    ("https://" + "a" * 300 + ".com/", "website", "域名段超过 63 字符"),
     ("https://x.com/%zz", "twitter", "半截百分号编码"),
     ("https://", "website", "只有 scheme"),
     ("https://com/", "website", "只有一段 host"),
@@ -197,3 +204,108 @@ def test_条数封顶():
         ("reddit", "https://reddit.com/r/a"), ("github", "https://github.com/a"),
     ])
     assert len(got) == 6                        # 六个类别各一条 = 上限
+
+
+# ============================================================
+# ⚠️⚠️ 长度上限(H4)
+# ============================================================
+# 上面必拦表里那条 `"https://" + "a" * 300 + ".com/"` **不测长度**:
+# 它的 host 只有一段 300 字符的标签,先被 `_label_ok` 的 63 字符段长挡下来了 ——
+# 把长度上限从 200 改成 100000 跑全量,一条都不红。
+# 长度上限是"超长 URL → notifier 盲切 → HTML 不配平 → Telegram 400 整条推送发不出去"
+# 这条链路上的**唯一一道闸**,下面两条用**合法**的长 URL(每段 ≤63、TLD 在表里)把它夹住。
+_LONG_PATH_HOST = "https://example.com/"          # 20 字符
+_LEGAL_200 = _LONG_PATH_HOST + "a" * 180          # 正好 200
+_LEGAL_201 = _LONG_PATH_HOST + "a" * 181          # 201
+
+
+def test_合法但超长的URL被长度上限挡下():
+    """
+    ⚠️⚠️ 每一段都合法(host 是 example.com,路径只是普通 ASCII),
+       只有**总长**越了线 —— 除了长度这一道,没有任何别的判定拦得住它。
+    ⚠️ 断言写死 200 / 201,不 import _MAX_URL_CHARS。
+    """
+    assert len(_LEGAL_200) == 200 and len(_LEGAL_201) == 201
+    assert safe_url(_LEGAL_200, "website") == _LEGAL_200, "200 字符本该放行"
+    assert safe_url(_LEGAL_201, "website") is None, "201 字符本该被长度上限挡下"
+
+
+def test_社媒那一侧的长度上限也在():
+    """⚠️ 封闭 host 表挡不住长路径:t.me/<很长的一串> 每一段都合法。"""
+    ok = "https://t.me/" + "b" * 187                # 13 + 187 = 200
+    too_long = "https://t.me/" + "b" * 188          # 201
+    assert len(ok) == 200 and len(too_long) == 201
+    assert safe_url(ok, "telegram") == ok
+    assert safe_url(too_long, "telegram") is None
+
+
+def test_超长URL在社媒行的收口上也进不去():
+    """⚠️ 端到端:safe_social_links 是渲染入口那道收口,长度上限必须在它后面也成立。"""
+    assert safe_social_links([("website", _LEGAL_201)]) is None
+    assert safe_social_links([("website", _LEGAL_201),
+                              ("twitter", "https://x.com/ok")]) == \
+        (("twitter", "https://x.com/ok"),)
+
+
+# ============================================================
+# ⚠️⚠️ 顶级域:只判形态,**没有白名单**(H5)
+# ============================================================
+# 依据(2026-09-03 实测):抽 1600 个生产库里被推送过的代币走 DexScreener,
+# 拿到 662 条官网 / 496 个去重域名,旧版的顶级域白名单整条丢掉 54 条 = 8.16%,
+# 其中 **42 条是纯粹被那张表误杀的** —— 29 个不同顶级域,包括 www.whitehouse.gov、
+# youtu.be、linktr.ee、slate.foundation、archive.ph、striker.cat、burger.mom …
+# 而那张表里本来就有 xyz/top/vip/cc/ws/gd/ly,对坏人基本不构成约束。
+# 去掉之后同一份样本丢弃率 → 1.81%。
+# ⚠️ 下面这些是**样本里真实出现过**的域名,写死字面量。
+_REAL_TLD_PASS = [
+    "https://www.whitehouse.gov/",
+    "https://youtu.be/dQw4w9WgXcQ",
+    "https://linktr.ee/somecoin",
+    "https://slate.foundation/",
+    "https://archive.ph/abcde",
+    "https://giwa.markets/",
+    "https://striker.cat/",
+    "https://burger.mom/",
+    "https://stonk.rocks/",
+    "https://unicorn.place/",
+    "https://pons.company/",
+    "https://agentos.services/",
+    "https://nov.ag/",
+    "https://glados.aperture.institute/",
+    "https://xgirls.eth.limo/",
+    "https://hoodmorn.ing/",
+]
+
+
+@pytest.mark.parametrize("url", _REAL_TLD_PASS)
+def test_真实出现过的冷门顶级域不再被误杀(url):
+    """⚠️ 把顶级域白名单加回来的那一刻,这一整组当场红。"""
+    assert safe_url(url, "website") == url, url
+
+
+def test_顶级域仍然要成形():
+    """
+    ⚠️⚠️ 去掉白名单**不等于**这一道没了。它还留着唯一真正干活的那部分:
+       顶级域必须是纯 ASCII 字母且 >= 2 位 —— 挡的是 IP 字面量与尾随点,
+       那两样才是"看起来是域名其实不是"的真实路径。
+    """
+    assert safe_url("https://1.2.3.4/x", "website") is None      # IP 字面量
+    assert safe_url("https://192.168.0.1/", "website") is None
+    assert safe_url("https://x.com./a", "website") is None       # 尾随点
+    assert safe_url("https://evil.z/", "website") is None        # 顶级域 1 位
+    assert safe_url("https://evil.123/", "website") is None      # 顶级域是数字
+    assert safe_url("https://evil.co-m/", "website") is None     # 顶级域带连字符
+    assert safe_url("https://xn--80ak6aa92e.com/", "website") is None   # punycode 仍然拦
+
+
+def test_放开顶级域没有放开别的任何一道():
+    """⚠️ 其余五道必须**原样**还在 —— 这条是 H5 那次改动的回归网。"""
+    assert safe_url("http://ok-site.foundation/", "website") is None       # http 仍不放行
+    assert safe_url("https://ok@evil.foundation/", "website") is None      # userinfo
+    assert safe_url("https://ok.foundation:8443/", "website") is None      # 端口
+    assert safe_url("https://ok.foundation/a b", "website") is None        # 空白
+    assert safe_url('https://ok.foundation/"x', "website") is None         # 引号
+    assert safe_url("https://a.b.c.d.e.f.g.foundation/", "website") is None  # 段数超上限
+    assert safe_url("https://ok.foundation/" + "a" * 200, "website") is None  # 超长
+    # 社媒各类的封闭 host 表**没有**受影响
+    assert safe_url("https://ok.foundation/x", "twitter") is None

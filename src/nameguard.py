@@ -787,7 +787,7 @@ def has_new_ascii_word(zh, source_text) -> bool:
 #    (safe_display / safe_ident / safe_address / safe_exchange)守的都是"印出来的字",
 #    而这里守的是"点下去会去哪儿" —— 两者的失败后果完全不是一个量级:
 #    前者最坏是读者读到一句假话,后者是读者**被带到攻击者的站点**,
-#    而且链接文字还是我们自己写的「官网」「Twitter」,天然带着我们的背书。
+#    而且链接文字还是我们自己写的「网站」「Twitter」,天然带着我们的背书。
 #
 # ============ 为什么不是"写个 URL 正则" ============
 # 上一轮本项目的 BLOCKER 就是手写正则收交易所名(字符集里带 `.` 与 `-`),
@@ -813,50 +813,55 @@ def has_new_ascii_word(zh, source_text) -> bool:
 #   4. netloc:出现 `@`(userinfo)/ `:`(端口)/ `[` `]`(IPv6)一律整条丢弃。
 #      → https://x.com@evil.com 在这一步死掉。
 #   5. host:逐段 LDH 校验(小写字母数字与 `-`,不许首尾 `-`,每段 <=63,总长 <=253),
-#      至少两段,**顶级域必须在 _URL_TLDS 这张封闭表里**,且不许 xn-- 开头(punycode)。
+#      至少两段,**顶级域必须是纯 ASCII 字母且 >= 2 位**,且不许 xn-- 开头(punycode)。
 #      → 纯数字 IP、`x.com.` 尾点、西里尔域名全在这一步死掉。
 #   6. 社媒类(kind != "website"):host 必须**逐字等于** _SOCIAL_HOSTS[kind] 里的某一项。
 #      → https://x.com.evil.com 在这一步死掉(等值比对,不是后缀比对)。
 #
-# ============ 「官网」那一类为什么放开 host(取舍与代价)============
-# 官网的 host **本质上不可枚举**:每个项目一个域名,这正是"官网"的定义。
+# ============ 「网站」那一类为什么放开 host(取舍与代价)============
+# 它的 host **本质上不可枚举**:每个项目一个域名,这正是"项目自己的站"的定义。
 # 三个选项:
 #   (a) 整条不显示 —— 用户明确点名要"网站",直接砍掉等于没做这件事;
 #   (b) 只显示文字不给链接 —— 但 URL 本身是攻击者可控的自由文本,把它当文字印出来
 #       反而更糟(那是 safe_display 明令拦掉的域名形态);
 #   (c) 放开 host,但把**其余五道**全部收死,并且链接文字用我们自己的常量。
-# 选 (c)。代价是明确的、写在这里:**一个能发币的人可以让「官网」这两个字指向他选的
+# 选 (c)。代价是明确的、写在这里:**一个能发币的人可以让这个链接指向他选的
 # 任意 https 站点**。缓解只有三条,都不消除风险:
-#   · 链接文字永远是我们的常量「官网」,URL 本身不出现在消息里 —— 攻击者拿不到
-#     "文字说 A、其实去 B" 这个额外的欺骗层(文字本来就只说"官网");
-#   · 顶级域封闭表把一批一次性/薅羊毛 TLD 挡在外面;
+#   · 链接文字永远是我们自己的常量,URL 本身不出现在消息里;
+#   · scheme 只许 https,再加整套形态校验(LDH / 段数 / 长度 / punycode / userinfo / 端口);
 #   · 同一条信息在 fomo.family 的代币页上本来就以同样的形式对同一批读者展示 ——
 #     我们没有新增一个上游没有的通道。
 # ⚠️ 这条取舍**必须**留在这里:后来人看到 "website 放行任意 host" 时,
 #    第一反应会是"这不是漏了一道门吗",而它是被权衡过的。
+#
+# ============ ⚠️⚠️ 为什么把顶级域封闭表**去掉了**(H5,2026-09-03 实测)============
+# 上一版对 host 还压了一张"顶级域白名单"。实测证明那张表**既拦不住坏人、又误杀好人**:
+#   · 误杀:抽 1600 个"生产库里被推送过"的代币走 DexScreener(0 失败),拿到
+#     **662 条官网 / 496 个去重域名**,旧码整条丢掉 54 条 = **8.16%**;
+#     其中 **42 条是纯粹被顶级域白名单误杀的**。而误杀的根本不是 exotic TLD:
+#       www.whitehouse.gov · youtu.be(4) · linktr.ee(3) · giwa.markets(4) ·
+#       slate.foundation · archive.ph · stonk.rocks · burger.mom · striker.cat ·
+#       wojak.bid · unicorn.place · pons.company · agentos.services · nov.ag …
+#     29 个不同的顶级域,靠往表里补是补不完的(TLD 有一千多个,还在增加)。
+#   · 拦不住:那张表里本来就有 xyz / top / vip / cc / ws / gd / ly —— 一次性域名与
+#     短链域全在白名单内。它对"发币人指向自己选的站"这件事**基本不构成约束**。
+#   ⇒ 去掉表,只留"顶级域必须是纯 ASCII 字母且 >= 2 位"这一条**形态**判据
+#     (它挡的是 `1.2.3.4` 这种 IP 字面量与 `x.com.` 这种尾点 —— 那才是这一道真正的活儿)。
+#     去掉之后同一份样本的官网丢弃率 8.16% → **1.81%**(12/662),剩下的是
+#     10 条 http:// 明文(刻意不放行)+ 1 条 URL 自带空格 + 1 条超过 200 字符。
+# ⚠️⚠️ 与之配套:链接文字从「官网」改成「网站」(见 formatter.SOCIAL_LABELS)。
+#    「官网」是**我们对上游内容的背书**,而指向哪儿完全由发币人决定 ——
+#    实测样本里就有指向娱乐新闻、指向某条推文的"官网"。放开 host 的同时
+#    还说这是"官方",等于把风险原样放大;「网站」只陈述"这里有个网站链接"。
 _MAX_URL_CHARS = 200
 _URL_SCHEME = "https://"
 # href 属性的闭合字符与几个历史上被用来绕过解析的字符。⚠️ 出现即**整条丢弃**,
 # 不做转义放行:转义只解决 HTML 层,解决不了"这条 URL 是被构造出来骗解析器的"。
 _URL_FORBIDDEN_CHARS = frozenset("\"'<>\\`")
-# 顶级域封闭表。⚠️ 与 _SPLIT_DOMAIN_TLDS **刻意不共用**:那张表是"看着像域名就拦"的
-#    黑名单语义,这张是"只有表里的才放行"的白名单语义 —— 一张表两种语义,
-#    改一处必伤另一处(这个项目已经有过"一份表放两个地方走岔"的教训)。
-# ⚠️ 选表依据:2026-09-03 生产库四条链去重代币走 DexScreener 实测(见报告),
-#    覆盖真实出现过的全部顶级域,外加几个常见的通用域。表外的官网 → 那一段消失。
-_URL_TLDS = frozenset({
-    "com", "net", "org", "io", "co", "app", "xyz", "fun", "gg", "ai", "so",
-    "dev", "art", "money", "finance", "cash", "exchange", "capital", "fund",
-    "tech", "digital", "live", "life", "world", "space", "online", "site",
-    "club", "team", "chat", "social", "network", "systems", "tools", "wtf",
-    "lol", "meme", "pizza", "ninja", "wiki", "news", "blog", "press", "media",
-    "info", "pro", "biz", "cc", "tv", "me", "us", "uk", "de", "fr", "jp",
-    "kr", "in", "id", "sg", "hk", "tw", "cn", "au", "ca", "ch", "nl", "se",
-    "no", "fi", "it", "es", "pt", "br", "mx", "ar", "za", "ru", "eu", "vip",
-    "top", "one", "zone", "store", "shop", "market", "trade", "global",
-    "group", "family", "house", "studio", "agency", "works", "run", "sh",
-    "gd", "ly", "to", "am", "fm", "st", "at", "is", "im", "re", "cx", "ws",
-})
+# 顶级域的**形态**下限:纯 ASCII 字母、至少 2 位。⚠️ 这**不是白名单**(那张表已经
+#    去掉,理由见上面 H5 那段),它只负责一件事:把 `1.2.3.4` 这种 IP 字面量与
+#    `x.com.` 这种尾点挡在外面 —— 顶级域里出现数字或空段的都不是域名。
+_MIN_TLD_CHARS = 2
 # 社媒各类的 host **封闭表**。⚠️ 等值比对,不是后缀比对 —— 后缀比对放行
 #    x.com.evil.com,那是这一类判定最经典的洞。
 # ⚠️ 每加一个 host 都要问一句"这个域名今天真的是它家的吗":discordapp.com 是
@@ -871,7 +876,7 @@ _SOCIAL_HOSTS = {
     "reddit": frozenset({"reddit.com", "www.reddit.com", "old.reddit.com"}),
     "github": frozenset({"github.com", "www.github.com"}),
 }
-# 我们**认识**的社媒类别。⚠️ 顺序就是展示顺序(官网在最前,与用户给的样例一致)。
+# 我们**认识**的社媒类别。⚠️ 顺序就是展示顺序(website 在最前,与用户给的样例一致)。
 # ⚠️⚠️ 表外的 type(medium / tiktok / youtube …)**一律跳过**,不显示原文:
 #    链接文字必须是我们自己的常量(见 formatter.SOCIAL_LABELS),而"显示原文"
 #    等于把上游的自由文本当链接文字印出去 —— 那正是这一轮要堵的口子
@@ -891,7 +896,7 @@ def _label_ok(lab: str) -> bool:
 
 
 def _host_ok(host: str) -> bool:
-    """host 的封闭校验:逐段 LDH、2~6 段、顶级域在白名单里。"""
+    """host 的形态校验:逐段 LDH、2~6 段、顶级域是纯 ASCII 字母且 >= 2 位。"""
     if not host or len(host) > 253 or host.startswith(".") or host.endswith("."):
         return False
     labels = host.split(".")
@@ -899,7 +904,9 @@ def _host_ok(host: str) -> bool:
         return False
     if not all(_label_ok(lab) for lab in labels):
         return False
-    return labels[-1] in _URL_TLDS
+    tld = labels[-1]
+    # ⚠️ 顶级域**没有**白名单(H5,理由见上面那段实测)。只判形态。
+    return len(tld) >= _MIN_TLD_CHARS and tld.isascii() and tld.isalpha()
 
 
 def _percent_ok(text: str) -> bool:
@@ -997,11 +1004,12 @@ def safe_social_links(items) -> tuple[tuple[str, str], ...] | None:
 # ============================================================
 # 发射台名的门禁(safe_launchpad)—— **封闭枚举**,与 safe_exchange 同一套路数
 # ============================================================
-# ⚠️⚠️ 为什么**不能**用 safe_display:实测(2026-09-03,生产库四条链 4305 个去重代币
+# ⚠️⚠️ 为什么**不能**用 safe_display:实测(2026-09-03,生产库**六条链** 9810 个去重代币
 #    全量走 filterTokens)真实存在的发射台名里,最常见的几个恰好是**域名形态**:
-#      Pump.fun 1139 · o1.exchange 44 · Four.meme 27 · Feel.cash 5 · bow.fun 1 · tren.ch 3
-#    safe_display 的"域名形态整段丢弃"那条会把它们全部毙掉 —— 1219 / 3422 = **35.6%**
-#    的命中被打掉,而且打掉的是 Solana 上唯一重要的那一个(Pump.fun 占该链 83%)。
+#      Pump.fun 3405 · Four.meme 171 · o1.exchange 57 · Nad.Fun 11 · Feel.cash 5 ·
+#      bow.fun 4 · tren.ch 3 · AMERICA.fun 2 · hood.fun 1
+#    safe_display 的"域名形态整段丢弃"那条会把它们全部毙掉 —— 3659 / 7818 = **46.8%**
+#    的命中被打掉,而且打掉的是 Solana 上唯一重要的那一个(Pump.fun 占该链 79%)。
 #    这不是"门禁太严",是**门选错了**:那道门是给"名字"用的,而发射台名不是名字,
 #    它是一个**平台标识**,和交易所名一样 —— 世界上就那么几个,可以逐个数出来。
 #
@@ -1012,54 +1020,83 @@ def safe_social_links(items) -> tuple[tuple[str, str], ...] | None:
 #    **凡是能枚举的一律不许手写模式匹配。**
 #
 # ============ 这张表的依据(全部实测)============
-# 2026-09-03,生产库只读取出四条链**全部**去重代币(robinhood 1960 / solana 1528 /
-# bsc 657 / base 160,共 4305 个),分 22 批走 filterTokens(每批 200、间隔 10 秒,
-# 0 个 429),得到的 launchpadName 全集就是下面这 25 个,一个不多一个不少。
-# 覆盖率:robinhood 72.0% · solana 89.5% · bsc 86.4% · base 47.5%
-# (与调研数据 74.0 / 89.7 / 86.5 / 47.2 逐条对得上)。
+# 2026-09-03(第二轮,H1),生产库只读取出**六条链全部**去重代币
+# (solana 4804 / robinhood 3053 / bsc 1330 / base 503 / ethereum 104 / monad 16,
+#  共 9810 个),分 50 批走 filterTokens(每批 200、**间隔 11 秒、全程串行**,
+# 0 个 429),得到的 launchpadName 全集就是下面这 44 个,一个不多一个不少。
+# 有发射台的代币 7818 / 9807;覆盖率:solana 90.5% · bsc 76.8% · robinhood 70.4% ·
+# monad 68.8% · base 56.5% · ethereum 3.8%。
+#
+# ⚠️⚠️ **上一版这张表是错的**:它只枚举了 robinhood/solana/bsc/base **四条链**,
+#    就断言"25 个是全集"。而 models.NETWORK_CHAIN_ID 里有**六条**,
+#    poller._token_extra_map → tokeninfo._lookup 对 ethereum / monad 一样会发请求。
+#    漏掉的里面有 **Nad.Fun** —— monad 上有发射台的币 **100%** 都是它,
+#    也就是说 monad 链的 🚀 那一行在上一版里**永远不会显示**,而唯一的痕迹只有一条
+#    DEBUG 日志。少一条链 = 那条链整条功能静默失效。**加链就得重跑这张表。**
 #
 # ============ 代价(明写)============
 # **上游出现一个新发射台时,🚀 那一行不显示,直到有人把它加进这张表。**
 # 这正是本项目"宁可缺失整行,绝不印错"的既有取舍(与 safe_exchange、
 # 与 dexscreener.STOCK_NAME_MARKERS 同一条)。为了让"有人加进来"这件事真的发生,
-# formatter._launchpad_line 在遇到表外的名字时打一条 DEBUG —— 日志里看得到。
+# formatter._launchpad_line 在遇到表外的名字时打一条 **WARNING**(上一版是 DEBUG,
+# 而默认日志级别看不到 DEBUG —— 那等于这张表过期了也没人知道。静默失效是这个项目
+# 反复吃过的亏,所以这条日志抬到 WARNING:它是这张表唯一的"该更新了"的信号)。
 #
 # ⚠️ 键是**小写**的上游原值,值是**我们的规范写法**(大小写不受上游摆布)。
 # ⚠️ "Pons" / "Pons V2" 是本仓库自己产出的值(robinhood 上的 pons 币要按创建工厂
 #    分版本,见 tokeninfo.PONS_FACTORIES),所以两者都在表里。
+# ⚠️ 注释里的数字是**全库出现次数**(跨链合计),括号里是它出现过的链 ——
+#    同一个发射台跨多条链(Flap 在 bsc/robinhood/base 都有),按链分组会误导。
 _LAUNCHPADS = {
-    # ---- robinhood ----
-    "pons": "Pons",                       # 1235 个;robinhood 上会被 tokeninfo 分成 V1/V2
-    "pons v2": "Pons V2",                 # 本仓库自己产出的值
-    "long": "LONG",                       # 109
-    "flap": "Flap",                       # 27(bsc 上 540、base 上 1)
-    "uniswapcca": "UniswapCCA",           # 17
-    "virtuals": "Virtuals",               # 10
-    "bankr": "Bankr",                     # 6(base 上 20)
-    "feel.cash": "Feel.cash",             # 3(base 上 2)⚠️ 域名形态,safe_display 会毙掉
-    "sushi launch": "Sushi Launch",       # 2
-    "trench": "Trench",                   # 2
-    "bow.fun": "bow.fun",                 # 1  ⚠️ 域名形态
-    # ---- solana ----
-    "pump.fun": "Pump.fun",               # 1139 ⚠️ 域名形态,而且是全库最常见的一个
-    "stonkfun": "StonkFun",               # 126
-    "meteoradbc": "MeteoraDBC",           # 75
-    "bonk": "Bonk",                       # 10
-    "launchlab": "LaunchLab",             # 5
-    "tren.ch": "tren.ch",                 # 3  ⚠️ 域名形态
-    "easya kickstart": "EasyA Kickstart",  # 2
-    "bags": "BAGS",                       # 2
-    "meteora alpha vault": "Meteora Alpha Vault",  # 2
-    "metaplex": "Metaplex",               # 1
-    "printr": "Printr",                   # 1
-    "jupiter studio": "Jupiter Studio",   # 1
-    # ---- bsc ----
-    "four.meme": "Four.meme",             # 27 ⚠️ 域名形态
-    # ---- base ----
-    "o1.exchange": "o1.exchange",         # 44 ⚠️ 域名形态
-    "clanker v4": "Clanker V4",           # 5
+    # ---- 上游原值(按全库出现次数从多到少)----
+    "pump.fun": "Pump.fun",               # 3405 solana ⚠️ 域名形态,全库最常见
+    "pons": "Pons",                       # 1834 robinhood;会被 tokeninfo 分成 V1/V2
+    "flap": "Flap",                       # 901  bsc 848 · robinhood 52 · base 1
+    "meteoradbc": "MeteoraDBC",           # 589  solana
+    "stonkfun": "StonkFun",               # 173  solana
+    "four.meme": "Four.meme",             # 171  bsc ⚠️ 域名形态
+    "long": "LONG",                       # 133  robinhood
+    "bankr": "Bankr",                     # 128  base 108 · robinhood 20
+    "clanker v4": "Clanker V4",           # 80   base
+    "uniswapcca": "UniswapCCA",           # 72   robinhood 69 · ethereum 2 · base 1
+    "o1.exchange": "o1.exchange",         # 57   base ⚠️ 域名形态
+    "bags": "BAGS",                       # 56   solana
+    "virtuals": "Virtuals",               # 37   robinhood 22 · base 15
+    "bonk": "Bonk",                       # 34   solana
+    "launchlab": "LaunchLab",             # 32   solana
+    "pump mayhem": "Pump Mayhem",         # 22   solana
+    "nad.fun": "Nad.Fun",                 # 11   monad ⚠️ 域名形态;**monad 上的 100%**
+    "printr": "Printr",                   # 9    solana
+    "flaunch": "Flaunch",                 # 8    base
+    "sushi launch": "Sushi Launch",       # 7    robinhood
+    "easya kickstart": "EasyA Kickstart",  # 6   solana
+    "zora creator": "Zora Creator",       # 5    base
+    "feel.cash": "Feel.cash",             # 5    base 2 · robinhood 3 ⚠️ 域名形态
+    "bow.fun": "bow.fun",                 # 4    robinhood ⚠️ 域名形态
+    "heaven": "Heaven",                   # 4    solana
+    "baseapp": "Baseapp",                 # 3    base
+    "four.meme fair": "Four.meme Fair",   # 3    bsc ⚠️ 域名形态
+    "trench": "Trench",                   # 3    robinhood
+    "tren.ch": "tren.ch",                 # 3    solana ⚠️ 域名形态
+    "moonshot": "Moonshot",               # 3    solana
+    "meteora alpha vault": "Meteora Alpha Vault",  # 3 solana
+    "liquid": "Liquid",                   # 2    base
+    "livo": "Livo",                       # 2    ethereum(该链只有它和 UniswapCCA)
+    "jupiter studio": "Jupiter Studio",   # 2    solana
+    "america.fun": "AMERICA.fun",         # 2    solana ⚠️ 域名形态
+    "zora": "Zora",                       # 1    base
+    "baseapp creator": "Baseapp Creator",  # 1   base
+    "hood.fun": "hood.fun",               # 1    robinhood ⚠️ 域名形态
+    "moonit": "Moonit",                   # 1    solana
+    "dubdub": "DubDub",                   # 1    solana
+    "believe": "Believe",                 # 1    solana
+    "blowfish": "Blowfish",               # 1    solana
+    "vertigo": "Vertigo",                 # 1    solana
+    "metaplex": "Metaplex",               # 1    solana
+    # ---- 本仓库自己产出的值 ----
+    "pons v2": "Pons V2",                 # robinhood 上按创建工厂分出来的版本
 }
-# 对外只读:formatter 用它判"要不要打那条"名字不在表里"的 DEBUG",测试用它做枚举断言。
+# 对外只读:formatter 用它判"要不要打那条"名字不在表里"的 WARNING",测试用它做枚举断言。
 LAUNCHPAD_NAMES = frozenset(_LAUNCHPADS.values())
 
 
@@ -1069,7 +1106,7 @@ def safe_launchpad(s) -> str | None:
 
     ⚠️ 返回**表里的规范写法**,不是上游原串:大小写也不受上游摆布。
     ⚠️ bidi 控制符与 safe_display / safe_exchange 同一条口径:来过就整段丢弃。
-    ⚠️ 因为返回值只可能是表里那 26 个之一,它**不可能**含分隔符、`「」`、域名路径、
+    ⚠️ 因为返回值只可能是表里那 45 个之一,它**不可能**含分隔符、`「」`、域名路径、
        scheme、@提及 —— 所以渲染时**不套 `「」` 容器**(与 safe_exchange 同一条理由:
        它已经不是自由文本了),这也正好对上用户样例里的 `🚀 发射台 · LONG`。
     """

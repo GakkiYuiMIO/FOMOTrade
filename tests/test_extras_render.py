@@ -52,6 +52,50 @@ def test_发射台是封闭枚举表外的一律不显示():
         assert "发射台" not in render(make_event(), launchpad=bad), bad
 
 
+# ⚠️⚠️ 2026-09-03 第二轮(H1)实测:上一版那张封闭表只枚举了 **四条链**
+#    (robinhood/solana/bsc/base),而 models.NETWORK_CHAIN_ID 里有**六条** ——
+#    ethereum 与 monad 同样会走 filterTokens。六条链 9810 个去重代币重跑一遍,
+#    全集是 44 个名字,上一版漏了下面这 19 个。其中 **Nad.Fun 是 monad 上有发射台的
+#    币的 100%** —— 也就是说 monad 链的 🚀 那一行在上一版里**从来没有显示过**。
+# ⚠️ 名字与出现次数写死在这一侧,不 import _LAUNCHPADS:
+#    这张表是"实测结论",不是"代码说什么就是什么"。
+_SIX_CHAIN_NEW = [
+    ("Pump Mayhem", "solana"), ("Nad.Fun", "monad"), ("Flaunch", "base"),
+    ("Zora Creator", "base"), ("Heaven", "solana"), ("Baseapp", "base"),
+    ("Four.meme Fair", "bsc"), ("Moonshot", "solana"), ("Liquid", "base"),
+    ("Livo", "ethereum"), ("AMERICA.fun", "solana"), ("Zora", "base"),
+    ("Baseapp Creator", "base"), ("hood.fun", "robinhood"), ("Moonit", "solana"),
+    ("DubDub", "solana"), ("Believe", "solana"), ("Blowfish", "solana"),
+    ("Vertigo", "solana"),
+]
+
+
+@pytest.mark.parametrize(("name", "chain"), _SIX_CHAIN_NEW, ids=[n for n, _ in _SIX_CHAIN_NEW])
+def test_六条链全量枚举出来的发射台名一个不漏(name, chain):
+    """⚠️ 大小写也钉住:显示的是**我们的规范写法**,不是上游原串的任意变体。"""
+    assert f"🚀 发射台 · {name}" in _lines(launchpad=name), (name, chain)
+    assert f"🚀 发射台 · {name}" in _lines(launchpad=name.upper()), (name, chain)
+
+
+def test_表外的发射台名打的是WARNING不是DEBUG():
+    """
+    ⚠️⚠️ 这条日志是"上游出了新发射台、这张封闭表该更新了"的**唯一**发现途径。
+       上一版打的是 DEBUG,而默认日志级别看不到 DEBUG —— 于是 monad 上的 Nad.Fun
+       整整一版都不显示,没有任何人知道。**静默失效**是这个项目反复吃过的亏。
+    ⚠️ 用 loguru 自己的 sink 抓(它不走 caplog);级别写死 "WARNING"。
+    """
+    from loguru import logger
+
+    got = []
+    sink = logger.add(lambda m: got.append((m.record["level"].name, m.record["message"])),
+                      level="WARNING")
+    try:
+        assert "发射台" not in render(make_event(), launchpad="BrandNewPad")
+    finally:
+        logger.remove(sink)
+    assert any(lvl == "WARNING" and "不在封闭表里" in msg for lvl, msg in got), got
+
+
 def test_持有人那一行逐字并带千分位():
     assert "🧑‍🤝‍🧑 持有人 1,194" in _lines(token_holders=1194)
     assert "🧑‍🤝‍🧑 持有人 33,633" in _lines(token_holders=33633)
@@ -72,7 +116,7 @@ def test_社媒那一行用我们自己的文字():
     ⚠️⚠️ 链接文字是**我们的常量**,永远不用上游给的 label(那是发币的人填的自由文本,
        而链接文字带着我们的背书)。
     """
-    assert ('🔗 <a href="https://cashcat.cc/">官网</a> · '
+    assert ('🔗 <a href="https://cashcat.cc/">网站</a> · '
             '<a href="https://x.com/cashcat_token">Twitter</a> · '
             '<a href="https://t.me/cashcat_robinhood">Telegram</a>') in _lines(token_socials=SOC)
 
@@ -82,8 +126,8 @@ def test_六类社媒的文字():
                                 ("telegram", "https://t.me/a"), ("discord", "https://discord.gg/a"),
                                 ("reddit", "https://reddit.com/r/a"),
                                 ("github", "https://github.com/a")))
-    line = [ln for ln in got if ln.startswith("🔗") and "官网" in ln][0]
-    assert "官网" in line and "Twitter" in line and "Telegram" in line
+    line = [ln for ln in got if ln.startswith("🔗") and "网站" in ln][0]
+    assert "网站" in line and "Twitter" in line and "Telegram" in line
     assert "Discord" in line and "Reddit" in line and "GitHub" in line
 
 
@@ -91,9 +135,9 @@ def test_六类社媒的文字():
 # ⚠️⚠️ 三行**各自独立**
 # ============================================================
 @pytest.mark.parametrize(("kw", "gone", "kept"), [
-    ({"launchpad": None, "token_holders": 1194, "token_socials": SOC}, "发射台", ("持有人", "官网")),
-    ({"launchpad": "LONG", "token_holders": None, "token_socials": SOC}, "持有人", ("发射台", "官网")),
-    ({"launchpad": "LONG", "token_holders": 1194, "token_socials": None}, "官网", ("发射台", "持有人")),
+    ({"launchpad": None, "token_holders": 1194, "token_socials": SOC}, "发射台", ("持有人", "网站")),
+    ({"launchpad": "LONG", "token_holders": None, "token_socials": SOC}, "持有人", ("发射台", "网站")),
+    ({"launchpad": "LONG", "token_holders": 1194, "token_socials": None}, "网站", ("发射台", "持有人")),
 ])
 def test_任一拿不到只掉那一行(kw, gone, kept):
     text = render(make_event(), **kw)
@@ -151,7 +195,7 @@ def test_发射台为空串或空白时整行消失():
 def test_社媒全空时整行消失():
     for bad in (None, (), [], "不是列表"):
         text = render(make_event(), token_socials=bad)
-        assert "官网" not in text and "Twitter" not in text, repr(bad)
+        assert "网站" not in text and "Twitter" not in text, repr(bad)
 
 
 # ============================================================
@@ -179,7 +223,7 @@ def test_行序_发射台与持有人在市值之后底池之前():
 def test_行序_社媒在平台链接之前而平台链接在CA之前():
     """⚠️ CA 独占最后一行是硬规则(§10.3),社媒绝不能挤到它后面。"""
     lines = render(make_event(), token_socials=SOC).split("\n")
-    soc = next(i for i, ln in enumerate(lines) if "官网" in ln)
+    soc = next(i for i, ln in enumerate(lines) if "网站" in ln)
     fomo = next(i for i, ln in enumerate(lines) if ">FOMO<" in ln)
     assert soc < fomo < len(lines) - 1
     assert lines[-1].startswith("<code>")
@@ -206,7 +250,7 @@ def test_必拦硬基线打进社媒槽位零泄漏(raw, rule):
     base = render(make_event())
     text = render(make_event(),
                   token_socials=[("website", raw), ("twitter", raw), (raw, raw)])
-    assert "官网" not in text and "Twitter" not in text, f"{raw!r} 漏进了社媒行({rule})"
+    assert "网站" not in text and "Twitter" not in text, f"{raw!r} 漏进了社媒行({rule})"
     # ⚠️ 链接总数不许比"没有社媒"那条多 —— 多一个就是多一个可点出口
     assert text.count("<a href") == base.count("<a href"), f"{raw!r} 多长出一个链接({rule})"
 
@@ -221,7 +265,11 @@ _EVIL_URLS = [
     "https://x.com/a\nb",
     "https://" + "a" * 300 + ".com/",
     "https://1.2.3.4/",
-    "https://evil.zzz/",
+    # ⚠️ H5 之后**没有**顶级域白名单了(evil.zzz 现在放行,理由见 nameguard 那段实测)。
+    #    这一道只判形态,所以红队样本换成"顶级域根本不成形"的三种。
+    "https://evil.z/",
+    "https://evil.123/",
+    "https://evil.co-m/",
 ]
 
 
@@ -231,21 +279,22 @@ def test_恶意URL在渲染入口就被拦掉(url):
     base = render(make_event())
     for kind in ("website", "twitter"):
         text = render(make_event(), token_socials=[(kind, url)])
-        assert "官网" not in text and "Twitter" not in text, (kind, url)
+        assert "网站" not in text and "Twitter" not in text, (kind, url)
         assert text.count("<a href") == base.count("<a href"), (kind, url)
 
 
-def test_社媒类的host是等值比对而官网那一类刻意放开():
+def test_社媒类的host是等值比对而网站那一类刻意放开():
     """
     ⚠️⚠️ `https://x.com.evil.com/` 在 twitter 那一类**必须**被拦(封闭 host 表是
-       **等值**比对,不是后缀比对);但它在「官网」那一类是**放行**的 ——
-       官网的 host 本质上不可枚举,那是刻意的取舍(见 nameguard 里
-       "官网那一类为什么放开 host" 那段,含代价)。这条把两侧都钉住,免得后来人
-       看到"website 放行了 evil.com"以为是漏洞、顺手把官网整块删掉。
+       **等值**比对,不是后缀比对);但它在「网站」那一类是**放行**的 ——
+       项目自己的站 host 本质上不可枚举,那是刻意的取舍(见 nameguard 里
+       "「网站」那一类为什么放开 host" 那段,含代价)。这条把两侧都钉住,免得后来人
+       看到"website 放行了 evil.com"以为是漏洞、顺手把这一类整块删掉。
+    ⚠️ 也正因为放开,链接文字才必须是**不带背书**的「网站」而不是「官网」(H5)。
     """
     assert "Twitter" not in render(make_event(),
                                    token_socials=[("twitter", "https://x.com.evil.com/")])
-    assert ">官网</a>" in render(make_event(),
+    assert ">网站</a>" in render(make_event(),
                                 token_socials=[("website", "https://x.com.evil.com/")])
 
 
@@ -267,7 +316,7 @@ def test_上游的label永远不出现在消息里():
     """
     text = render(make_event(), token_socials=(("website", "https://cashcat.cc/"),))
     assert "官方客服" not in text
-    assert ">官网<" in text
+    assert ">网站<" in text
 
 
 def test_门禁炸了也只是这几行消失():
@@ -277,7 +326,7 @@ def test_门禁炸了也只是这几行消失():
 
     text = render(make_event(), token_socials=Boom(), launchpad="LONG", token_holders=1194)
     assert "🚀 发射台 · LONG" in text and "持有人 1,194" in text
-    assert "官网" not in text
+    assert "网站" not in text
 
 
 # ============================================================
@@ -290,7 +339,7 @@ def test_pump成交推送也带这三行():
                              launchpad="Pump.fun", token_holders=118265, token_socials=SOC)
     assert "🚀 发射台 · Pump.fun" in text
     assert "🧑‍🤝‍🧑 持有人 118,265" in text
-    assert ">官网</a>" in text
+    assert ">网站</a>" in text
     assert text.split("\n")[-1].startswith("<code>")
 
 
@@ -314,5 +363,5 @@ def test_分发预警也带这三行():
         launchpad="LONG", token_holders=1194, token_socials=SOC)
     assert "🚀 发射台 · LONG" in text
     assert "持有人 1,194" in text
-    assert ">官网</a>" in text
+    assert ">网站</a>" in text
     assert text.split("\n")[-1].startswith("<code>")
