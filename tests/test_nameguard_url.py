@@ -72,8 +72,10 @@ _URL_MUST_BLOCK = [
     ("https://[::1]/x", "website", "IPv6 字面量"),
     ("https://x.com:8080/a", "twitter", "带端口"),
     ("https://x.com./a", "twitter", "尾随点(DNS 上等价于 x.com,但不等值)"),
-    # ⚠️⚠️ H5 之后**没有**顶级域白名单了(实测:那张表误杀 7.58% 的真实官网,
-    #    而它里面本来就有 xyz/top/vip/cc/ws/gd/ly —— 对坏人基本不构成约束)。
+    # ⚠️⚠️ H5 之后**没有**顶级域白名单了(实测:那张表误杀 8.16% 的真实官网 ——
+    #    662 条真实官网里 54 条被丢,其中 42 条纯粹是被这张表误杀的,涉及 29 个不同 TLD,
+    #    包括 www.whitehouse.gov / youtu.be / linktr.ee 这种一点都不 exotic 的域;
+    #    而表里本来就含 xyz/top/vip/cc/ws/gd/ly —— 对坏人基本不构成约束)。
     #    这一道现在只判**形态**:顶级域必须是纯 ASCII 字母且 >= 2 位。
     ("https://evil.z/", "website", "顶级域只有 1 位"),
     ("https://evil.123/", "website", "顶级域是数字"),
@@ -81,9 +83,12 @@ _URL_MUST_BLOCK = [
     ("https://x.co​m/a", "twitter", "零宽空格拆域名"),
     ("https://x.com/a b", "twitter", "URL 里有空格"),
     ("https://x.com/a\nb", "twitter", "URL 里有换行(能在消息里造出一整行伪造字段)"),
-    # ⚠️ 这条其实挡在 **域名段 63 字符**那一道上,**不是**长度上限 ——
-    #    它的 host 只有一段 300 字符的标签。真正钉长度上限的在文件末尾(H4)。
-    ("https://" + "a" * 300 + ".com/", "website", "域名段超过 63 字符"),
+    # ⚠️⚠️ 这条**先**死在长度上限(第 2 道:313 > 200),根本走不到 host 那一道(第 5 道)。
+    #    safe_url 的门禁顺序是 1 字符集 → 2 长度 → 3 scheme → 4 netloc → 5 host,
+    #    上一轮的注释把这条说成"挡在域名段 63 字符上",是**说反了** —— 已实测更正:
+    #    把 _MAX_URL_CHARS 调大之后它仍被拦,那时才轮到 _label_ok 兜底。
+    #    真正**独占**钉住长度上限与 63 字符段长的用例各在文件末尾。
+    ("https://" + "a" * 300 + ".com/", "website", "313 字符:先撞长度上限"),
     ("https://x.com/%zz", "twitter", "半截百分号编码"),
     ("https://", "website", "只有 scheme"),
     ("https://com/", "website", "只有一段 host"),
@@ -309,3 +314,44 @@ def test_放开顶级域没有放开别的任何一道():
     assert safe_url("https://ok.foundation/" + "a" * 200, "website") is None  # 超长
     # 社媒各类的封闭 host 表**没有**受影响
     assert safe_url("https://ok.foundation/x", "twitter") is None
+
+
+def test_域名段63字符上限自己有独占的钉子():
+    """
+    ⚠️⚠️ 这条是补上一轮的漏:当时**唯一**自称覆盖 63 字符段长的样本
+       (`"https://" + "a"*300 + ".com/"`,313 字符)其实先死在长度上限那一道,
+       于是把 _label_ok 的 63 改成 6300,全量 pytest **0 红** —— 那道门是裸的。
+    ⚠️ 这里的样本**刻意做短**(77 字符,远在 200 的长度上限之内),
+       所以它只可能死在段长那一道上。
+    """
+    ok63 = "https://" + "a" * 63 + ".com/"       # 76 字符,单段正好 63 → 放行
+    bad64 = "https://" + "a" * 64 + ".com/"      # 77 字符,单段 64 → 只可能死在段长
+    assert len(ok63) < 200 and len(bad64) < 200
+    assert safe_url(ok63, "website") == ok63
+    assert safe_url(bad64, "website") is None
+
+
+def test_社媒条数不设上限是因为类别本身封顶():
+    """
+    ⚠️⚠️ 上一版有个 `_MAX_SOCIAL_LINKS = 6` 的"上限",实际是**死常量** ——
+       结果按 SOCIAL_KINDS 逐类去重,同类只取第一个,所以条数天然 <= 类别数(6),
+       那个 [:6] 切片永远切不掉任何东西(实测把它改成 100,全量 pytest 0 红)。
+       已删掉。这条测试钉住真正在起作用的那个不变量:**上游塞再多也只出 <= 6 条**。
+    ⚠️ 死常量 + 空转测试是最糟的组合 —— 它让人以为有一道门,而那道门是画上去的。
+    """
+    raw = []
+    for i in range(50):                       # 每类塞 50 条,共 300 条
+        raw.append(("twitter", f"https://x.com/a{i}"))
+        raw.append(("telegram", f"https://t.me/b{i}"))
+        raw.append(("discord", f"https://discord.gg/c{i}"))
+        raw.append(("reddit", f"https://www.reddit.com/r/d{i}"))
+        raw.append(("github", f"https://github.com/e{i}"))
+        raw.append(("website", f"https://site{i}.com/"))
+    got = safe_social_links(raw)
+    assert got is not None
+    assert len(got) == 6, got                 # 六类各一条,不多不少
+    assert [k for k, _ in got] == ["website", "twitter", "telegram",
+                                   "discord", "reddit", "github"]
+    # 同类只取第一个:取到的是 i=0 那条,不是 i=49
+    assert dict(got)["twitter"] == "https://x.com/a0"
+    assert dict(got)["website"] == "https://site0.com/"

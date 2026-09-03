@@ -59,22 +59,59 @@ def test_发射台是封闭枚举表外的一律不显示():
 #    币的 100%** —— 也就是说 monad 链的 🚀 那一行在上一版里**从来没有显示过**。
 # ⚠️ 名字与出现次数写死在这一侧,不 import _LAUNCHPADS:
 #    这张表是"实测结论",不是"代码说什么就是什么"。
-_SIX_CHAIN_NEW = [
-    ("Pump Mayhem", "solana"), ("Nad.Fun", "monad"), ("Flaunch", "base"),
-    ("Zora Creator", "base"), ("Heaven", "solana"), ("Baseapp", "base"),
-    ("Four.meme Fair", "bsc"), ("Moonshot", "solana"), ("Liquid", "base"),
-    ("Livo", "ethereum"), ("AMERICA.fun", "solana"), ("Zora", "base"),
-    ("Baseapp Creator", "base"), ("hood.fun", "robinhood"), ("Moonit", "solana"),
-    ("DubDub", "solana"), ("Believe", "solana"), ("Blowfish", "solana"),
-    ("Vertigo", "solana"),
+# ⚠️⚠️ 必须钉**全部** 45 条,不能只钉新增的那 19 条 —— 复验实测:只钉新增的那一版,
+#    把 Flap(901 次命中)、MeteoraDBC(589)、Clanker V4(80)从 _LAUNCHPADS 里删掉,
+#    全量 pytest **0 红**。45 条里当时有 22 条没有任何测试守着,
+#    而命中次数最多的几个恰好都在没守着的那一半里。
+# 每项 =(上游原值, 我们的规范写法, 主要出现的链)。
+_ALL_LAUNCHPADS = [
+    ("Pump.fun", "Pump.fun", "solana"), ("pons", "Pons", "robinhood"),
+    ("Flap", "Flap", "bsc"), ("MeteoraDBC", "MeteoraDBC", "solana"),
+    ("StonkFun", "StonkFun", "solana"), ("Four.meme", "Four.meme", "bsc"),
+    ("LONG", "LONG", "robinhood"), ("Bankr", "Bankr", "base"),
+    ("Clanker V4", "Clanker V4", "base"), ("UniswapCCA", "UniswapCCA", "robinhood"),
+    ("o1.exchange", "o1.exchange", "base"), ("BAGS", "BAGS", "solana"),
+    ("Virtuals", "Virtuals", "robinhood"), ("Bonk", "Bonk", "solana"),
+    ("LaunchLab", "LaunchLab", "solana"), ("Pump Mayhem", "Pump Mayhem", "solana"),
+    ("Nad.Fun", "Nad.Fun", "monad"), ("Printr", "Printr", "solana"),
+    ("Flaunch", "Flaunch", "base"), ("Sushi Launch", "Sushi Launch", "robinhood"),
+    ("EasyA Kickstart", "EasyA Kickstart", "solana"),
+    ("Zora Creator", "Zora Creator", "base"), ("Feel.cash", "Feel.cash", "base"),
+    ("bow.fun", "bow.fun", "robinhood"), ("Heaven", "Heaven", "solana"),
+    ("Baseapp", "Baseapp", "base"), ("Four.meme Fair", "Four.meme Fair", "bsc"),
+    ("Trench", "Trench", "robinhood"), ("tren.ch", "tren.ch", "solana"),
+    ("Moonshot", "Moonshot", "solana"),
+    ("Meteora Alpha Vault", "Meteora Alpha Vault", "solana"),
+    ("Liquid", "Liquid", "base"), ("Livo", "Livo", "ethereum"),
+    ("Jupiter Studio", "Jupiter Studio", "solana"),
+    ("AMERICA.fun", "AMERICA.fun", "solana"), ("Zora", "Zora", "base"),
+    ("Baseapp Creator", "Baseapp Creator", "base"), ("hood.fun", "hood.fun", "robinhood"),
+    ("Moonit", "Moonit", "solana"), ("DubDub", "DubDub", "solana"),
+    ("Believe", "Believe", "solana"), ("Blowfish", "Blowfish", "solana"),
+    ("Vertigo", "Vertigo", "solana"), ("Metaplex", "Metaplex", "solana"),
+    # 本仓库自己产出的值(tokeninfo 按创建工厂把 pons 分成 V1/V2)
+    ("Pons V2", "Pons V2", "robinhood"),
 ]
 
 
-@pytest.mark.parametrize(("name", "chain"), _SIX_CHAIN_NEW, ids=[n for n, _ in _SIX_CHAIN_NEW])
-def test_六条链全量枚举出来的发射台名一个不漏(name, chain):
+def test_封闭表的条数写死在测试这一侧():
+    """
+    ⚠️ 45 这个数字是**实测结论**(六条链 9810~9882 个去重代币,fixer 与两个复验者
+       各自独立枚举都得 44 个上游名,加上我们自产的 Pons V2)。写死在这一侧,
+       是为了让"有人往 _LAUNCHPADS 里加了一条却没有对应实测依据"当场变红:
+       加表项必须同时把它加进上面那张实测表。
+    """
+    assert len(_ALL_LAUNCHPADS) == 45
+    assert len({d for _, d, _ in _ALL_LAUNCHPADS}) == 45
+
+
+@pytest.mark.parametrize(("raw", "shown", "chain"), _ALL_LAUNCHPADS,
+                         ids=[d for _, d, _ in _ALL_LAUNCHPADS])
+def test_六条链全量枚举出来的发射台名一个不漏(raw, shown, chain):
     """⚠️ 大小写也钉住:显示的是**我们的规范写法**,不是上游原串的任意变体。"""
-    assert f"🚀 发射台 · {name}" in _lines(launchpad=name), (name, chain)
-    assert f"🚀 发射台 · {name}" in _lines(launchpad=name.upper()), (name, chain)
+    assert f"🚀 发射台 · {shown}" in _lines(launchpad=raw), (raw, shown, chain)
+    assert f"🚀 发射台 · {shown}" in _lines(launchpad=raw.upper()), (raw, shown, chain)
+    assert f"🚀 发射台 · {shown}" in _lines(launchpad=raw.lower()), (raw, shown, chain)
 
 
 def test_表外的发射台名打的是WARNING不是DEBUG():

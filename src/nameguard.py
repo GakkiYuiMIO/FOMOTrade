@@ -882,8 +882,12 @@ _SOCIAL_HOSTS = {
 #    等于把上游的自由文本当链接文字印出去 —— 那正是这一轮要堵的口子
 #    (websites[].label 同理,永远不用)。代价是少显示几类社媒,认了。
 SOCIAL_KINDS = ("website", "twitter", "telegram", "discord", "reddit", "github")
-# 一条消息里最多列几个社媒链接。⚠️ 上游可以塞任意多条,不设上限就能把一行顶爆预算。
-_MAX_SOCIAL_LINKS = 6
+# ⚠️⚠️ 这里**不需要**"最多列几条"的上限:下面按类别去重、同类只取第一个,
+#    所以条数天然被 len(SOCIAL_KINDS) 封顶,上游塞 300 条也只出 6 条。
+#    上一版有个 `_MAX_SOCIAL_LINKS = 6` 的切片,实测是**死常量**(改成 100 全量 0 红)——
+#    死规则加上一条永远绿的测试,比没有规则更糟:它让人以为有一道门,而那道门是画上去的。
+#    真正的闸是这张类别表本身。往里加类别 = 一行会多列一条,
+#    test_社媒条数不设上限是因为类别本身封顶 会当场变红,提醒你想清楚版面。
 
 
 def _label_ok(lab: str) -> bool:
@@ -997,7 +1001,8 @@ def safe_social_links(items) -> tuple[tuple[str, str], ...] | None:
         clean = safe_url(url, k)
         if clean is not None:
             got[k] = clean
-    out = tuple((k, got[k]) for k in SOCIAL_KINDS if k in got)[:_MAX_SOCIAL_LINKS]
+    # ⚠️ 不切片:条数已被 SOCIAL_KINDS 封顶(见那里的注释)。
+    out = tuple((k, got[k]) for k in SOCIAL_KINDS if k in got)
     return out or None
 
 

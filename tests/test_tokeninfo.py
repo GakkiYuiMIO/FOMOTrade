@@ -936,3 +936,54 @@ def test_持有人的默认内存TTL就是90秒(glossary, monkeypatch):
     lk.begin_round()
     lk.lookup([("solana", addr)])
     assert len(fc.calls) == 2, "满 90 秒还在用旧的持有人数 —— 默认 TTL 被放大了"
+
+
+def test_失败负缓存的默认TTL就是1小时(glossary):
+    """
+    ⚠️⚠️ 补 H2 漏掉的一个:上面那条「失败和查无的负缓存 TTL 不是同一个」只钉了
+       **两档之间的距离** (> 6 天),没钉 error 那一档的**绝对值** ——
+       把 TTL_ERROR_SEC 从 3600 改成 60 或 86400,那条照样绿。
+    ⚠️ 一次网络抖动该按住多久是个产品决定:太短会每 tick 重打(有过 tick 从 5s 拖到 90s 的教训),
+       太长会让一行凭空消失半天且没有任何日志说是缓存干的。3600 是那个折中,写死在这里。
+    ⚠️ 断言写死 3600,不 import TTL_ERROR_SEC。
+    """
+    import time as _real_time
+
+    fail = FakeFilter(payload=None)
+    fail.fetch = lambda keys: (None, 0.0)          # 请求失败
+    lk = _lookup(glossary, fail)
+    lk.begin_round()
+    t0 = int(_real_time.time())
+    lk.lookup([("robinhood", CUM)])
+    with glossary() as conn:
+        row = conn.execute("select source, expires_at from name_glossary "
+                           "where kind='launchpad'").fetchone()
+    assert row is not None and row["source"] == "error"
+    # ⚠️ 用真实时钟 + 1 秒容差:expires_at = int(time.time()) + TTL,
+    #    跨秒最多差 1。容差这么窄,把 3600 改成 60 / 1800 / 86400 都会当场红。
+    #    (刻意**不**用假时钟:实测把 tokeninfo.time 换掉之后这条路径一行缓存都不写,
+    #     断言就变成在测一条走不到的路径 —— 那正是这一轮在修的那种空转。)
+    delta = row["expires_at"] - t0
+    assert 3600 <= delta <= 3601, f"失败负缓存不是 1 小时,是 {delta} 秒"
+
+
+def test_外呼超时的默认值就是12秒(monkeypatch):
+    """
+    ⚠️⚠️ 补 H2 漏掉的一个:`_TIMEOUT_SEC` 之前零覆盖 —— 改成 600 全量 0 红。
+       它是"外部接口不许拖慢推送"这条唯一的硬闸:墙钟预算只在**两次外呼之间**检查,
+       一次外呼自己卡住的话,只有 timeout 能把它拽回来。
+    ⚠️ 超时设在 Session 构造上、不在 .post() 上 —— 所以这里抓的是 Session 的 kwargs。
+    ⚠️ 断言写死 12.0,不 import _TIMEOUT_SEC。
+    """
+    seen = {}
+
+    class _FakeSession:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    from curl_cffi import requests as cffi_requests
+    monkeypatch.setattr(cffi_requests, "Session", _FakeSession)
+
+    tokeninfo.FilterTokensClient(proxy="")._session()
+    assert seen["timeout"] == 12.0, f"外呼超时被改成了 {seen.get('timeout')}"
+    assert seen["impersonate"] == "chrome", "没了 impersonate 会被 Cloudflare 回 430"
