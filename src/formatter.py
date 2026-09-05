@@ -57,6 +57,7 @@ from src.nameguard import (
     safe_ident,
     safe_launchpad,
     safe_social_links,
+    safe_username,
 )
 from src.nameguard import strip_controls_keep_emoji as _no_controls
 
@@ -253,6 +254,17 @@ UNTRUSTED_FIELDS = {
     #    可以逐个数出来 —— 而"能枚举的一律不许手写模式匹配"是本项目上一轮的血教训。
     #    详见 nameguard._LAUNCHPADS 上面那一大段(含全量实测依据与代价)。
     "launchpad": safe_launchpad,
+    # ⚠️⚠️ /chips 回执里 💊 那半边的 **pump 用户名**(GET /mint-positions/{mint} 的
+    #    userName)。谁都能把自己的 pump 用户名改成 `已清仓 · 亏损 99%` / `t.me/scam`,
+    #    而它印在一行**长得像记录**的东西里(名字 · 数量 · 盈亏)。
+    # ⚠️⚠️ 本轮(J8)从 safe_display 换成**专用的** safe_username(封闭形状)。
+    #    换的理由是实测:safe_display 的标点白名单里没有 `_`,而 519 个真实 userName 里
+    #    有 27 个带 `_` —— 它把 **4.24%** 的真实用户名打成「未知用户」,
+    #    读者看到的是一条认不出人的持仓记录,而"认出是谁"正是名单功能的全部意义。
+    #    safe_username 同一份语料丢 **0.00%**,45 条 _MUST_BLOCK 硬基线仍然零泄漏。
+    #    ⚠️ 也**不是** safe_ident:那一道允许空格,`Send SOL to my wallet now`
+    #       整句穿过去 —— 见 nameguard.safe_username 顶上那段。
+    "pump_username": safe_username,
 }
 
 # 译文字段 → 它的**原文**是哪个字段。⚠️ safe_display 的"含 CJK 时不许有 ≥5 位 ASCII 串"
@@ -345,6 +357,12 @@ _REVIEWED_PARAMS = frozenset({
     # pump 喊单那条推送的参数。thesis 是**用户自己写的正文**,走 _clip 不走形状门禁
     # (形状门禁是给"名字"用的,一句话本来就过不了词数上限)。
     "thesis", "multiple", "likes", "view_count", "created_at",
+    # /chips 里 pump 名单成员行的两个**数字**参数(render_pump_chip_row)。
+    # ⚠️ amount_held 是持仓数量、pnl_pct 是盈亏百分比,取值层给的就是 float/None;
+    #    形状门禁是给"名字"用的,套在数字上没有意义。渲染层只做记法
+    #    (fmt_token_amount / fmt_signed_pct),两者都对非数字输入返回 None。
+    # ⚠️ 那一行**唯一**的文本参数 pump_username 在 UNTRUSTED_FIELDS 里,不在这儿。
+    "amount_held", "pnl_pct",
 })
 
 
@@ -2534,3 +2552,100 @@ def _pump_callout_stats_line(likes, view_count) -> str | None:
     if n_view is not None:
         parts.append(f"{EMOJI_PUMP_VIEW} {n_view}")
     return SEP.join(parts) if parts else None
+
+
+# ============================================================
+# /chips 回执里 💊 那半边 —— pump.fun 平台筹码的名单成员行
+# ============================================================
+# pump 用户名的展示上限。与 _PUMP_NAME_CHARS 同值不是巧合:同一个字段
+# (pump 的 userName)在买卖推送与这条回执里占的展示位应当一样宽,
+# 一处调宽另一处不动的话,同一个人在两条消息里会被截成两个不同的名字。
+_PUMP_CHIP_NAME_CHARS = 24
+
+
+def fmt_token_amount(v) -> str | None:
+    """
+    代币持仓数量 → 展示串。取不到返回 None(那一段消失,绝不打 0)。
+
+    ⚠️⚠️ 这份实现是**唯一**的一份:/chips 的 FOMO 半边(bot._chips_qty)与
+       pump 半边(render_pump_chip_row)都走它。同一条回执里两半边的数量
+       如果一个写 `14,584,546`、另一个写 `14.58M`,读者会以为那是两种不同的量。
+       (原来这段代码在 bot._chips_qty 里,pump 半边接进来时搬到这儿,
+        bot 那个名字保留成一行转调,调用点一个字都没动。)
+    ⚠️ memecoin 的供应量常在 1e9~1e15 量级,每三位一个逗号能写出二十几个字符,
+       一行就被它吃掉 —— 十亿以上换成 B/T 单位。
+    ⚠️ 0 < |v| < 1 时保留四位小数:高价币可能真的只持有零点几枚,
+       四舍五入成 0 就是把"有一点"谎报成"没有"。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    f = float(d)
+    a = abs(f)
+    for div, unit in ((1e12, "T"), (1e9, "B")):
+        if a >= div:
+            return f"{f / div:,.2f}{unit}"
+    if 0 < a < 1:
+        return f"{f:,.4f}"
+    return f"{f:,.0f}"
+
+
+def fmt_signed_pct(v) -> str | None:
+    """
+    带正负号的百分比 → 展示串。取不到返回 None(那一段消失)。
+
+    ⚠️⚠️ 与 fmt_token_amount 同一条理由:唯一实现,bot._ca_pct_str 转调它。
+    ⚠️ 百分比直接来自接口,没有任何天然上限:`f"{1e300:+.1f}%"` 是 **302 个字符**,
+       一个字段就能白吃掉三分之一展示位。所以超出人还读得动的量级
+       (十亿个点 = 一千万倍)换科学计数法 —— 信息一个数量级都不少,
+       长度从最坏 302 回到最多 11。
+    ⚠️ 阈值取 1e9 而不是更小:真实的百倍千倍(+10000%)必须照原样显示,
+       换记法反而更难读。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    f = float(d)
+    return f"{f:+.2e}%" if abs(f) >= 1e9 else f"{f:+.1f}%"
+
+
+@_guard_untrusted
+def render_pump_chip_row(*, pump_username: str | None = None,
+                         amount_held=None, pnl_pct=None) -> str:
+    """
+    /chips 里一位 pump 名单成员的持仓行:`「1000XCryptoD」 · 14,584,546 枚 · +306.2%`。
+
+    ⚠️⚠️ 这个函数存在的**唯一**理由是收口:`pump_username` 来自
+       `GET /mint-positions/{mint}` 的 `userName`,**谁都能把自己的 pump 用户名改成
+       `已清仓 · 亏损 99%` 或 `t.me/scam`**。/chips 的其余部分全在 bot.py 里拼,
+       而门禁表(UNTRUSTED_FIELDS)只对挂了 @_guard_untrusted 的渲染函数生效 ——
+       把这一行搬进 formatter,那个字段才进得了那张表、才被
+       tests/test_nameguard_chokepoint.py 的反射不变量看得见。
+       在 bot 里"记得调一下 safe_display"是守不住的那种约定(见 UNTRUSTED_FIELDS
+       上面那段:漏过两个字段的教训)。
+    ⚠️⚠️ 它走 **safe_username(封闭形状)+ 「」容器**,另外两道门都不是它:
+       · **不是** safe_ident(pump 买卖推送里同一个用户名走的那道):那道只判**形态**
+         且**允许空格**,`私聊我领空投 加V信 abcdefg` / `Send SOL to my wallet now`
+         原样穿过去。买卖推送那边靠"这一行的其余部分全是我们自己写的短语"扛着;
+         而这里的行长得像一条**记录**(名字 · 数量 · 盈亏),混进一句话就是伪造的记录。
+       · **不再是** safe_display(上一版走的那道):它的标点白名单里没有 `_`,
+         实测 519 个真实 userName 里被它打成「未知用户」的有 **4.24%**(`AR_04` /
+         `Bart_da_charts` / `_togi_` 这类)—— 一条**认不出人**的持仓记录,
+         而"认出是谁"正是名单功能的全部意义。safe_username 同一份语料丢 **0.00%**,
+         45 条 _MUST_BLOCK 硬基线仍然零泄漏(两个数字都是实测,见 nameguard.safe_username)。
+    ⚠️ 退回「未知用户」而不是整行消失:这一行的其余两段(数量、盈亏)是**真值**,
+       而"名单里有人持有"这件事本身也是真的 —— 整行删掉等于把它谎报成"没人持有"。
+       这与 _display_name 里"handle 过不了门禁 → 退回 user_id → 未知用户"
+       是同一条既有规矩,不是新发明的占位符。
+    ⚠️ 数量 / 盈亏各自独立:取不到的那一段消失,绝不补 0(0 枚是"清仓"这个真实值)。
+    ⚠️ 返回值**已转义**,调用方直接拼行,不要再 escape 一遍。
+    """
+    name = _clip(pump_username or "", _PUMP_CHIP_NAME_CHARS)
+    seg = [_quoted(name) if name else TEXT_UNKNOWN_USER]
+    amount_text = fmt_token_amount(amount_held)
+    if amount_text is not None:
+        seg.append(f"{amount_text} 枚")
+    pct_text = fmt_signed_pct(pnl_pct)
+    if pct_text is not None:
+        seg.append(pct_text)
+    return SEP.join(seg)

@@ -40,15 +40,17 @@ from src.formatter import (
     render,
     render_alpha_listing,
     render_pump_callout,
+    render_pump_chip_row,
     render_pump_trade,
     render_transfer_in_signal,
     render_transfer_in_watch,
 )
 
-# ⚠️ 六个渲染函数**全部**列在这里。少列一个 = 那个函数的参数从此不受这条不变量约束,
+# ⚠️ 七个渲染函数**全部**列在这里。少列一个 = 那个函数的参数从此不受这条不变量约束,
 #    所以下面另有一条断言:formatter 里所有 `render*` 公开函数都必须出现在这个元组里。
 _RENDERERS = (render, render_pump_trade, render_transfer_in_watch,
-              render_transfer_in_signal, render_alpha_listing, render_pump_callout)
+              render_transfer_in_signal, render_alpha_listing, render_pump_callout,
+              render_pump_chip_row)
 
 # ============================================================
 # 写死在**测试这一侧**的字段清单 —— D1 不变量的判卷依据
@@ -75,6 +77,15 @@ _EXPECT_UNTRUSTED = {
     #    这条当场红,而那正是要防的:实测最常见的发射台名(Pump.fun / o1.exchange /
     #    Four.meme / Feel.cash)全是域名形态,safe_display 会把 35.6% 的命中打掉。
     "launchpad": "safe_launchpad",
+    # ⚠️⚠️ /chips 回执里 💊 那半边的 pump 用户名(mint-positions.userName)。
+    #    它走**专用的** safe_username(封闭形状 [A-Za-z0-9_] ≤32 + 三条地址形态 + 数字 ≤7),
+    #    另外两道门都不行,换成任何一道这条当场红:
+    #      · safe_ident —— 允许空格,`Send SOL to my wallet now` 整句穿过去,
+    #        而这一行长得像一条**记录**(名字 · 数量 · 盈亏),混进一句话就是伪造的记录;
+    #      · safe_display —— 标点白名单里没有 `_`,实测 519 个真实 userName 里
+    #        它把 4.24% 打成「未知用户」(`AR_04` / `Bart_da_charts` / `_togi_`),
+    #        而 safe_username 同一份语料丢 0.00%、45 条 _MUST_BLOCK 仍然零泄漏。
+    "pump_username": "safe_username",
 }
 _EXPECT_IDENT = {
     "token_symbol": "safe_ident",        # 币符号,陌生人可控($t.me/pumpgrp 曾原样进标题)
@@ -122,6 +133,9 @@ _EXPECT_REVIEWED = {
     #    ⚠️ 它**不叫** holders —— 那个名字已经被两条推送各占一次了。
     "token_holders",
     "thesis", "multiple", "likes", "view_count", "created_at",
+    # /chips 的 pump 名单成员行:两个**数字**参数(持仓数量 / 盈亏百分比)。
+    # ⚠️ 那一行唯一的文本参数 pump_username 在 _EXPECT_UNTRUSTED 里,不在这份名单里。
+    "amount_held", "pnl_pct",
 }
 
 
@@ -262,7 +276,8 @@ def test_门禁自己炸了也只是那一段不显示():
 
 @pytest.mark.parametrize("fn_name", ["render", "render_pump_trade",
                                      "render_transfer_in_watch", "render_transfer_in_signal",
-                                     "render_alpha_listing", "render_pump_callout"])
+                                     "render_alpha_listing", "render_pump_callout",
+                                     "render_pump_chip_row"])
 def test_装饰器不改变签名(fn_name):
     """⚠️ 反射检查要看得到真实签名,不能是 (*args, **kwargs) —— 否则不变量全空转。"""
     fn = getattr(formatter, fn_name)

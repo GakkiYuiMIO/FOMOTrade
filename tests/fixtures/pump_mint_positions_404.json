@@ -1,0 +1,7 @@
+{
+ "statusCode": 404,
+ "timestamp": "2026-09-05T03:52:15.614Z",
+ "path": "/mint-positions/",
+ "message": "Cannot GET /mint-positions/",
+ "error": "Not Found"
+}

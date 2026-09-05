@@ -716,6 +716,65 @@ def safe_ident(s) -> str | None:
     return " ".join(strip_controls_keep_emoji(raw).split())
 
 
+# ---- pump 用户名的门禁:**形状封闭**(本轮 J8)-------------------------------
+# ⚠️⚠️ 为什么不能沿用前面两道:
+#   · safe_display(名字类)——  它的形状规则是给"币名 / 公司名"定的:标点白名单里
+#     **没有** `_`,于是 `AR_04` / `Bart_da_charts` / `_togi_` 这类正常用户名整条被丢。
+#     实测(见下)519 个真实 userName 里丢 22 条 = **4.24%**,而被丢的 20 条只是带 `_`。
+#     丢掉的后果不是"少一行":那一行退回「未知用户」,读者看到的是一条
+#     **认不出人**的持仓记录 —— 名单功能的意义就在于认出是谁。
+#   · safe_ident(符号类)——  它**允许空格**,于是 `Send SOL to my wallet now`、
+#     `私聊我领空投 加V信 abcdefg` 这几条 _MUST_BLOCK 样本原样穿过去
+#     (render_pump_chip_row 那一行长得像一条记录,混进一句话就是一条伪造的记录)。
+# ⚠️⚠️ 所以这一道走**封闭形状**(与 safe_address 同一套路数,不是模式匹配):
+#     `[A-Za-z0-9_]`,长度 ≤ 32。判据是实测,不是拍脑袋 ——
+#     2026-09-05 的 519 个真实 pump userName(423 个 live 翻页 + 123 个夹具,去重后 519,
+#     见 tests/fixtures/pump_usernames_live.json):
+#       · 含空白的 **0** 个;含非 ASCII 的 **0** 个;含 `.` 的 **0** 个;
+#       · 除字母数字外只出现过一个字符:`_`(27 次);
+#       · 最长 15 字符(pump 自己就卡在 15),最短 3。
+#     取 32 而不是 15:留一倍余量给老账号,同时仍然远小于 EVM 地址(42)。
+# ⚠️ 封闭形状之外还留三条**形态**规则:charset 拦不住"全是字母数字"的地址 ——
+#    `0xabcd`(EVM 4 位起)、`7a6a3b93cb3ffead`(裸 hex 16 位)、
+#    `CTPoyCwkjMvoJwU4xvZZqoD8tiYk6yDchySiN5gGpump`(base58 26 位起)三种形态
+#    每一种都能整条塞进 `[A-Za-z0-9]` 里。其余四条(scheme / @提及 / IPv4 / 电话)
+#    **不再重复施加**:它们各自要求 `:` `@` `.` `+`,而这四个字符**不在**这道白名单里,
+#    再写一遍就是死规则(本项目的教训:死规则 + 空转测试是最糟的组合)。
+_RE_USERNAME = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
+_USERNAME_BAD_PATTERNS = (_RE_EVM, _RE_BARE_HEX, _RE_BASE58)
+# 数字总量上限 7。⚠️ 判据同样是那 519 条实测:数字总量分布
+#    {0:349, 1:29, 2:28, 3:36, 4:31, 5:44, 6:2} —— 实测上界只有 6,取 7 丢 **0** 条。
+#    下限由**目标可达性**定(与 _MAX_IDENT_DIGITS 同一条理由,两者恰好同值但各有各的账):
+#    手机号 11 位、QQ 号 9~10 位,7 位以下的数字串够不着一个"可拨可加"的目标。
+#    ⚠️ 少了这一条,`13800138000` 这种纯数字的用户名整条放行 —— 它全在白名单字符里。
+_MAX_USERNAME_DIGITS = 7
+
+
+def safe_username(s) -> str | None:
+    """
+    pump 用户名(mint-positions.userName / users.username)的门禁。
+    不合格 → None,调用方退回「未知用户」,同一行的数量与盈亏照常显示。
+
+    ⚠️ 实测(2026-09-05,519 个真实 userName):丢弃 **0 条 = 0.00%**;
+       同一份语料在 safe_display 下丢 22 条 = 4.24%。
+       tests/test_nameguard_shape.py 的 45 条 _MUST_BLOCK 硬基线**零泄漏**。
+    ⚠️ 返回的是**叠平后**的串(与另外两道一致);这里不必留 emoji ——
+       白名单里压根没有 emoji,能通过的串一个控制符都不含。
+    """
+    raw = str(s or "")
+    if any(ch in _BIDI_CONTROLS for ch in raw):
+        return None
+    text = flatten(raw)
+    if not _RE_USERNAME.match(text):
+        return None
+    for pat in _USERNAME_BAD_PATTERNS:
+        if pat.search(text):
+            return None
+    if sum(1 for ch in text if _is_digit_like(ch)) > _MAX_USERNAME_DIGITS:
+        return None
+    return text
+
+
 # ---- 合约地址的门禁:**形状封闭**,不是模式匹配 ------------------------------
 # ⚠️⚠️ 地址这一类字段不能走 safe_ident —— 那道的裸 hex / base58 / 0x 三条规则
 #    本来就是拿来拦地址的,把它套在"这里就该是一个地址"的槽位上等于全丢。

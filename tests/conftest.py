@@ -84,6 +84,16 @@ def _no_tokeninfo_network(monkeypatch):
     monkeypatch.setattr(_t.BlockscoutClient, "_get", lambda self, path, tag: None)
     monkeypatch.setattr(_t._GATE, "_next_at", 0.0, raising=False)
     monkeypatch.setattr(_t._GATE, "_sleep", lambda _s: None, raising=False)
+
+    # ⚠️⚠️ pump.fun 的那把闸同理,而且它是后加的、当初漏了桩 ——
+    #    复验实测:整场测试**真的 sleep 了 39.0 秒**,而且是进程级跨用例耦合
+    #    (一条用例把 _next_at 推后,后面所有用例陪等)。与上面那把同一条理由。
+    # ⚠️ 要测闸本身的用例请自己造实例(`PumpRateGate(clock=…, sleep=…)`),
+    #    别依赖这把单例 —— 见 tests/test_pumpfun.py::Test限速闸。
+    from src import pumpfun as _pf
+
+    monkeypatch.setattr(_pf._GATE, "_next_at", 0.0, raising=False)
+    monkeypatch.setattr(_pf._GATE, "_sleep", lambda _s: None, raising=False)
     yield
 
 

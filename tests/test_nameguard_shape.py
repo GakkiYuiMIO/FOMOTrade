@@ -57,6 +57,9 @@ CJK 判定          用 unicodedata.category(+ 字符名),**不是码点区间**
 # ruff: noqa: N802, RUF001
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from src.nameguard import safe_display
@@ -822,3 +825,99 @@ def test_别的文字体系不算中日韩():
     assert safe_display("العرب") is None, "整段阿拉伯文不许当名字"
     assert safe_display("币ا名") is None, "混进一个阿拉伯字母也不许"
     assert safe_display("币ก名") is None, "混进一个泰文字母也不许"
+
+
+# ============================================================
+# pump 用户名的专用门禁 safe_username(本轮 J8)
+# ============================================================
+# ⚠️⚠️ 语料怎么来的:2026-09-05 走 `GET /mint-positions/{$CAP}` 串行翻 9 页
+#    (每页之间隔 0.3 秒,10 个请求 14.3 秒全部 200、零拒连)拿到 423 个真实 userName,
+#    再并上 tests/fixtures 里各条链响应中的 123 个,**去重后 519 个**,
+#    原样冻结在 tests/fixtures/pump_usernames_live.json。
+#
+# ============ 实测结果(定规则的依据)============
+#   · safe_display  丢 22 / 519 = **4.24%** —— 其中 20 条只是带 `_`
+#     (`AR_04` / `Bart_da_charts` / `_togi_` …),另外 2 条是 6 位数字
+#     (`Mike777777` / `six666888eight`);
+#   · safe_username 丢 **0 / 519 = 0.00%**,而 45 条 _MUST_BLOCK 硬基线**零泄漏**。
+#
+# ============ 519 条语料的形态分布(封闭形状的依据)============
+#   · 含空白的      0 条        · 含非 ASCII 的  0 条       · 含 `.` 的  0 条
+#   · 字母数字之外只出现过一个字符:`_`(27 次)
+#   · 长度 3 ~ 15(pump 自己就卡在 15);数字总量 {0:349,1:29,2:28,3:36,4:31,5:44,6:2}
+_USERNAME_CORPUS = json.loads(
+    (Path(__file__).parent / "fixtures" / "pump_usernames_live.json")
+    .read_text(encoding="utf-8"))
+
+
+def test_用户名语料的规模与形态():
+    """⚠️ 语料本身也要钉住:有人往里加几条编的,下面两条丢弃率就没有意义了"""
+    from src.nameguard import safe_username
+
+    assert len(_USERNAME_CORPUS) == 519
+    assert len(set(_USERNAME_CORPUS)) == 519, "语料里有重复"
+    assert [n for n in _USERNAME_CORPUS if not n.isascii()] == []
+    assert [n for n in _USERNAME_CORPUS if any(c.isspace() for c in n)] == []
+    assert [n for n in _USERNAME_CORPUS if "." in n] == []
+    assert max(len(n) for n in _USERNAME_CORPUS) == 15
+    assert len([n for n in _USERNAME_CORPUS if "_" in n]) == 20
+    assert safe_username is not None
+
+
+def test_实测丢弃率为零():
+    """
+    ⚠️⚠️ 这条是 J8 的判据本身:目标 ≤ 1%,实测 0%。
+       任何一条把规则收紧的改动(字符白名单里去掉 `_`、长度上限压到 15 以下、
+       数字上限压到 5)都会在这里当场红。
+    """
+    from src.nameguard import safe_username
+
+    dropped = [n for n in _USERNAME_CORPUS if safe_username(n) is None]
+    assert dropped == [], f"丢了 {len(dropped)} 条真实用户名:{dropped[:20]}"
+
+
+def test_同一份语料safe_display要丢掉四点二四个百分点():
+    """
+    ⚠️⚠️ 反方向:这条钉住"换门禁不是瞎折腾"。上一版走 safe_display,
+       519 条里丢 22 条 —— 每一条都是一行**认不出人**的持仓记录。
+       它同时保证 safe_display 自己没被悄悄放松(放松了这条也红)。
+    """
+    from src.nameguard import safe_display
+
+    dropped = [n for n in _USERNAME_CORPUS if safe_display(n) is None]
+    assert len(dropped) == 22, dropped
+    assert len([n for n in dropped if "_" in n]) == 20
+
+
+@pytest.mark.parametrize(("raw", "rule"), _MUST_BLOCK, ids=[r[1] for r in _MUST_BLOCK])
+def test_用户名门禁也要拦住全部硬基线(raw, rule):
+    """⚠️⚠️ 45 条一条都不许漏 —— 换门禁绝不能换掉安全性"""
+    from src.nameguard import safe_username
+
+    assert safe_username(raw) is None, f"{raw!r} 本该被拦住({rule})"
+
+
+@pytest.mark.parametrize(("raw", "why"), [
+    ("13800138000", "纯数字的用户名:11 位数字全在白名单字符里,只有数字总量那条拦得住"),
+    ("0xabcd", "EVM 地址形态(4 位起),白名单字符全在里面"),
+    ("7a6a3b93cb3ffead", "裸 hex 16 位刚好踩线"),
+    ("CTPoyCwkjMvoJwU4xvZZqoD8tiYk6yDchySiN5gGpump", "base58 地址(26 位起)"),
+    ("ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJj", "34 个字符 —— 超过上限 32"),
+    ("", "空串"),
+    ("   ", "全是空白"),
+    ("已清仓", "非 ASCII:封闭形状之外"),
+    ("A B", "带空格 —— safe_ident 会放行,这一道不许"),
+])
+def test_封闭形状之外的一律拦住(raw, why):
+    from src.nameguard import safe_username
+
+    assert safe_username(raw) is None, f"{raw!r} 本该被拦住({why})"
+
+
+@pytest.mark.parametrize("raw", ["AR_04", "_togi_", "glitch___", "Bart_da_charts",
+                                 "1000XCryptoD", "six666888eight", "Mike777777",
+                                 "abc", "ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKk"])
+def test_正常用户名原样放行(raw):
+    from src.nameguard import safe_username
+
+    assert safe_username(raw) == raw

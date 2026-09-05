@@ -1,0 +1,7 @@
+{
+ "statusCode": 400,
+ "timestamp": "2026-09-05T03:51:26.903Z",
+ "path": "/mint-positions/DEADBEEFnotarealmintaddress1234567890?sortBy=TOP&pageSize=50&updatesLimit=0&page=0",
+ "message": "mint is not a valid base58 or EVM mint address",
+ "error": "Bad Request"
+}

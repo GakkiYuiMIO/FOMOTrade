@@ -2948,3 +2948,164 @@ class Test底池对手:
         dex = _FakeDex([[_pair("bsc", MINT_BSC, CA_SPCXB, "S", "<script>alert(1)</script>")]])
         _watcher_with_dex(tg, client, dex).run_once()
         assert "<script>" not in tg.sent[0]
+
+
+# ============================================================
+# 打 pump.fun 的进程级限速闸(本轮 J2)
+# ============================================================
+# ⚠️⚠️ 这一组守的是一件**用户看不见、却比"命令慢一点"严重得多**的事:
+#    /chips 的 💊 半边与这里的推送监控打的是**同一个主机、同一个出口 IP**。
+#    2026-09-05 实测:一条 /chips 按当时的策略发 61 个匿名请求、并发 10,
+#    把 frontend-api-v3.pump.fun 打到**主机级拒连**,那段时间推送监控一起瞎掉。
+# ⚠️ 断言里的间隔、上限一律**写死字面量**,不从 src.pumpfun import 常量。
+class _RecordingGate:
+    """记账用的假闸。ok=False 时永远拿不到。"""
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = 0
+
+    def acquire(self) -> bool:
+        self.calls += 1
+        return self.ok
+
+
+class _Resp2:
+    def __init__(self, payload, status=200):
+        self.status_code = status
+        self._payload = payload
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+
+class _Sess2:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls: list = []
+
+    def get(self, url, **kw):
+        self.calls.append(url)
+        return _Resp2(self.payload)
+
+    def post(self, url, **kw):
+        self.calls.append(url)
+        return _Resp2(self.payload)
+
+    def close(self):
+        pass
+
+
+def _gated_client(gate, payload=None):
+    c = pf.PumpClient(proxy="", gate=gate)
+    sess = _Sess2(payload if payload is not None else {"positions": [], "totalCount": 0})
+    c._tl.session = sess
+    return c, sess
+
+
+class Test限速闸:
+    def test_默认拿到的就是模块那把单例(self):
+        """⚠️⚠️ 做成实例级 = 两个 PumpClient 各一把 = 闸形同虚设(tokeninfo._GATE 同一条教训)"""
+        a = pf.PumpClient(proxy="")
+        b = pf.PumpClient(proxy="")
+        assert a._gate is b._gate
+        assert a._gate is pf._GATE
+
+    def test_推送监控自己建的client也是同一把闸(self, db, cfg):
+        """
+        ⚠️⚠️ 这是"共用"两个字的**全部意义**:命令侧把主机打挂,推送监控跟着瞎掉。
+           watcher 不传 client 时自己 new 一个 PumpClient —— 它必须落在同一把闸上。
+        """
+        cfg()
+        w = pf.PumpWatcher(FakeNotifier())
+        try:
+            assert w._client._gate is pf._GATE
+            assert w._client._gate is pf.PumpClient(proxy="")._gate
+        finally:
+            w.close()
+
+    def test_命令侧与推送侧的每个请求都过同一把闸(self):
+        """
+        ⚠️ 两条路各挑一个真实入口:mint-positions 是 /chips 的 💊 半边走的,
+           user-portfolio 与 callout/list 是推送监控每轮按人打的。
+        """
+        gate = _RecordingGate()
+        c, sess = _gated_client(gate)
+        c.fetch_mint_positions("0x2f219c706e052dc25372a0c59dcc2afe0cab12f3", 0)
+        c.fetch_coin_payload("0x2f219c706e052dc25372a0c59dcc2afe0cab12f3")
+        c.fetch_portfolio("21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm")
+        c.fetch_callouts(HEX_UID)
+        c.resolve_user("hexiecs")
+        assert gate.calls == 5, "有请求绕过了闸"
+        assert len(sess.calls) == 5
+
+    def test_拿不到闸就一个字节都不发(self):
+        """⚠️ 与"这次没拿到"同义:返回 None,走既有的失败路径(在 /chips 那边会被记成一页没取到)"""
+        gate = _RecordingGate(ok=False)
+        c, sess = _gated_client(gate)
+        assert c.fetch_mint_positions("0x2f219c706e052dc25372a0c59dcc2afe0cab12f3", 0) is None
+        assert c.fetch_portfolio("21rgbFW6sujQovCw3qt6R2EdE97Yzzvk8sSc37Bb72Cm") is None
+        assert sess.calls == [], "闸都没拿到还把请求发出去了"
+
+    def test_闸真的把两次请求隔开(self):
+        """⚠️ 注入假时钟与假 sleep:第二次必须被推后一个间隔,不靠真等"""
+        slept: list[float] = []
+        now = [0.0]
+        g = pf.PumpRateGate(interval=0.15, max_wait=2.0,
+                            clock=lambda: now[0], sleep=slept.append)
+        assert g.acquire() is True
+        assert slept == []
+        assert g.acquire() is True
+        assert slept == [0.15], "第二次没有被推后一个间隔"
+
+    def test_排队太久就放弃而不是无限等(self):
+        """⚠️ 绝不无限等:/chips 有墙钟预算,推送监控挂在 tick 的墙钟上"""
+        now = [0.0]
+        g = pf.PumpRateGate(interval=10.0, max_wait=2.0,
+                            clock=lambda: now[0], sleep=lambda s: None)
+        assert g.acquire() is True
+        assert g.acquire() is False, "要等 10 秒还傻等着"
+
+    def test_出厂参数下排队上限真的会触发(self):
+        """
+        ⚠️⚠️ 上一版这道上限**数学上不可达**,而当时的用例是用 interval=10.0
+           (非默认值)、单线程连调两次过关的 —— 那种形状旧代码照样绿。
+           真实缺陷只在**并发排队**时露出来:旧版把 sleep 写在锁**里**,
+           排队时间被锁吸收、根本不进 `wait`,于是每个人看到的 wait 恒 <= 一个间隔。
+           实测(40 线程 / 出厂参数):旧版返回 False 的 **0 个**、单线程真等了 5.85 秒;
+           订位式是 26 个放弃、最长等待 1.95 秒(守住 2.0)。
+        ⚠️ 这里用**出厂参数**(一个都不传)+ 不前进的假时钟来制造排队深度:
+           第 N 次订位的等待 = N x 0.15 秒,超过 2.0 秒就该放弃。
+           2.0 / 0.15 = 13.33 → 前 14 次(0..13 个间隔)拿得到,第 15 次该 False。
+        ⚠️ 断言写死 14 / 15,不 import interval 与 max_wait。
+        """
+        slept: list[float] = []
+        g = pf.PumpRateGate(clock=lambda: 0.0, sleep=slept.append)   # 时钟不动 = 全在排队
+        got = [g.acquire() for _ in range(20)]
+        assert got[:14] == [True] * 14, f"出厂参数下前 14 次该拿得到,实际 {got[:14]}"
+        assert got[14] is False, "排到 2 秒开外还不放弃 —— 上限又不可达了"
+        assert all(x is False for x in got[14:]), got[14:]
+        # 放弃的人**不占坑**:否则每个失败者也把 _next_at 推后,队列会自己越滚越长。
+        # ⚠️ 14 次拿到只睡 13 次 —— **第一次 wait=0 不睡**(队列是空的),别写成 14。
+        assert len(slept) == 13, f"放弃的那几次也睡了/占位了,slept={slept}"
+        assert slept[0] == pytest.approx(0.15), slept[0]
+        assert slept[-1] == pytest.approx(1.95), slept[-1]
+
+    def test_默认间隔与等待上限(self):
+        """
+        ⚠️⚠️ 钉住**默认值**:不传参数,用假时钟观察。
+           间隔 0.15 秒(峰值 6.7 请求/秒);等待上限 2.0 秒。
+        """
+        slept: list[float] = []
+        now = [0.0]
+        g = pf.PumpRateGate(clock=lambda: now[0], sleep=slept.append)
+        g.acquire()
+        g.acquire()
+        assert slept == [0.15]
+        now[0] = 0.0
+        g2 = pf.PumpRateGate(clock=lambda: now[0], sleep=lambda s: None)
+        g2._next_at = 2.0                      # 还要等 2.0 秒:恰好等于上限,放行
+        assert g2.acquire() is True
+        g2._next_at = 2.01                     # 多 0.01 秒:放弃
+        assert g2.acquire() is False
