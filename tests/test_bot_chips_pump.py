@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -459,3 +460,349 @@ class Test分母超预算:
         assert _has(out, "   ⚠️ pump 没给总供应量,占比算不出来")
         assert _line(out, "你的 pump 名单") == "👥 你的 pump 名单 · 1 人持有"
         assert _has(out, "「1000XCryptoD」")
+
+
+# ============================================================
+# 7. 两半边的**顺序**(本轮 J1 的 BLOCKER)
+# ============================================================
+def _idx(out: str, needle: str) -> int:
+    for i, ln in enumerate(out.split("\n")):
+        if needle in ln:
+            return i
+    raise AssertionError(f"没有含 {needle!r} 的行:\n{out}")
+
+
+def _fomo_two():
+    """FOMO 半边:3 个持有人,其中 2 个在名单里(alice 持仓多、bob 少)"""
+    return FakeFomo({"4663": {"topHolders": [_holder("f-1", "alice", 3000.0, 30.0),
+                                             _holder("f-2", "bob", 1000.0, 10.0),
+                                             _holder("f-9", "zeta", 500.0, 5.0)],
+                              "totalHolders": 3}})
+
+
+class Test两半边的顺序:
+    """
+    ⚠️⚠️ 三个复验者各自独立打出来的 BLOCKER:pump 三段接进 **head** 之后,
+       🏦 FOMO 名单的成员明细行(_ca_assemble 的 body)整段被挤到
+       「👥 你的 pump 名单」表头**下面** —— 而两边的行形(三个空格缩进 + ` · `)
+       一模一样,读者无从分辨。那不是排版难看,是**把 A 平台的人算到 B 平台名下**。
+    ⚠️ 上一版的 38 条 bot 用例里 FOMO 名单**恒为空**,所以这个组合一次都没被跑到。
+       这里两边名单**都非空**。
+    """
+
+    def _out(self, monkeypatch, tmp_path):
+        pump = FakePump({0: _page(1, [_pos(UID_1000X, name="1000XCryptoD",
+                                           held=5e7, pnl=235.08)])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_two(), pump=pump,
+                 members=[("f-1", "alice"), ("f-2", "bob")],
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        return b._cmd_chips(f"{CA_CAP} robinhood")
+
+    def test_逐行顺序_FOMO整段在前pump整块在后(self, monkeypatch, tmp_path):
+        out = self._out(monkeypatch, tmp_path)
+        _assert_tg_ok(out)
+        order = ["🏦 FOMO 平台", "👥 你的名单", "@alice", "@bob",
+                 "💊 pump.fun 平台", "👥 你的 pump 名单", "「1000XCryptoD」"]
+        got = [_idx(out, x) for x in order]
+        assert got == sorted(got), f"顺序不对({order} → {got}):\n{out}"
+
+    def test_FOMO的成员行紧跟在自己的名单头后面(self, monkeypatch, tmp_path):
+        """⚠️ 不只是"在 pump 之前":中间**一行都不许插**,插进去就是换了个归属"""
+        out = self._out(monkeypatch, tmp_path)
+        lines = out.split("\n")
+        head = _idx(out, "👥 你的名单")
+        assert lines[head + 1].startswith("   @alice")
+        assert lines[head + 2].startswith("   @bob")
+
+    def test_pump的成员行紧跟在pump名单头后面(self, monkeypatch, tmp_path):
+        out = self._out(monkeypatch, tmp_path)
+        lines = out.split("\n")
+        head = _idx(out, "👥 你的 pump 名单")
+        assert lines[head + 1].startswith("   「1000XCryptoD」")
+
+    def test_两个名单头之间只有FOMO自己的人(self, monkeypatch, tmp_path):
+        """
+        ⚠️⚠️ 反方向的不变量:「👥 你的名单」与「💊 pump.fun 平台」之间的每一行
+           都必须是 FOMO 的人。上一版这里躺着的是 pump 的表头与 pump 的人。
+        """
+        out = self._out(monkeypatch, tmp_path)
+        lines = out.split("\n")
+        seg = lines[_idx(out, "👥 你的名单") + 1:_idx(out, "💊 pump.fun 平台")]
+        assert seg == ["   @alice · 3,000 枚 · $30.00", "   @bob · 1,000 枚 · $10.00"], seg
+
+    def test_人多时收口行也留在FOMO那一段(self, monkeypatch, tmp_path):
+        """⚠️ 「还有 N 人未显示」说的是 FOMO 的人,排到 pump 下面就变成在说 pump 的人"""
+        holders = [_holder(f"f-{i}", f"user{i:02d}", 3000.0 - i, 30.0) for i in range(14)]
+        fomo = FakeFomo({"4663": {"topHolders": holders, "totalHolders": 14}})
+        pump = FakePump({0: _page(1, [_pos(UID_1000X, name="1000XCryptoD", held=5e7)])},
+                        _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=fomo, pump=pump,
+                 members=[(f"f-{i}", f"user{i:02d}") for i in range(14)],
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        _assert_tg_ok(out)
+        assert _idx(out, "还有 4 人未显示") < _idx(out, "💊 pump.fun 平台")
+
+
+class Test出口预算里pump那几行的位置:
+    """
+    ⚠️⚠️ pump 那几行现在走 _ca_assemble 的 mid 段,而 mid 与 tail 一样**先被预留**。
+       超预算时先让成员行少展开几个人 —— 成员行自带一句诚实的「还有 N 人未显示」,
+       而 mid 被末尾那个 while 从下往上 pop 掉时是**静默**的,
+       最先被 pop 的恰恰是「⚠️ 平台只给了人数、没给持仓明细」那句告警:
+       告警没了、表头还在,读者会把一个有保留的结论当成确定的。
+    """
+
+    def test_预算不够时先砍成员行而不是静默掉pump那几行(self):
+        from src.bot import _ca_assemble, _chips_member_row
+
+        # 一段撑得很满的 head(每行都在单行上限之内)+ 一段不算短的 mid
+        head = ["H" * 900, "E" * 900, "A" * 100]
+        mid = [f"💊 第 {i} 行 " + "P" * 180 for i in range(8)]
+        rows = [{"handle": f"user{i:02d}", "amount": 1000.0, "value": 10.0}
+                for i in range(10)]
+        out = _ca_assemble(head, rows, [], "<code>0xdead</code>",
+                           render=_chips_member_row, max_rows=10,
+                           omit_fmt="…按持仓数量排序,还有 {n} 人未显示", mid=mid)
+        assert len(out) <= 3696, f"撑破了预算(实际 {len(out)})"
+        for line in mid:
+            assert line in out, f"pump 那一段被静默掉了一行:{line[:20]}…"
+        assert "人未显示" in out, "成员行被砍了却没如实收口"
+        assert out.endswith("</code>")
+
+
+# ============================================================
+# 8. 「我们只看到一部分人」的六种原因(本轮 J3 / J5 / J7)
+# ============================================================
+class _SlowRest(FakePump):
+    """第一页立刻返回,后面的页各睡 0.4 秒 —— 用来把墙钟预算撞在**翻页**那一段"""
+
+    def fetch_mint_positions(self, mint, page=0, page_size=50):
+        if page:
+            time.sleep(0.4)
+        return super().fetch_mint_positions(mint, page, page_size)
+
+
+class _FlakyRest(FakePump):
+    """第 1、2 页请求挂掉(我们这边的故障),其余照常"""
+
+    def fetch_mint_positions(self, mint, page=0, page_size=50):
+        if page in (1, 2):
+            raise RuntimeError("我们这边的网络挂了")
+        return super().fetch_mint_positions(mint, page, page_size)
+
+
+def _warn_text(out: str) -> str:
+    """回执里那句「看不全」的提示(去掉它前面的占比段)"""
+    for ln in out.split("\n"):
+        if "⚠️" in ln and "总供应量" not in ln and "没给持仓明细" not in ln:
+            return "⚠️" + ln.split("⚠️", 1)[1]
+    raise AssertionError(f"没有「看不全」的提示行:\n{out}")
+
+
+_ROWS50 = [_pos(f"u{i}") for i in range(50)]
+
+
+def _scene(name):
+    """六种「看不全」的成因,各造一份 pump 桩"""
+    if name == "平台没给总数":
+        return FakePump({0: {"positions": [_pos("a"), _pos("b")]}}, _coin())
+    if name == "我们有页没取到":
+        return _FlakyRest({0: _page(200, _ROWS50), 3: _page(200, [_pos("z")])}, _coin())
+    if name == "撞预算":
+        return _SlowRest({p: _page(300, _ROWS50) for p in range(6)}, _coin())
+    if name == "轻档":
+        return FakePump({0: _page(9000, _ROWS50)}, _coin())
+    if name == "自报比明细少":
+        return FakePump({0: _page(1, [_pos("a"), _pos("b")])}, _coin())
+    if name == "平台没给全":
+        return FakePump({0: _page(107, [_pos("a")])}, _coin())
+    raise AssertionError(name)
+
+
+_ALL_SCENES = ["平台没给总数", "我们有页没取到", "撞预算", "轻档",
+               "自报比明细少", "平台没给全"]
+
+
+class Test看不全的六种原因:
+    """
+    ⚠️⚠️ 上一版只参数化了 2 种(轻档 / 平台没给全):把「撞预算」与「平台没给总数」
+       那两句改成与第三句一模一样,全量 4106 条**全绿**。
+       读者靠这句话判断"要不要自己再查一次" —— 写成同一句就是在编原因。
+    """
+
+    def _out(self, monkeypatch, tmp_path, scene):
+        from src import pumpchips
+
+        if scene == "撞预算":
+            monkeypatch.setattr(pumpchips, "BUDGET_SEC", 0.15)
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=_scene(scene),
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        return b._cmd_chips(f"{CA_CAP} robinhood")
+
+    @pytest.mark.parametrize(("scene", "expect"), [
+        ("平台没给总数", "⚠️ 平台没给总数,2 人只是下界"),
+        ("我们有页没取到", "⚠️ 我们这边有 2 页没取到,只统计到 51/200 人,真实值更高"),
+        ("撞预算", "⚠️ 时间不够,只统计到 50/300 人,真实值更高"),
+        ("轻档", "⚠️ 人多,仅统计前 50 名,真实值更高"),
+        ("自报比明细少", "⚠️ 平台自报的人数比明细还少,这份数据自相矛盾,已按 2 人算"),
+        ("平台没给全", "⚠️ 平台只给出 1/107 人的明细,真实值更高"),
+    ])
+    def test_每一种原因各有各的话(self, monkeypatch, tmp_path, scene, expect):
+        out = self._out(monkeypatch, tmp_path, scene)
+        assert _has(out, expect), f"{scene}:\n{out}"
+
+    def test_六种原因两两不同(self, monkeypatch, tmp_path):
+        """⚠️ 覆盖**全部**分支,不是 2/6"""
+        seen = {}
+        for scene in _ALL_SCENES:
+            seen[scene] = _warn_text(self._out(monkeypatch, tmp_path, scene))
+        assert len(set(seen.values())) == len(_ALL_SCENES), f"有两种原因说了同一句话:{seen}"
+
+
+class Test页失败时不许说前N名内无人:
+    """
+    ⚠️⚠️ 「前 N 名内无人」有个前提:手上这批人得真的是按持仓排下来的一个**连续前缀**。
+       第 1 页没取到、第 2 页取到了,手上这批人中间是有窟窿的 ——
+       这时说「前 N 名内无人」是**假陈述**。
+    """
+
+    def test_页失败时改说已看到的多少人里没有(self, monkeypatch, tmp_path):
+        pump = _FlakyRest({0: _page(200, _ROWS50), 3: _page(200, [_pos("z")])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _line(out, "你的 pump 名单") == \
+            "👥 你的 pump 名单 · 已看到的 51 人里没有,没能确认"
+        assert "名内无人" not in out
+
+    def test_页失败时命中的那句也不说前N名(self, monkeypatch, tmp_path):
+        rows = [_pos(UID_1000X, held=1e8)] + _ROWS50[:49]
+        pump = _FlakyRest({0: _page(200, rows), 3: _page(200, [_pos("z")])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _line(out, "你的 pump 名单") == \
+            "👥 你的 pump 名单 · 1 人在已看到的 51 人里 · ≥10.0%"
+
+    def test_一页都没挂时照旧说前N名内(self, monkeypatch, tmp_path):
+        """⚠️ 反方向:没有窟窿时「前 N 名内」是**真陈述**,不许被这条改掉"""
+        pump = FakePump({0: _page(9000, _ROWS50)}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _line(out, "你的 pump 名单") == "👥 你的 pump 名单 · 前 50 名内无人"
+
+
+class Test平台没给总数的两条分支:
+    """⚠️ `total is None` 的两条文案(表头 + 提示)上一版**全项目零测试**"""
+
+    def test_表头与提示各说各的(self, monkeypatch, tmp_path):
+        pump = FakePump({0: {"positions": [_pos("a"), _pos("b")]}}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        _assert_tg_ok(out)
+        assert _line(out, "💊") == "💊 pump.fun 平台 · 持有人 ≥2(平台没给总数)"
+        assert _has(out, "⚠️ 平台没给总数,2 人只是下界")
+
+
+class Test平台确认没人:
+    """
+    ⚠️⚠️ `totalCount=0` 是**已确认**的事实(实测 200 `{"positions":[],"totalCount":0}`),
+       不是"没查到"。上一版名单那行打的是「没有持仓明细,判断不了」——
+       与上一行「持有人 0」自相矛盾。
+    """
+
+    def test_持有人0时名单说的是无人持有(self, monkeypatch, tmp_path):
+        pump = FakePump({0: fx("pump_mint_positions_zero")}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        _assert_tg_ok(out)
+        assert _line(out, "💊") == "💊 pump.fun 平台 · 持有人 0"
+        assert _line(out, "你的 pump 名单") == "👥 你的 pump 名单 · 无人持有"
+        assert "判断不了" not in out
+
+    def test_平台自报有人却不给明细时仍然说判断不了(self, monkeypatch, tmp_path):
+        """⚠️ 反方向:「平台上确实没人」与「我们没拿到明细」是两件事,不许被上一条合并掉"""
+        pump = FakePump({0: _page(107, [])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD")])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _line(out, "你的 pump 名单") == "👥 你的 pump 名单 · 没有持仓明细,判断不了"
+
+
+class Test软删除的人不算在名单里:
+    """
+    ⚠️⚠️ /pump del 是**软删除**(store.remove_pump_user 只把 active 置 0)。
+       少了 `active = 1` 这个条件,已经移出监控的人会继续出现在「你的 pump 名单」里
+       —— 而上一版这条件**零覆盖**。
+    """
+
+    def test_移出监控的人不再出现(self, monkeypatch, tmp_path):
+        from src import store
+
+        pump = FakePump({0: _page(2, [_pos(UID_1000X, name="1000XCryptoD", held=5e7),
+                                      _pos(UID_STRANGER, name="ZzTop", held=1e7)])},
+                        _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, "1000XCryptoD"), (UID_STRANGER, "ZzTop")])
+        before = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _line(before, "你的 pump 名单") == "👥 你的 pump 名单 · 2 人持有 · 6.000%"
+        assert _has(before, "「ZzTop」")
+
+        with store.get_conn() as conn:
+            with store.tx(conn):
+                store.remove_pump_user(conn, UID_STRANGER)
+        after = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert not _has(after, "「ZzTop」"), f"软删除的人还在名单里:\n{after}"
+        assert _line(after, "你的 pump 名单") == "👥 你的 pump 名单 · 1 人持有 · 5.000%"
+
+
+class Test用户名的展示上限:
+    """⚠️ `_PUMP_CHIP_NAME_CHARS = 24` 上一版零覆盖(截断是**可达**的)"""
+
+    def test_超过24个字符就截断(self, monkeypatch, tmp_path):
+        long_name = "ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLl"          # 30 个字符
+        pump = FakePump({0: _page(1, [_pos(UID_1000X, name=long_name, held=5e7)])},
+                        _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, long_name)])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        _assert_tg_ok(out)
+        assert _has(out, "「ZzYyXxWwVvUuTtSsRrQqPpOo…」"), out
+        assert long_name not in out
+
+    def test_正好24个字符不截断(self, monkeypatch, tmp_path):
+        name24 = "ZzYyXxWwVvUuTtSsRrQqPpOo"                   # 24 个字符
+        pump = FakePump({0: _page(1, [_pos(UID_1000X, name=name24, held=5e7)])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, name24)])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        assert _has(out, f"「{name24}」")
+        assert "…" not in _line(out, name24)
+
+
+# ============================================================
+# 9. pump 用户名的门禁换成 safe_username(本轮 J8)
+# ============================================================
+class Test带下划线的用户名不再被误杀:
+    """
+    ⚠️⚠️ 实测(2026-09-05,519 个真实 pump userName,
+       见 tests/fixtures/pump_usernames_live.json):
+       safe_display 丢 22 条 = **4.24%**,其中 20 条只是带 `_`;safe_username 丢 **0 条**。
+       被丢的后果不是"少一行":那一行退回「未知用户」,读者看到的是一条**认不出人**的
+       持仓记录,而"认出是谁"正是名单功能的全部意义。
+    """
+
+    @pytest.mark.parametrize("name", ["AR_04", "Bart_da_charts", "_togi_",
+                                      "glitch___", "six666888eight", "Mike777777"])
+    def test_真实用户名原样显示(self, monkeypatch, tmp_path, name):
+        pump = FakePump({0: _page(1, [_pos(UID_1000X, name=name, held=5e7)])}, _coin())
+        b = _bot(monkeypatch, tmp_path, fomo=_fomo_ok(), pump=pump,
+                 pump_members=[(UID_1000X, name)])
+        out = b._cmd_chips(f"{CA_CAP} robinhood")
+        _assert_tg_ok(out)
+        assert _has(out, f"「{name}」"), out
+        assert "未知用户" not in out

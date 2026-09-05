@@ -1873,13 +1873,18 @@ class CommandBot:
                 f"{_ca_clip(_chain_name(net), CA_CHAIN_CHARS)}"]
         head += _chips_platform_lines(st, err)
         head += _chips_watch_lines(st, err)
-        # ⚠️⚠️ 💊 pump 那半边接在这里,而且**只接在这条成功路径上**:
-        #    上面几条早退分支(一条链都没定下来 / 接口挂了)返回的是**诊断消息**,
-        #    在一条"没查到、可能猜错链"的消息后面挂一段别的平台的筹码只会更难读。
+        # ⚠️⚠️ 💊 pump 那半边**只接在这条成功路径上**:上面几条早退分支
+        #    (一条链都没定下来 / 接口挂了)返回的是**诊断消息**,在一条"没查到、
+        #    可能猜错链"的消息后面挂一段别的平台的筹码只会更难读。
         #    代价是:一个只在 pump 上、FOMO 完全没有的币仍然看不到 💊 那半边 ——
         #    这是刻意的取舍(见 README「已知取舍」),换来的是既有行为一个字节都不变。
-        # ⚠️ 它排在 FOMO 半边之后,所以 pump 挂掉/超时最坏只是少了 💊 那几行。
-        head += _pump_chips_lines(self._pump, ca, pump_members)
+        # ⚠️⚠️ 它走 **mid** 而不是 head(本轮 J1 修的 BLOCKER)。接进 head 的那一版
+        #    把 🏦 FOMO 名单的成员明细行(= _ca_assemble 的 body)整段挤到了
+        #    「👥 你的 pump 名单」表头**下面**,而两边行形一模一样 ——
+        #    FOMO 的人被读成 pump 平台的持有人。不变式在 _ca_assemble 的 docstring 里,
+        #    tests/test_bot_chips_pump.py 有一条逐行顺序的用例钉着。
+        # ⚠️ 它仍然排在 FOMO 半边之后,所以 pump 挂掉/超时最坏只是少了 💊 那几行。
+        pump_lines = _pump_chips_lines(self._pump, ca, pump_members)
 
         tail: list[str] = []
         # ⚠️ 两条注脚都在解释「占比这个数怎么来的」,所以**共用同一道守卫**:
@@ -1895,7 +1900,8 @@ class CommandBot:
 
         return _ca_assemble(head, st["matched"], tail, anchor,
                             render=_chips_member_row, max_rows=MAX_CHIPS_MEMBER_ROWS,
-                            omit_fmt="…按持仓数量排序,还有 {n} 人未显示")
+                            omit_fmt="…按持仓数量排序,还有 {n} 人未显示",
+                            mid=pump_lines)
 
     def _chips_fetch(self, ca: str, candidates: list[str]):
         """
@@ -2337,9 +2343,27 @@ def _ca_size(lines: list[str]) -> int:
 
 def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str, *,
                  render=None, max_rows: int = MAX_CA_THESIS_ROWS,
-                 omit_fmt: str = "…按投入本金排序,还有 {n} 位未显示") -> str:
+                 omit_fmt: str = "…按投入本金排序,还有 {n} 位未显示",
+                 mid: list[str] | None = None) -> str:
     """
-    头部 + 可变长的主体行 + 尾部 + CA 锚点 → 最终消息。
+    头部 + 可变长的主体行 +(mid)+ 尾部 + CA 锚点 → 最终消息。
+
+    ## mid 是什么,为什么不能拼进 head(本轮 J1)
+    主体行(rows)永远排在 head 之后。所以谁把"另一段完整的东西"接在 head 尾巴上,
+    它就会把 rows **抽到自己下面**。/chips 就踩过这个:💊 pump 三段接进 head 之后,
+    🏦 FOMO 名单的成员明细行(rows)全部被印在「👥 你的 pump 名单」那行下面,
+    而两边的行形(三个空格缩进 + ` · ` 分隔)**一模一样** —— 读者无从分辨,
+    连"还有 N 人未显示"都一起挪过去了。那不是排版难看,是**把 A 平台的人算到 B 平台名下**。
+    mid 就是那一段的位置:排在 rows(及它的收口行)**全部之后**、tail 之前。
+
+    ## 超预算时先截谁
+    mid 与 tail 一样在 room 里**先被预留**,也就是说预算不够时先让 rows 少展开几个人。
+    理由:rows 自己带一套**诚实的收口机制**("…还有 N 人未显示"),少展开一个人
+    读者看得见;而 mid 那几行没有 —— 它被末尾那个 while 循环从下往上 pop 掉时是**静默**的,
+    而且最先被 pop 的恰恰是成员行与那句「⚠️ 平台只给了人数、没给持仓明细」的告警 ——
+    告警没了、表头还在,读者会把一个有保留的结论当成确定的。容得下就全写、容不下就
+    把压力转给一个会自己报数的地方,比静默地掩掉一句告警强。
+    (末尾那个 while 仍然是最后的兜底:哪一段自己就胀破预算时,按整行砍仍然成立。)
 
     render / max_rows / omit_fmt 三个关键字参数只是把"主体行长什么样"外置出去,
     好让 /chips 复用同一套出口不变式 —— 不变式的价值全在"已经被证明过、被测试守住",
@@ -2368,9 +2392,11 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
     """
     render = render or _ca_thesis_row
     head = [_ca_fit_line(x) for x in head]
+    mid = [_ca_fit_line(x) for x in (mid or [])]
     tail = [_ca_fit_line(x) for x in tail]
     anchor = _ca_fit_line(anchor)         # 幂等:调用方已经收过口也不会二次损坏
-    room = CA_MSG_BUDGET - _ca_size(head) - _ca_size(tail) - len(anchor) - _CA_OMIT_RESERVE
+    room = (CA_MSG_BUDGET - _ca_size(head) - _ca_size(mid) - _ca_size(tail)
+            - len(anchor) - _CA_OMIT_RESERVE)
     body: list[str] = []
     used = 0
     shown = 0
@@ -2393,6 +2419,9 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
     omitted = len(rows) - shown
     if omitted:
         lines.append(omit_fmt.format(n=omitted))
+    # ⚠️⚠️ mid 必须排在**收口行之后**:"还有 N 人未显示"说的是 rows,
+    #    排到 mid 下面就变成在说 mid 那一段的人。
+    lines.extend(mid)
     lines.extend(tail)
     # 兜底:哪一段自己就撑破预算都照样只按整行砍(_ca_size(lines) + len(anchor)
     # 恰好等于 "\n".join(lines + [anchor]) 的长度,不是估算)
@@ -2622,23 +2651,39 @@ def _chips_watch_lines(st: dict, err: str | None) -> list[str]:
 
 def _pump_coverage_warn(ch) -> str:
     """
-    「我们只看到了一部分人」这句提示。⚠️ 三种"看不全"的原因**措辞必须不同** ——
+    「我们只看到了一部分人」这句提示。⚠️ 每一种"看不全"的原因**措辞必须不同** ——
     读者据此判断"要不要自己再查一次":
 
-      · 轻档       —— 是**我们**主动只看前 50 名(币太大,全翻会拖住这条同步命令);
-      · 撞预算     —— 我们本来要全翻,时间不够;
-      · 平台没给全 —— 我们该翻的都翻完了,是**平台**只给出这么多明细
-                      (实测很常见:totalCount=107 的币明细只有 1 条,见 pumpchips 模块头)。
+      · 平台没给总数 —— 连分母都没有,手上这些人只是下界;
+      · 我们有页没取到 —— **我们这边**的请求挂了(或限速闸没排上)。再查一次很可能就全了;
+      · 撞预算       —— 我们本来要全翻,时间不够;
+      · 轻档         —— 是**我们**主动只看前 50 名(币太大,全翻会拖住这条同步命令);
+      · 自报比明细还少 —— 平台给的总数比我们手上的条数还小,这份数据**自相矛盾**;
+      · 平台没给全   —— 我们该翻的都翻完了、每一页都拿到了,是**平台**只给出这么多明细
+                        (实测很常见:totalCount=107 的币明细只有 1 条,见 pumpchips 模块头)。
 
-    把三件事写成同一句"仅统计前 N 名"就是在编原因。
+    把它们写成同一句"仅统计前 N 名"就是在编原因。
+    ⚠️⚠️ 第二条(failed_pages)是本轮 J3 补的:上一版 _page 把任何一页的失败
+       **吞成空页且不留痕迹**,于是"我们自己挂了"被静默并进"平台只给出 N/M 人的明细"——
+       读者据此以为"再查也没用",而真相恰恰相反。
+    ⚠️⚠️ 第五条(自报比明细还少)是本轮 J7 补的:pumpchips 在 total < covered 时
+       会把 total 抬到 covered(以手上真有的条数为准),于是上一版会打出
+       「平台只给出 9/9 人的明细,真实值更高」这种**自己打自己脸**的句子。
+       ⚠️ 判据是 `covered >= total`:exact 为真时根本不会调到这个函数,
+          所以进到这里还 covered == total,只可能是被抬上来的那种自相矛盾。
     """
     covered, total = ch.covered, ch.total
     if total is None:
         return f"⚠️ 平台没给总数,{covered:,} 人只是下界"
+    if ch.failed_pages:
+        return (f"⚠️ 我们这边有 {ch.failed_pages} 页没取到,"
+                f"只统计到 {covered:,}/{total:,} 人,真实值更高")
     if ch.partial:
         return f"⚠️ 时间不够,只统计到 {covered:,}/{total:,} 人,真实值更高"
     if not ch.full_scan:
         return f"⚠️ 人多,仅统计前 {covered:,} 名,真实值更高"
+    if covered >= total:
+        return f"⚠️ 平台自报的人数比明细还少,这份数据自相矛盾,已按 {covered:,} 人算"
     return f"⚠️ 平台只给出 {covered:,}/{total:,} 人的明细,真实值更高"
 
 
@@ -2691,10 +2736,18 @@ def _pump_chips_watch_lines(ch) -> list[str]:
        写成「无人持有」就是把"我们没看见"谎报成"不存在"。
     ⚠️ 一条明细都没拿到时既不说"有"也不说"无" —— 那时「前 0 名内无人」
        是句什么都没说的话。
+    ⚠️⚠️ exact 那一支必须判在 covered==0 **之前**(本轮 J7):`totalCount=0` 是
+       「平台上确实没人托管持仓」这个**已确认**的事实(实测 200
+       `{"positions":[],"totalCount":0}`),它的 covered 也是 0 ——
+       先判 covered==0 会让这条自洽的回执打出「持有人 0」+「没有持仓明细,判断不了」
+       两句互相打架的话。exact 为真且 covered==0 只可能是 total==0 这一种情况。
+    ⚠️⚠️ 「前 N 名内」这个说法**有前提**:手上这批人得真的是按持仓排下来的一个
+       **连续前缀**。页失败(failed_pages)或撞预算(partial)时不是 ——
+       第 1 页没取到、第 2 页取到了,手上这批人中间是有窟窿的,
+       这时说「前 N 名内无人」是**假陈述**。那两种情况改说「已看到的 N 人里」,
+       并把"没能确认"四个字写出来(本轮 J3)。
     """
     matched, covered, pct = ch.matched, ch.covered, ch.watch_pct
-    if covered == 0:
-        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 没有持仓明细,判断不了"]
     if ch.exact:
         if not matched:
             return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 无人持有"]
@@ -2702,9 +2755,16 @@ def _pump_chips_watch_lines(ch) -> list[str]:
         if pct is not None:
             line += f" · {_chips_pct(pct)}"
         return [line]
+    if covered == 0:
+        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 没有持仓明细,判断不了"]
+    # 手上这批人是不是一个连续的"前 N 名"
+    prefix = not ch.failed_pages and not ch.partial
     if not matched:
-        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 前 {covered:,} 名内无人"]
-    line = f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · {len(matched)} 人在前 {covered:,} 名内"
+        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 前 {covered:,} 名内无人"] if prefix else [
+            f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 已看到的 {covered:,} 人里没有,没能确认"]
+    line = (f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · {len(matched)} 人在前 {covered:,} 名内"
+            if prefix else
+            f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · {len(matched)} 人在已看到的 {covered:,} 人里")
     if pct is not None:
         line += f" · {_chips_ge_pct(pct)}"
     return [line]

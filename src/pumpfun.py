@@ -139,6 +139,77 @@ _CHAIN_ID_DISPLAY_ONLY = {
 # 剩不到 5 说明我们打得太密(或者别的进程在共用这个出口 IP),该让用户知道。
 _RATE_LIMIT_WARN = 5
 
+# ============================================================
+# ⚠️⚠️ 打 pump.fun 的**进程级**限速闸(本轮 J2)
+# ============================================================
+# 事故实录(2026-09-05):一条 /chips 命令按当时的策略要发 61 个匿名请求
+# (60 页 mint-positions + 1 个 coins-v3),并发 10 —— 实测把
+# frontend-api-v3.pump.fun 打到**主机级拒连**(不是 429,是连不上),
+# 而 pump 的**推送监控**(PumpWatcher)用的是**同一个主机、同一个出口 IP**:
+# 命令把它打挂,推送监控在那段时间里一起瞎掉。
+# "命令慢一点"与"推送监控失明"不是一个量级的后果。
+#
+# ⇒ 闸做成**进程级单例**,挂在 PumpClient._json —— 这是两条路唯一的公共咽喉:
+#      · 命令侧:bot 的 PumpClient(/chips 的 💊 半边、/pump add)
+#      · 推送侧:PumpWatcher 的 PumpClient(每人一个持仓请求 + 每个变动 mint 的成交/市值)
+#    做成实例级 = 两个 PumpClient 各有一把闸 = 闸门形同虚设(这正是
+#    tokeninfo._GATE 那条注释里的同一条教训:限流按 IP 算,闸就必须按进程算)。
+#
+# 间隔 0.15 秒 = 峰值 6.7 请求/秒。⚠️ 依据是实测,不是拍脑袋:
+#   · 出事那次是 ~12 请求/秒持续 5 秒(61 个请求);
+#   · 2026-09-05 复测 —— **串行 + 0.3 秒间隔**打 9 页 mint-positions + 1 个 coins-v3,
+#     10 个请求 14.3 秒,全部 200,零拒连(单个请求本身耗时 0.47~3.33 秒,
+#     也就是说串行时**真实间隔已经远大于 0.15 秒**,闸对串行路径等于不存在)。
+#   · 推送监控是**严格串行**的(PumpWatcher._check 里就是个 for 循环),
+#     每个请求自己就要几百毫秒 —— 0.15 秒的闸对它几乎不产生等待。
+#     真正被这道闸压住的只有 /chips 那种**线程池并发**的突发。
+_MIN_REQUEST_INTERVAL_SEC = 0.15
+# 等闸最多等多久;超过就**不发这个请求**(返回 None = 这一页/这一次当作没拿到)。
+# ⚠️ 绝不无限等:/chips 有 8 秒墙钟预算,推送监控挂在 tick 的墙钟上。
+# ⚠️ 2.0 秒对单条 /chips 的自身排队宽出一倍有余:新策略下它最多 14 个请求,
+#    并发 4,任一请求的最坏等待约 4 × 0.15 = 0.6 秒。
+_GATE_MAX_WAIT_SEC = 2.0
+
+
+class PumpRateGate:
+    """
+    「任意两次 pump.fun 请求至少隔 _MIN_REQUEST_INTERVAL_SEC」。**进程级单例**。
+
+    ⚠️ 与 tokeninfo._RateGate 同一套形状(interval / max_wait / clock / sleep 可注入),
+       刻意不复用同一个类:两边的间隔、上限、以及"拿不到闸之后怎么办"都不一样,
+       共用一个类只会让两组参数互相牵制。
+    ⚠️ 拿不到闸返回 False,调用方**不发请求**(与"这次没拿到"同义)——
+       在 /chips 那边它会被记成一页没取到,并在文案里如实说出来。
+    """
+
+    def __init__(self, interval: float = _MIN_REQUEST_INTERVAL_SEC,
+                 max_wait: float = _GATE_MAX_WAIT_SEC,
+                 clock=time.monotonic, sleep=time.sleep) -> None:
+        self._interval = float(interval)
+        self._max_wait = float(max_wait)
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._next_at = 0.0        # 下一次**允许**发请求的时刻
+
+    def acquire(self) -> bool:
+        """拿到闸 → True(并把下一次的时刻推后一个间隔);要等太久 → False。"""
+        with self._lock:
+            now = self._clock()
+            wait = self._next_at - now
+            if wait > self._max_wait:
+                return False
+            if wait > 0:
+                self._sleep(wait)
+                now = self._clock()
+            self._next_at = now + self._interval
+            return True
+
+
+# 进程级的那一把。⚠️ 测试要换掉它就注入自己的 gate(PumpClient(gate=...)),
+#    或者 monkeypatch 这个名字 —— 但**生产代码里绝不能有第二个实例**。
+_GATE = PumpRateGate()
+
 # /users/{key} 里 key 的合法字符集 —— **它来自 Telegram 消息,是不可信输入**。
 # 覆盖三种真实形态:pump 用户名(hexiecs / 1000XCryptoD / brc20_niubi)、
 # base58 的 SVM 地址、`0x` 开头的 EVM 地址。长度 64 比最长的 base58 地址还宽。
@@ -761,10 +832,14 @@ class PumpClient:
        共用一个是概率性的崩溃/串包(与 client.HttpFomoClient 同一条理由)。
     """
 
-    def __init__(self, proxy: str | None = None) -> None:
+    def __init__(self, proxy: str | None = None, gate: PumpRateGate | None = None) -> None:
         s = get_settings()
         self._proxy = s.fomo_proxy if proxy is None else proxy
         self._tl = threading.local()
+        # ⚠️⚠️ 缺省就是那把**进程级**的闸(见 _GATE 上面那段事故实录):
+        #    命令侧的 client 与推送监控的 client 必须是同一把,否则闸形同虚设。
+        #    gate 参数只给测试注入用,生产代码一律不传。
+        self._gate = _GATE if gate is None else gate
 
     def _session(self):
         sess = getattr(self._tl, "session", None)
@@ -800,7 +875,16 @@ class PumpClient:
                            remaining, tag)
 
     def _json(self, tag: str, method: str, url: str, **kw):
-        """一次请求 → JSON。任何失败(网络/超时/非 2xx/结构变更)一律 None。"""
+        """
+        一次请求 → JSON。任何失败(网络/超时/非 2xx/结构变更)一律 None。
+
+        ⚠️⚠️ **进程级限速闸就挂在这里**,因为这是命令侧与推送侧唯一的公共咽喉
+           (见 _GATE 上面那段事故实录)。拿不到闸就**一个字节都不发**,
+           返回 None —— 与"这次没拿到"同义,调用方按既有的失败路径处理。
+        """
+        if not self._gate.acquire():
+            logger.warning("pump.fun 限速闸排队太久,这次不发请求 | {}", tag)
+            return None
         try:
             resp = getattr(self._session(), method)(url, **kw)
         except Exception as e:  # noqa: BLE001

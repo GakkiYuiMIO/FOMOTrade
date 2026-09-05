@@ -101,6 +101,36 @@ class FakePump:
         return self.coin
 
 
+def fetch_chips_default(client):
+    """
+    走**默认策略**跑一趟(workers / budget_sec / full_scan_max 一个都不传)。
+
+    ⚠️ Test默认策略常量 那一组存在的全部意义就是这一行:上一版每条用例都把三个参数
+       显式传进去,于是模块里那三个常量改成任何值都不会有人红。
+    """
+    from src.pumpchips import fetch_chips
+
+    return fetch_chips(client, CA_CAP, {})
+
+
+class _FakeClock:
+    """
+    喂给 pumpchips 的假 `time` 模块(只用得上 monotonic)。序列用完之后一直返回最后一个值。
+
+    ⚠️ 它换掉的是 **pumpchips 命名空间里的 time**,不是全局 time 模块 ——
+       线程池内部用的是它自己 import 的那一个,不受影响。
+    """
+
+    def __init__(self, seq):
+        self._seq = list(seq)
+        self._i = 0
+
+    def monotonic(self) -> float:
+        v = self._seq[min(self._i, len(self._seq) - 1)]
+        self._i += 1
+        return v
+
+
 # ============================================================
 # 1. 解析:四条链的真实响应 + 空列表 + 400 / 404
 # ============================================================
@@ -730,3 +760,180 @@ class Test分母超预算:
         c = FakePump({0: _page(1, [_pos(UID_1000X, held=5e7)])}, _coin(), coin_delay=0.4)
         ch = fetch_chips(c, CA_CAP, {}, workers=2, budget_sec=0.05)
         assert ch.bad_supply is False
+
+
+# ============================================================
+# 4. 策略常量的**默认值**(本轮 J4)
+# ============================================================
+class Test默认策略常量:
+    """
+    ⚠️⚠️ 复验打出来的空白:FULL_SCAN_MAX / WORKERS / BUDGET_SEC 三个常量
+       **零覆盖** —— 3000 改成 5000、改成 2999,WORKERS 与 BUDGET_SEC 逐个改,
+       全量测试一条都不红。下面每一条都**不传**对应参数(走默认路径),
+       断言写死字面量。
+    """
+
+    def test_默认降级阈值是600人也就是12页(self):
+        """⚠️ 600 = ceil(600/50) = 12 页。阈值调小 → 这里会降级成 1 页;调大也不影响这条,由下一条守"""
+        pages = {p: _page(600, [_pos(f"u{p}-{i}") for i in range(50)]) for p in range(12)}
+        c = FakePump(pages, _coin())
+        ch = fetch_chips_default(c)
+        assert sorted(p for k, _, p, _ in c.calls if k == "positions") == list(range(12))
+        assert ch.full_scan is True
+        assert ch.covered == 600
+
+    def test_601人就降级成只看第一页(self):
+        """⚠️ 与上一条**只差一个人**:阈值调大一格这条当场红"""
+        c = FakePump({0: _page(601, [_pos(f"u{i}") for i in range(50)])}, _coin())
+        ch = fetch_chips_default(c)
+        assert [p for k, _, p, _ in c.calls if k == "positions"] == [0]
+        assert ch.full_scan is False
+
+    def test_一条命令最多13个请求(self):
+        """
+        ⚠️⚠️ 这是本轮 J2 的**硬上限**:12 页 + 1 个分母。
+           出事那次是 61 个(60 页 + 分母),并发 10 → 主机级拒连,
+           而推送监控与它共用同一个出口 IP。
+        """
+        pages = {p: _page(600, [_pos(f"u{p}-{i}") for i in range(50)]) for p in range(12)}
+        c = FakePump(pages, _coin())
+        ch = fetch_chips_default(c)
+        assert ch.requests == 13
+        assert len(c.calls) == 13
+
+    def test_再大的币也不会超过这个上限(self):
+        """⚠️ 60 万人的币:降级成轻档,第一页 + 分母 = 2 个请求"""
+        c = FakePump({0: _page(600000, [_pos(f"u{i}") for i in range(50)])}, _coin())
+        ch = fetch_chips_default(c)
+        assert ch.requests == 2
+        assert len(c.calls) == 2
+
+    def test_默认并发是4(self):
+        """
+        ⚠️⚠️ 上界与下界一起钉:6 页 → 第 1..5 页共 5 个翻页任务丢进池子。
+           并发 4 时**同时在飞的翻页请求峰值恰好是 4**(第 5 个要等一个位置);
+           改成 3 → 峰值 3,改成 5 或 10 → 峰值 5。两个方向都会红。
+        ⚠️ 分母那个任务不参与计数:它在 FakePump 里瞬间返回,占不住位置。
+        """
+        class _Counting(FakePump):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.inflight = 0
+                self.peak = 0
+                self._c = threading.Lock()
+
+            def fetch_mint_positions(self, mint, page=0, page_size=50):
+                if page:
+                    with self._c:
+                        self.inflight += 1
+                        self.peak = max(self.peak, self.inflight)
+                    try:
+                        time.sleep(0.3)
+                        return super().fetch_mint_positions(mint, page, page_size)
+                    finally:
+                        with self._c:
+                            self.inflight -= 1
+                return super().fetch_mint_positions(mint, page, page_size)
+
+        c = _Counting({p: _page(300, [_pos(f"u{p}")]) for p in range(6)}, _coin())
+        fetch_chips_default(c)
+        assert c.peak == 4, f"翻页并发峰值应当是 4,实际 {c.peak}"
+
+    def test_默认墙钟预算是8秒_没到点就照常翻页(self, monkeypatch):
+        """
+        ⚠️⚠️ 用**假时钟**两侧夹住 8.0 这个默认值,不真等 8 秒:
+           第一页返回时"已经过去 7.9 秒" → 还没到点,该翻的页照翻。
+           预算被改小(比如 5.0)这条当场红。
+        """
+        from src import pumpchips
+
+        monkeypatch.setattr(pumpchips, "time", _FakeClock([0.0, 0.0, 7.9, 0.0]))
+        c = FakePump({p: _page(120, [_pos(f"u{p}")]) for p in range(3)}, _coin())
+        ch = fetch_chips_default(c)
+        assert sorted(p for k, _, p, _ in c.calls if k == "positions") == [0, 1, 2]
+        assert ch.partial is False
+
+    def test_默认墙钟预算是8秒_过了点就一页都不再翻(self, monkeypatch):
+        """⚠️ 同上,另一侧:8.1 秒已经过点。预算被改大(比如 10.0)这条当场红"""
+        from src import pumpchips
+
+        monkeypatch.setattr(pumpchips, "time", _FakeClock([0.0, 0.0, 8.1, 0.0]))
+        c = FakePump({p: _page(120, [_pos(f"u{p}")]) for p in range(3)}, _coin())
+        ch = fetch_chips_default(c)
+        assert [p for k, _, p, _ in c.calls if k == "positions"] == [0]
+        assert ch.partial is True
+
+    def test_墙钟预算管得住第一页(self):
+        """
+        ⚠️⚠️ 复验打出来的洞:上一版第一页是**同步发出、不受预算约束**的,
+           deadline 要等它回来才第一次被检查 —— 生产上界其实是 curl 的 20 秒超时,
+           不是这里承诺的 8 秒。实测:预算 0.5 秒、第一页 3 秒 → 整整等满 3.00 秒。
+           现在第一页超预算就当"这次没查到"(返回 None → 💊 整块不出现)。
+        """
+        from src.pumpchips import fetch_chips
+
+        c = FakePump({0: _page(1, [_pos("a")])}, _coin(), delay=1.5)
+        t0 = time.monotonic()
+        ch = fetch_chips(c, CA_CAP, {}, budget_sec=0.3)
+        elapsed = time.monotonic() - t0
+        assert ch is None, "第一页超了预算却照样把结果拼了出来"
+        assert elapsed < 1.0, f"预算没管住第一页,实际等了 {elapsed:.2f}s"
+
+
+# ============================================================
+# 5. 页失败要**留痕**(本轮 J3)
+# ============================================================
+class Test页失败留痕:
+    """
+    ⚠️⚠️ 上一版 _page 把任何一页的失败**吞成空页且不留痕迹**,于是
+       "我们自己的请求挂了"被静默并进"平台只给出 N/M 人的明细" —— 那是在编原因:
+       读者据此以为"再查也没用",而真相是再查一次很可能就全了。
+    """
+
+    def test_请求挂了的页会被记下来(self):
+        from src.pumpchips import fetch_chips
+
+        class _Flaky(FakePump):
+            def fetch_mint_positions(self, mint, page=0, page_size=50):
+                if page in (1, 2):
+                    raise RuntimeError("我们这边的网络挂了")
+                return super().fetch_mint_positions(mint, page, page_size)
+
+        c = _Flaky({0: _page(200, [_pos("a")]), 3: _page(200, [_pos("d")])}, _coin())
+        ch = fetch_chips(c, CA_CAP, {}, workers=4)
+        assert ch.failed_pages == 2
+        assert ch.covered == 2, "没挂的那两页照常统计进来"
+
+    def test_响应结构不对的页同样算没取到(self):
+        """⚠️ 从读者的角度它与请求挂了是同一件事:我们这边没拿到"""
+        from src.pumpchips import fetch_chips
+
+        c = FakePump({0: _page(150, [_pos("a")]), 1: {"data": []},
+                      2: _page(150, [_pos("c")])}, _coin())
+        ch = fetch_chips(c, CA_CAP, {}, workers=3)
+        assert ch.failed_pages == 1
+
+    def test_平台真给了空页不算我们没取到(self):
+        """⚠️⚠️ 反方向:`{"positions":[],"totalCount":150}` 是**平台**的答案,不是我们的故障"""
+        from src.pumpchips import fetch_chips
+
+        c = FakePump({0: _page(150, [_pos("a")]), 1: _page(150, []),
+                      2: _page(150, [])}, _coin())
+        ch = fetch_chips(c, CA_CAP, {}, workers=3)
+        assert ch.failed_pages == 0
+        assert ch.covered == 1
+
+
+class Test用户名匹配的大小写语义:
+    def test_userId区分大小写(self):
+        """
+        ⚠️⚠️ 刻意**不做**大小写折叠:两边的 userId 同源(都是 pump 接口给的 UUID),
+           /pump add 存的就是接口返回的那一份。折叠只会把两个**不同**的键当成一个,
+           而它换不来任何一条真实的命中。
+        """
+        from src.pumpchips import fetch_chips
+
+        c = FakePump({0: _page(1, [_pos("ABC-def", held=5.0)])}, _coin())
+        assert fetch_chips(c, CA_CAP, {"abc-DEF": "x"}).matched == []
+        assert [m["user_id"] for m in fetch_chips(c, CA_CAP, {"ABC-def": "x"}).matched] \
+            == ["ABC-def"]

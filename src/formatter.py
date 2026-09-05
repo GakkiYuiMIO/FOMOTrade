@@ -57,6 +57,7 @@ from src.nameguard import (
     safe_ident,
     safe_launchpad,
     safe_social_links,
+    safe_username,
 )
 from src.nameguard import strip_controls_keep_emoji as _no_controls
 
@@ -253,13 +254,17 @@ UNTRUSTED_FIELDS = {
     #    可以逐个数出来 —— 而"能枚举的一律不许手写模式匹配"是本项目上一轮的血教训。
     #    详见 nameguard._LAUNCHPADS 上面那一大段(含全量实测依据与代价)。
     "launchpad": safe_launchpad,
-    # ⚠️⚠️ 本轮(J1)新增:/chips 回执里 💊 那半边的 **pump 用户名**
-    #    (GET /mint-positions/{mint} 的 userName)。谁都能把自己的 pump 用户名改成
-    #    `已清仓 · 亏损 99%` / `t.me/scam`,而它印在一行**长得像记录**的东西里
-    #    (名字 · 数量 · 盈亏)。走 safe_display(名字类)**不是** safe_ident ——
-    #    理由见 render_pump_chip_row 的注释:safe_ident 只判形态不判形状,
-    #    `Send SOL to my wallet now` / `私聊我领空投 加V信 abcdefg` 能原样穿过去。
-    "pump_username": safe_display,
+    # ⚠️⚠️ /chips 回执里 💊 那半边的 **pump 用户名**(GET /mint-positions/{mint} 的
+    #    userName)。谁都能把自己的 pump 用户名改成 `已清仓 · 亏损 99%` / `t.me/scam`,
+    #    而它印在一行**长得像记录**的东西里(名字 · 数量 · 盈亏)。
+    # ⚠️⚠️ 本轮(J8)从 safe_display 换成**专用的** safe_username(封闭形状)。
+    #    换的理由是实测:safe_display 的标点白名单里没有 `_`,而 519 个真实 userName 里
+    #    有 27 个带 `_` —— 它把 **4.24%** 的真实用户名打成「未知用户」,
+    #    读者看到的是一条认不出人的持仓记录,而"认出是谁"正是名单功能的全部意义。
+    #    safe_username 同一份语料丢 **0.00%**,45 条 _MUST_BLOCK 硬基线仍然零泄漏。
+    #    ⚠️ 也**不是** safe_ident:那一道允许空格,`Send SOL to my wallet now`
+    #       整句穿过去 —— 见 nameguard.safe_username 顶上那段。
+    "pump_username": safe_username,
 }
 
 # 译文字段 → 它的**原文**是哪个字段。⚠️ safe_display 的"含 CJK 时不许有 ≥5 位 ASCII 串"
@@ -2618,15 +2623,16 @@ def render_pump_chip_row(*, pump_username: str | None = None,
        tests/test_nameguard_chokepoint.py 的反射不变量看得见。
        在 bot 里"记得调一下 safe_display"是守不住的那种约定(见 UNTRUSTED_FIELDS
        上面那段:漏过两个字段的教训)。
-    ⚠️⚠️ 它走 **safe_display + 「」容器**,而不是 pump 买卖推送里那个 `username`
-       走的 safe_ident。两者都是同一个 pump 用户名,门不一样是有意的:
-       safe_ident 只判**形态**(域名 / scheme / @ / 地址 / 数字量),不判形状,
-       于是 `私聊我领空投 加V信 abcdefg`、`Send SOL to my wallet now`、`...`
-       这几条 _MUST_BLOCK 样本能原样穿过去。买卖推送那边靠"这一行的其余部分
-       全是我们自己写的短语"扛着;而这里的行长得像一条**记录**
-       (名字 · 数量 · 盈亏),混进去一句话就是一条伪造的记录。
-       名字类字段就该走名字类的门 —— 代价是带 `_` 的用户名(brc20_niubi)
-       会被字符白名单打掉,那时退回「未知用户」,数量与盈亏照常显示。
+    ⚠️⚠️ 它走 **safe_username(封闭形状)+ 「」容器**,另外两道门都不是它:
+       · **不是** safe_ident(pump 买卖推送里同一个用户名走的那道):那道只判**形态**
+         且**允许空格**,`私聊我领空投 加V信 abcdefg` / `Send SOL to my wallet now`
+         原样穿过去。买卖推送那边靠"这一行的其余部分全是我们自己写的短语"扛着;
+         而这里的行长得像一条**记录**(名字 · 数量 · 盈亏),混进一句话就是伪造的记录。
+       · **不再是** safe_display(上一版走的那道):它的标点白名单里没有 `_`,
+         实测 519 个真实 userName 里被它打成「未知用户」的有 **4.24%**(`AR_04` /
+         `Bart_da_charts` / `_togi_` 这类)—— 一条**认不出人**的持仓记录,
+         而"认出是谁"正是名单功能的全部意义。safe_username 同一份语料丢 **0.00%**,
+         45 条 _MUST_BLOCK 硬基线仍然零泄漏(两个数字都是实测,见 nameguard.safe_username)。
     ⚠️ 退回「未知用户」而不是整行消失:这一行的其余两段(数量、盈亏)是**真值**,
        而"名单里有人持有"这件事本身也是真的 —— 整行删掉等于把它谎报成"没人持有"。
        这与 _display_name 里"handle 过不了门禁 → 退回 user_id → 未知用户"

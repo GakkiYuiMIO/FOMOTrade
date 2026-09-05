@@ -77,14 +77,15 @@ _EXPECT_UNTRUSTED = {
     #    这条当场红,而那正是要防的:实测最常见的发射台名(Pump.fun / o1.exchange /
     #    Four.meme / Feel.cash)全是域名形态,safe_display 会把 35.6% 的命中打掉。
     "launchpad": "safe_launchpad",
-    # ⚠️⚠️ 本轮 J1 新增:/chips 回执里 💊 那半边的 pump 用户名(mint-positions.userName)。
-    #    它走 **safe_display**,与 pump 买卖推送里那个 `username`(safe_ident)**不同门**,
-    #    这是有意的 —— 换成 safe_ident 这条当场红,而那正是要防的:
-    #      render_pump_chip_row(pump_username='Send SOL to my wallet now')
-    #        → Send SOL to my wallet now · 14,584,546 枚 · +306.2%
-    #    safe_ident 只判形态(域名/scheme/@/地址/数字量),这一句形态全过。
-    #    这一行长得像一条**记录**(名字 · 数量 · 盈亏),混进去一句话就是伪造的记录。
-    "pump_username": "safe_display",
+    # ⚠️⚠️ /chips 回执里 💊 那半边的 pump 用户名(mint-positions.userName)。
+    #    它走**专用的** safe_username(封闭形状 [A-Za-z0-9_] ≤32 + 三条地址形态 + 数字 ≤7),
+    #    另外两道门都不行,换成任何一道这条当场红:
+    #      · safe_ident —— 允许空格,`Send SOL to my wallet now` 整句穿过去,
+    #        而这一行长得像一条**记录**(名字 · 数量 · 盈亏),混进一句话就是伪造的记录;
+    #      · safe_display —— 标点白名单里没有 `_`,实测 519 个真实 userName 里
+    #        它把 4.24% 打成「未知用户」(`AR_04` / `Bart_da_charts` / `_togi_`),
+    #        而 safe_username 同一份语料丢 0.00%、45 条 _MUST_BLOCK 仍然零泄漏。
+    "pump_username": "safe_username",
 }
 _EXPECT_IDENT = {
     "token_symbol": "safe_ident",        # 币符号,陌生人可控($t.me/pumpgrp 曾原样进标题)

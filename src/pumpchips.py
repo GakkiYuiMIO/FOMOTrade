@@ -28,6 +28,11 @@ pump.fun 平台筹码 —— /chips 回执里 💊 那半边的**取值与聚合
     $CAP       totalCount=430   翻完只有 426 行
     USER(base) totalCount=3478  翻完只有 3475 行
 
+⚠️ 这几个数**录制于 2026-09-05,会变**:同一天晚些时候复测,$CAP 的 totalCount
+   已经是 424。夹具(tests/fixtures/pump_mint_positions_robinhood.json)与
+   README 里的 430 都是**这一刻的快照**,三处必须是同一个数;
+   谁重新录夹具,这里与 README 一起改。
+
 也就是说服务端自报的人数里,有一部分**永远不会出现在明细里**(仓位太小、
 账号状态、或者别的我们看不见的过滤)。所以:
 
@@ -59,8 +64,14 @@ pump.fun 平台筹码 —— /chips 回执里 💊 那半边的**取值与聚合
    同时使用(共用是概率性的崩溃/串包)。这一点由 PumpClient._session 的
    threading.local 保证,本模块只负责不去破坏它 —— 绝不把 session 抓出来传进线程。
 
-⚠️ 限流:实测累计 300+ 请求零 429、零封禁(连打 10/30/60 次全 200,p50 0.3~0.8s)。
-   失败形态是标准 NestJS JSON(400 参数错 / 404 路由不存在),**没有观察到任何 429**。
+⚠️⚠️ 限流:这条注释上一版写的是"实测累计 300+ 请求零 429、零封禁",而 2026-09-05
+   出了一次真事故 —— 一条 /chips 按当时的策略要发 **61 个请求**(60 页 + 分母)、并发 10,
+   约 12 请求/秒持续 5 秒,把 frontend-api-v3.pump.fun 打到**主机级拒连**
+   (**不是 429**,是连不上);而 pump 的**推送监控**用的是同一个主机、同一个出口 IP,
+   那段时间跟着一起瞎掉。所以"没观察到 429"这句话是对的,却完全不足以说明安全 ——
+   这个主机的防护不走 429 那条路。
+   现在两道闸一起管:FULL_SCAN_MAX=600(一条命令 ≤ 13 个请求)+ pumpfun 里那把
+   **进程级**限速闸(峰值 6.7 请求/秒,命令侧与推送侧共用同一把)。
 """
 from __future__ import annotations
 
@@ -76,16 +87,26 @@ from loguru import logger
 from src.pumpfun import MINT_POSITIONS_MAX_PAGE_SIZE, _as_float, _as_text
 
 # 超过这么多人就降级成轻档(只取前 50 名)。
-# ⚠️ 依据是实测的**墙钟**,不是拍脑袋:全量翻页要 ceil(total/50) 个请求,
-#    workers=10 下实测 —— 427 人 / 9 请求 2.4s;1209 人 / 25 请求 4.0s;
-#    3478 人 / 70 请求 6.3s。3000 人对应 60 个请求 ≈ 5.4s,在 8 秒预算内还剩余量;
-#    取 5000(100 个请求 ≈ 9s)会**常态性**撞预算,于是"全量"这个承诺经常兑现不了 ——
-#    那比一开始就说"只看了前 50 名"更糟:后者是诚实的下界,前者是残缺的全量。
-FULL_SCAN_MAX = 3000
-# 翻页并发。实测 workers=6 → 10.3s、workers=10 → 6.3s、workers=20 → 2.5s(同一个 70 页的币),
-# 全程零 429。取 10 而不是 20:这是一条**同步命令**的顺带请求,没有理由为了省 4 秒
-# 去把一个匿名公开端点打到我们自己都没测过的密度。
-WORKERS = 10
+# ⚠️⚠️ **本轮(J2)从 3000 降到 600**,理由是一次真实事故,不是墙钟:
+#    3000 对应 ceil(3000/50) = 60 页,加上分母就是**一条同步命令 61 个请求**,
+#    并发 10 → 实测 ~12 请求/秒持续 5 秒,把 frontend-api-v3.pump.fun 打到
+#    **主机级拒连**(不是 429,是连不上);而 pump 的**推送监控**用的是同一个主机、
+#    同一个出口 IP,那段时间里跟着一起瞎掉。
+#    「一条命令看得更全」换「推送监控失明」是笔亏本买卖 —— 轻档只是把
+#    「仅统计前 50 名」这句诚实的下界说出来,而推送失明是**用户根本不知道**的静默损失。
+# ⚠️ 600 = 12 页 + 1 个分母 = **一条 /chips 最多 13 个请求**(旧值是 61)。
+#    12 页这个密度 2026-09-05 复测过:串行 + 0.3 秒间隔打 9 页 + 1 个分母,
+#    10 个请求 14.3 秒全部 200、零拒连;再叠上 pumpfun 那道进程级限速闸
+#    (峰值 6.7 请求/秒),并发档的峰值密度低于出事那次的一半。
+# ⚠️ 600 人以上的币会降级成轻档 —— 实测这类币(USER 3478 人、65Nt7Tdis 2035 人)
+#    本来也从来没有 exact 过(见模块头那张表:自报人数与明细条数常年对不上),
+#    降级损失的是"下界更低",不是"从精确掉成下界"。
+FULL_SCAN_MAX = 600
+# 翻页并发。⚠️ **本轮(J2)从 10 降到 4**:真正的吞吐上限现在是 pumpfun 那道进程级
+#    限速闸(峰值 6.7 请求/秒),再多的线程只会排在闸前面干等,一秒都省不下来,
+#    却会在闸出问题时把突发放大回事故那天的量级。
+#    4 个线程 × 单请求实测 0.47~3.3 秒,12 页的墙钟在 8 秒预算内仍有余量。
+WORKERS = 4
 # 整块的墙钟预算(秒)。/chips 是同步命令,用户在等回执 —— 超了就用已经拿到的部分,
 # 并在文案里说明是部分结果。⚠️ 它**只管 pump 这一块**:超预算绝不影响
 # 🏦 FOMO 那半边(那半边在这之前就已经拼好了)。
@@ -147,6 +168,14 @@ class PumpChips:
     # ⚠️ 它与"分母压根没拿到"是两件事:前者要告诉用户"这个数对不上",
     #    后者只是"没拿到"。文案不同,见 bot._pump_chips_platform_lines。
     bad_supply: bool = False
+    # ⚠️⚠️ **我们这边**有几页没取到(请求挂了 / 限速闸没排上 / 响应结构不对)。本轮 J3 新增。
+    #    上一版把这件事**吞掉不留痕**,于是"我们自己的请求失败"被归因成
+    #    "平台只给出 N/M 人的明细" —— 那是在**编原因**:读者据此以为
+    #    "再查也没用,平台就这么多",而真相是再查一次很可能就全了。
+    # ⚠️ 它同时是「前 N 名内无人」那句话的**否决位**:页失败时我们手上这批人
+    #    根本不是一个连续的"前 N 名"(第 1 页挂了、第 2 页拿到了),
+    #    那句话在这种情况下是**假陈述**。见 bot._pump_chips_watch_lines。
+    failed_pages: int = 0
     # 这一块**计划**发出的请求数(第一页 + 分母 + 要翻的页)。
     # ⚠️ 只用于报告与日志,**不进文案**;撞预算时还没开跑的那几个会被取消,
     #    所以它是上界而不是实发数 —— 别拿它当计费依据。
@@ -317,14 +346,28 @@ def _dedupe(rows: list[MintPosition]) -> list[MintPosition]:
 # ============================================================
 # 取值(带并发与墙钟预算)
 # ============================================================
-def _page(client, mint: str, page: int) -> list[MintPosition]:
-    """翻一页。任何失败一律当**空页**处理 —— 少几个人只是占比更低,绝不炸掉整块。"""
+def _page(client, mint: str, page: int) -> list[MintPosition] | None:
+    """
+    翻一页。**成功返回行(可能是 0 行),失败返回 None** —— 两者绝不能混。
+
+    ⚠️⚠️ 上一版失败时返回 `[]`,于是"我们这边挂了"与"平台这一页真的没人"
+       变成同一个值,**不留任何痕迹**。下游的 _pump_coverage_warn 因此把
+       第四种原因静默并进第三种,打出「平台只给出 N/M 人的明细」——
+       那句话在页失败时是**编出来的原因**(它自己的 docstring 写着
+       "把三件事写成同一句就是在编原因")。
+    ⚠️ 失败仍然**不炸掉整块**:调用方把 None 记成一页没取到,少几个人只是占比更低。
+    ⚠️ `parse_mint_positions` 返回 None(响应结构不对 / 客户端返回 None,包括
+       限速闸没排上)同样算"没取到" —— 从读者的角度它与请求挂了是同一件事。
+    """
     try:
         parsed = parse_mint_positions(client.fetch_mint_positions(mint, page))
     except Exception as e:  # noqa: BLE001
-        logger.warning("pump mint-positions 第 {} 页失败(这一页当空处理): {}", page, e)
-        return []
-    return [] if parsed is None else parsed[1]
+        logger.warning("pump mint-positions 第 {} 页失败(记成一页没取到): {}", page, e)
+        return None
+    if parsed is None:
+        logger.warning("pump mint-positions 第 {} 页响应不可用(记成一页没取到)", page)
+        return None
+    return parsed[1]
 
 
 def _supply(client, mint: str) -> float | None:
@@ -352,9 +395,13 @@ def fetch_chips(client, mint: str, members: dict[str, str], *,
                      分子是"已拿到明细的人"的合计,一页都没拿到时是 None 而不是 0;
        · 名单命中 —— 只依赖明细;明细恒空时 matched 是空**而且** covered==0,
                      调用方据此说"判断不了"而不是"没人"。
-    ⚠️ 墙钟预算是**整块**的:第一页之前就开始计时,超了就用手上有的,partial=True。
-       /chips 是同步命令,用户在等 —— 宁可给一份说清楚是部分结果的数据,
-       也不能让他对着一个转圈的输入框等半分钟。
+    ⚠️⚠️ 墙钟预算是**整块**的,而且**从第一页就开始管**(本轮 J4 修):
+       上一版 deadline 虽然在第一页之前就设好了,第一页却是**同步发出、不受预算约束**的,
+       deadline 要等它返回之后才第一次被检查 —— 于是生产上界其实是
+       pumpfun._TIMEOUT_SEC(20 秒 curl 超时),不是这里承诺的 8 秒。
+       实测:预算 0.5 秒、第一页耗时 3 秒 → 整整等满 3.00 秒。
+       现在第一页也走线程池 + result(timeout=…),超预算就当"这个币这次没查到"
+       (返回 None → 💊 整块不出现),绝不让一条同步命令替 curl 数到 20。
     ⚠️ 线程池只传 client(它内部按 threading.local 每线程建一个 Session),
        绝不把 Session 抓出来跨线程共用 —— libcurl 的 easy handle 不能这么用。
     """
@@ -367,26 +414,36 @@ def fetch_chips(client, mint: str, members: dict[str, str], *,
     full_scan_max = FULL_SCAN_MAX if full_scan_max is None else full_scan_max
 
     deadline = time.monotonic() + budget_sec
-    first = parse_mint_positions(_first_page(client, mint))
-    if first is None:
-        return None                    # 这个币根本不在 pump 上 / 请求挂了 → 整块不出现
-    total, rows = first
     requests = 1
-
-    want_pages = 1
-    if total is not None and total > 0:
-        want_pages = math.ceil(total / MINT_POSITIONS_MAX_PAGE_SIZE)
-    light = total is not None and total > full_scan_max
-    if light:
-        want_pages = LIGHT_PAGES
-
+    failed_pages = 0
     partial = False
-    # 分母与第 1..n-1 页一起丢进同一个池子:它们互不依赖,串行只是白等一个往返。
-    jobs: list = []
-    if want_pages > 1:
-        jobs = list(range(1, want_pages))
     ex = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
+        # ⚠️⚠️ 第一页也走池子 + 预算(J4)。它同步发出去的那一版等于把上界交给了
+        #    curl 的 20 秒超时,而这里承诺的是 8 秒。
+        try:
+            first = parse_mint_positions(
+                ex.submit(_first_page, client, mint).result(
+                    timeout=max(0.0, deadline - time.monotonic())))
+        except Exception:  # noqa: BLE001
+            logger.warning("pump mint-positions 第一页没在 {} 秒预算内拿到"
+                           "(💊 整块不显示) | {}", budget_sec, mint[:16])
+            return None
+        if first is None:
+            return None                # 这个币根本不在 pump 上 / 请求挂了 → 整块不出现
+        total, rows = first
+
+        want_pages = 1
+        if total is not None and total > 0:
+            want_pages = math.ceil(total / MINT_POSITIONS_MAX_PAGE_SIZE)
+        light = total is not None and total > full_scan_max
+        if light:
+            want_pages = LIGHT_PAGES
+
+        # 分母与第 1..n-1 页一起丢进同一个池子:它们互不依赖,串行只是白等一个往返。
+        jobs: list = []
+        if want_pages > 1:
+            jobs = list(range(1, want_pages))
         fut_supply = ex.submit(_supply, client, mint)
         requests += 1
         futs = {}
@@ -400,7 +457,12 @@ def fetch_chips(client, mint: str, members: dict[str, str], *,
         if futs:
             try:
                 for fut in as_completed(futs, timeout=max(0.0, deadline - time.monotonic())):
-                    rows.extend(fut.result())
+                    got = fut.result()
+                    # ⚠️ None = 这一页**我们这边**没取到(见 _page)。留痕,不当空页。
+                    if got is None:
+                        failed_pages += 1
+                    else:
+                        rows.extend(got)
             except TimeoutError:
                 partial = True
                 logger.warning("pump 筹码翻页超出 {} 秒预算,用已拿到的部分 | {}",
@@ -414,6 +476,9 @@ def fetch_chips(client, mint: str, members: dict[str, str], *,
         # ⚠️ cancel_futures=True + wait=False:超预算之后还没开跑的任务直接取消,
         #    已经在跑的让它自己结束(curl 自带 20 秒超时),绝不在这里等它。
         ex.shutdown(wait=False, cancel_futures=True)
+    if failed_pages:
+        logger.warning("pump 筹码有 {} 页我们这边没取到(文案里如实说出来) | {}",
+                       failed_pages, mint[:16])
 
     rows = _dedupe(rows)
     covered = len(rows)
@@ -449,6 +514,7 @@ def fetch_chips(client, mint: str, members: dict[str, str], *,
         watch_pct=_ratio(_sum_amounts([r for r in rows if r.user_id in members
                                        and r.holds_now]), supply),
         bad_supply=bad_supply,
+        failed_pages=failed_pages,
         requests=requests,
     )
 

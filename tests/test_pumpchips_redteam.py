@@ -124,11 +124,14 @@ def test_回执里只出现我们自己写的那几个字段():
     ⚠️⚠️ 反方向的不变量:pump 那几行里除了**名字、数量、盈亏百分比**之外,
        不该出现任何来自接口的字符串。这条用一个"每个字段都是可识别的哨兵值"的
        响应来验 —— 哪个字段被顺手渲染出去了,一眼看得见。
+    ⚠️ 正常名字取 `Bart_da_charts`(2026-09-05 的真实 pump userName,带 `_`):
+       它顺带钉住本轮 J8 —— 上一版走 safe_display 时这种名字会被打成「未知用户」,
+       而 519 个真实 userName 里带 `_` 的有 27 个。
     """
-    out = _receipt(local_name="正常名字", api_name="哨兵_apiname",
+    out = _receipt(local_name="Bart_da_charts", api_name="哨兵_apiname",
                    thesis="哨兵_thesis", wallet="哨兵_wallet",
                    x_username="哨兵_x", kind="哨兵_kind")
-    assert "「正常名字」" in out
+    assert "「Bart_da_charts」" in out
     for sentinel in ("哨兵_apiname", "哨兵_thesis", "哨兵_wallet",
                      "哨兵_x", "哨兵_kind"):
         assert sentinel not in out, f"{sentinel} 被渲染出去了:\n{out}"
