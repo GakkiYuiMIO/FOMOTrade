@@ -193,17 +193,25 @@ class PumpRateGate:
         self._next_at = 0.0        # 下一次**允许**发请求的时刻
 
     def acquire(self) -> bool:
-        """拿到闸 → True(并把下一次的时刻推后一个间隔);要等太久 → False。"""
+        """拿到闸 → True(并把下一次的时刻推后一个间隔);要排太久 → False。"""
+        # ⚠️⚠️ **先在锁内订位、再到锁外睡** —— 顺序反过来这道闸的上限就废了。
+        #    旧版把 sleep 写在锁**里**,于是并发调用全在锁上排队,而排队时间根本
+        #    不进 `wait`:每个持锁者退出前把 _next_at 推到"自己睡醒 + 一个间隔",
+        #    下一个人读到的 wait 恒 <= interval(0.15) < max_wait(2.0),
+        #    于是 `wait > self._max_wait` 这条分支**数学上不可达** ——
+        #    「排队超过 2 秒就放弃这一次」变成一句永远兑现不了的话。
+        #    实测(40 线程 / 出厂参数):返回 False 的 **0 个**,而单线程真等了 5.85 秒。
+        #    订位式相反:第 N 个人算出的 wait = N × interval,会**真的**超过上限。
         with self._lock:
             now = self._clock()
-            wait = self._next_at - now
+            slot = self._next_at if self._next_at > now else now
+            wait = slot - now
             if wait > self._max_wait:
-                return False
-            if wait > 0:
-                self._sleep(wait)
-                now = self._clock()
-            self._next_at = now + self._interval
-            return True
+                return False           # ⚠️ 不订位:_next_at 一动不动,否则放弃的人也占了坑
+            self._next_at = slot + self._interval
+        if wait > 0:
+            self._sleep(wait)          # ⚠️ 锁外
+        return True
 
 
 # 进程级的那一把。⚠️ 测试要换掉它就注入自己的 gate(PumpClient(gate=...)),

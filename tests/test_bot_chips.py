@@ -262,7 +262,10 @@ def test_分母拿不到时占比整段消失而不是显示0(monkeypatch, tmp_p
     assert _line_with(out, "FOMO 平台") == "🏦 FOMO 平台 · 持有人 1"
     assert _line_with(out, "你的名单") == "👥 你的名单 · 1 人持有"
     assert "@alice · 12,345,678 枚 · $42.00" in out, out
-    assert "拿不到总供应量" in out, out
+    # ⚠️ 注脚必须**指名 🏦**:它解释的是 FOMO 那半边的分母,而 💊 那半边用的是
+    #    另一个来源(pump 的 coins-v3)。J1 之后 tail 排在 💊 整块之后,不指名就会
+    #    被读成"pump 的占比算不出来"。
+    assert "拿不到 🏦 那边的总供应量" in out, out
     _assert_chips_invariant(out)
 
 

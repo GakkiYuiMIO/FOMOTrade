@@ -1892,11 +1892,17 @@ class CommandBot:
         #    再挂一句"拿不到供应量"或"占比是近似值"都是答非所问。
         #    这道守卫曾经只加在前一条分支上,于是"分子挂了 + 本地有行情"会渲染出
         #    一句凭空的"占比是近似值",而上面一个百分号都没有。
+        # ⚠️⚠️ 两条都必须**指名 🏦**:它们解释的是 FOMO 那半边的分母,
+        #    而 💊 那半边的分母是另一个来源(pump 的 coins-v3.total_supply_str)。
+        #    J1 之后 tail 排在 mid(💊 整块)**之后**,一条不指名的注脚贴在 pump 底下,
+        #    会被读成"pump 的占比是近似值" —— 那是把一个数的口径安到另一个数头上。
+        #    (为什么不改成排在 💊 之前:mid/tail 的位置与预算预留是 J1 刚钉死的不变量,
+        #     动结构的风险远大于收益;指名两个字就把歧义消掉了。)
         if err is None and not st["empty"]:
             if supply is None:
-                tail = ["", "⚠️ 拿不到总供应量,只能报持有人与数量,占比算不出来"]
+                tail = ["", "⚠️ 拿不到 🏦 那边的总供应量,只能报持有人与数量,占比算不出来"]
             elif estimated:
-                tail = ["", "ℹ️ 总供应量取自本地行情推算(市值÷价格),占比是近似值"]
+                tail = ["", "ℹ️ 🏦 那边的总供应量取自本地行情推算(市值÷价格),占比是近似值"]
 
         return _ca_assemble(head, st["matched"], tail, anchor,
                             render=_chips_member_row, max_rows=MAX_CHIPS_MEMBER_ROWS,

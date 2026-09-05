@@ -3067,6 +3067,31 @@ class Test限速闸:
         assert g.acquire() is True
         assert g.acquire() is False, "要等 10 秒还傻等着"
 
+    def test_出厂参数下排队上限真的会触发(self):
+        """
+        ⚠️⚠️ 上一版这道上限**数学上不可达**,而当时的用例是用 interval=10.0
+           (非默认值)、单线程连调两次过关的 —— 那种形状旧代码照样绿。
+           真实缺陷只在**并发排队**时露出来:旧版把 sleep 写在锁**里**,
+           排队时间被锁吸收、根本不进 `wait`,于是每个人看到的 wait 恒 <= 一个间隔。
+           实测(40 线程 / 出厂参数):旧版返回 False 的 **0 个**、单线程真等了 5.85 秒;
+           订位式是 26 个放弃、最长等待 1.95 秒(守住 2.0)。
+        ⚠️ 这里用**出厂参数**(一个都不传)+ 不前进的假时钟来制造排队深度:
+           第 N 次订位的等待 = N x 0.15 秒,超过 2.0 秒就该放弃。
+           2.0 / 0.15 = 13.33 → 前 14 次(0..13 个间隔)拿得到,第 15 次该 False。
+        ⚠️ 断言写死 14 / 15,不 import interval 与 max_wait。
+        """
+        slept: list[float] = []
+        g = pf.PumpRateGate(clock=lambda: 0.0, sleep=slept.append)   # 时钟不动 = 全在排队
+        got = [g.acquire() for _ in range(20)]
+        assert got[:14] == [True] * 14, f"出厂参数下前 14 次该拿得到,实际 {got[:14]}"
+        assert got[14] is False, "排到 2 秒开外还不放弃 —— 上限又不可达了"
+        assert all(x is False for x in got[14:]), got[14:]
+        # 放弃的人**不占坑**:否则每个失败者也把 _next_at 推后,队列会自己越滚越长。
+        # ⚠️ 14 次拿到只睡 13 次 —— **第一次 wait=0 不睡**(队列是空的),别写成 14。
+        assert len(slept) == 13, f"放弃的那几次也睡了/占位了,slept={slept}"
+        assert slept[0] == pytest.approx(0.15), slept[0]
+        assert slept[-1] == pytest.approx(1.95), slept[-1]
+
     def test_默认间隔与等待上限(self):
         """
         ⚠️⚠️ 钉住**默认值**:不传参数,用假时钟观察。
