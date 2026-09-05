@@ -146,6 +146,29 @@ _RATE_LIMIT_WARN = 5
 #    (见 resolve_user 里那个路径穿越的实例)。
 _USER_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# ============ GET /mint-positions/{mint} 的固定参数 ============
+# 这几个值全部来自**服务端 400 校验回包**,不是猜的(2026-09-05 实测):
+#   · sortBy ∈ {LATEST, TOP, LOWEST_ENTRY};
+#   · pageSize **硬上限 50**,传 51 直接
+#     `400 {"message":["pageSize must not be greater than 50"]}`;
+#   · page 是 **0-indexed**,offset = page × pageSize;
+#     offset / limit / skip / cursor 全部被**静默忽略**,只有 page 生效。
+# ⚠️⚠️ **绝不要传 `withThesis=true`** —— 它只返回写了 callout 的持有人,
+#    大部分币直接返回空列表,一传就会把"这个币没人持有"这个假事实报出去。
+MINT_POSITIONS_SORT_BY = "TOP"          # 按持仓量从多到少 —— "前 N 名"这个说法的依据
+MINT_POSITIONS_MAX_PAGE_SIZE = 50       # 服务端硬上限,超了整页 400
+# 每行捎带多少条 callout 更新。0 = 一条都不要:/chips 只报筹码不报观点,
+# 拿了也不显示,白白把响应体撑大一个量级。
+MINT_POSITIONS_UPDATES_LIMIT = 0
+
+# mint 的合法字符集 —— **它来自 Telegram 消息,是不可信输入**,与 _USER_KEY_RE 同一条理由:
+# 原样拼进 URL 路径就是路径穿越口子(`…/mint-positions/../../following-positions/alerts`
+# 会打到那个**需要登录**的端点上)。
+# ⚠️ 比 _USER_KEY_RE 还窄一格:代币地址只有两种真实形态(base58 与 `0x…`),
+#    两者都只用 ASCII 字母数字,连 `_` `-` 都用不上,而 `.` `/` `?` `#` `%` 与空白
+#    是唯一能改变 URL 结构的东西 —— 一个都不放。
+_MINT_RE = re.compile(r"^[0-9A-Za-z]{1,80}$")
+
 
 # ============================================================
 # 数据结构
@@ -848,9 +871,57 @@ class PumpClient:
         ⚠️ 两条链共用这一个端点(实测 Solana 的 PUNCHMA 与 Robinhood 的
            0x04a2df…2b36 都是 200),不需要按链分支。
         """
-        payload = self._json(f"coins-v3/{mint[:8]}…", "get",
-                             f"{FRONTEND_BASE}/coins-v3/{mint}")
-        return parse_coin(payload)
+        return parse_coin(self.fetch_coin_payload(mint))
+
+    def fetch_coin_payload(self, mint: str):
+        """
+        /coins-v3/{mint} 的**原始响应**。失败 / mint 非法一律 None。
+
+        ⚠️ 为什么单独开一个:CoinStats 只留了推送要的那几个字段,而 /chips 的
+           pump 半边要的是 `total_supply_str` / `base_decimals`(占比的**分母**)。
+           往 CoinStats 上再挂两个字段会让每一条 CoinStats 的等值比较都跟着变
+           (夹具里那几条 `CoinStats(...) == ` 的断言当场红),而那两个字段
+           与推送半点关系都没有 —— 两个用途,两条取值路径,同一个请求。
+        ⚠️ mint 过与 resolve_user 同一道白名单再 quote:它来自 Telegram 消息。
+           实测非 base58/EVM 形态的串服务端自己也会 400,但那已经是**发出去之后**了。
+        """
+        m = (mint or "").strip()
+        if not _MINT_RE.match(m):
+            logger.warning("pump.fun mint 含非法字符,不发请求: {!r}", m[:80])
+            return None
+        return self._json(f"coins-v3/{m[:8]}…", "get",
+                          f"{FRONTEND_BASE}/coins-v3/{quote(m, safe='')}")
+
+    def fetch_mint_positions(self, mint: str, page: int = 0,
+                             page_size: int = MINT_POSITIONS_MAX_PAGE_SIZE):
+        """
+        某个币在 pump 平台上的**托管持仓人**的一页。原始响应,失败一律 None。
+
+        ⚠️⚠️ 这是**匿名公开端点**:实测不带任何头、不 impersonate 也是 200。
+           这个功能全程不登录、不用任何凭据 —— `/followed-holders/{mint}` 那条
+           要登录(401),`/following-positions/alerts` 同理,一条都不碰。
+        ⚠️⚠️ 返回里的 `totalCount` 是**平台托管持仓人数**,与
+           `/token-holders/{mint}/count` 的 `holderCount`(**链上地址数**)
+           是两个不同量级的数(实测 Hr8CpESJ:链上 178 / 平台 167;
+           65Nt7Tdis:链上 8561 / 平台 2035),而且链上那个只有 Solana 有,
+           bsc/base/robinhood/eth 全部 404。**绝不能拿链上数冒充平台数**,
+           更不许两个数相加或相除。本功能只用 totalCount。
+        ⚠️ page_size 在这里**硬夹到 50**:服务端 51 就整页 400,而调用方传大一点
+           "想少发几个请求"是个太自然的想法 —— 夹在发出去之前,不留这个坑。
+        ⚠️ page 是 0-indexed(服务端语义),调用方按 0 起算。
+        """
+        m = (mint or "").strip()
+        if not _MINT_RE.match(m):
+            logger.warning("pump.fun mint 含非法字符,不发请求: {!r}", m[:80])
+            return None
+        return self._json(
+            f"mint-positions/{m[:8]}…p{page}", "get",
+            f"{FRONTEND_BASE}/mint-positions/{quote(m, safe='')}",
+            params={"sortBy": MINT_POSITIONS_SORT_BY,
+                    "pageSize": min(int(page_size), MINT_POSITIONS_MAX_PAGE_SIZE),
+                    "updatesLimit": MINT_POSITIONS_UPDATES_LIMIT,
+                    "page": int(page)},
+        )
 
     def fetch_callouts(self, user_key: str, limit: int = 30) -> list[Callout] | None:
         """

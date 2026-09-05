@@ -1,0 +1,9 @@
+{
+ "statusCode": 400,
+ "timestamp": "2026-09-05T03:51:27.212Z",
+ "path": "/mint-positions/0x2f219c706e052dc25372a0c59dcc2afe0cab12f3?sortBy=TOP&pageSize=51&updatesLimit=0&page=0",
+ "message": [
+  "pageSize must not be greater than 50"
+ ],
+ "error": "Bad Request"
+}

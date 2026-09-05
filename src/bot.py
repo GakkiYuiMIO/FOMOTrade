@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 
-from src import store
+from src import formatter, pumpchips, store
 
 # total_supply_of 与 client 那边的响应形状是一体的:它知道 totalSupply 埋在 .token.info 里、
 # 也知道 0 / 负数要当"没拿到"处理。在 bot 里再解一遍等于把同一个契约抄成两份,迟早走岔。
@@ -443,6 +443,24 @@ _CA_MONEY_SCI = 1e15
 MAX_CHIPS_MEMBER_ROWS = 10
 # 占比小到这个量级以下就不再报数字 —— 再往下全是量化噪声,写出来只是假精确
 _CHIPS_PCT_FLOOR = 0.0001
+
+# ============ 💊 pump.fun 平台那半边 ============
+# ⚠️⚠️ 它与上面 🏦 FOMO 那半边是**两个平台的两份数据**,只是印在同一条回执里:
+#    分子分母各自独立、失败各自独立,两个百分比**不可以**相加、相减或相除
+#    (同一个人可能在两个平台上都持有,加起来会重复计算)。
+#    共用的只有"精确 vs 下界"这条判据与它的措辞 —— 那必须一致,否则同一条消息里
+#    同一个记号(≥)会有两种含义。
+# ⚠️ 取值/聚合全在 src/pumpchips.py(含实测事实与翻页策略),这里只负责文案。
+EMOJI_PUMP_CHIPS = "💊"          # pump.fun 的药丸标志
+# ⚠️ 名单那行**刻意复用 👥**:铁律 1 里行首 emoji 是聊天列表预览的扫描锚点,
+#    而"名单命中"在两半边是同一类信息 —— 给它两个锚点反而更难扫。
+#    区分交给紧跟的文字(「你的名单」vs「你的 pump 名单」),而上一行的 💊
+#    已经把这半边整个标出来了。
+EMOJI_PUMP_WATCH = "👥"
+# pump 名单区最多展开几个人。⚠️ 比 FOMO 那半边(10)少一半是有意的:
+#    这半边是**加在一条已有回执后面**的,两半边加起来不能把原来的信息挤下去;
+#    而 pump 名单本身就是个位数规模(/pump add 手工维护),5 行足够看清是谁。
+MAX_PUMP_CHIP_ROWS = 5
 
 
 class CommandBot:
@@ -1809,6 +1827,10 @@ class CommandBot:
             local_nets = _local_token_nets(conn, ca)
             local_symbol = _local_token_symbol(conn, ca)
             members = _load_watch_members(conn)
+            # 💊 那半边的名单。⚠️ 与上面那份是**两个平台的两份名单**,绝不能互相顶替:
+            #    watch_users 是 FOMO 的人(按 handle 加的),pump_watch_users 是
+            #    pump.fun 的人(按 pump 用户名/钱包加的),同一个自然人在两边是两条记录。
+            pump_members = _load_pump_members(conn)
 
         if forced_net:
             candidates = [forced_net]
@@ -1851,6 +1873,13 @@ class CommandBot:
                 f"{_ca_clip(_chain_name(net), CA_CHAIN_CHARS)}"]
         head += _chips_platform_lines(st, err)
         head += _chips_watch_lines(st, err)
+        # ⚠️⚠️ 💊 pump 那半边接在这里,而且**只接在这条成功路径上**:
+        #    上面几条早退分支(一条链都没定下来 / 接口挂了)返回的是**诊断消息**,
+        #    在一条"没查到、可能猜错链"的消息后面挂一段别的平台的筹码只会更难读。
+        #    代价是:一个只在 pump 上、FOMO 完全没有的币仍然看不到 💊 那半边 ——
+        #    这是刻意的取舍(见 README「已知取舍」),换来的是既有行为一个字节都不变。
+        # ⚠️ 它排在 FOMO 半边之后,所以 pump 挂掉/超时最坏只是少了 💊 那几行。
+        head += _pump_chips_lines(self._pump, ca, pump_members)
 
         tail: list[str] = []
         # ⚠️ 两条注脚都在解释「占比这个数怎么来的」,所以**共用同一道守卫**:
@@ -2171,7 +2200,7 @@ def _ca_pos_str(v: float) -> str:
     return _ca_money(v)
 
 
-def _ca_pct_str(v: float) -> str:
+def _ca_pct_str(v) -> str | None:
     """
     百分比展示。
 
@@ -2184,8 +2213,12 @@ def _ca_pct_str(v: float) -> str:
        长度从最坏 302 个字符回到最多 11 个。
        ⚠️ 阈值取 1e9 而不是更小:真实的百倍千倍(+10000%)必须照原样显示,
           换记法反而更难读。_f 已经把 NaN / Infinity 过滤成 None,这里不会拿到非有限值。
+
+    ⚠️⚠️ 实现已搬到 formatter.fmt_signed_pct(理由与 _chips_qty 相同:/chips 的
+       pump 半边在 formatter 里渲染盈亏,两边各留一份记法迟早写出两种百分比)。
+       这里只是一行转调,调用点一个字都没动,输出逐字节相同。
     """
-    return f"{v:+.2e}%" if abs(v) >= 1e9 else f"{v:+.1f}%"
+    return formatter.fmt_signed_pct(v)
 
 
 def _ca_append_pnl(seg: list[str], label: str, pnl: float | None, pct: float | None) -> None:
@@ -2207,8 +2240,9 @@ def _ca_append_pnl(seg: list[str], label: str, pnl: float | None, pct: float | N
     else:
         amount = _signed_money(pnl)
     piece = f"{label} {amount}"
-    if pct is not None:
-        piece += f" ({_ca_pct_str(pct)})"
+    pct_text = _ca_pct_str(pct) if pct is not None else None
+    if pct_text is not None:
+        piece += f" ({pct_text})"
     seg.append(piece)
 
 
@@ -2449,18 +2483,18 @@ def _chips_ge_pct(p: float, sep: str = "") -> str:
     return f"≥{sep}{_chips_pct(p)}"
 
 
-def _chips_qty(v: float) -> str:
+def _chips_qty(v) -> str | None:
     """
-    持仓数量展示。memecoin 的供应量常在 1e9~1e15 量级,每三位一个逗号能写出
-    二十几个字符,一行就被它吃掉 —— 十亿以上换成 B/T 单位。
+    持仓数量展示。⚠️ 实现已搬到 formatter.fmt_token_amount,这里只是一行转调。
+
+    ⚠️⚠️ 为什么要搬:同一条 /chips 回执现在有两半边(🏦 FOMO 与 💊 pump),
+       pump 那半边的成员行在 formatter 里渲染(它带一个必须过门禁的用户名,
+       见 render_pump_chip_row)。两边各留一份数量记法的话,同一条回执里
+       会出现 `14,584,546` 与 `14.58M` 两种写法,读者会以为那是两种不同的量。
+    ⚠️ 输出与搬之前逐字节相同(有测试钉着);唯一的差别是解析不出来时返回 None
+       而不是抛 TypeError —— 那一段照既有规矩消失,绝不补一个凭空的 0。
     """
-    a = abs(v)
-    for div, unit in ((1e12, "T"), (1e9, "B")):
-        if a >= div:
-            return f"{v / div:,.2f}{unit}"
-    if 0 < a < 1:
-        return f"{v:,.4f}"                # 高价币可能真的只持有零点几枚,别四舍五入成 0
-    return f"{v:,.0f}"
+    return formatter.fmt_token_amount(v)
 
 
 def _chips_match_members(holders: list[dict], members: dict[str, str]) -> list[dict]:
@@ -2586,6 +2620,162 @@ def _chips_watch_lines(st: dict, err: str | None) -> list[str]:
     return [line]
 
 
+def _pump_coverage_warn(ch) -> str:
+    """
+    「我们只看到了一部分人」这句提示。⚠️ 三种"看不全"的原因**措辞必须不同** ——
+    读者据此判断"要不要自己再查一次":
+
+      · 轻档       —— 是**我们**主动只看前 50 名(币太大,全翻会拖住这条同步命令);
+      · 撞预算     —— 我们本来要全翻,时间不够;
+      · 平台没给全 —— 我们该翻的都翻完了,是**平台**只给出这么多明细
+                      (实测很常见:totalCount=107 的币明细只有 1 条,见 pumpchips 模块头)。
+
+    把三件事写成同一句"仅统计前 N 名"就是在编原因。
+    """
+    covered, total = ch.covered, ch.total
+    if total is None:
+        return f"⚠️ 平台没给总数,{covered:,} 人只是下界"
+    if ch.partial:
+        return f"⚠️ 时间不够,只统计到 {covered:,}/{total:,} 人,真实值更高"
+    if not ch.full_scan:
+        return f"⚠️ 人多,仅统计前 {covered:,} 名,真实值更高"
+    return f"⚠️ 平台只给出 {covered:,}/{total:,} 人的明细,真实值更高"
+
+
+def _pump_chips_platform_lines(ch) -> list[str]:
+    """
+    💊 平台侧文案。与 🏦 FOMO 侧**同一条判据**:covered == total 才敢说「持仓 X%」,
+    否则只能说「≥X%」并把覆盖范围写出来。
+
+    ⚠️ 分母缺失时占比那一段整段消失,绝不打 0%(见 pumpchips._ratio)。
+    ⚠️ 「持有人 0」是**真实值**照常显示(实测 200 `{"positions":[],"totalCount":0}`
+       —— pump 认得这个币,平台上确实没人托管持仓),它与"查不到"是两件事,
+       后者在 pumpchips.fetch_chips 里返回 None,💊 整块根本不出现。
+    """
+    total, covered, pct = ch.total, ch.covered, ch.plat_pct
+    head = (f"{EMOJI_PUMP_CHIPS} pump.fun 平台 · 持有人 {total:,}" if total is not None
+            else f"{EMOJI_PUMP_CHIPS} pump.fun 平台 · 持有人 ≥{covered:,}(平台没给总数)")
+    if ch.exact and pct is not None:
+        return [f"{head} · 持仓 {_chips_pct(pct)}"]
+
+    lines = [head]
+    if covered == 0:
+        # ⚠️ 平台自报有人、却一条明细都不给(实测:非 pump 上架的币 —— 它只是被 pump
+        #    用户持有的外部币,coins-v3 直接返回 null)。这时**必须说清楚为什么**,
+        #    否则下面那句"判断不了"会被读成"我们查过了,名单里没人"。
+        if total:
+            lines.append("   ⚠️ 平台只给了人数、没给持仓明细,占比与名单都判断不了")
+        return lines
+    if not ch.exact:
+        warn = _pump_coverage_warn(ch)
+        lines.append(f"   持仓 {_chips_ge_pct(pct, ' ')}   {warn}" if pct is not None
+                     else f"   {warn}")
+    if pct is None:
+        # 分子有、分母没有(或分母对不上)。⚠️ 与 FOMO 侧那句注脚同义,但必须挨着 💊
+        #    这一块说 —— 两半边的分母是两个不同的来源,一句话盖两边会指鹿为马。
+        # ⚠️⚠️ "没拿到分母"与"分母自相矛盾"是**两句话**:后者读者应当知道
+        #    pump 自己给的数就对不上(实测 $PUMP:已统计的持仓比它自报的总供应量还多),
+        #    写成"没给"会让人以为是我们没查到。
+        lines.append("   ⚠️ pump 给的总供应量比已统计的持仓还少,这个分母不可信,占比不显示"
+                     if ch.bad_supply else "   ⚠️ pump 没给总供应量,占比算不出来")
+    return lines
+
+
+def _pump_chips_watch_lines(ch) -> list[str]:
+    """
+    💊 名单侧文案。与 FOMO 侧同源同口径,措辞逐字对齐(同一条消息里同一个说法
+    必须是同一个意思)。
+
+    ⚠️⚠️ 「无人持有」与「前 N 名内无人」是**两件不同的事**,绝不能混:
+       前者是"全都看过了,确实没有",后者是"我们只看到前 N 名,他可能在后面"。
+       写成「无人持有」就是把"我们没看见"谎报成"不存在"。
+    ⚠️ 一条明细都没拿到时既不说"有"也不说"无" —— 那时「前 0 名内无人」
+       是句什么都没说的话。
+    """
+    matched, covered, pct = ch.matched, ch.covered, ch.watch_pct
+    if covered == 0:
+        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 没有持仓明细,判断不了"]
+    if ch.exact:
+        if not matched:
+            return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 无人持有"]
+        line = f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · {len(matched)} 人持有"
+        if pct is not None:
+            line += f" · {_chips_pct(pct)}"
+        return [line]
+    if not matched:
+        return [f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · 前 {covered:,} 名内无人"]
+    line = f"{EMOJI_PUMP_WATCH} 你的 pump 名单 · {len(matched)} 人在前 {covered:,} 名内"
+    if pct is not None:
+        line += f" · {_chips_ge_pct(pct)}"
+    return [line]
+
+
+def _pump_chip_member_lines(ch) -> list[str]:
+    """
+    命中的名单成员,每人一行。超出 MAX_PUMP_CHIP_ROWS 的收口成一句"还有 N 人未显示"。
+
+    ⚠️⚠️ 行本身由 **formatter.render_pump_chip_row** 渲染,不在这里拼:
+       那一行里的 pump 用户名是攻击者可控的自由文本,而门禁表(UNTRUSTED_FIELDS)
+       只对挂了 @_guard_untrusted 的渲染函数生效。在这里 f-string 拼一下
+       就绕过了整套收口 —— 那正是 tests/test_nameguard_chokepoint.py 存在的理由。
+    ⚠️ 返回的行**已转义**,交给 _ca_fit_line 时不要再 escape。
+    """
+    lines = [f"   {formatter.render_pump_chip_row(pump_username=m['name'], amount_held=m['amount'], pnl_pct=m['pnl_pct'])}"
+             for m in ch.matched[:MAX_PUMP_CHIP_ROWS]]
+    omitted = len(ch.matched) - len(lines)
+    if omitted:
+        lines.append(f"   …按持仓数量排序,还有 {omitted} 人未显示")
+    return lines
+
+
+def _pump_chips_lines(get_client, ca: str, members: dict[str, str]) -> list[str]:
+    """
+    💊 那半边的全部行。**任何失败都返回空列表**(整块消失),绝不炸掉整条回执。
+
+    ⚠️⚠️ 第一个参数收的是"**怎么拿到客户端**"这个动作,而不是客户端本身:
+       PumpClient 是懒建的,建它要 import curl_cffi(带原生库),而那一步自己
+       也会失败(没装 / 装坏了)。放在 try 外面的话,一个 ImportError 会把整条
+       /chips 炸掉 —— 连 🏦 FOMO 那半边一起。有用例钉着这条。
+    ⚠️⚠️ 名单为空(还没 /pump add 过人)时**名单那两段整个不出现** ——
+       对着一个空名单说"无人持有"是句误导:读者会以为我们查过了。
+       平台人数与占比照常显示,它们与名单没有关系。
+    ⚠️ 这里是 /chips 里**唯一**一处对 pump 的外呼。它排在 🏦 FOMO 那半边**之后**,
+       所以 pump 挂掉/超时的最坏后果是"回执少了 💊 那几行",FOMO 半边一个字都不变。
+    """
+    try:
+        ch = pumpchips.fetch_chips(get_client(), ca, members)
+    except Exception:  # noqa: BLE001
+        logger.exception("/chips 的 pump 半边整块失败(只让 💊 消失) | {}", ca[:16])
+        return []
+    if ch is None:
+        return []                      # 这个币根本不在 pump 上 → 回执与接入前一模一样
+    lines = _pump_chips_platform_lines(ch)
+    if members:
+        lines += _pump_chips_watch_lines(ch)
+        lines += _pump_chip_member_lines(ch)
+    return lines
+
+
+def _load_pump_members(conn) -> dict[str, str]:
+    """
+    pump 名单成员:user_id → 展示名。
+
+    ⚠️ 只取 active = 1:/pump del 是软删除,退出名单的人不该再算进「你的 pump 名单」
+       (与 _load_watch_members 同一条理由)。
+    ⚠️ **不看 seeded / callout_seeded** —— 那两位是推送侧的冷启动播种位,
+       与"他现在持不持有"完全无关;拿它们过滤会让刚 /pump add 的人凭空消失。
+    ⚠️ username 允许是 NULL:那时展示名退回接口给的 userName(见
+       pumpchips._match_members),两者都会在渲染入口过 safe_display。
+    """
+    return {
+        str(r["user_id"]): (r["username"] or "")
+        for r in conn.execute(
+            "SELECT user_id, username FROM pump_watch_users WHERE active = 1"
+        ).fetchall()
+        if r["user_id"]
+    }
+
+
 def _chips_member_row(m: dict) -> list[str]:
     """
     名单成员一行:`   @handle · 1,234,567 枚 · $890`。
@@ -2593,8 +2783,9 @@ def _chips_member_row(m: dict) -> list[str]:
     ⚠️ 缺的字段整段消失,不打 "N/A" 也不打 0 —— 与 /ca 的买家行同一条规矩。
     """
     seg = [f"@{_ca_clip(m['handle'], CA_HANDLE_CHARS)}"]
-    if m["amount"] is not None:
-        seg.append(f"{_chips_qty(m['amount'])} 枚")
+    qty = _chips_qty(m["amount"]) if m["amount"] is not None else None
+    if qty is not None:
+        seg.append(f"{qty} 枚")
     if m["value"] is not None:
         seg.append(_ca_money(m["value"]))
     return ["   " + " · ".join(seg)]
