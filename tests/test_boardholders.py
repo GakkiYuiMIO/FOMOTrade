@@ -462,6 +462,61 @@ class Test缓存与预算:
         assert lk.cached("robinhood", "0x" + CA_MEME[2:].upper()) is not None
         assert len(c.holder_calls) == 1
 
+    # ------------------------------------------------------------------
+    # ⚠️⚠️ 上面那几条闸门的用例都**自己注入了参数**(per_round=3 / wall_clock_sec=6.0
+    #    / _BoardCache(error_ttl=...)),于是它们只证明了"闸门这套机制是通的",
+    #    **完全没有钉住生产默认值**。变异跑当场抓到:把 _HOLDERS_PER_ROUND 改成
+    #    100000、_ROUND_WALL_CLOCK_SEC 改成 100000.0、_BOARD_ERROR_TTL_SEC 改成 0.0,
+    #    全量 4578 条**一条都不红**(实测)—— 也就是说线上的闸门可以被悄悄拿掉。
+    #    下面三条用**生产默认值**(一个参数都不传)重做一遍。
+    # ------------------------------------------------------------------
+    def test_不传参数时次数上限就是生产那个值(self):
+        """⚠️ 十个币进来,只该发 6 个持有人请求(第 7 个起本轮不显示)。"""
+        c = FakeClient()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache())   # 只换缓存,闸门用默认
+        lk.begin_round()
+        lk.lookup([("robinhood", f"0x{i:040x}") for i in range(1, 11)])
+        assert len(c.holder_calls) == 6
+
+    def test_不传参数时墙钟闸就是生产那个值(self):
+        """
+        ⚠️ 每次外呼假装花 2 秒:拉榜 2 秒 + 两个持有人请求 4 秒 = 6 秒,到顶。
+           墙钟默认值被改大 → 十个币全查完 → 这条红。
+        """
+        ticks = iter([float(2 * i) for i in range(40)])
+        c = FakeClient()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache(),
+                                   clock=lambda: next(ticks, 999.0))
+        lk.begin_round()
+        lk.lookup([("robinhood", f"0x{i:040x}") for i in range(1, 11)])
+        assert len(c.holder_calls) == 2
+
+    def test_不传参数时榜单失败的负缓存是分钟量级(self):
+        """
+        ⚠️ 拉榜失败后**半分钟内**绝不重试:一次上游抖动不该让后面每一条推送
+           都再去试一次(那正是上游抖动时最不该做的事)。
+           负缓存 TTL 被改成 0 → 第二次 lookup 又拉一次 → 这条红。
+        """
+        now = [1000.0]
+        c = FakeClient(board_error=RuntimeError("上游 500"))
+        cache = bh._BoardCache(clock=lambda: now[0])          # ttl / error_ttl 都用默认
+        lk = bh.BoardHoldersLookup(c, board_cache=cache)
+        lk.lookup([("robinhood", CA_MEME)])
+        now[0] += 30.0
+        lk.lookup([("solana", CA_STONK)])
+        assert len(c.board_calls) == 1
+
+    def test_不传参数时榜单成功的缓存是分钟量级(self):
+        """⚠️ 同上的正向:成功之后几分钟内不该再拉榜(榜与币无关)。"""
+        now = [1000.0]
+        c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
+        cache = bh._BoardCache(clock=lambda: now[0])
+        lk = bh.BoardHoldersLookup(c, board_cache=cache)
+        lk.lookup([("robinhood", CA_MEME)])
+        now[0] += 120.0
+        lk.lookup([("solana", CA_STONK)])
+        assert len(c.board_calls) == 1
+
     def test_只读缓存路径脏输入也不抛(self):
         lk = make(FakeClient())
         assert lk.cached(None, None) is None
