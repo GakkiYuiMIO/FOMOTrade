@@ -531,3 +531,41 @@ class Test两道门各自钉住:
         body = [ln for ln in _board_holders_lines(rows, (50, 90, 90, True, 150))
                 if ln.startswith("   #")]
         assert len(body) == 3
+
+
+# ============================================================
+# ⚠️⚠️ 隐形字符的**两道**处置各自钉住
+# ============================================================
+# 变异跑抓到:只把 safe_username 那一条 Cf 判断退回「只查 bidi」时,全量**一条都不红** ——
+# 因为 safe_board_rows 的「整行丢弃」跑在前面,把它整个盖住了。
+# 这正是 K5 那条教训的同一形状:串联的两道门,后面那道永远测不到。
+# 所以 safe_username 必须有一条**只驱动它自己**的用例。
+class Test隐形字符的两道处置:
+    def test_门禁函数本身对任何隐形字符都返回空(self):
+        """
+        ⚠️⚠️ 只驱动 nameguard.safe_username。退回「只查 bidi」时:
+           零宽空格 / 软连字符 / BOM / word-joiner 这四条全部漏过去,
+           而漏过去的结果是 **"unipcs"** —— 榜上第 1 名的 handle,一次定向冒名。
+        ⚠️ 这道门还给 /chips 的 💊 pump 成员行用(那一行也长得像一条记录),
+           所以它自己必须是硬的,不能靠上游某个调用方替它把关。
+        """
+        from src.nameguard import safe_username
+
+        for evil in ("uni​pcs", "uni­pcs", "unip﻿cs", "uni⁠pcs",
+                     "uni‍pcs", "币‮ pmup"):
+            assert safe_username(evil) is None, repr(evil)
+
+    def test_干净的handle照常放行(self):
+        """⚠️ 反向:代价必须是 0,否则这道门就把真人打成「未知用户」了。"""
+        from src.nameguard import safe_username
+
+        for good in ("unipcs", "The__Solstice", "ether_monk", "397397", "0xnobi"):
+            assert safe_username(good) == good, good
+
+    def test_门禁在成员行那一侧同样生效(self):
+        """⚠️ 同一道门守着 💊 pump 成员行 —— 那一行的处置是退回「未知用户」。"""
+        from src.formatter import render_pump_chip_row
+
+        out = render_pump_chip_row(pump_username="uni​pcs", amount_held=1.0, pnl_pct=2.0)
+        assert "unipcs" not in out
+        assert "未知用户" in out
