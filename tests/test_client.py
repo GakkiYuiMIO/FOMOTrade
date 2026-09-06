@@ -477,7 +477,15 @@ def test_榜单小于一的夹到一(monkeypatch):
 # ============================================================
 # auth_invalidate=False —— 锦上添花型调用方绝不处置登录态
 # ============================================================
-def _counting_client(status: int):
+# 2026-09-06 用一个伪造令牌打 /v2/leaderboard/24h 真的收到的报文
+# (逐字节同 tests/fixtures/fomo_leaderboard_401.json)。
+# ⚠️ 注意 responseObject 是**空数组**:靠"解析出来是不是空"判鉴权失败会把
+#    "榜真的空了"和"令牌坏了"混成一件事 —— 判据只能是 HTTP 状态码。
+_REAL_401_BODY = ('{"success": false, "message": "Unexpected error in JWT '
+                  'authentication middleware", "responseObject": [], "statusCode": 401}')
+
+
+def _counting_client(status: int, body: str = _REAL_401_BODY):
     """记下 tokens.invalidate() 被调了几次。"""
     box = {"invalidated": 0, "requests": 0}
 
@@ -492,7 +500,7 @@ def _counting_client(status: int):
 
         def _request(self, path, params=None):
             box["requests"] += 1
-            return (status, '{"message":"unauthorized"}', {})
+            return (status, body, {})
 
     return Fake(), box
 

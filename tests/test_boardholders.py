@@ -420,6 +420,20 @@ class Test缓存与预算:
         lk.lookup([("robinhood", f"0x{i:040x}") for i in range(5)])
         assert len(c.holder_calls) == 1
 
+    def test_拉榜的耗时也计入墙钟(self):
+        """
+        ⚠️⚠️ 拉榜同样挂在 tick 的墙钟上(而且它可能在**等另一个 job 的那把锁**)。
+           不把它记进账,墙钟闸对"榜慢了"这种情况就完全失效。
+        """
+        ticks = iter([0.0, 7.0])          # 光拉榜就花了 7 秒 > 墙钟 6 秒
+        c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
+        lk = make(c, wall_clock_sec=6.0, per_round=99,
+                  clock=lambda: next(ticks, 99.0))
+        lk.begin_round()
+        assert lk.lookup([("robinhood", CA_MEME)]) == {}
+        assert len(c.board_calls) == 1
+        assert c.holder_calls == [], "墙钟已经用光,后面一个持有人请求都不该发"
+
     def test_持有人结果进内存缓存后不再重复请求(self):
         c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
         lk = make(c)
@@ -540,3 +554,50 @@ class Test交给渲染层的参数:
     def test_精确样本的口径(self, board):
         blk = bh.match_block(board, load("fomo_top_holders_robinhood_cleat.json"), 150)
         assert blk.render_args()["board_scope"] == (1, 87, 87, True, 150)
+
+
+# ============================================================
+# 真实的 400 / 401 报文(2026-09-06 亲手打出来的)
+# ============================================================
+# ⚠️ 这两份夹具是**真实响应**,不是编的:
+#   400 —— 故意把 networkId 传成链名 "robinhood";
+#   401 —— 用一个伪造令牌打榜单(全程走假的 token provider,不碰真实登录态)。
+class Test真实的错误报文:
+    def test_四百的报文说的就是链id不是数字(self):
+        """
+        ⚠️⚠️ 这条把"networkId 必须是数字"从一句注释变成一份**证据**:
+           服务端的原话是 `Expected number, received nan`。
+        """
+        body = load("fomo_top_holders_400_chainname.json")
+        assert body["statusCode"] == 400
+        assert body["success"] is False
+        assert body["message"] == (
+            "Invalid input: query.tokens.0.networkId - Expected number, received nan")
+        assert body["responseObject"]["validationErrors"][0]["field"] == \
+            "query.tokens.0.networkId"
+
+    def test_四百的报文走生产解析路径也只让这一块消失(self):
+        """⚠️ client 会把 400 抛成 FomoAPIError;本模块吞掉它,这一块整块不出现。"""
+        from src.client import FomoAPIError
+
+        body = load("fomo_top_holders_400_chainname.json")
+        c = FakeClient(holders_error=FomoAPIError(
+            f"/hodlers/top HTTP 400: {json.dumps(body)[:300]}"))
+        assert make(c).lookup([("robinhood", CA_MEME)]) == {}
+
+    def test_四百一的报文(self):
+        body = load("fomo_leaderboard_401.json")
+        assert body["statusCode"] == 401
+        assert body["message"] == "Unexpected error in JWT authentication middleware"
+        # ⚠️ 注意它的 responseObject 是**空数组**而不是对象 —— 直接喂给解析层
+        #    会得到一个"空榜",而不是一个异常。所以判据必须是 HTTP 状态码,
+        #    绝不能靠"解析出来是不是空"来判鉴权失败。
+        assert body["responseObject"] == []
+        assert bh.parse_board(body["responseObject"]) == {}
+
+    def test_四百一走生产路径这一块消失且推送不受影响(self):
+        """⚠️⚠️ client 对 401 抛的是 AuthError,而 poller 对 AuthError 的处置是**停机**。"""
+        c = FakeClient(board_error=AuthError(
+            "/v2/leaderboard/24h 鉴权失败(HTTP 401);本次调用不处置登录态"))
+        assert make(c).lookup([("robinhood", CA_MEME)]) == {}
+        assert c.holder_calls == [], "榜都没拿到,就不该再去问持有人"

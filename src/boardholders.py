@@ -296,11 +296,14 @@ class _BoardCache:
         self._board: dict[str, BoardRow] | None = None
         self._size = 0
 
-    def get(self, client, timed=None) -> tuple[dict[str, BoardRow] | None, int, bool]:
+    def get(self, client) -> tuple[dict[str, BoardRow] | None, int, bool]:
         """
         → (榜单索引 或 None, 榜单行数, 是不是这次真发了请求)。
 
-        timed:调用方用来把耗时记进本轮墙钟账的包装器(见 BoardHoldersLookup._timed)。
+        ⚠️ 调用方负责把**整段**耗时(含下面这把锁的等待)记进本轮墙钟账 ——
+           见 BoardHoldersLookup._lookup。锁的等待也算是有理由的:poller 与
+           pump.fun watcher 是两个 job,两边同时到期时后到的那个是**真的在等**
+           前一个的那次请求,不记账就等于墙钟闸对它失效。
         """
         with self._lock:
             now = self._clock()
@@ -315,7 +318,7 @@ class _BoardCache:
                                               auth_invalidate=False)
 
             try:
-                rows = call() if timed is None else timed(call)
+                rows = call()
             except Exception as e:  # noqa: BLE001
                 # ⚠️ AuthError 也在这里被吞掉:这一块绝不能把"登录态失效"这件事
                 #    捅到推送主路径去(poller 对 AuthError 的处置是**停机**)。
@@ -449,7 +452,12 @@ class BoardHoldersLookup:
         client = self._ensure_client()
         if client is None:
             return out
-        board, size, _ = self._board.get(client, self._timed)
+        # ⚠️ 拉榜的耗时(含等锁)同样计入本轮墙钟账 —— 它跟持有人请求一样挂在 tick 上
+        t0 = self._clock()
+        try:
+            board, size, _ = self._board.get(client)
+        finally:
+            self._spent += self._clock() - t0
         if not board:
             # 榜单没拿到(失败,或者一行都解析不出来)—— 这一块整体没有意义了
             return out
