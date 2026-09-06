@@ -29,6 +29,7 @@ from loguru import logger
 
 from src import copyworker, store
 from src.auth import AuthError
+from src.boardholders import BoardHoldersLookup
 from src.client import (
     NotSupportedError,
     UserGoneError,
@@ -703,6 +704,12 @@ class Poller:
         #    与 _pool_lookup / _names 同一条铁律:失败一律自己吞掉,
         #    绝不允许它有能力影响任何一条推送的发出。
         self._token_extras = TokenExtraLookup()
+        # 🏅 盈利榜持有人(这个币的持有人里有谁挂在 24h 盈利榜上)。
+        # ⚠️ 复用**这个** client(不另建一份连接);榜单本身是进程级缓存、与币无关,
+        #    poller 与 pumpfun 那份共用同一份(见 boardholders._BOARD)。
+        # ⚠️ 与 _pool_lookup / _names / _token_extras 同一条铁律:失败一律自己吞掉,
+        #    绝不允许它有能力影响任何一条推送的发出;401/403 更不许去处置登录态。
+        self._board_holders = BoardHoldersLookup(client)
         # 名单内转账标注(B-9)用:每 tick 刷新一次,避免 normalize_* 里再开 DB 连接
         self._watched_ids: set[str] = set()
         self._watched_handles: set[str] = set()
@@ -1558,6 +1565,8 @@ class Poller:
             worker.close()
         self._pool_lookup.close()
         self._token_extras.close()
+        # ⚠️ 它用的是 poller 自己的 client(注入进去的),close() 只清引用、不关连接
+        self._board_holders.close()
 
     def _start_thesis(self, batch: list[tuple]):
         """
@@ -1962,8 +1971,38 @@ class Poller:
             logger.warning("发射台/持有人查询失败,本轮这两行不显示 | {}", e)
             return {}
 
+    def _board_holder_map(self, pending: list[FomoEvent]) -> dict:
+        """
+        本轮要推的这些币的 🏅 盈利榜持有人 → {(链, 归一化地址): BoardBlock}。
+
+        ⚠️ 与 _token_extra_map 同一套筛选:只问**买卖**推送要用的币(转入走 cached_only、
+           不新开请求),计价币跳过。
+        ⚠️⚠️ 与 _token_extra_map 的差别是**请求形态**:filterTokens 能跨链混批、
+           整轮一个请求;而 /hodlers/top 一次只能问一个币,所以这里是
+           **每个币一个请求**,靠 boardholders 自己的每 tick 次数上限 + 墙钟闸兜住
+           (超了就后面那些币这一块不显示,绝不阻塞推送)。
+        ⚠️⚠️ 整段包在 try 里,失败一律降级为空 dict:
+           **绝不能出现"因为查不到盈利榜所以整条推送没发出去"**。
+        """
+        pairs: list[tuple[str, str]] = []
+        for ev in pending:
+            if ev.event_type not in (EVENT_BUY, EVENT_SELL) or ev.is_quote:
+                continue
+            net = (ev.network_id or "").strip()
+            ca = (ev.token_address or "").strip()
+            if net and ca:
+                pairs.append((net, ca))
+        if not pairs:
+            return {}
+        try:
+            return self._board_holders.lookup(pairs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("盈利榜持有人查询失败,这一块本轮不显示 | {}", e)
+            return {}
+
     def _name_extras(self, pool_quotes: dict, network_id, token_address, token_symbol,
-                     pq, *, cached_only: bool, extras: dict | None = None) -> dict:
+                     pq, *, cached_only: bool, extras: dict | None = None,
+                     boards: dict | None = None) -> dict:
         """
         A/B/C 三段的数据 → render 的关键字参数。缺哪段就没哪个键(那一行整行消失)。
 
@@ -2045,6 +2084,18 @@ class Poller:
         except Exception as e:  # noqa: BLE001
             logger.warning("发射台/持有人获取失败,这两行不显示 | {} {} | {}",
                            network_id, token_address, e)
+        # ⚠️⚠️ 🏅 盈利榜持有人**又是单独一段 try**:它是第三条外呼路径
+        #    (两个 FOMO 端点),与上面两段任何一段都不该互相带走。
+        #    零命中时 render_args() 返回 {} —— 那一块整块不出现(绝不打「0 人」)。
+        try:
+            key = (net, normalize_token_address(token_address))
+            blk = (self._board_holders.cached(net, token_address) if cached_only
+                   else (boards or {}).get(key))
+            if blk is not None:
+                out.update(blk.render_args())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("盈利榜持有人获取失败,这一块不显示 | {} {} | {}",
+                           network_id, token_address, e)
         return out
 
     def _dispatch(self, conn, snapshots: dict, new_events: list[FomoEvent], dry_run: bool) -> None:
@@ -2086,6 +2137,11 @@ class Poller:
         with suppress(Exception):
             self._token_extras.begin_round()
         token_extras = self._token_extra_map(pending)
+        # 🏅 盈利榜持有人:榜单进程级缓存(与币无关,一次拉 150 行大家共用)+
+        # 每个币一个持有人请求,次数与墙钟预算从这里起算。见 _board_holder_map。
+        with suppress(Exception):
+            self._board_holders.begin_round()
+        board_blocks = self._board_holder_map(pending)
         # 币名/股票说明的每 tick 预算从这里起算(见 namecn.NameGlossary)
         with suppress(Exception):
             self._names.begin_round()
@@ -2125,7 +2181,7 @@ class Poller:
             # 英文全名(A)/ 中文名(C)/ 股票说明(B)。转入推送只读缓存、不发请求
             names = self._name_extras(pool_quotes, ev.network_id, ev.token_address,
                                       ev.token_symbol, pq, cached_only=is_transfer_in,
-                                      extras=token_extras)
+                                      extras=token_extras, boards=board_blocks)
             try:
                 text = (
                     # ⚠️ 转入逐条推送同样带三行,但**只读缓存**(cached_only=True):
@@ -2135,7 +2191,9 @@ class Poller:
                                              token_name_zh=names.get("token_name_zh"),
                                              launchpad=names.get("launchpad"),
                                              token_holders=names.get("token_holders"),
-                                             token_socials=names.get("token_socials"))
+                                             token_socials=names.get("token_socials"),
+                                             board_holders=names.get("board_holders"),
+                                             board_scope=names.get("board_scope"))
                     if is_transfer_in else
                     render(
                         ev,

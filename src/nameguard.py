@@ -1180,3 +1180,58 @@ def safe_launchpad(s) -> str | None:
     if not text:
         return None
     return _LAUNCHPADS.get(text.lower())
+
+
+# ============================================================
+# 🏅 盈利榜持有人行的门禁(safe_board_rows)—— 结构化字段,与 safe_social_links 同路数
+# ============================================================
+# ⚠️⚠️ 这一块印出来长得像**一条记录**:`#28 「frankdegods」 · 11,020,000 枚 ·
+#    粉丝 218,710 · 全平台24h +$323.15K`。而 handle 是**本人可控**的:
+#    谁都能把自己的 FOMO 用户名改成 `已清仓 · 亏损 99%` 或 `t.me/scam`,
+#    混进这一行就是一条伪造的记录 —— 与 /chips 的 pump 成员行是同一个威胁模型。
+# ⚠️⚠️ handle 走 **safe_username**(封闭形状 [A-Za-z0-9_] ≤32 + 三条地址形态 + 数字 ≤7),
+#    实测依据(2026-09-05,24h 榜 150 行全量):
+#      · 150/150 逐条匹配 `[A-Za-z0-9_]{1,32}` —— 最长 15 字符、数字最多 7 个;
+#      · safe_username 丢 **0/150 = 0.00%**;
+#      · safe_display 丢 **14/150 = 9.33%**(`The__Solstice` / `ether_monk` /
+#        `397397` 这类带 `_` 或纯数字的),而丢掉的后果是这一行**认不出是谁**;
+#      · safe_ident 同样丢 0 条,但它**允许空格** —— `Send SOL to my wallet now`
+#        整句穿过去,而这一行长得像一条记录(J8 那条教训一字不差地适用)。
+# ⚠️⚠️ **只印 userHandle,不印 displayName**。同一份 150 行语料里 displayName 在
+#    safe_username 下丢 **32/150 = 21.33%**(中文名 / 空格 / emoji:`point farm capital`
+#    `RugDalio✨` `Ethermonk 📿`),要显示它就只能退回 safe_ident 那道允许空格的门 ——
+#    为了一个"更好看但随时可改、还会重名"的名字,把这一行的门从封闭形状降级成
+#    形态匹配,不划算。handle 才是能拿去 FOMO 上搜到人的那个标识。
+# ⚠️ handle 不合格 → 置 None(渲染层退回「未知用户」),**整行保留**:
+#    这一行的其余三段(排名 / 持仓 / 盈亏)是真值,而排名本身就能定位到人;
+#    丢掉整行会让上面那句「N 人」与下面列出的行数对不上,那才是真的错。
+# ⚠️ 排名不是正整数 → **整行丢弃**:`#N` 是这一行的锚,锚都不可信就没什么可说的了。
+# 一次最多放行几行。⚠️ 调用方(boardholders)已经截过一次,这里是第二道:
+#    实测一个币最多命中过 31 人(robinhood PONS),原样铺开就是 31 行。
+_MAX_BOARD_ROWS = 10
+
+
+def safe_board_rows(items) -> tuple[tuple, ...] | None:
+    """
+    ((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …) → 同形结构;一条都不剩 → None。
+
+    ⚠️ 只处置 **handle** 这一个文本槽位;另外四个是数字,由渲染层的格式化函数
+       各自判(拿不到就那一段消失,绝不补 0)—— 形状门禁套在数字上没有意义。
+    ⚠️ 返回 None 时调用方那一整块消失(与"零命中"同一种表现)。
+    """
+    try:
+        seq = list(items or ())
+    except TypeError:
+        return None
+    out: list[tuple] = []
+    for item in seq:
+        try:
+            rank, handle, amount, followers, pnl24h = item
+        except (TypeError, ValueError):
+            continue
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+            continue
+        out.append((rank, safe_username(handle), amount, followers, pnl24h))
+        if len(out) >= _MAX_BOARD_ROWS:
+            break
+    return tuple(out) or None

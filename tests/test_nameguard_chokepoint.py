@@ -86,6 +86,13 @@ _EXPECT_UNTRUSTED = {
     #        它把 4.24% 打成「未知用户」(`AR_04` / `Bart_da_charts` / `_togi_`),
     #        而 safe_username 同一份语料丢 0.00%、45 条 _MUST_BLOCK 仍然零泄漏。
     "pump_username": "safe_username",
+    # ⚠️⚠️ 本轮新增:🏅 盈利榜持有人那一块的**行**
+    #    ((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。它是**结构化**字段,
+    #    门禁收整体、返回同形结构(与 token_socials / safe_social_links 同一套路数)。
+    #    里面那个 handle 是**本人可控**的,而这一行长得像一条**记录** ——
+    #    换成 safe_ident(允许空格,整句话能穿过去)或 safe_display(实测把 9.33% 的
+    #    真实 handle 打成「未知用户」)这条当场红。实测依据见 nameguard.safe_board_rows。
+    "board_holders": "safe_board_rows",
 }
 _EXPECT_IDENT = {
     "token_symbol": "safe_ident",        # 币符号,陌生人可控($t.me/pumpgrp 曾原样进标题)
@@ -136,6 +143,11 @@ _EXPECT_REVIEWED = {
     # /chips 的 pump 名单成员行:两个**数字**参数(持仓数量 / 盈亏百分比)。
     # ⚠️ 那一行唯一的文本参数 pump_username 在 _EXPECT_UNTRUSTED 里,不在这份名单里。
     "amount_held", "pnl_pct",
+    # 🏅 那一块的**口径**:(命中人数, 比对了前几名持有人, 服务端自报总数, 是否精确,
+    # 榜单行数)—— 五个都是数字/布尔。
+    # ⚠️ 那一块唯一的文本槽位(handle)在 board_holders 里,由 safe_board_rows 收口,
+    #    不在这份"已复核"的名单里。
+    "board_scope",
 }
 
 

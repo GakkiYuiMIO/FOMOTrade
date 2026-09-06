@@ -416,3 +416,132 @@ def test_总供应量解析与脏值兜底():
     assert C.total_supply_of({"token": {"info": {"totalSupply": "0"}}}) is None
     assert C.total_supply_of({"token": {"info": {"totalSupply": "-1"}}}) is None
     assert C.total_supply_of({"token": {"info": {"totalSupply": "abc"}}}) is None
+
+
+# ============================================================
+# 榜单的 limit 上限(2026-09-05 实测)
+# ============================================================
+# ⚠️⚠️ 这几条钉住一件事:服务端真实上限是 **150**,不是 100。
+#    上一版 get_leaderboard 里写的是 `min(int(limit), 100)`,注释说"服务端硬上限 100"
+#    —— 那句话是 **_FOLLOWING_PAGE 的**(/followingPaginate 传 200 确实 400),
+#    被错抄到了排行榜上。代价:榜上第 101~150 名永远看不见,而且**没有任何报错**。
+#    实测:limit=150 → 150 行;151/160/175/199/500/1000 一律静默返回 150。
+_BOARD_ENVELOPE = {"responseObject": [{"id": "u1", "userHandle": "a", "pnl24h": 1.0}]}
+
+
+def test_榜单一次能拉到一百五十行(monkeypatch):
+    """⚠️ 改回 min(limit, 100) 这条当场红。"""
+    c, box = _wired_http_client(monkeypatch, json.dumps(_BOARD_ENVELOPE))
+
+    c.get_leaderboard("24h", 150)
+
+    assert box["gets"][0]["params"]["limit"] == 150, box["gets"][0]["params"]
+    assert box["gets"][0]["url"] == "https://prod-api.fomo.family/v2/leaderboard/24h"
+
+
+def test_榜单超过一百五十的照样夹到一百五十(monkeypatch):
+    """⚠️ 服务端对 >150 是**静默**返回 150(不报错),我们自己也夹在同一个数上。"""
+    c, box = _wired_http_client(monkeypatch, json.dumps(_BOARD_ENVELOPE))
+
+    for n in (151, 500, 1000):
+        c.get_leaderboard("24h", n)
+
+    assert [g["params"]["limit"] for g in box["gets"]] == [150, 150, 150]
+
+
+def test_榜单绝不再夹回一百(monkeypatch):
+    """⚠️⚠️ 独占钉子:任何把上限改回 100(或任何 <150 的值)的改动,这条必红。"""
+    c, box = _wired_http_client(monkeypatch, json.dumps(_BOARD_ENVELOPE))
+
+    c.get_leaderboard("24h", 120)
+    c.get_leaderboard("24h", 101)
+
+    assert [g["params"]["limit"] for g in box["gets"]] == [120, 101]
+
+
+def test_关注列表分页上限与榜单上限不是同一个数():
+    """⚠️ 两条限制曾经被混为一谈。/followingPaginate 是 100,排行榜是 150。"""
+    assert C._FOLLOWING_PAGE == 100
+    assert C.LEADERBOARD_MAX_LIMIT == 150
+
+
+def test_榜单小于一的夹到一(monkeypatch):
+    """⚠️ limit **必传**,不带直接 400;传 0/负数同理。"""
+    c, box = _wired_http_client(monkeypatch, json.dumps(_BOARD_ENVELOPE))
+
+    c.get_leaderboard("24h", 0)
+
+    assert box["gets"][0]["params"]["limit"] == 1
+
+
+# ============================================================
+# auth_invalidate=False —— 锦上添花型调用方绝不处置登录态
+# ============================================================
+def _counting_client(status: int):
+    """记下 tokens.invalidate() 被调了几次。"""
+    box = {"invalidated": 0, "requests": 0}
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {
+                "invalidate": lambda s: box.__setitem__("invalidated",
+                                                        box["invalidated"] + 1),
+                "get_access_token": lambda s: "t",
+            })()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None):
+            box["requests"] += 1
+            return (status, '{"message":"unauthorized"}', {})
+
+    return Fake(), box
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_关掉处置开关后401不作废登录态(status):
+    """
+    ⚠️⚠️ 这一块(🏅 盈利榜持有人)是推送里可有可无的一行,而登录态是**全进程共用**的。
+       让一个可有可无的请求去 invalidate() 好端端的 access token(甚至在没有
+       refresh token 时打出"请重新 --login"),是拿主路径的命赌一行装饰。
+       真过期时主路径自己会 401、自己续期,这一块下一轮就自愈了。
+    """
+    c, box = _counting_client(status)
+
+    with pytest.raises(C.AuthError):
+        c._fetch_ok("/v2/leaderboard/24h", {"limit": 150}, auth_invalidate=False)
+
+    assert box["invalidated"] == 0, "锦上添花型调用方绝不许处置登录态"
+    assert box["requests"] == 1, "而且不重试 —— 401 重试一次也是白挨一次"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_默认仍然照旧续期一次(status):
+    """⚠️ 反向:主路径的行为一字不变(续期后重试一次,仍失败才抛)。"""
+    c, box = _counting_client(status)
+
+    with pytest.raises(C.AuthError):
+        c._fetch_ok("/v2/users/x/swaps")
+
+    assert box["invalidated"] == 1
+    assert box["requests"] == 2
+
+
+def test_关掉处置开关不影响Cloudflare那条分支():
+    """⚠️ Cloudflare 拦截仍要单独说清 —— 用户的处置完全不同(改 FOMO_CLIENT_IMPL)。"""
+    box = {"invalidated": 0}
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {
+                "invalidate": lambda s: box.__setitem__("invalidated", 1),
+                "get_access_token": lambda s: "t",
+            })()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None):
+            return (403, "<html>Attention Required! | Cloudflare</html>", {})
+
+    with pytest.raises(C.AuthError) as ei:
+        Fake()._fetch_ok("/hodlers/top", auth_invalidate=False)
+    assert "Cloudflare" in str(ei.value)
+    assert box["invalidated"] == 0

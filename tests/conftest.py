@@ -98,6 +98,31 @@ def _no_tokeninfo_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_boardholders_network(monkeypatch):
+    """
+    整场测试的兜底防线之四:**没有任何一条用例可以真的去打 FOMO 的榜单 / 持有人榜**。
+
+    ⚠️⚠️ 与前三道同一条理由,而且这条有一个**独有**的危险:PumpWatcher 手上没有
+       FOMO client,它那个 BoardHoldersLookup 的 client 是 None —— 真要发请求时
+       会自己 `build_client()`,那会读**真实登录态**、发**真实带鉴权的请求**。
+       一条走到 _check 的用例就够了。
+    ⚠️ 桩法是**只拿掉 build_client 这条兜底**,注入进来的 client 照用:
+       poller / 本功能的用例自己注入假 client,行为一字不变;
+       没注入的(PumpWatcher)拿到 None → lookup 直接返回 {} → 那一块不出现,
+       与改造前逐字节一致。
+    ⚠️⚠️ 榜单缓存是**进程级单例**(boardholders._BOARD):一条用例灌进去的假榜
+       会被后面所有用例读到 —— 那是测试之间最难查的那种耦合。每条用例前后各清一次。
+    """
+    from src import boardholders as _b
+
+    _b._BOARD.reset()
+    monkeypatch.setattr(_b.BoardHoldersLookup, "_ensure_client",
+                        lambda self: self._client)
+    yield
+    _b._BOARD.reset()
+
+
+@pytest.fixture(autouse=True)
 def _clear_stop_flag():
     """
     client 的停机 Event 是**模块级全局**。某个用例设了它而不清,

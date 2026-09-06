@@ -46,7 +46,18 @@ EP_TRADES = "/trades"
 EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
 # 榜单。period ∈ {24h, 7d, 30d, following};⚠️ limit 必传,不带直接 400
 EP_LEADERBOARD = "/v2/leaderboard/{period}"
-# ⚠️ 服务端硬上限 100,传 201 会直接 400 —— 实测出来的,不要改大
+# 榜单一次能拿到的**最大**行数。⚠️⚠️ 实测(2026-09-05)服务端真实上限是 **150**:
+#   limit=150 → 150 行;151 / 160 / 175 / 199 / 500 / 1000 一律**静默返回 150**(不报错)。
+# ⚠️⚠️ 上一版这里写的是 `min(int(limit), 100)`,注释说"服务端硬上限 100" —— 那句话
+#    是**下面那行 _FOLLOWING_PAGE 的**(/followingPaginate 传 200 确实 400 "must be
+#    less than or equal to 100"),被错抄到了排行榜上。代价实打实:榜上第 101~150 名
+#    (用户截图里的 `#118`)永远看不见,而且没有任何报错、没有任何日志。
+# ⚠️ 这个端点**没有分页**:offset / page / skip / cursor 四种参数实测全部被静默忽略
+#    (四种都原样返回第 1 页)。所以 150 就是这个榜的全部,别再去试翻页。
+LEADERBOARD_MAX_LIMIT = 150
+# ⚠️ 服务端硬上限 100,传 201 会直接 400 —— 实测出来的,不要改大。
+# ⚠️⚠️ 这一条只对 /v2/users/{uid}/followingPaginate 成立,**与排行榜无关**
+#    (排行榜是 150,见上)。两者曾经被混为一谈,别再合并。
 _FOLLOWING_PAGE = 100
 # 某人的**全部**转账流水(与任意第三方之间的,不限于"我与他")。
 # ⚠️ 这条注释更正了一个长期的错误结论。此前记的是"FOMO 不提供转账查询" ——
@@ -246,13 +257,15 @@ class FomoClient(Protocol):
     def iter_transfers(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
-    def get_top_holders(self, token_address: str, network_id) -> dict: ...
+    def get_top_holders(self, token_address: str, network_id, *,
+                        auth_invalidate: bool = True) -> dict: ...
     def get_token_meta(self, token_address: str, network_id) -> dict: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
     def get_activity_feed(self, limit: int = 100) -> list[dict]: ...
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
-    def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list[dict]: ...
+    def get_leaderboard(self, period: str = "24h", limit: int = 20, *,
+                        auth_invalidate: bool = True) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
     def fetch_snapshot(self, user_id: str) -> UserSnapshot: ...
@@ -503,13 +516,26 @@ class _BaseFomoClient:
         """释放资源(连接池 / 浏览器)。默认无操作。"""
 
     # ---------- 重试与错误分类 ----------
-    def _fetch_ok(self, path: str, params: dict | None = None) -> str:
+    def _fetch_ok(self, path: str, params: dict | None = None, *,
+                  auth_invalidate: bool = True) -> str:
         """
         取一个 2xx 的响应体,否则抛 FomoAPIError。
 
         ⚠️ AuthError 直接上抛不拦截:登录态挂掉是全局问题,
            包成 FomoAPIError 会让 poller 以为只是某个接口抖动,继续空转刷日志,
            而设计文档 §3.5 要求的是「告警需要重新登录 + 停止轮询」。
+
+        auth_invalidate=False —— **锦上添花型**调用方专用(目前只有 🏆 盈利榜持有人
+        那一块,见 src/boardholders.py)。它把 401/403 的处置改成「立刻抛 AuthError、
+        既不 tokens.invalidate() 也不重试」:
+          ⚠️⚠️ 这一块是推送里**可有可无**的一行,而 invalidate() 与随后的续期是
+             **全进程共用**那份登录态的事。让一个可有可无的请求去把好端端的
+             access token 标记失效(甚至在没有 refresh token 时打出"请重新 --login"
+             的告警),是拿主路径的命去赌一行装饰 —— 与 fetch_token_meta 上面
+             那条既有教训同一条(那边是"匿名请求不该碰令牌",这边是
+             "次要请求不该处置令牌")。
+          ⚠️ 真令牌过期时主路径(swaps / feed)自己会 401 → 自己 invalidate → 自己续期,
+             这一块下一轮就自愈了。它**从不**需要自己去修登录态。
         """
         if stop_requested():
             raise FomoAPIError(f"{path} 停机中,未发出")
@@ -564,6 +590,13 @@ class _BaseFomoClient:
                         f"{path} 被 Cloudflare WAF 拦截(HTTP {status})—— 不是鉴权问题。"
                         f"请把 .env 里的 FOMO_CLIENT_IMPL 改成 playwright 重试。"
                     )
+                if not auth_invalidate:
+                    # ⚠️⚠️ 锦上添花型调用方:**不碰令牌、不重试**,直接把这次失败抛回去。
+                    #    调用方(boardholders)会把它吞成"这一块本轮不显示"。
+                    raise AuthError(
+                        f"{path} 鉴权失败(HTTP {status});本次调用不处置登录态"
+                        f"(auth_invalidate=False),主路径自会续期"
+                    )
                 if not auth_retried:
                     auth_retried = True
                     logger.warning("HTTP {} 疑似 token 失效,续期后重试一次 | {}", status, path)
@@ -597,8 +630,10 @@ class _BaseFomoClient:
             )
         raise FomoAPIError(f"{path} 重试 {_MAX_ATTEMPTS} 次仍失败")
 
-    def _get(self, path: str, params: dict | None = None):
-        return _parse_json(self._fetch_ok(path, params), path)
+    def _get(self, path: str, params: dict | None = None, *,
+             auth_invalidate: bool = True):
+        return _parse_json(self._fetch_ok(path, params,
+                                          auth_invalidate=auth_invalidate), path)
 
     # ---------- 端点 ----------
     def resolve_handle(self, handle: str) -> tuple[str, str, str]:
@@ -705,20 +740,30 @@ class _BaseFomoClient:
     def get_balances(self, user_id: str) -> list[dict]:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
 
-    def get_leaderboard(self, period: str = "24h", limit: int = 20) -> list[dict]:
+    def get_leaderboard(self, period: str = "24h", limit: int = 20, *,
+                        auth_invalidate: bool = True) -> list[dict]:
         """
         榜单。period ∈ {24h, 7d, 30d, following};following 是"我关注的人里的排名"。
 
-        ⚠️ limit **必传**:不带直接 400。服务端上限 100,传更大也只给 100。
+        ⚠️ limit **必传**:不带直接 400。
+        ⚠️⚠️ 服务端上限是 **150**(LEADERBOARD_MAX_LIMIT),不是 100 ——
+           实测 limit=150 给 150 行,151/160/175/199/500/1000 一律静默返回 150。
+           上一版这里夹在 100,于是榜上第 101~150 名(用户截图里的 `#118`)
+           永远看不见。**别再把它改回 100**,那句"上限 100"说的是 _FOLLOWING_PAGE。
+        ⚠️ 这个端点没有分页(offset/page/skip/cursor 实测全部静默忽略),150 就是全部。
+        ⚠️ **排名 = 返回顺序的 1-based 下标** —— 响应里**没有** rank 字段。
         字段:id / displayName / userHandle / totalPnL / pnl24h / pnl7d / pnl30d /
              totalVolume / numTrades / followers / totalHoldings / topHoldings[] / clan。
+        ⚠️ 周期与盈亏字段一一对应:24h → `pnl24h`,7d → `pnl7d`,30d → `pnl30d`。
         ⚠️ 实测(2026-08-22):period="following" 一个请求返回 79 行,
-           同时带全部四个盈亏字段;period="7d" 之类返回的是**全站前 100 榜**,
+           同时带全部四个盈亏字段;period="7d" 之类返回的是**全站榜**,
            只有 pnl7d 一项,且大半不是我们名单里的人 —— 采集名单盈亏只能用 following。
+        auth_invalidate:见 _fetch_ok。推送路径(boardholders)传 False。
         """
         p = (period or "24h").strip().lower()
         path = EP_LEADERBOARD.format(period=quote(p, safe=""))
-        return _as_list(self._get(path, {"limit": max(1, min(int(limit), 100))}))
+        n = max(1, min(int(limit), LEADERBOARD_MAX_LIMIT))
+        return _as_list(self._get(path, {"limit": n}, auth_invalidate=auth_invalidate))
 
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]:
         """
@@ -856,7 +901,8 @@ class _BaseFomoClient:
             params["afterTime"] = int(after_ms)
         return _as_list(self._get(EP_TOKEN_THESIS, params))
 
-    def get_top_holders(self, token_address: str, network_id) -> dict:
+    def get_top_holders(self, token_address: str, network_id, *,
+                        auth_invalidate: bool = True) -> dict:
         """
         某个币的持有人榜(/chips 的分子)。返回 responseObject 里对应这个币的那个对象:
           {"tokenAddress": …, "networkId": …, "totalHolders": 26, "topHolders": [ … ]}
@@ -870,12 +916,17 @@ class _BaseFomoClient:
            limit 也钳死在 100。调用方必须自己拿 len(topHolders) 与 totalHolders 比,
            判断手上这份数据是全量还是截断 —— 那是 /chips「精确 / 下界」两套文案的唯一依据。
         ⚠️ 解析不出来返回 {} 而不是抛异常:上层据此显示"没查到",与猜错链是同一种表现。
+        ⚠️⚠️ networkId **必须是数字**:传链名(如 "robinhood")服务端直接 400
+           "Expected number, received nan"。_as_network_number 负责这一步转换,
+           调用方传链名或数字都行,但**别把它绕过去**。
+        auth_invalidate:见 _fetch_ok。推送路径(boardholders)传 False。
         """
         tokens = json.dumps(
             [{"address": token_address, "networkId": _as_network_number(network_id)}],
             separators=(",", ":"),
         )
-        payload = self._get(EP_TOP_HOLDERS, {"tokens": tokens, "limit": TOP_HOLDERS_LIMIT})
+        payload = self._get(EP_TOP_HOLDERS, {"tokens": tokens, "limit": TOP_HOLDERS_LIMIT},
+                            auth_invalidate=auth_invalidate)
         ro = _unwrap(payload)
         # 请求里只放了一个币,响应就只有一个元素;仍按"可能是裸对象"兜底(与 _as_obj 同一条理由)
         if isinstance(ro, list):
