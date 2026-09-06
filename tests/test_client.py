@@ -12,6 +12,7 @@ client.py 重试与错误分类的单测。
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -236,10 +237,13 @@ def _wired_http_client(monkeypatch, body: str, *, status: int = 200):
         def __init__(self, **kw):
             box["session_kwargs"] = kw
 
-        def get(self, url, params=None, headers=None):
+        def get(self, url, params=None, headers=None, **kw):
+            # ⚠️ **kw 是为了把"多传了什么关键字"也录下来 —— 装饰性调用会带 timeout=,
+            #    而主路径**一个多余的关键字都不许带**(有用例逐条钉住)。
             box["gets"].append({"url": url,
                                 "params": dict(params or {}),
-                                "headers": dict(headers or {})})
+                                "headers": dict(headers or {}),
+                                "extra_kwargs": dict(kw)})
             return _Resp()
 
         def close(self):
@@ -553,3 +557,329 @@ def test_关掉处置开关不影响Cloudflare那条分支():
         Fake()._fetch_ok("/hodlers/top", auth_invalidate=False)
     assert "Cloudflare" in str(ei.value)
     assert box["invalidated"] == 0
+
+
+# ============================================================
+# ⚠️⚠️ 装饰性调用的独立策略(fast_fail=True)
+# ============================================================
+# 这一段钉的是一个**实测出来的**阻塞:🏅 盈利榜持有人那一块复用主路径的重试机时,
+# 一个 429 + `Retry-After: 60` 能让**单个请求**阻塞 140.3 秒
+# (3 次尝试 × 12s 超时 + sleep 62.49 + 41.78),而这一段是同步跑在发消息**之前**的。
+# ⚠️ 断言全部写死字面量:1 次请求、0 次 sleep、超时 5.0 秒。
+def _policy_client(responses, *, headers=None):
+    """
+    记下:发了几次请求、每次传了什么 timeout、sleep 了几次各多久。
+
+    ⚠️ responses 是一串 (status, body),按顺序回;用完之后一直回最后一个。
+    """
+    box = {"requests": [], "sleeps": []}
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {
+                "invalidate": lambda s: None,
+                "get_access_token": lambda s: "t",
+            })()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None, *, timeout=None):
+            box["requests"].append(timeout)
+            i = min(len(box["requests"]) - 1, len(responses) - 1)
+            status, body = responses[i]
+            return status, body, dict(headers or {})
+
+    return Fake(), box
+
+
+def _no_sleep(monkeypatch, box):
+    """把可打断的等待换成只记账 —— 用例里绝不能真的睡 60 秒。"""
+    def fake_sleep(seconds):
+        box["sleeps"].append(seconds)
+        return False
+    monkeypatch.setattr(C, "sleep_or_stop", fake_sleep)
+
+
+def test_装饰性调用碰上429只发一次也一秒都不睡(monkeypatch):
+    """
+    ⚠️⚠️ 这条是这一整轮改动的支点。上一版:3 次请求 + 两次 sleep(总计 ~104 秒)。
+       现在:**1 次请求、0 次 sleep**,立刻抛回去让调用方把这一块隐掉。
+    """
+    c, box = _policy_client([(429, "slow down")], headers={"Retry-After": "60"})
+    _no_sleep(monkeypatch, box)
+
+    with pytest.raises(C.FomoAPIError):
+        c._fetch_ok("/v2/leaderboard/24h", {"limit": 150},
+                    auth_invalidate=False, fast_fail=True)
+
+    assert len(box["requests"]) == 1
+    assert box["sleeps"] == []
+
+
+def test_装饰性调用碰上503也只发一次(monkeypatch):
+    c, box = _policy_client([(503, "boom")])
+    _no_sleep(monkeypatch, box)
+
+    with pytest.raises(C.FomoAPIError):
+        c._fetch_ok("/hodlers/top", None, auth_invalidate=False, fast_fail=True)
+
+    assert len(box["requests"]) == 1
+    assert box["sleeps"] == []
+
+
+def test_装饰性调用碰上传输失败也只发一次(monkeypatch):
+    box = {"requests": [], "sleeps": []}
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {"invalidate": lambda s: None,
+                                          "get_access_token": lambda s: "t"})()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None, *, timeout=None):
+            box["requests"].append(timeout)
+            raise C._TransportError("连不上")
+
+    _no_sleep(monkeypatch, box)
+    with pytest.raises(C.FomoAPIError):
+        Fake()._fetch_ok("/hodlers/top", None, fast_fail=True)
+
+    assert len(box["requests"]) == 1
+    assert box["sleeps"] == []
+
+
+def test_装饰性调用的超时是五秒(monkeypatch):
+    """⚠️ 主路径是 12.0 秒;装饰性那条必须更短,否则「只试一次」照样能卡 12 秒。"""
+    c, box = _policy_client([(200, "[]")])
+    _no_sleep(monkeypatch, box)
+
+    c._fetch_ok("/v2/leaderboard/24h", {"limit": 150}, fast_fail=True)
+
+    assert box["requests"] == [5.0]
+
+
+def test_装饰性策略下单个请求的最坏阻塞上界(monkeypatch):
+    """
+    ⚠️⚠️ **把上界算出来断言**,而不是「看起来更快了」:
+       最坏 = 尝试次数 × 单次超时 + 全部 sleep = 1 × 5.0 + 0 = **5.0 秒**。
+       (上一版同一个算式:3 × 12.0 + 62.49 + 41.78 = 140.3 秒。)
+    """
+    c, box = _policy_client([(429, "slow down")], headers={"Retry-After": "60"})
+    _no_sleep(monkeypatch, box)
+
+    with pytest.raises(C.FomoAPIError):
+        c._fetch_ok("/v2/leaderboard/24h", {"limit": 150}, fast_fail=True)
+
+    worst = sum(t for t in box["requests"]) + sum(box["sleeps"])
+    assert worst == 5.0
+
+
+# ---- 反向:主路径**一个字节都不许变** ----------------------------------------
+def test_主路径碰上429仍然重试三次并按RetryAfter睡(monkeypatch):
+    """
+    ⚠️⚠️ 这条是「绝不许改动主路径重试行为」的正面证据:
+       3 次请求、2 次 sleep,每次 sleep 都落在 60 × (1±0.35) 的抖动区间里。
+    """
+    c, box = _policy_client([(429, "slow down")], headers={"Retry-After": "60"})
+    _no_sleep(monkeypatch, box)
+
+    with pytest.raises(C.FomoAPIError):
+        c._fetch_ok("/v2/users/x/swaps")
+
+    assert len(box["requests"]) == 3
+    assert len(box["sleeps"]) == 2
+    assert all(39.0 <= w <= 81.0 for w in box["sleeps"]), box["sleeps"]
+    assert box["requests"] == [None, None, None]
+
+
+def test_主路径碰上503仍然重试三次并线性退避(monkeypatch):
+    c, box = _policy_client([(503, "boom")])
+    _no_sleep(monkeypatch, box)
+
+    with pytest.raises(C.FomoAPIError):
+        c._fetch_ok("/v2/users/x/balances")
+
+    assert len(box["requests"]) == 3
+    assert len(box["sleeps"]) == 2
+    # 1.5 × 1 与 1.5 × 2,各带 ±35% 抖动
+    assert 0.9 <= box["sleeps"][0] <= 2.1, box["sleeps"]
+    assert 1.9 <= box["sleeps"][1] <= 4.1, box["sleeps"]
+
+
+def test_主路径一个多余的关键字都不传给底层():
+    """
+    ⚠️⚠️ 主路径必须走**与上一版逐字节相同**的调用形态:`self._request(path, params)`,
+       不带 timeout=。这条用一个**签名里根本没有 timeout** 的假实现来证明 ——
+       哪天有人把 _send 改成「永远传 timeout」,这条当场 TypeError。
+    """
+    calls = []
+
+    class OldStyle(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {"invalidate": lambda s: None,
+                                          "get_access_token": lambda s: "t"})()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None):        # ⚠️ 没有 timeout 这个形参
+            calls.append(path)
+            return 200, "[]", {}
+
+    assert OldStyle()._fetch_ok("/v2/users/x/swaps") == "[]"
+    assert calls == ["/v2/users/x/swaps"]
+
+
+def test_主路径真的走到curl时也不带timeout(monkeypatch):
+    """⚠️ 上一条测的是基类;这条测**真的** HttpFomoClient 递给 curl_cffi 的关键字。"""
+    c, box = _wired_http_client(monkeypatch, "[]")
+
+    c.get_leaderboard("24h", 150)
+
+    assert box["gets"][0]["extra_kwargs"] == {}
+    assert box["session_kwargs"]["timeout"] == 12.0
+
+
+def test_装饰性调用走到curl时带的是五秒(monkeypatch):
+    c, box = _wired_http_client(monkeypatch, "[]")
+
+    c.get_leaderboard("24h", 150, auth_invalidate=False, fast_fail=True)
+
+    assert box["gets"][0]["extra_kwargs"] == {"timeout": 5.0}
+
+
+def test_持有人那个端点的装饰性调用同样带五秒(monkeypatch):
+    c, box = _wired_http_client(monkeypatch, '{"responseObject": []}')
+
+    c.get_top_holders("0xabc", 4663, auth_invalidate=False, fast_fail=True)
+
+    assert box["gets"][0]["extra_kwargs"] == {"timeout": 5.0}
+
+
+def test_两个开关互不相干():
+    """
+    ⚠️ auth_invalidate 管「401 要不要动登录态」,fast_fail 管「失败要不要重试」。
+       两条各自默认关,而且 fast_fail=True 时 401 的处置一个字不变。
+    """
+    box = {"invalidated": 0, "requests": []}
+
+    class Fake(C._BaseFomoClient):
+        def __init__(self):
+            self._tokens = type("T", (), {
+                "invalidate": lambda s: box.__setitem__("invalidated",
+                                                        box["invalidated"] + 1),
+                "get_access_token": lambda s: "t"})()
+            self._thesis_tpl = None
+
+        def _request(self, path, params=None, *, timeout=None):
+            box["requests"].append(timeout)
+            return 401, '{"statusCode": 401}', {}
+
+    with pytest.raises(C.AuthError):
+        Fake()._fetch_ok("/v2/leaderboard/24h", None,
+                         auth_invalidate=False, fast_fail=True)
+
+    assert box["invalidated"] == 0
+    assert box["requests"] == [5.0]
+
+
+# ============================================================
+# ⚠️⚠️ 榜单的**真实信封**:responseObject 里还套一层
+# ============================================================
+# 这一块从 client 那一层一路测到 boardholders.parse_board。上一版这条链子**零覆盖**:
+# 既有的 limit 用例喂的是 {"responseObject": [ … ]}(裸列表),
+# 而 boardholders 的夹具是**已经解包好**的 150 行裸列表 —— 中间那一层
+# (_unwrap → _as_list 的「信封里只有一个数组就不必猜键名」)没有任何东西钉着它。
+# 解包一坏,这一块会**静默永不出现**(拿到空榜 = 一行都对不齐 = 整块消失,没有任何报错)。
+# ⚠️ 两种形态都钉:套一层的信封 + 已解包的裸列表(committed 的 150 行夹具就是后者)。
+#
+# ============ 夹具的出处 ============
+# tests/fixtures/fomo_leaderboard_envelope.json
+#   · **信封形状**是 2026-09-06 亲手打一次 GET /v2/leaderboard/24h?limit=150 记下来的:
+#     HTTP 200,顶层键 ['message', 'responseObject', 'statusCode', 'success'],
+#     `responseObject` 是 **dict**、里面只有一个键 `leaderboard`、值是 **150 行**的数组。
+#   · **行**取自 fomo_leaderboard_24h.json(真实),只留 #1 / #28 / #144 三行,免得
+#     再存一份 150 行的大文件。
+#   · ⚠️ `message` 那一串**当时没有记下来**,这里留空 —— 与本功能无关,
+#     不许在这儿编一句看起来像真的话。
+_BOARD_REAL_ENVELOPE = json.loads(
+    (pathlib.Path(__file__).parent / "fixtures" / "fomo_leaderboard_envelope.json")
+    .read_text(encoding="utf-8"))
+
+
+def test_榜单真实信封的形状(monkeypatch):
+    """⚠️ 先把夹具本身钉住:responseObject 是 dict,里面套着 leaderboard 数组。"""
+    assert sorted(_BOARD_REAL_ENVELOPE) == ["message", "responseObject", "statusCode",
+                                            "success"]
+    assert _BOARD_REAL_ENVELOPE["statusCode"] == 200
+    assert list(_BOARD_REAL_ENVELOPE["responseObject"]) == ["leaderboard"]
+    assert isinstance(_BOARD_REAL_ENVELOPE["responseObject"]["leaderboard"], list)
+
+
+def test_套了一层leaderboard的信封也解得出来(monkeypatch):
+    c, _ = _wired_http_client(monkeypatch, json.dumps(_BOARD_REAL_ENVELOPE))
+
+    rows = c.get_leaderboard("24h", 150, auth_invalidate=False, fast_fail=True)
+
+    assert [r["userHandle"] for r in rows] == ["unipcs", "Aurelius0121",
+                                               "deliveryydriver"]
+
+
+def test_信封解包坏掉时这一块会静默消失(monkeypatch):
+    """
+    ⚠️⚠️ 从 client 一路跑到 parse_board:名次必须是 1/2/3,而且**对得齐**。
+       把 _unwrap 拆了(或把「信封里只有一个数组」那条兜底拆了),这里拿到的是空榜 ——
+       没有异常、没有日志,只是这一块从此永不出现。这条就是那件事的告警。
+    """
+    from src import boardholders as bh
+
+    c, _ = _wired_http_client(monkeypatch, json.dumps(_BOARD_REAL_ENVELOPE))
+    board = bh.parse_board(c.get_leaderboard("24h", 150, auth_invalidate=False,
+                                             fast_fail=True))
+
+    assert len(board) == 3
+    by_rank = {r.rank: r.handle for r in board.values()}
+    assert by_rank == {1: "unipcs", 2: "Aurelius0121", 3: "deliveryydriver"}
+    assert board["36adb85a-c0fd-5fa8-916d-8fdc32fe4237"].followers == 542169
+
+
+def test_裸列表那种形态也照样解得出来(monkeypatch):
+    """⚠️ committed 的 150 行夹具就是这一种(已解包),两种都得吃。"""
+    c, _ = _wired_http_client(monkeypatch, json.dumps(
+        [{"id": "u1", "userHandle": "unipcs", "pnl24h": 1.0}]))
+
+    rows = c.get_leaderboard("24h", 150, auth_invalidate=False, fast_fail=True)
+
+    assert [r["userHandle"] for r in rows] == ["unipcs"]
+
+
+# ============================================================
+# ⚠️ playwright 下「多一套浏览器」这条代价:复用同一个 client 对象**也省不下来**
+# ============================================================
+def test_浏览器是按线程起的不是按client对象起的():
+    """
+    ⚠️⚠️ 这条把 README「已知代价」那一段变成一条可证伪的断言:
+       `PlaywrightFomoClient` 的 page / browser 挂在 **threading.local()** 上
+       (Playwright 的同步 API 绑定创建它的线程,跨线程调用会挂死 —— 既有事实)。
+       所以浏览器是**按线程**起的:把 poller 那份 client 传给 pump.fun 那个 job,
+       它在自己的线程里照样会 _ensure_page() 再拉起一整套 ——
+       那 ~300MB **省不下来**,而复用反而会把两个 job 的生命周期绑在一起。
+    ⚠️ 只查结构,不启动任何浏览器。
+    """
+    import threading
+
+    tokens = type("T", (), {"get_access_token": lambda s: "t",
+                            "invalidate": lambda s: None})()
+    c = C.PlaywrightFomoClient(tokens)
+
+    assert isinstance(c._tl, threading.local)
+    assert getattr(c._tl, "page", None) is None
+    # ⚠️ _instances 是**按对象**计数的 —— 两个 client 对象各自数 1,
+    #    于是那句"第 2 个浏览器实例"的 WARNING 不会打出来(README 里如实记了这条)。
+    assert c._instances == 0
+    assert C.PlaywrightFomoClient(tokens)._instances == 0
+    # http 那条路同理:Session 也是每线程一份
+    assert isinstance(C.HttpFomoClient(tokens)._tl, threading.local)
+
+
+def test_playwright不能并发这条约束还在():
+    """⚠️ 与上一条同源:线程退出时浏览器不回收,所以 _fetch_snapshots 对它强制串行。"""
+    assert C.PlaywrightFomoClient.supports_concurrency is False
+    assert C.HttpFomoClient.supports_concurrency is True

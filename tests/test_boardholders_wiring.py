@@ -73,13 +73,15 @@ class BoardFake:
         self.board_calls = 0
         self.holder_calls: list[str] = []
 
-    def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True):
+    def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                        fast_fail):
         self.board_calls += 1
         if self._board_boom is not None:
             raise self._board_boom
         return self._board
 
-    def get_top_holders(self, token_address, network_id, *, auth_invalidate=True):
+    def get_top_holders(self, token_address, network_id, *, auth_invalidate=True,
+                        fast_fail):
         self.holder_calls.append(token_address)
         if self._holders_boom is not None:
             raise self._holders_boom
@@ -331,3 +333,230 @@ def test_poller那个复用自己的client(db):
     p = Poller(client, FakeNotifier())
     assert p._board_holders._client is client
     assert p._board_holders._owns_client is False
+
+
+# ============================================================
+# ⚠️⚠️ 卖出推送 / 计价币过滤 —— 上一版这两条**零覆盖**
+# ============================================================
+# 变异跑抓到:`_board_holder_map` 只收 EVENT_BUY(卖出推送悄悄少一块)、
+# 去掉 `ev.is_quote` 过滤(每一笔 $SOL / $USDC 成交都白打一个持有人请求),
+# 两条改动上一版全量 4587 条**一条都不红**。
+def _sell_swap(sid="s1", ca=_CA_AI, sym="AI") -> dict:
+    """一条 Robinhood 链上的**卖出** swap(与 test_poller._rh_swap 同形,只换方向)。"""
+    from tests.test_poller import _FUTURE_MS
+
+    return {"id": sid, "networkId": "robinhood", "tokenAddress": ca, "symbol": sym,
+            "side": "sell", "timestamp": _FUTURE_MS, "amountUsd": 2500.0,
+            "txHash": f"tx-{sid}", "holdingUsd": 0.0}
+
+
+def test_卖出推送同样带上这一块(db):
+    """
+    ⚠️⚠️ 卖出与买入是**同一族**推送(README 的表里两行都打了 ✅)。
+       `_board_holder_map` 只收 EVENT_BUY 时这条当场红。
+    """
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot("uA", swaps=[_sell_swap()], transfers=[],
+                                            thesis=[], balances=[])})
+    tg = FakeNotifier()
+    bc = BoardFake(holders={_CA_AI: _holders(UID_1, UID_144, total=15305)})
+    _poller(client, tg, _FakeDex(), bc).tick()
+
+    assert len(tg.sent) == 1
+    assert "卖出" in tg.sent[0]
+    lines = tg.sent[0].split("\n")
+    assert "🏅 盈利榜持有人 ≥2 人" in lines
+    assert any(ln.startswith("   #1 「unipcs」") for ln in lines)
+    assert bc.holder_calls == [_CA_AI]
+
+
+def test_计价币的成交一个持有人请求都不发(db):
+    """
+    ⚠️⚠️ 计价币($SOL / $USDC / 原生代币哨兵)照常推送,但**绝不为它问持有人** ——
+       那是每一笔计价币成交白打一个请求,而 🏅 对计价币也没有任何意义。
+       去掉 `ev.is_quote` 过滤时这条当场红。
+    """
+    quote_ca = "0x" + "e" * 40           # 原生代币哨兵,models.is_quote_token 认它
+    _add_ready("uA", "alice")
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_rh_swap("q1", ca=quote_ca, sym="ETH")],
+        transfers=[], thesis=[], balances=[])})
+    tg = FakeNotifier()
+    bc = BoardFake(holders={quote_ca: _holders(UID_1)})
+    _poller(client, tg, _FakeDex(), bc).tick()
+
+    assert len(tg.sent) == 1, "计价币的成交本身照常推送"
+    assert bc.holder_calls == [], "但绝不为它问持有人"
+    assert bc.board_calls == 0, "一个币都不用问,连榜都不该拉"
+    assert "🏅" not in tg.sent[0]
+
+
+def test_买入与卖出混在一轮里各自都问到了(db):
+    """⚠️ 两种方向同轮:两个币各一个请求,榜只拉一次。"""
+    _add_ready("uA", "alice")
+    other = "0x" + "c" * 40
+    client = FakeClient({"uA": UserSnapshot(
+        "uA", swaps=[_rh_swap("b1"), _sell_swap("s1", ca=other, sym="ZZZ")],
+        transfers=[], thesis=[], balances=[])})
+    tg = FakeNotifier()
+    bc = BoardFake(holders={_CA_AI: _holders(UID_1), other: _holders(UID_144)})
+    _poller(client, tg, _FakeDex(), bc).tick()
+
+    assert len(tg.sent) == 2
+    assert sorted(bc.holder_calls) == sorted([_CA_AI, other])
+    assert bc.board_calls == 1
+    assert all("🏅" in m for m in tg.sent)
+
+
+# ============================================================
+# ⚠️⚠️ pump.fun 那条接线的**端到端**用例(真的跑到 run_once)
+# ============================================================
+# 上一版那两条 pump 用例一条只驱动 `_name_extras`、一条只查 client 是不是 None,
+# **没有一条跑到 run_once**。变异跑抓到:把 `board_blocks` 断掉(传空 dict)、
+# 或者干脆不查(`_board_holder_map` 直接 return {}),全量 4587 条一条都不红 ——
+# 也就是说这一整条接线可以被悄悄拆掉而 CI 全绿。
+@pytest.fixture
+def pump_cfg(monkeypatch):
+    """pump 那条路的门槛/窗口显式给死,不吃 .env 的默认值。"""
+    for k, v in {"FOMO_PUMP_MIN_USD": "100", "FOMO_PUMP_MAX_MINTS": "8",
+                 "FOMO_PUMP_TRADE_MAX_AGE_SEC": "7200",
+                 "FOMO_PUMP_CALLOUT_MAX_AGE_SEC": "7200"}.items():
+        monkeypatch.setenv(k, v)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _pump_watcher(board_client, notifier):
+    """一个真的 PumpWatcher,只把 🏅 那一块的 FOMO client 换成假的。"""
+    from src import pumpfun as pf
+    from tests.test_pumpfun import (
+        HEX_SVM,
+        MINT_SOL,
+        pos_row,
+        position_payload,
+        seeded_user,
+        trade_payload,
+    )
+    from tests.test_pumpfun import (
+        FakeClient as PumpFakeClient,
+    )
+
+    seeded_user()
+    client = PumpFakeClient(portfolios={HEX_SVM: position_payload(pos_row(held=2.0))},
+                            trades={MINT_SOL: trade_payload()})
+    w = pf.PumpWatcher(notifier, client)
+    w._board_holders = BoardHoldersLookup(board_client, board_cache=bh._BoardCache())
+    return w, MINT_SOL, client
+
+
+def test_pump成交推送跑到run_once才带上这一块(db, pump_cfg):
+    """
+    ⚠️⚠️ 端到端:`PumpWatcher.run_once()` → 真的发出去的那条消息里必须有这一块。
+       把 `_board_holder_map` 拆掉 / 把 board_blocks 断掉,这条当场红。
+    """
+    from tests.test_pumpfun import FakeNotifier as PumpNotifier
+
+    tg = PumpNotifier()
+    bc = BoardFake()
+    w, mint, _pc = _pump_watcher(bc, tg)
+    bc._holders[mint] = _holders(UID_1, UID_144, total=15305)
+
+    assert w.run_once() == 1
+    assert len(tg.sent) == 1
+    lines = tg.sent[0].split("\n")
+    assert "🏅 盈利榜持有人 ≥2 人" in lines
+    assert any(ln.startswith("   #1 「unipcs」") for ln in lines)
+    assert any(ln.startswith("   #144 「deliveryydriver」") for ln in lines)
+    assert "   ⚠️ 只比对了前 2/15,305 名持有人,榜只到前 150 名 —— 没显示≠没有" in lines
+    assert bc.holder_calls == [mint], "每个 mint 一个持有人请求"
+    assert bc.board_calls == 1
+
+
+def test_pump那条路问的是数字链id(db, pump_cfg):
+    """⚠️ 传链名服务端直接 400 —— 这条钉住 pump 那一侧也转成了数字。"""
+    from tests.test_pumpfun import FakeNotifier as PumpNotifier
+
+    seen: list = []
+
+    class Recording(BoardFake):
+        def get_top_holders(self, token_address, network_id, *, auth_invalidate=True,
+                            fast_fail):
+            seen.append((network_id, auth_invalidate, fast_fail))
+            return super().get_top_holders(token_address, network_id,
+                                           auth_invalidate=auth_invalidate,
+                                           fast_fail=fast_fail)
+
+    tg = PumpNotifier()
+    bc = Recording()
+    w, mint, _pc = _pump_watcher(bc, tg)
+    bc._holders[mint] = _holders(UID_1)
+
+    assert w.run_once() == 1
+    assert seen == [(1399811149, False, True)]
+
+
+def test_pump零命中时整块不出现但成交照推(db, pump_cfg):
+    from tests.test_pumpfun import FakeNotifier as PumpNotifier
+
+    tg = PumpNotifier()
+    bc = BoardFake()
+    w, mint, _pc = _pump_watcher(bc, tg)
+    bc._holders[mint] = _holders("not-on-board")
+
+    assert w.run_once() == 1
+    assert "🏅" not in tg.sent[0]
+    assert "0 人" not in tg.sent[0]
+
+
+def test_pump这一块整个炸了成交照样推(db, pump_cfg):
+    """⚠️⚠️ **绝不能出现「因为查不到盈利榜所以成交没推出去」**。"""
+    from tests.test_pumpfun import FakeNotifier as PumpNotifier
+
+    tg = PumpNotifier()
+    bc = BoardFake(board_boom=RuntimeError("上游 500"))
+    w, mint, _pc = _pump_watcher(bc, tg)
+
+    assert w.run_once() == 1
+    assert len(tg.sent) == 1
+    assert "🏅" not in tg.sent[0]
+
+
+def test_pump那条路每轮都重置预算(db, pump_cfg):
+    """
+    ⚠️⚠️ begin_round 没被调 = 第二轮起额度是空的,这一块从此**永久消失**。
+       把额度压到 1,连跑两轮 —— 第二轮必须还有。
+    """
+    from tests.test_pumpfun import (
+        HEX_SVM,
+        pos_row,
+        position_payload,
+    )
+    from tests.test_pumpfun import (
+        FakeNotifier as PumpNotifier,
+    )
+
+    tg = PumpNotifier()
+    bc = BoardFake()
+    w, mint, pc = _pump_watcher(bc, tg)
+    bc._holders[mint] = _holders(UID_1)
+    w._board_holders._per_round = 1
+
+    assert w.run_once() == 1
+    assert "🏅" in tg.sent[0]
+
+    # 第二轮:持仓再变一次(换一笔成交),额度必须已经重置
+    pc.portfolios[HEX_SVM] = position_payload(pos_row(held=9.0))
+    pc.trades[mint] = _second_trade()
+    w._board_holders._cache.clear()          # 绕开 90 秒内存缓存,逼它真的再问一次
+    assert w.run_once() == 1
+    assert len(tg.sent) == 2
+    assert "🏅" in tg.sent[1]
+    assert bc.holder_calls == [mint, mint]
+
+
+def _second_trade():
+    """第二笔成交(换 tx / slot,否则会被去重挡掉)。"""
+    from tests.test_pumpfun import trade_payload
+
+    return trade_payload(tx="TX_2", slot="0002")

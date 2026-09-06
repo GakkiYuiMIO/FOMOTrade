@@ -44,7 +44,10 @@ EP_BALANCES = "/v2/users/{uid}/balances"
 # 持仓单(含已平仓的)。orderBy 只接受 'closedAt' / 'realizedPnlUsd' 两个值
 EP_TRADES = "/trades"
 EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
-# 榜单。period ∈ {24h, 7d, 30d, following};⚠️ limit 必传,不带直接 400
+# 榜单。period ∈ {24h, 7d, 30d, following}。
+# ⚠️⚠️ 这里曾经写着"limit 必传,不带直接 400" —— **那句话是错的**,2026-09-06 实测:
+#    不带 limit 返回的是 **200 + 150 行**(服务端自己的默认值)。仍然一律显式传,
+#    但理由是"别依赖一个没有承诺的默认值",不是"不传会 400"。
 EP_LEADERBOARD = "/v2/leaderboard/{period}"
 # 榜单一次能拿到的**最大**行数。⚠️⚠️ 实测(2026-09-05)服务端真实上限是 **150**:
 #   limit=150 → 150 行;151 / 160 / 175 / 199 / 500 / 1000 一律**静默返回 150**(不报错)。
@@ -131,6 +134,30 @@ _BACKOFF_SEC = 1.5
 #    真实日志里出现过 5 个 balances 在 22:38:17 同秒 504、又在同秒一起重试,
 #    等于把瞬时压力原样重放一遍。
 _JITTER = 0.35
+
+# ============================================================
+# ⚠️⚠️ **装饰性调用**的独立策略(fast_fail=True)
+# ============================================================
+# 上面那套(3 次尝试 / 12s 超时 / 429 按 Retry-After 退避)是**主路径**的账:
+# 一条 swaps 拿不到,这一轮就真的少了几笔成交,值得多等。
+#
+# ⚠️⚠️ 但推送里那些**可有可无的一行**(目前只有 🏅 盈利榜持有人,见 src/boardholders.py)
+#    复用这套是一条实打实的伤害。离线量化过(把 sleep 换成只记账):
+#      429 + Retry-After: 60 → 请求 3 次,sleep=[62.49, 41.78] 合计 104.27s;
+#                              叠上每次 12.0s 连接超时,单个请求最坏阻塞 **140.3s**;
+#      503                  → sleep=[1.53, 3.48] 合计 5.01s + 3×12s 超时。
+#    而这一段是**同步**跑在发消息之前的(poller._board_holder_map 在 _dispatch 里),
+#    也就是说:一行装饰能把整个 tick 的推送卡住两分多钟。
+#
+# ⇒ 装饰性调用走**自己**的一条策略:**单次尝试、5 秒超时、不按 Retry-After 睡、
+#   不退避重试**。失败就是这一块本轮不显示 —— 下一 tick(15~27 秒)会再来,
+#   一条装饰行不值得让读者晚两分钟收到成交提醒。
+# ⚠️ 5.0s 的判据是实测余量:README 记的真网络实测是每个币 0.35~1.48 秒
+#    (p50 0.3-1.2s),5 秒是 3 倍以上的头。
+# ⚠️⚠️ 这条策略**绝不许反向影响主路径**:fast_fail 默认 False,为 False 时
+#    _fetch_ok 走的还是上面那套一模一样的代码路径(有测试逐条钉住主路径行为不变)。
+_DECORATIVE_TIMEOUT_SEC = 5.0
+_DECORATIVE_ATTEMPTS = 1
 
 
 def _backoff(attempt: int) -> float:
@@ -258,14 +285,16 @@ class FomoClient(Protocol):
     def get_token_thesis(self, token_address: str, network_id, after_ms: int | None = None,
                          limit: int = 100) -> list[dict]: ...
     def get_top_holders(self, token_address: str, network_id, *,
-                        auth_invalidate: bool = True) -> dict: ...
+                        auth_invalidate: bool = True,
+                        fast_fail: bool = False) -> dict: ...
     def get_token_meta(self, token_address: str, network_id) -> dict: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
     def get_activity_feed(self, limit: int = 100) -> list[dict]: ...
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
     def get_leaderboard(self, period: str = "24h", limit: int = 20, *,
-                        auth_invalidate: bool = True) -> list[dict]: ...
+                        auth_invalidate: bool = True,
+                        fast_fail: bool = False) -> list[dict]: ...
     def iter_swap_buys(self, user_id: str, max_items: int) -> Iterator[dict]: ...
     def raw_get(self, path: str, params: dict | None = None) -> tuple[int, object, dict]: ...
     def fetch_snapshot(self, user_id: str) -> UserSnapshot: ...
@@ -509,15 +538,31 @@ class _BaseFomoClient:
 
     # ---------- 子类实现 ----------
     def _request(self, path: str, params: dict | None = None) -> tuple[int, str, dict]:
-        """发一个带鉴权的 GET,返回 (status_code, body_text, headers)。传输失败抛 _TransportError。"""
+        """
+        发一个带鉴权的 GET,返回 (status_code, body_text, headers)。传输失败抛 _TransportError。
+
+        ⚠️ 子类可以额外收一个 `timeout=` 关键字(装饰性调用要更短的超时,见
+           _DECORATIVE_TIMEOUT_SEC)。**签名里刻意不写死这个参数**:
+           _send() 只在真要缩短超时时才带上它,不带时调用形态与上一版逐字节相同 ——
+           主路径与所有既有的假 client 都不受影响。
+        """
         raise NotImplementedError
+
+    def _send(self, path: str, params: dict | None, timeout: float | None):
+        """
+        _request 的唯一调用点。⚠️ timeout 为 None 时**一个多余的关键字都不传** ——
+        主路径的调用形态必须与上一版逐字节相同(有测试钉住)。
+        """
+        if timeout is None:
+            return self._request(path, params)
+        return self._request(path, params, timeout=timeout)
 
     def close(self) -> None:
         """释放资源(连接池 / 浏览器)。默认无操作。"""
 
     # ---------- 重试与错误分类 ----------
     def _fetch_ok(self, path: str, params: dict | None = None, *,
-                  auth_invalidate: bool = True) -> str:
+                  auth_invalidate: bool = True, fast_fail: bool = False) -> str:
         """
         取一个 2xx 的响应体,否则抛 FomoAPIError。
 
@@ -525,7 +570,7 @@ class _BaseFomoClient:
            包成 FomoAPIError 会让 poller 以为只是某个接口抖动,继续空转刷日志,
            而设计文档 §3.5 要求的是「告警需要重新登录 + 停止轮询」。
 
-        auth_invalidate=False —— **锦上添花型**调用方专用(目前只有 🏆 盈利榜持有人
+        auth_invalidate=False —— **锦上添花型**调用方专用(目前只有 🏅 盈利榜持有人
         那一块,见 src/boardholders.py)。它把 401/403 的处置改成「立刻抛 AuthError、
         既不 tokens.invalidate() 也不重试」:
           ⚠️⚠️ 这一块是推送里**可有可无**的一行,而 invalidate() 与随后的续期是
@@ -536,9 +581,21 @@ class _BaseFomoClient:
              "次要请求不该处置令牌")。
           ⚠️ 真令牌过期时主路径(swaps / feed)自己会 401 → 自己 invalidate → 自己续期,
              这一块下一轮就自愈了。它**从不**需要自己去修登录态。
+
+        fast_fail=True —— **装饰性**调用方专用(同上,目前只有 🏅 那一块)。它把整套
+        重试机换成:**单次尝试、5 秒超时、不按 Retry-After 睡、不退避重试**。
+          ⚠️⚠️ 理由见 _DECORATIVE_TIMEOUT_SEC 上面那一大段:复用主路径这套重试机时,
+             一个 429 + `Retry-After: 60` 能让单个装饰性请求最坏阻塞 **140.3 秒**,
+             而这一段是同步跑在发消息**之前**的。一条装饰行不值得让读者晚两分钟
+             收到成交提醒 —— 失败就是这一块本轮不显示,下一 tick 会再来。
+          ⚠️ 与 auth_invalidate 是**两件事**:那条管"401 要不要动登录态",
+             这条管"失败要不要重试"。两条互不依赖,各自默认关。
         """
         if stop_requested():
             raise FomoAPIError(f"{path} 停机中,未发出")
+        # ⚠️ 装饰性调用只试一次、超时更短;主路径两个值都与上一版逐字节相同。
+        max_attempts = _DECORATIVE_ATTEMPTS if fast_fail else _MAX_ATTEMPTS
+        timeout = _DECORATIVE_TIMEOUT_SEC if fast_fail else None
         attempt = 0
         auth_retried = False
         # ⚠️ 记住"这一路上见过 401/403"。401 若正好落在**最后一次**尝试上,
@@ -549,13 +606,13 @@ class _BaseFomoClient:
         #    _MAX_ATTEMPTS 从 5 降到 3 之后,凑齐"前面两次失败 + 最后一次 401"的门槛低了不少,
         #    而这个 API 一次抖动就能甩出一串 504/429。
         auth_status: int | None = None
-        while attempt < _MAX_ATTEMPTS:
+        while attempt < max_attempts:
             attempt += 1
             try:
-                status, text, headers = self._request(path, params)
+                status, text, headers = self._send(path, params, timeout)
             except _TransportError as e:
                 _note_transient("传输失败")
-                if attempt < _MAX_ATTEMPTS and not stop_requested():
+                if attempt < max_attempts and not stop_requested():
                     wait = _backoff(attempt)
                     logger.debug("请求传输失败,{:.1f}s 后重试 | {} | {}", wait, path, e)
                     if sleep_or_stop(wait):
@@ -569,7 +626,7 @@ class _BaseFomoClient:
             if status == 429:
                 _note_transient("限流 429")
                 wait = _retry_after(headers)
-                if attempt < _MAX_ATTEMPTS and not stop_requested():
+                if attempt < max_attempts and not stop_requested():
                     logger.debug("FOMO 限流 429,{:.1f}s 后重试 | {}", wait, path)
                     if sleep_or_stop(wait):
                         raise FomoAPIError(f"{path} 停机中,放弃重试")
@@ -609,7 +666,7 @@ class _BaseFomoClient:
 
             if status >= 500:
                 _note_transient(f"服务端 {status}")
-            if status >= 500 and attempt < _MAX_ATTEMPTS and not stop_requested():
+            if status >= 500 and attempt < max_attempts and not stop_requested():
                 wait = _backoff(attempt)
                 logger.debug("FOMO 服务端错误 {},{:.1f}s 后重试 | {}", status, wait, path)
                 if sleep_or_stop(wait):
@@ -625,15 +682,16 @@ class _BaseFomoClient:
         if auth_status is not None:
             # 重试次数耗尽,但这一路上出现过鉴权失败 —— 必须以 AuthError 收场(见循环前的说明)
             raise AuthError(
-                f"{path} 鉴权失败(HTTP {auth_status},重试 {_MAX_ATTEMPTS} 次耗尽)"
+                f"{path} 鉴权失败(HTTP {auth_status},重试 {max_attempts} 次耗尽)"
                 f" —— 请重新执行 --login"
             )
-        raise FomoAPIError(f"{path} 重试 {_MAX_ATTEMPTS} 次仍失败")
+        raise FomoAPIError(f"{path} 重试 {max_attempts} 次仍失败")
 
     def _get(self, path: str, params: dict | None = None, *,
-             auth_invalidate: bool = True):
+             auth_invalidate: bool = True, fast_fail: bool = False):
         return _parse_json(self._fetch_ok(path, params,
-                                          auth_invalidate=auth_invalidate), path)
+                                          auth_invalidate=auth_invalidate,
+                                          fast_fail=fast_fail), path)
 
     # ---------- 端点 ----------
     def resolve_handle(self, handle: str) -> tuple[str, str, str]:
@@ -741,7 +799,8 @@ class _BaseFomoClient:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
 
     def get_leaderboard(self, period: str = "24h", limit: int = 20, *,
-                        auth_invalidate: bool = True) -> list[dict]:
+                        auth_invalidate: bool = True,
+                        fast_fail: bool = False) -> list[dict]:
         """
         榜单。period ∈ {24h, 7d, 30d, following};following 是"我关注的人里的排名"。
 
@@ -754,6 +813,14 @@ class _BaseFomoClient:
            永远看不见。**别再把它改回 100**,那句"上限 100"说的是 _FOLLOWING_PAGE。
         ⚠️ 这个端点没有分页(offset/page/skip/cursor 实测全部静默忽略),150 就是全部。
         ⚠️ **排名 = 返回顺序的 1-based 下标** —— 响应里**没有** rank 字段。
+        ⚠️⚠️ **信封比别的端点多套一层**(2026-09-06 亲手打一次记下来的):
+            {"success":…, "message":…, "statusCode":200,
+             "responseObject": {"leaderboard": [ …150 行… ]}}
+           也就是说 responseObject 是个 **dict**、不是裸数组。这条链子靠
+           _unwrap → _as_list 的"信封里只有一个数组就不必猜键名"那条兜底走通;
+           它一坏,🏅 那一块会**静默永不出现**(空榜 = 一行都对不齐 = 整块消失,
+           没有异常、没有日志)。tests/test_client.py 里有从 client 一路测到
+           boardholders.parse_board 的用例,夹具是 fomo_leaderboard_envelope.json。
         字段:id / displayName / userHandle / totalPnL / pnl24h / pnl7d / pnl30d /
              totalVolume / numTrades / followers / totalHoldings / topHoldings[] / clan。
         ⚠️ 周期与盈亏字段一一对应:24h → `pnl24h`,7d → `pnl7d`,30d → `pnl30d`。
@@ -765,7 +832,8 @@ class _BaseFomoClient:
         p = (period or "24h").strip().lower()
         path = EP_LEADERBOARD.format(period=quote(p, safe=""))
         n = max(1, min(int(limit), LEADERBOARD_MAX_LIMIT))
-        return _as_list(self._get(path, {"limit": n}, auth_invalidate=auth_invalidate))
+        return _as_list(self._get(path, {"limit": n}, auth_invalidate=auth_invalidate,
+                                  fast_fail=fast_fail))
 
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]:
         """
@@ -904,7 +972,8 @@ class _BaseFomoClient:
         return _as_list(self._get(EP_TOKEN_THESIS, params))
 
     def get_top_holders(self, token_address: str, network_id, *,
-                        auth_invalidate: bool = True) -> dict:
+                        auth_invalidate: bool = True,
+                        fast_fail: bool = False) -> dict:
         """
         某个币的持有人榜(/chips 的分子)。返回 responseObject 里对应这个币的那个对象:
           {"tokenAddress": …, "networkId": …, "totalHolders": 26, "topHolders": [ … ]}
@@ -919,8 +988,13 @@ class _BaseFomoClient:
            判断手上这份数据是全量还是截断 —— 那是 /chips「精确 / 下界」两套文案的唯一依据。
         ⚠️ 解析不出来返回 {} 而不是抛异常:上层据此显示"没查到",与猜错链是同一种表现。
         ⚠️⚠️ networkId **必须是数字**:传链名(如 "robinhood")服务端直接 400
-           "Expected number, received nan"。_as_network_number 负责这一步转换,
-           调用方传链名或数字都行,但**别把它绕过去**。
+           "Expected number, received nan"。
+        ⚠️⚠️ 这里曾经写着"_as_network_number 负责这一步转换,调用方传链名或数字都行"
+           —— **那句话是错的**。_as_network_number 只做 `int(str(x).strip())`,
+           **不做任何别名映射**(它自己的 docstring 就写着"只做能转数字就转,
+           不做别名映射"):传 "robinhood" 进去,原样返回 "robinhood",然后 400。
+           别名表在 models.NETWORK_CHAIN_ID / bot._NETWORK_RAW_ID,**调用方必须自己查**
+           (boardholders._fetch_one 就是这么做的)。
         auth_invalidate:见 _fetch_ok。推送路径(boardholders)传 False。
         """
         tokens = json.dumps(
@@ -928,7 +1002,7 @@ class _BaseFomoClient:
             separators=(",", ":"),
         )
         payload = self._get(EP_TOP_HOLDERS, {"tokens": tokens, "limit": TOP_HOLDERS_LIMIT},
-                            auth_invalidate=auth_invalidate)
+                            auth_invalidate=auth_invalidate, fast_fail=fast_fail)
         ro = _unwrap(payload)
         # 请求里只放了一个币,响应就只有一个元素;仍按"可能是裸对象"兜底(与 _as_obj 同一条理由)
         if isinstance(ro, list):
@@ -1097,12 +1171,20 @@ class HttpFomoClient(_BaseFomoClient):
                          threading.current_thread().name, settings.fomo_proxy or "无")
         return sess
 
-    def _request(self, path: str, params: dict | None = None) -> tuple[int, str, dict]:
+    def _request(self, path: str, params: dict | None = None, *,
+                 timeout: float | None = None) -> tuple[int, str, dict]:
+        """
+        ⚠️ timeout 只有**装饰性**调用会传(见 _DECORATIVE_TIMEOUT_SEC):它覆盖 Session
+           上那个 _TIMEOUT_SEC=12.0。不传时**一个多余的关键字都不带给 curl_cffi** ——
+           主路径的调用形态与上一版逐字节相同。
+        """
         token = self._tokens.get_access_token()
         url = BASE_URL + path
         clean = {k: v for k, v in (params or {}).items() if v is not None}
+        kw = {} if timeout is None else {"timeout": timeout}
         try:
-            resp = self._ensure_session().get(url, params=clean or None, headers=_auth_headers(token))
+            resp = self._ensure_session().get(url, params=clean or None,
+                                              headers=_auth_headers(token), **kw)
         except Exception as e:  # noqa: BLE001
             raise _TransportError(str(e)) from e
         return resp.status_code, resp.text or "", dict(resp.headers or {})
@@ -1123,15 +1205,21 @@ class HttpFomoClient(_BaseFomoClient):
 # ============================================================
 # 在页面里发 fetch:同源策略下 CORS 天然放行,Cloudflare 看到的是一个真实浏览器。
 # 捕获异常返回 status:0,让 Python 侧统一走 _TransportError。
-_FETCH_JS = """async ({url, headers}) => {
+_FETCH_JS = """async ({url, headers, timeoutMs}) => {
+  const ctl = (timeoutMs > 0) ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
   try {
-    const r = await fetch(url, {method: 'GET', headers, credentials: 'include'});
+    const opts = {method: 'GET', headers, credentials: 'include'};
+    if (ctl) { opts.signal = ctl.signal; }
+    const r = await fetch(url, opts);
     const body = await r.text();
     const h = {};
     r.headers.forEach((v, k) => { h[k] = v; });
     return {status: r.status, body: body, headers: h};
   } catch (e) {
     return {status: 0, body: String(e), headers: {}};
+  } finally {
+    if (timer) { clearTimeout(timer); }
   }
 }"""
 
@@ -1216,7 +1304,14 @@ class PlaywrightFomoClient(_BaseFomoClient):
         self._tl.page = None
 
     # ---------- 请求 ----------
-    def _request(self, path: str, params: dict | None = None) -> tuple[int, str, dict]:
+    def _request(self, path: str, params: dict | None = None, *,
+                 timeout: float | None = None) -> tuple[int, str, dict]:
+        """
+        ⚠️ timeout(装饰性调用专用)在**页面里**生效:AbortController + setTimeout。
+           ⚠️⚠️ 它管不住**冷启动**那一段 —— 本实现按线程私有拉起浏览器,
+              第一次调用还要付 chromium 启动 + page.goto(timeout 60s) 的钱。
+              这条代价如实记在 README「已知代价」里。
+        """
         token = self._tokens.get_access_token()
         url = BASE_URL + path
         clean = {k: v for k, v in (params or {}).items() if v is not None}
@@ -1225,7 +1320,9 @@ class PlaywrightFomoClient(_BaseFomoClient):
 
         page = self._ensure_page()
         try:
-            res = page.evaluate(_FETCH_JS, {"url": url, "headers": _auth_headers(token)})
+            res = page.evaluate(_FETCH_JS, {"url": url, "headers": _auth_headers(token),
+                                            "timeoutMs": (None if timeout is None
+                                                          else int(timeout * 1000))})
         except Exception as e:  # noqa: BLE001
             # 页面/浏览器挂了就整套重建,否则后面每次请求都会撞同一具尸体
             self._teardown()

@@ -168,7 +168,9 @@ LABEL_BOARD_PNL = "全平台24h"
 LABEL_BOARD_AMOUNT = "枚"
 LABEL_BOARD_FOLLOWERS = "粉丝"
 # 一条推送最多列几行。⚠️ 数据层(boardholders.MAX_ROWS)已经截过一次,这里是第二道
-#    (与 nameguard._MAX_BOARD_ROWS 一起共三道):实测一个币最多命中过 31 人。
+#    (与 nameguard._MAX_BOARD_ROWS 一起共三道)。
+# ⚠️ 这里曾经写着"实测一个币最多命中过 31 人" —— 那个数与同轮报告里的 42 对不上、
+#    而且两个都没有夹具兜底,已经统一成仓库里能证明的口径,见 boardholders.MAX_ROWS。
 _BOARD_MAX_ROWS = 3
 # handle 的限长。⚠️ 门禁(safe_username)已经把它收在 32 字符的封闭形状里,
 #    这里只是与其余文本字段同一条通道(_clip:叠平 → 限长 → 转义)。
@@ -944,6 +946,30 @@ def _token_holders_line(n) -> str | None:
     return f"{EMOJI_TOKEN_HOLDERS} {LABEL_TOKEN_HOLDERS} {v:,}"
 
 
+def _within_people_bound(v) -> bool:
+    """
+    人数类槽位的**上界**判据。⚠️⚠️ 复用 `_MAX_TOKEN_HOLDERS`(10 亿)—— 同一个
+    formatter 里**同样形态**的数必须**同样处置**,绝不写第二份阈值。
+
+    它挡的是一个具体的形态(见 _MAX_TOKEN_HOLDERS 那一段):这些槽位收的是上游给的数,
+    而"一串 10~11 位数字"正是手机号 / QQ 号的形态。上一版 🧑‍🤝‍🧑 那一行拦住了
+    `13,800,138,000`,而**同一份 formatter** 的 🏅 那一块两个槽位没拦:
+        totalHolders = 13800138000 → ⚠️ 只比对了前 1/13,800,138,000 名持有人…
+        followers    = 13800138000 → #1「unipcs」· 粉丝 13,800,138,000 …
+    两处处置不一致本身就是一个洞:攻击者只要换个槽位就行。
+
+    ⚠️ 取不到值返回 **True** —— "拿不到"是另一回事,由各自的格式化函数按既有规矩
+       处置(那一段消失);这里只回答"拿到的这个数是不是大得说不出口"。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return True
+    try:
+        return int(d) <= _MAX_TOKEN_HOLDERS
+    except (InvalidOperation, ValueError, OverflowError):
+        return False
+
+
 def _board_pnl_text(v) -> str | None:
     """
     全平台 24h 盈亏 → `+$323.15K` / `-$1.20M`。拿不到 None(那一段消失,绝不打 0)。
@@ -990,7 +1016,11 @@ def _board_row(row) -> str | None:
     amount_text = fmt_token_amount(amount)
     if amount_text is not None:
         seg.append(f"{amount_text} {LABEL_BOARD_AMOUNT}")
-    followers_text = _fmt_count(followers)
+    # ⚠️⚠️ 粉丝数也有**上界**(与 🧑‍🤝‍🧑 那一行同一条 _MAX_TOKEN_HOLDERS):
+    #    `粉丝 13,800,138,000` 既是假事实、又是一条可拨可加的目标。
+    #    超界 → **那一段消失**(与"取不到"同一条既有规矩,见本函数上面那条 ⚠️)。
+    followers_text = (_fmt_count(followers) if _within_people_bound(followers)
+                      else None)
     if followers_text is not None:
         seg.append(f"{LABEL_BOARD_FOLLOWERS} {followers_text}")
     pnl_text = _board_pnl_text(pnl24h)
@@ -1010,7 +1040,15 @@ def _board_note(covered, total, exact: bool, board_size) -> str | None:
     ⚠️ `len(topHolders) == totalHolders` 时 (a) 消失,这时才敢说"全数比对过" ——
        但 (b) **永远在**,所以精确那套写法里仍然要留着榜的那半句。
     ⚠️ 总数拿不到 → 连分母都没有,那半句改口说清楚,绝不假装知道。
+    ⚠️⚠️ 总数有**上界**(与 🧑‍🤝‍🧑 那一行同一条 _MAX_TOKEN_HOLDERS):
+       `只比对了前 1/13,800,138,000 名持有人` 里那个数是上游给的,而"一串 10~11 位
+       数字"正是手机号的形态。超界 → **整行消失**(与 _token_holders_line 逐字同一条
+       处置:这一行**说不出口**,少一行是"我们没说",印出去是"我们说错了")。
+       ⚠️ 刻意**不**退回"(平台没给总数)"那半句 —— 平台给了,只是给的是个说不出口的数;
+          说"没给"是另一句假话。
     """
+    if not _within_people_bound(total):
+        return None
     board = (f",榜只到前 {board_size:,} 名" if isinstance(board_size, int)
              and not isinstance(board_size, bool) and board_size > 0 else "")
     if exact and isinstance(total, int) and not isinstance(total, bool):

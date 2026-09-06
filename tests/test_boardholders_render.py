@@ -226,13 +226,47 @@ class Test门禁:
     @pytest.mark.parametrize("evil", [
         "t.me/scamgroup", "Send SOL to my wallet now", "已清仓 · 亏损 99%",
         "javascript:alert(1)", "0x7a6a3b93cb3ffead8b180b5f537e0ce7832d1e18",
-        "假「名字」", "币‮ pmup", "13800138000",
+        "假「名字」", "13800138000",
     ])
     def test_几种典型攻击串一个都进不来(self, evil):
+        """⚠️ 形状不合格 → 退回「未知用户」(这一行的其余三段是真值)。"""
         out = render(ev(), board_holders=((5, evil, 1.0, 1, 1.0),),
                      board_scope=(1, 90, 90, True, 150))
         assert evil not in out
         assert "未知用户" in out
+
+    @pytest.mark.parametrize("evil", [
+        "uni​pcs",      # 零宽空格 → 归一化后正好是榜上第 1 名 unipcs
+        "uni­pcs",      # 软连字符(类别同样是 Cf)
+        "unip﻿cs",      # BOM
+        "uni⁠pcs",      # word joiner
+        "币‮ pmup",     # bidi 覆盖(它也是 Cf)
+    ], ids=["零宽空格", "软连字符", "BOM", "word-joiner", "bidi"])
+    def test_隐形字符的_handle_整行丢弃而不是退回未知用户(self, evil):
+        """
+        ⚠️⚠️ 这一类**不是**"名字印不出来",是**定向冒名**:删掉隐形字符之后剩下的串
+           正好等于**另一个真人**的 handle(`uni​pcs` → `unipcs`,榜上第 1 名)。
+           显示归一化后的名字 = 显示一个作者从没写过的名字,而且既冒名又搜不到人。
+           处置与 nameguard 既有的 bidi 口径同一条:**整行丢弃**。
+           这里只有这一行,所以整块消失(绝不退回「未知用户」)。
+        """
+        out = render(ev(), board_holders=((5, evil, 1.0, 1, 1.0),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert evil not in out
+        assert "unipcs" not in out
+        assert "未知用户" not in out
+        assert "🏅" not in out
+        assert "#5" not in out
+
+    def test_隐形字符只丢它自己那一行(self):
+        """⚠️ 独立性:同一块里干净的那一行照常显示,「N 人」由「另有」如实兜住。"""
+        out = render(ev(), board_holders=((1, "uni​pcs", 1.0, 1, 1.0),
+                                          (7, "ether_monk", 2.0, 3, 4.0)),
+                     board_scope=(2, 90, 90, True, 150))
+        assert "「ether_monk」" in out
+        assert "unipcs" not in out
+        assert "🏅 盈利榜持有人 2 人" in out
+        assert "   另有 1 人在榜" in out
 
     def test_带下划线的真实_handle_照常显示(self):
         """⚠️ 实测榜上有 `The__Solstice` / `ether_monk` / `397397` 这类;丢掉它们
@@ -324,3 +358,176 @@ class Test另外两条推送:
                                 coin_mint="0xabc", amount_usd=10.0,
                                 board_holders="脏", board_scope=None)
         assert "bob" in out and "$MEME" in out
+
+
+# ============================================================
+# ⚠️⚠️ 人数类槽位的**上界**(与 🧑‍🤝‍🧑 那一行同一条阈值)
+# ============================================================
+# 干净树上走生产渲染路径复现过这两条:
+#     totalHolders = 13800138000 → ⚠️ 只比对了前 1/13,800,138,000 名持有人…
+#     followers    = 13800138000 → #1「unipcs」· 粉丝 13,800,138,000 …
+# 而**同一份 formatter** 早就为 🧑‍🤝‍🧑 那一行写了 10 亿的上界(同一个数走那一行是整行消失)。
+# 两处处置不一致本身就是洞:攻击者换个槽位就行。
+# ⚠️ 判据不是「防御性编程」:一串 10~11 位数字正是手机号 / QQ 号的形态,
+#    印出去既是假事实、又是一条可拨可加的目标。
+class Test人数槽位的上界:
+    def test_粉丝数超上界时那一段消失(self):
+        out = render(ev(), board_holders=((1, "unipcs", 7330874.0, 13800138000,
+                                           323150.0),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert "13,800,138,000" not in out
+        assert "13800138000" not in out
+        assert "   #1 「unipcs」 · 7,330,874 枚 · 全平台24h +$323.15K" in out.split("\n")
+
+    def test_粉丝数正好在上界上照常显示(self):
+        """⚠️ 上界是 10 亿(含),不是「大数一律不显示」—— 边界两侧各钉一次。"""
+        out = render(ev(), board_holders=((1, "unipcs", None, 1000000000, None),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」 · 粉丝 1,000,000,000" in out.split("\n")
+
+    def test_粉丝数比上界大一就消失(self):
+        out = render(ev(), board_holders=((1, "unipcs", None, 1000000001, None),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」" in out.split("\n")
+        assert "1,000,000,001" not in out
+        assert "粉丝" not in out
+
+    def test_持有人总数超上界时口径整行消失(self):
+        """
+        ⚠️⚠️ 与 🧑‍🤝‍🧑 那一行逐字同一条处置:这一行**说不出口**,
+           少一行是「我们没说」,印出去是「我们说错了」。
+        ⚠️ 刻意**不**退回「(平台没给总数)」—— 平台给了,只是给的是个说不出口的数。
+        """
+        out = render(ev(), board_holders=((1, "unipcs", 1.0, 1, 1.0),),
+                     board_scope=(1, 97, 13800138000, False, 150))
+        lines = out.split("\n")
+        assert "13,800,138,000" not in out
+        assert "🏅 盈利榜持有人 ≥1 人" in lines          # 这一块本身还在
+        assert "「unipcs」" in out
+        assert not any("只比对了" in ln for ln in lines)
+        assert not any("平台没给总数" in ln for ln in lines)
+
+    def test_总数正好在上界上照常显示(self):
+        out = render(ev(), board_holders=((1, "unipcs", 1.0, 1, 1.0),),
+                     board_scope=(1, 97, 1000000000, False, 150))
+        assert "   ⚠️ 只比对了前 97/1,000,000,000 名持有人,榜只到前 150 名 —— 没显示≠没有" \
+            in out.split("\n")
+
+    def test_总数比上界大一就整行消失(self):
+        out = render(ev(), board_holders=((1, "unipcs", 1.0, 1, 1.0),),
+                     board_scope=(1, 97, 1000000001, False, 150))
+        assert not any("只比对了" in ln for ln in out.split("\n"))
+
+    def test_两个槽位与持有人那一行用的是同一条阈值(self):
+        """
+        ⚠️⚠️ 同一个 formatter 里**同样形态**的数必须**同样处置**。这条把三处放在
+           一起打同一个数:🧑‍🤝‍🧑 整行消失、粉丝那一段消失、口径那一行消失。
+           哪天有人给 🏅 这边另写一份阈值,三条断言就不会再同时成立。
+        """
+        phone = 13800138000
+        out = render(ev(), token_holders=phone,
+                     board_holders=((1, "unipcs", 1.0, phone, 1.0),),
+                     board_scope=(1, 97, phone, False, 150))
+        assert "13,800,138,000" not in out
+        assert "🧑‍🤝‍🧑" not in out
+        assert "粉丝" not in out
+        assert "只比对了" not in out
+
+
+# ============================================================
+# ⚠️⚠️ 0 与 None 分得开:0 是真实值
+# ============================================================
+class Test零与缺失分得开:
+    def test_全平台盈亏正好为零照常印出来(self):
+        """
+        ⚠️⚠️ 一个人今天不赚不亏是**真事**,不是「拿不到」。把 `if d is None`
+           改成 `if not d`,这一段会静默消失 —— 而读者看到的是「这个人没有盈亏数据」,
+           那是一句假话。(上一版全量一条都不红。)
+        """
+        out = render(ev(), board_holders=((1, "unipcs", 1.0, 1, 0.0),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」 · 1 枚 · 粉丝 1 · 全平台24h +$0.00" in out.split("\n")
+
+    def test_全平台盈亏拿不到时才少那一段(self):
+        out = render(ev(), board_holders=((1, "unipcs", 1.0, 1, None),),
+                     board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」 · 1 枚 · 粉丝 1" in out.split("\n")
+        assert "全平台24h" not in out
+
+    def test_粉丝数为零与拿不到是两件事(self):
+        zero = render(ev(), board_holders=((1, "unipcs", None, 0, None),),
+                      board_scope=(1, 90, 90, True, 150))
+        none = render(ev(), board_holders=((1, "unipcs", None, None, None),),
+                      board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」 · 粉丝 0" in zero.split("\n")
+        assert "   #1 「unipcs」" in none.split("\n")
+        assert "粉丝" not in none
+
+    def test_持仓数量为零与拿不到是两件事(self):
+        """⚠️ 0 枚 = 清仓,是有意义的真实值。"""
+        zero = render(ev(), board_holders=((1, "unipcs", 0.0, None, None),),
+                      board_scope=(1, 90, 90, True, 150))
+        assert "   #1 「unipcs」 · 0 枚" in zero.split("\n")
+
+
+# ============================================================
+# ⚠️⚠️ 两道门各自钉住(纵深防御,任一单侧降级都必须红)
+# ============================================================
+# 复验实测:只把 nameguard 那一侧降级成 safe_ident → 全量 4587 全绿;
+#           只把 formatter 那一侧降级成 safe_ident → 全量 4587 全绿;
+#           **两处同时降级**才 35 failed。
+# ⇒ 227 条红队用例对**单点**降级完全不敏感:任一道门可以被悄悄拿掉而 CI 全绿。
+# 原因很直白:红队全部走 render() 这个入口,两道门是**串联**的,拿掉一道另一道还在。
+# 所以每一道门必须**各自**有一条只驱动它自己的用例。
+#
+# ⚠️ 两道门都留着(不是冗余可删):
+#   · nameguard.safe_board_rows 是**渲染入口的收口**(_guard_untrusted 那张表),
+#     它同时还做「行数上限 10」与「隐形字符整行丢弃」两件 formatter 那边没有的事;
+#   · formatter._board_row 那一道是**幂等的第二道**,守的是「有人绕过入口直接调
+#     _board_holders_lines / 新加一条渲染入口忘了登记字段」这条真实的路
+#     (本仓库已经出现过一次:token_symbol 曾被登记成「已审查」,门在旁边被原样打开)。
+class Test两道门各自钉住:
+    def test_门禁那一侧独占用例(self):
+        """
+        ⚠️⚠️ 只驱动 nameguard.safe_board_rows。降级成 safe_ident 时 ——
+           safe_ident **允许空格**,整句话会原样穿过去 —— 这条当场红。
+        """
+        from src.nameguard import safe_board_rows
+
+        got = safe_board_rows([(28, "Send SOL to my wallet now", 1.0, 2, 3.0)])
+        assert got == ((28, None, 1.0, 2, 3.0),)
+
+        ok = safe_board_rows([(28, "The__Solstice", 1.0, 2, 3.0)])
+        assert ok == ((28, "The__Solstice", 1.0, 2, 3.0),)
+
+    def test_渲染那一侧独占用例(self):
+        """
+        ⚠️⚠️ 只驱动 formatter._board_row(绕开渲染入口那道收口)。
+           降级成 safe_ident 时同样是整句话穿过去 —— 这条当场红。
+        """
+        from src.formatter import _board_row
+
+        assert _board_row((28, "Send SOL to my wallet now", None, None, None)) == \
+            "#28 未知用户"
+        assert _board_row((28, "The__Solstice", None, None, None)) == \
+            "#28 「The__Solstice」"
+
+    def test_门禁那一侧的行数上限是十(self):
+        """
+        ⚠️⚠️ 上一版这个 10 **零覆盖**:改成 99999 全量一条都不红(渲染那一侧的 3
+           把它盖住了)。它是「万一渲染那一侧被改」时最后一道量的闸。
+        """
+        from src.nameguard import safe_board_rows
+
+        rows = [(i + 1, f"u{i}", 1.0, 1, 1.0) for i in range(50)]
+        got = safe_board_rows(rows)
+        assert len(got) == 10
+        assert [r[0] for r in got] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    def test_渲染那一侧的行数上限是三(self):
+        from src.formatter import _board_holders_lines
+
+        rows = tuple((i + 1, f"u{i}", None, None, None) for i in range(50))
+        body = [ln for ln in _board_holders_lines(rows, (50, 90, 90, True, 150))
+                if ln.startswith("   #")]
+        assert len(body) == 3

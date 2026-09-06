@@ -760,9 +760,22 @@ def safe_username(s) -> str | None:
        tests/test_nameguard_shape.py 的 45 条 _MUST_BLOCK 硬基线**零泄漏**。
     ⚠️ 返回的是**叠平后**的串(与另外两道一致);这里不必留 emoji ——
        白名单里压根没有 emoji,能通过的串一个控制符都不含。
+
+    ⚠️⚠️ **任何 Cf(格式控制)字符 → 整个 handle 丢弃**,不只是 bidi 那一小撮。
+       这一条替换了上一版那句只查 _BIDI_CONTROLS 的判断,理由是一个实打实的**冒名**:
+       `flatten()` 会把 Cf 全删掉,于是
+           safe_username("uni​pcs")  → "unipcs"
+           safe_username("uni­pcs")  → "unipcs"   (U+00AD 软连字符,类别也是 Cf)
+       一个**陌生** handle 被归一成**另一个真实的人**的 handle,而这一块印的正是
+       "榜上第 N 名是谁"。渲染出来的名字既冒名、又搜不到人 —— 与 _BIDI_CONTROLS
+       上面那段是同一条口径:**剔掉坏字符再显示 = 显示一个作者从没写过的名字**。
+    ⚠️ 代价是 0:这道门的白名单是 `[A-Za-z0-9_]`,里面一个 Cf 都没有;
+       实测的 519 个真实 pump userName 与 150 行真实榜单 handle 里含非 ASCII 的是 0 个。
+       (bidi 那一小撮全部是 Cf,所以这一条**包含**了上一版那一条,不是并列 ——
+        留两条会让 bidi 那条变成永远判不到的死规则。)
     """
     raw = str(s or "")
-    if any(ch in _BIDI_CONTROLS for ch in raw):
+    if any(unicodedata.category(ch) == "Cf" for ch in raw):
         return None
     text = flatten(raw)
     if not _RE_USERNAME.match(text):
@@ -1207,7 +1220,8 @@ def safe_launchpad(s) -> str | None:
 #    丢掉整行会让上面那句「N 人」与下面列出的行数对不上,那才是真的错。
 # ⚠️ 排名不是正整数 → **整行丢弃**:`#N` 是这一行的锚,锚都不可信就没什么可说的了。
 # 一次最多放行几行。⚠️ 调用方(boardholders)已经截过一次,这里是第二道:
-#    实测一个币最多命中过 31 人(robinhood PONS),原样铺开就是 31 行。
+#    ⚠️ 这里曾经写着"实测一个币最多命中过 31 人(robinhood PONS)" —— 那个数与同轮
+#       报告里的 42 对不上、两个都没有夹具兜底,已统一,见 boardholders.MAX_ROWS。
 _MAX_BOARD_ROWS = 10
 
 
@@ -1218,6 +1232,18 @@ def safe_board_rows(items) -> tuple[tuple, ...] | None:
     ⚠️ 只处置 **handle** 这一个文本槽位;另外四个是数字,由渲染层的格式化函数
        各自判(拿不到就那一段消失,绝不补 0)—— 形状门禁套在数字上没有意义。
     ⚠️ 返回 None 时调用方那一整块消失(与"零命中"同一种表现)。
+
+    ⚠️⚠️ handle 里带**隐形字符**(零宽空格 / 软连字符 / BOM…,统称 Cf)时,
+       这一行**整行丢弃**,而不是像别的不合格 handle 那样退回「未知用户」。
+       两者的区别不是"能不能渲染",是**意图**:
+         · 一个过不了形状门的 handle(带空格、太长)——  我们只是印不出这个名字,
+           而 `#N` 与持仓 / 盈亏三段仍是真值,退回「未知用户」是对的;
+         · 一个带零宽字符的 handle —— 它归一化之后**正好等于另一个真人的 handle**
+           (实测 `uni​pcs` → `unipcs`,而 unipcs 就是这个榜的第 1 名)。
+           这是一次**定向冒名**,这一行本身就是篡改的证据,不该出现在一个
+           长得像"记录"的地方。
+       ⚠️ 丢掉整行不会让上面那句「N 人」说假话:那个数来自取值层的命中总数,
+          少列的行由「另有 N 人在榜」如实兜住(见 formatter._board_holders_lines)。
     """
     try:
         seq = list(items or ())
@@ -1231,6 +1257,8 @@ def safe_board_rows(items) -> tuple[tuple, ...] | None:
             continue
         if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
             continue
+        if any(unicodedata.category(ch) == "Cf" for ch in str(handle or "")):
+            continue                       # ⚠️ 冒名 → 整行丢弃(见上)
         out.append((rank, safe_username(handle), amount, followers, pnl24h))
         if len(out) >= _MAX_BOARD_ROWS:
             break

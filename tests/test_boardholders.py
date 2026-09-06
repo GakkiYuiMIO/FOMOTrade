@@ -25,6 +25,8 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import threading
+import time
 
 import pytest
 
@@ -52,7 +54,9 @@ def board():
 class FakeClient:
     """
     ⚠️ 它记的是「上层到底传了什么」—— networkId 是不是数字、limit 是不是 150、
-       auth_invalidate 是不是 False,全靠这里留证。
+       auth_invalidate 是不是 False、fast_fail 是不是 True,全靠这里留证。
+    ⚠️⚠️ fast_fail **没有默认值**:上层漏传就是 TypeError,而不是"悄悄退回
+       主路径那套 3 次重试 / 12 秒超时 / 按 Retry-After 睡到 140 秒"。
     """
 
     def __init__(self, board_payload=None, holders=None, board_error=None,
@@ -64,14 +68,16 @@ class FakeClient:
         self.board_calls: list[tuple] = []
         self.holder_calls: list[tuple] = []
 
-    def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True):
-        self.board_calls.append((period, limit, auth_invalidate))
+    def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                        fast_fail):
+        self.board_calls.append((period, limit, auth_invalidate, fast_fail))
         if self._board_error is not None:
             raise self._board_error
         return self._board
 
-    def get_top_holders(self, token_address, network_id, *, auth_invalidate=True):
-        self.holder_calls.append((token_address, network_id, auth_invalidate))
+    def get_top_holders(self, token_address, network_id, *, auth_invalidate=True,
+                        fast_fail):
+        self.holder_calls.append((token_address, network_id, auth_invalidate, fast_fail))
         if self._holders_error is not None:
             raise self._holders_error
         return self._holders.get(token_address, {})
@@ -300,13 +306,13 @@ class Test请求形态:
     def test_榜单一次拉一百五十行(self):
         c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
         make(c).lookup([("robinhood", CA_MEME)])
-        assert c.board_calls == [("24h", 150, False)]
+        assert c.board_calls == [("24h", 150, False, True)]
 
     def test_持有人的链id必须是数字(self):
         """⚠️⚠️ 传链名服务端直接 400(`Expected number, received nan`)。"""
         c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
         make(c).lookup([("robinhood", CA_MEME)])
-        addr, net, auth = c.holder_calls[0]
+        addr, net, auth, fast = c.holder_calls[0]
         assert net == 4663
         assert isinstance(net, int) and not isinstance(net, bool)
         assert addr == CA_MEME
@@ -317,14 +323,14 @@ class Test请求形态:
         make(c).lookup([("robinhood", CA_MEME), ("solana", CA_STONK),
                         ("bsc", "0x21caef8a43163eea865baee23b9c2e327696a3bf"),
                         ("base", CA_EVAL)])
-        assert [n for _, n, _ in c.holder_calls] == [4663, 1399811149, 56, 8453]
+        assert [n for _, n, _, _ in c.holder_calls] == [4663, 1399811149, 56, 8453]
 
     def test_两个请求都不许处置登录态(self):
         """⚠️⚠️ auth_invalidate=False:401/403 绝不去 invalidate 全进程共用的令牌。"""
         c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
         make(c).lookup([("robinhood", CA_MEME)])
-        assert all(a is False for *_, a in c.board_calls)
-        assert all(a is False for *_, a in c.holder_calls)
+        assert all(call[2] is False for call in c.board_calls)
+        assert all(call[2] is False for call in c.holder_calls)
 
     def test_认不出的链一个请求都不发(self):
         c = FakeClient()
@@ -552,8 +558,9 @@ class Test各类失败:
 
         class Half(FakeClient):
             def get_top_holders(self, token_address, network_id, *,
-                                auth_invalidate=True):
-                self.holder_calls.append((token_address, network_id, auth_invalidate))
+                                auth_invalidate=True, fast_fail):
+                self.holder_calls.append((token_address, network_id, auth_invalidate,
+                                          fast_fail))
                 if token_address == CA_MEME:
                     raise RuntimeError("这个币炸了")
                 return good
@@ -656,3 +663,407 @@ class Test真实的错误报文:
             "/v2/leaderboard/24h 鉴权失败(HTTP 401);本次调用不处置登录态"))
         assert make(c).lookup([("robinhood", CA_MEME)]) == {}
         assert c.holder_calls == [], "榜都没拿到,就不该再去问持有人"
+
+
+# ============================================================
+# ⚠️⚠️ 装饰性请求的策略:**永不阻塞推送**
+# ============================================================
+# 这一整段钉的是三件实测出来的事(都是复验跑出来的真实数据):
+#   1. 复用主路径重试机时,一个 429 + `Retry-After: 60` 能让**单个装饰性请求**
+#      阻塞 140.3 秒(3 次尝试 × 12s 超时 + sleep 62.49 + 41.78);
+#   2. 墙钟闸只在「发下一个请求之前」检查,而**拉榜那一次根本不在闸的管辖内**;
+#   3. 拉榜是**锁内**做的网络请求 —— 实测另一个 job 被挡住 7.70 秒,
+#      而它自己一轮的墙钟预算才 6.0 秒。
+# ⚠️ 断言全部写死字面量。
+class Test装饰性请求的策略:
+    def test_两个请求都走单次尝试的那条策略(self):
+        """
+        ⚠️⚠️ fast_fail=True = 单次尝试 / 5 秒超时 / 不按 Retry-After 睡。
+           漏传就是「悄悄退回主路径那套能睡 104 秒的重试机」—— 假 client 那两个
+           形参**没有默认值**,漏传当场 TypeError。
+        """
+        c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
+        make(c).lookup([("robinhood", CA_MEME)])
+
+        assert c.board_calls == [("24h", 150, False, True)]
+        assert c.holder_calls == [(CA_MEME, 4663, False, True)]
+
+    def test_拉榜那一次在发出去之前就要过墙钟闸(self):
+        """
+        ⚠️⚠️ 上一版拉榜**只在事后记账**:闸只挡「下一个请求」,而拉榜那一次
+           根本不在闸的管辖内 —— 预算早就用光了,它照样会打出去。
+           这里让第一个币把 6 秒预算用光(持有人请求花 7 秒),然后让榜单缓存过期,
+           第二次 lookup **一个榜单请求都不该发**。
+        """
+        now = [0.0]
+        clk = lambda: now[0]                                       # noqa: E731
+
+        class Slow(FakeClient):
+            def get_top_holders(self, token_address, network_id, *,
+                                auth_invalidate=True, fast_fail):
+                now[0] += 7.0
+                return super().get_top_holders(token_address, network_id,
+                                               auth_invalidate=auth_invalidate,
+                                               fast_fail=fast_fail)
+
+        c = Slow()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache(ttl=0.0, clock=clk),
+                                   wall_clock_sec=6.0, per_round=99, clock=clk)
+        lk.begin_round()
+        lk.lookup([("robinhood", CA_MEME)])
+        lk.lookup([("base", CA_EVAL)])
+
+        assert len(c.holder_calls) == 1
+        assert len(c.board_calls) == 1, "墙钟已经用光,第二次连榜都不该去拉"
+
+    def test_整块每tick的最坏阻塞不超过十一秒(self):
+        """
+        ⚠️⚠️ 上界怎么算出来的:闸判的是「**在发之前**还剩不剩预算」,它管不住
+           已经发出去的那一次要跑多久 —— 那一半由 client 的 5 秒超时兜住。
+           两条合起来:墙钟预算 6.0 + 一次超时 5.0 = **11.0 秒**。
+           这里让**每一次**外呼都恰好花满 5 秒(即每次都超时),量实际阻塞。
+        """
+        now = [0.0]
+        clk = lambda: now[0]                                       # noqa: E731
+
+        class AlwaysTimeout(FakeClient):
+            def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                                fast_fail):
+                now[0] += 5.0
+                return super().get_leaderboard(period, limit,
+                                               auth_invalidate=auth_invalidate,
+                                               fast_fail=fast_fail)
+
+            def get_top_holders(self, token_address, network_id, *,
+                                auth_invalidate=True, fast_fail):
+                now[0] += 5.0
+                return super().get_top_holders(token_address, network_id,
+                                               auth_invalidate=auth_invalidate,
+                                               fast_fail=fast_fail)
+
+        c = AlwaysTimeout()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache(clock=clk),
+                                   clock=clk)          # 闸门全用生产默认值
+        lk.begin_round()
+        lk.lookup([("robinhood", f"0x{i:040x}") for i in range(1, 11)])
+
+        assert now[0] == 10.0
+        assert now[0] <= 11.0, "这一整块每 tick 的阻塞上界"
+        assert len(c.board_calls) == 1
+        assert len(c.holder_calls) == 1
+
+    def test_失败的那一次也要记进墙钟(self):
+        """⚠️ 超时最费时间 —— 不记账的话「一次超时」等于白送后面的币一次机会。"""
+        now = [0.0]
+        clk = lambda: now[0]                                       # noqa: E731
+
+        class Boom(FakeClient):
+            def get_top_holders(self, token_address, network_id, *,
+                                auth_invalidate=True, fast_fail):
+                self.holder_calls.append((token_address, network_id, auth_invalidate,
+                                          fast_fail))
+                now[0] += 7.0
+                raise TimeoutError("超时")
+
+        c = Boom()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache(clock=clk),
+                                   wall_clock_sec=6.0, per_round=99, clock=clk)
+        lk.begin_round()
+        lk.lookup([("robinhood", CA_MEME), ("base", CA_EVAL), ("solana", CA_STONK)])
+
+        assert len(c.holder_calls) == 1, "第一次就把 6 秒预算烧光了,后面两个不该再发"
+
+
+# ============================================================
+# ⚠️⚠️ 榜单那把闸:**拿不到就走人**,绝不等、绝不写负缓存
+# ============================================================
+class Test榜单单飞闸:
+    def test_另一个job正在拉时立刻返回而不是排队等(self):
+        """
+        ⚠️⚠️ 复现的就是复验报告里那个场景:一次拉榜 8 秒,poller 先进闸、
+           pump.fun watcher 后到。上一版后到的那个**真的被挡住 7.70 秒**,
+           而它自己一轮的墙钟预算才 6.0 秒 —— 记账是事后的,等待本身没有上限。
+           现在它必须**立刻**拿到 (None, 0, False)。
+        """
+        started, release = threading.Event(), threading.Event()
+
+        class SlowBoard:
+            def __init__(self):
+                self.calls = 0
+
+            def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                                fast_fail):
+                self.calls += 1
+                started.set()
+                release.wait(5.0)
+                return BOARD_RAW
+
+        class OtherJob:
+            def __init__(self):
+                self.calls = 0
+
+            def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                                fast_fail):
+                self.calls += 1
+                return BOARD_RAW
+
+        cache = bh._BoardCache()
+        slow, other = SlowBoard(), OtherJob()
+        t = threading.Thread(target=cache.get, args=(slow,), daemon=True)
+        t.start()
+        assert started.wait(5.0), "第一个 job 没能进到拉榜那一步"
+
+        t0 = time.monotonic()
+        board, size, fetched = cache.get(other)
+        waited = time.monotonic() - t0
+
+        assert (board, size, fetched) == (None, 0, False)
+        assert other.calls == 0, "第二个 job 绝不该自己再打一个榜单请求"
+        assert waited < 1.0, f"它等了 {waited:.2f}s —— 一条装饰行不配让另一个 job 等"
+        release.set()
+        t.join(5.0)
+
+    def test_拿不到闸不算失败所以不写负缓存(self):
+        """
+        ⚠️⚠️ 拿不到闸 ≠ 上游挂了。写负缓存会把「别人正在拉」错记成「拉失败」,
+           白白把这一块按住 60 秒 —— 而实际上下一 tick 就能直接命中缓存。
+        """
+        started, release = threading.Event(), threading.Event()
+
+        class SlowBoard:
+            def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                                fast_fail):
+                started.set()
+                release.wait(5.0)
+                return BOARD_RAW
+
+        class Later:
+            def __init__(self):
+                self.calls = 0
+
+            def get_leaderboard(self, period="24h", limit=20, *, auth_invalidate=True,
+                                fast_fail):
+                self.calls += 1
+                return BOARD_RAW
+
+        cache = bh._BoardCache()
+        t = threading.Thread(target=cache.get, args=(SlowBoard(),), daemon=True)
+        t.start()
+        assert started.wait(5.0)
+        assert cache.get(Later()) == (None, 0, False)      # 撞闸
+        release.set()
+        t.join(5.0)
+
+        later = Later()
+        board, size, fetched = cache.get(later)
+        assert size == 150
+        assert fetched is False, "上一轮那次撞闸绝不该留下负缓存"
+        assert later.calls == 0
+
+    def test_锁内绝不做网络请求(self):
+        """
+        ⚠️⚠️ 从源码层面钉住:`_BoardCache.get` 里那个 `with self._lock:` 块
+           **一条 client 调用都不许有**。上一版正是把整个 get_leaderboard
+           放在锁里 —— 这条一旦被改回去,当场红。
+        """
+        src = pathlib.Path(bh.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        cls = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.ClassDef) and n.name == "_BoardCache")
+        bad = []
+        for node in ast.walk(cls):
+            if not isinstance(node, ast.With):
+                continue
+            using_state_lock = any(
+                isinstance(it.context_expr, ast.Attribute)
+                and it.context_expr.attr == "_lock" for it in node.items)
+            if not using_state_lock:
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr in ("get_leaderboard", "get_top_holders")):
+                    bad.append(inner.func.attr)
+        assert bad == [], f"状态锁里做了网络请求:{bad}"
+
+    def test_那把单飞闸是不阻塞地拿的(self):
+        """⚠️ 源码层面再钉一道:acquire 必须带 blocking=False。"""
+        src = pathlib.Path(bh.__file__).read_text(encoding="utf-8")
+        assert "acquire(blocking=False)" in src
+        assert "self._fetch.acquire()" not in src
+
+
+# ============================================================
+# ⚠️⚠️ begin_round 必须把**两本账**都归零
+# ============================================================
+class Test每tick两本账都归零:
+    def test_连跑三个tick每次都用掉大半墙钟这一块仍然出现(self):
+        """
+        ⚠️⚠️ 删掉 `self._spent = 0.0` 时:第 2 个 tick 起点是 5.0(< 6.0 还能过),
+           跑完变成 10.0;第 3 个 tick 起点 10.0 ≥ 6.0 → 这一块**永久消失**,
+           而且没有任何报错、任何日志会说它错了。
+        """
+        now = [0.0]
+        clk = lambda: now[0]                                       # noqa: E731
+        meme = load("fomo_top_holders_robinhood_meme.json")
+
+        class Costly(FakeClient):
+            def get_top_holders(self, token_address, network_id, *,
+                                auth_invalidate=True, fast_fail):
+                self.holder_calls.append((token_address, network_id, auth_invalidate,
+                                          fast_fail))
+                now[0] += 5.0                    # 每 tick 用掉 6.0 里的 5.0
+                return meme
+
+        c = Costly()
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache(clock=clk),
+                                   wall_clock_sec=6.0, per_round=99, clock=clk)
+        seen = []
+        for i in range(1, 4):
+            lk.begin_round()
+            out = lk.lookup([("robinhood", f"0x{i:040x}")])
+            seen.append(("robinhood", f"0x{i:040x}") in out)
+
+        assert seen == [True, True, True], "第 3 个 tick 这一块必须还在"
+        assert len(c.holder_calls) == 3
+
+    def test_次数账同样每tick归零(self):
+        """⚠️ 反向对照:两本账是**两行代码**,删任何一行都得有东西红。"""
+        c = FakeClient()
+        lk = make(c, per_round=2)
+        for i in range(3):
+            lk.begin_round()
+            lk.lookup([("robinhood", f"0x{i}{j:039x}") for j in range(5)])
+        assert len(c.holder_calls) == 6
+
+
+# ============================================================
+# ⚠️⚠️ 生产默认值:钉**值**,不是量级
+# ============================================================
+# 上一版那三条「生产默认值」用例只钉住了量级(30 秒内 / 120 秒内),于是
+# TTL 300→**299**、负缓存 60→**59** 这种改动全量一条都不红。下面钉到秒。
+class Test生产默认值钉到秒:
+    def test_榜单成功缓存正好三百秒(self):
+        now = [1000.0]
+        c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
+        cache = bh._BoardCache(clock=lambda: now[0])       # ttl 用生产默认值
+        lk = bh.BoardHoldersLookup(c, board_cache=cache)
+        lk.lookup([("robinhood", CA_MEME)])
+
+        now[0] = 1299.5
+        lk.lookup([("solana", CA_STONK)])
+        assert len(c.board_calls) == 1, "299.5 秒时还该命中缓存(改成 299 这条红)"
+
+        now[0] = 1300.5
+        lk.lookup([("base", CA_EVAL)])
+        assert len(c.board_calls) == 2, "300.5 秒时必须重拉(改成 301 这条红)"
+
+    def test_榜单失败的负缓存正好六十秒(self):
+        now = [1000.0]
+        c = FakeClient(board_error=RuntimeError("上游 500"))
+        cache = bh._BoardCache(clock=lambda: now[0])       # error_ttl 用生产默认值
+        lk = bh.BoardHoldersLookup(c, board_cache=cache)
+        lk.lookup([("robinhood", CA_MEME)])
+
+        now[0] = 1059.5
+        lk.lookup([("solana", CA_STONK)])
+        assert len(c.board_calls) == 1, "59.5 秒时还在负缓存里(改成 59 这条红)"
+
+        now[0] = 1060.5
+        lk.lookup([("base", CA_EVAL)])
+        assert len(c.board_calls) == 2, "60.5 秒时必须再试一次(改成 61 这条红)"
+
+    def test_持有人内存缓存正好九十秒(self, monkeypatch):
+        """
+        ⚠️⚠️ 这个 TTL 上一版**零覆盖**:改成 999999 全量一条都不红。
+           它是 /tin 那条只读路径唯一的兜底,改大 = 印一个几小时前的名次
+           (持有人榜是快变量,那就是印一句假话)。
+        """
+        now = [1000.0]
+
+        class _FakeTime:
+            def time(self):
+                return now[0]
+
+            def monotonic(self):
+                return now[0]
+
+        monkeypatch.setattr(bh, "time", _FakeTime())
+        c = FakeClient(holders={CA_MEME: load("fomo_top_holders_robinhood_meme.json")})
+        lk = bh.BoardHoldersLookup(c, board_cache=bh._BoardCache())  # ttl 用生产默认值
+
+        lk.begin_round()
+        lk.lookup([("robinhood", CA_MEME)])
+        assert len(c.holder_calls) == 1
+
+        now[0] = 1089.5
+        lk.begin_round()
+        lk.lookup([("robinhood", CA_MEME)])
+        assert len(c.holder_calls) == 1, "89.5 秒时还该命中内存缓存"
+        assert lk.cached("robinhood", CA_MEME) is not None
+
+        now[0] = 1090.5
+        lk.begin_round()
+        lk.lookup([("robinhood", CA_MEME)])
+        assert len(c.holder_calls) == 2, "90.5 秒之后必须重新去问"
+        now[0] = 1090.5 + 90.5
+        assert lk.cached("robinhood", CA_MEME) is None
+
+
+# ============================================================
+# ⚠️⚠️ 榜单缓存是**进程级单例**
+# ============================================================
+class Test榜单缓存是进程级单例:
+    def test_不注入缓存时两个lookup共用同一份(self):
+        """
+        ⚠️⚠️ 改成实例级(每个 lookup 自己 new 一个 _BoardCache)时,上一版全量
+           一条都不红 —— 而线上榜单请求会**直接翻倍**(poller 一个、pump.fun 一个)。
+           这条不注入 board_cache,走的就是生产那条默认路径。
+        """
+        bh._BOARD.reset()
+        try:
+            c = FakeClient(holders={
+                CA_MEME: load("fomo_top_holders_robinhood_meme.json"),
+                CA_EVAL: load("fomo_top_holders_base_eval.json")})
+            bh.BoardHoldersLookup(c).lookup([("robinhood", CA_MEME)])
+            bh.BoardHoldersLookup(c).lookup([("base", CA_EVAL)])
+
+            assert len(c.board_calls) == 1, "榜与币无关,两个 lookup 只该拉一次"
+            assert len(c.holder_calls) == 2
+        finally:
+            bh._BOARD.reset()
+
+    def test_不注入时拿到的就是模块级那一份(self):
+        """⚠️ 与上一条互为正反面:**身份**相同,不是「碰巧只拉了一次」。"""
+        a = bh.BoardHoldersLookup(FakeClient())
+        b = bh.BoardHoldersLookup(FakeClient())
+        assert a._board is b._board
+        assert a._board is bh._BOARD
+
+
+# ============================================================
+# ⚠️⚠️ 0 与 None 分得开(0 是真实值)
+# ============================================================
+class Test零与缺失:
+    def test_num拒绝布尔但照常收零(self):
+        """⚠️ 去掉 isinstance(v, bool) 时:True 会变成 1.0,粉丝数凭空多一个人。"""
+        assert bh._num(True) is None
+        assert bh._num(False) is None
+        assert bh._num(0) == 0.0
+        assert bh._num("0") == 0.0
+        assert bh._num(0.0) == 0.0
+
+    def test_布尔进到榜单行里也不许变成数字(self):
+        got = bh.parse_board([{"id": "a", "followers": True, "pnl24h": True}])
+        assert got["a"].followers is None
+        assert got["a"].pnl24h is None
+
+    def test_盈亏正好为零是真实值(self):
+        """⚠️⚠️ 一个人今天不赚不亏是真事,不是「拿不到」—— 判空一律 is None。"""
+        got = bh.parse_board([{"id": "a", "pnl24h": 0, "followers": 0}])
+        assert got["a"].pnl24h == 0.0
+        assert got["a"].followers == 0
+        blk = bh.match_block(got, {"totalHolders": 1,
+                                   "topHolders": [{"humanAmount": 0.0,
+                                                   "user": {"id": "a"}}]}, 150)
+        assert blk.rows == ((1, None, 0.0, 0, 0.0),)

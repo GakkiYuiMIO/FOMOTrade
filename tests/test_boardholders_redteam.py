@@ -26,6 +26,7 @@ from __future__ import annotations
 import html
 import json
 import pathlib
+import unicodedata
 
 import pytest
 
@@ -82,14 +83,32 @@ def _leaked(evil: str, out: str) -> bool:
     return False
 
 
+def _has_invisible(s: str) -> bool:
+    """含不含 Unicode 的**格式控制**字符(零宽空格 / 软连字符 / BOM / bidi …)。"""
+    return any(unicodedata.category(ch) == "Cf" for ch in s)
+
+
 @pytest.mark.parametrize("evil", _EVILS, ids=_IDS)
 def test_userHandle_槽位零泄漏(evil):
-    """⚠️ 这是**唯一会被渲染**的那个槽位 —— 拦不住就直接印进推送。"""
+    """
+    ⚠️ 这是**唯一会被渲染**的那个槽位 —— 拦不住就直接印进推送。
+
+    ⚠️⚠️ 拦住之后有**两套**处置,取决于攻击串是哪一类:
+      · 含**隐形字符**(Cf:零宽空格 / 软连字符 / BOM / bidi)→ **整行丢弃**。
+        这类串归一化之后正好会变成**另一个真人的 handle**(`uni​pcs` → `unipcs`,
+        而 unipcs 就是这个榜的第 1 名),退回「未知用户」等于把一次定向冒名
+        留在一个长得像"记录"的地方。这里只有这一行,所以整块消失。
+      · 其余(形状不合格:带空格 / 域名 / 太长 …)→ 退回「未知用户」,
+        这一行的其余三段是真值,`#1` 本身就能在榜上定位到人。
+    """
     out = _push(_board(handle=evil), _holders(handle=evil))
     assert not _leaked(evil, out), out
-    # ⚠️ 拦住之后这一行仍在(退回「未知用户」),其余三段是真值
-    assert "未知用户" in out
-    assert "#1 " in out
+    if _has_invisible(evil):
+        assert "🏅" not in out, out
+        assert "未知用户" not in out, out
+    else:
+        assert "未知用户" in out
+        assert "#1 " in out
 
 
 @pytest.mark.parametrize("evil", _EVILS, ids=_IDS)
@@ -155,6 +174,8 @@ def test_一百五十个真实_handle_一个都没被误伤():
         out = _push([row], {"totalHolders": 1,
                             "topHolders": [{"humanAmount": 1.0,
                                             "user": {"id": row["id"]}}]})
-        if "未知用户" in out:
+        # ⚠️ 两种误伤都要抓:退回「未知用户」,以及**整行被丢掉**(那时整块消失)。
+        if "未知用户" in out or "🏅" not in out:
             lost.append(row["userHandle"])
     assert lost == [], lost
+    assert len(board_raw) == 150

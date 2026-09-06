@@ -13,6 +13,9 @@
 
 ============ 数据来自哪儿(两个端点,都要登录态)============
 ■ 榜单  GET /v2/leaderboard/24h?limit=150   (client.get_leaderboard)
+    ⚠️⚠️ 真实信封比别的端点**多套一层**(2026-09-06 实测):
+       `responseObject` 是 dict、里面只有一个键 `leaderboard`,值才是那 150 行。
+       解包由 client._unwrap → _as_list 兜住;它一坏,这一块**静默永不出现**。
     ⚠️⚠️ 服务端真实上限 **150**,不是 100:limit=150 → 150 行;
        151/160/175/199/500/1000 一律**静默返回 150**(不报错)。
        client 上一版把它夹在 100,于是第 101~150 名永远看不见 —— 本轮放开了,
@@ -76,8 +79,24 @@ activated/address/clan/…/followers/…/totalVolume/twitter/userHandle/verified
      各持一个 lookup 实例,实例级缓存等于把请求数悄悄翻倍。
 ■ 持有人是**按币的** → 每条推送 1 个请求,并且有
     · 每 tick 次数上限 _HOLDERS_PER_ROUND(6);
-    · 每 tick 墙钟闸 _ROUND_WALL_CLOCK_SEC(6.0 秒,把榜单那次也算进去)。
+    · 每 tick 墙钟闸 _ROUND_WALL_CLOCK_SEC(6.0 秒,把榜单那次也算进去,
+      而且**拉榜那一次在发出去之前**就要过这道闸)。
   任一触发 → 后面的币这一块不显示,**绝不阻塞推送**。
+■ ⚠️⚠️ 这一块的两个请求都走 client 的**装饰性策略**(fast_fail=True):
+  **单次尝试、5 秒超时、不按 Retry-After 睡、不退避重试**,见
+  client._DECORATIVE_TIMEOUT_SEC。上一版复用主路径那套重试机(3 次尝试 / 12 秒超时 /
+  429 按服务端 Retry-After 退避、夹在 60s),离线量化的最坏值是:
+      429 + Retry-After: 60 → 请求 3 次,sleep=[62.49, 41.78] 合计 104.27s,
+                              叠上 3×12.0s 连接超时 = **单个请求阻塞 140.3 秒**;
+      503                  → sleep=[1.53, 3.48] 合计 5.01s + 3×12s 超时。
+  而这一段是**同步**跑在 poller._dispatch 发消息**之前**的。
+  ⇒ 现在这一整块每 tick 的最坏阻塞 = 墙钟预算 6.0s + 一次超时 5.0s = **11.0 秒**,
+    有测试钉住。失败就是这一块本轮不显示 —— 下一 tick(15~27 秒)会再来。
+  ⚠️ 例外:FOMO_CLIENT_IMPL=playwright 时,某个线程**第一次**发请求还要付
+     chromium 冷启动(page.goto 的超时是 60s)。这条如实记在 README「已知代价」。
+■ ⚠️⚠️ 榜单那把 single-flight 闸是 **acquire(blocking=False)**:拿不到就说明
+  别的 job 正在拉,本轮这一块直接不显示 —— **绝不等**(一条装饰行不配让另一个
+  job 等),也**绝不写负缓存**(拿不到锁 ≠ 上游挂了)。见 _BoardCache。
 ■ 转入类推送(/tin 逐条)走 `cached()`:**只读内存缓存、一个请求都不发**。
   ⚠️ 如实记下代价(与 tokeninfo 的 H6 同一条):持有人响应的内存缓存只有 90 秒,
      一条转入基本不可能正好命中 —— 所以**转入推送实际上几乎永远没有这一块**。
@@ -124,9 +143,16 @@ _ROUND_WALL_CLOCK_SEC = 6.0
 _HOLDERS_TTL_SEC = 90.0
 _HOLDERS_CACHE_MAX = 2000
 
-# 一条推送最多列几个人。⚠️ 实测一个币最多命中过 **31** 人(robinhood 的 PONS),
-#    原样铺开就是 31 行 —— 这一块是推送的**配角**,不能把主体挤下屏幕。
-#    多出来的用「另有 N 人在榜」一句带过(那句话的数字仍是真值)。
+# 一条推送最多列几个人。
+# ⚠️⚠️ 这里曾经写着"实测一个币最多命中过 **31** 人(robinhood 的 PONS)",而同一轮的
+#    报告表里写的是 **42** —— 两个数对不上,而且**两个都无法从仓库里复现**
+#    (那次探测没有留下夹具)。所以本轮把口径统一成"仓库里能证明的那个数":
+#    committed 的 8 份真实 /hodlers/top 夹具里,命中人数最多的是 solana 的 STONK,
+#    **13 人**(见 tests/test_boardholders.py::test_三条链各自都能对上)。
+#    13 行铺开已经能把主体挤下屏幕,所以 MAX_ROWS 的判据本来就不是那个最大值,
+#    而是"这一块是推送的**配角**"。多出来的用「另有 N 人在榜」一句带过
+#    (那句话的数字仍是命中总数、仍是真值)。
+#    ⚠️ 别再往这条注释里写一个没有夹具兜底的"实测最大值"。
 MAX_ROWS = 3
 
 
@@ -283,6 +309,22 @@ class _BoardCache:
     ⚠️ 失败也进缓存(更短的 TTL):一次超时不该让后面每一条推送都再去试一次,
        那正好是上游抖动时最不该做的事。
     ⚠️ 拿不到就返回 None,调用方那一块整块消失。**绝不抛。**
+
+    ============ ⚠️⚠️ 两把锁,而且**锁内绝不做网络请求** ============
+    上一版把 `client.get_leaderboard(...)` 整个放在 `with self._lock:` 里面。
+    实测(假 client 模拟一次 8 秒拉榜,poller 先进锁、pump.fun watcher 后到):
+    **pump.fun 那个 job 被挡住 7.70 秒,而它自己一轮的墙钟预算才 6.0 秒** ——
+    记账是事后的,等待本身**没有任何上限**。一条装饰行不配让另一个 job 等。
+
+    所以拆成两把:
+      · `_lock`  —— 只护**内存状态**(缓存值 / 到期时刻),锁内全是赋值,微秒级;
+      · `_fetch` —— single-flight,**`acquire(blocking=False)`,拿不到就走人**。
+        拿不到锁 = "别的 job 正在拉这份全局榜单",本轮这一块不显示,下一 tick
+        大概率直接命中缓存。
+    ⚠️⚠️ 拿不到锁 **≠ 失败**:绝不写负缓存 —— 那会把"别人正在拉"错记成"上游挂了",
+       白白按住这一块 60 秒。
+    ⚠️ 这条"等不到就放弃"的口径与仓库既有的 tokeninfo._RateGate(_GATE_MAX_WAIT_SEC)
+       是同一条,只是这里的上界直接取 0。
     """
 
     def __init__(self, ttl: float = _BOARD_TTL_SEC,
@@ -291,49 +333,72 @@ class _BoardCache:
         self._ttl = float(ttl)
         self._error_ttl = float(error_ttl)
         self._clock = clock
+        # ⚠️ 只护内存状态,锁内不许出现任何 IO。
         self._lock = threading.Lock()
+        # ⚠️ single-flight 闸:同一时刻只有一个 job 在真拉榜,别人**不等**。
+        self._fetch = threading.Lock()
         self._until = 0.0
         self._board: dict[str, BoardRow] | None = None
         self._size = 0
+
+    def _cached(self):
+        """→ (命中吗, 榜单索引, 行数)。锁内只读内存,不做任何 IO。"""
+        with self._lock:
+            if self._clock() < self._until:
+                return True, self._board, self._size
+        return False, None, 0
 
     def get(self, client) -> tuple[dict[str, BoardRow] | None, int, bool]:
         """
         → (榜单索引 或 None, 榜单行数, 是不是这次真发了请求)。
 
-        ⚠️ 调用方负责把**整段**耗时(含下面这把锁的等待)记进本轮墙钟账 ——
-           见 BoardHoldersLookup._lookup。锁的等待也算是有理由的:poller 与
-           pump.fun watcher 是两个 job,两边同时到期时后到的那个是**真的在等**
-           前一个的那次请求,不记账就等于墙钟闸对它失效。
+        ⚠️ 调用方仍然要把这一段的耗时记进本轮墙钟账(见 BoardHoldersLookup._lookup),
+           但现在这一段**只可能**是"一次单尝试的短超时请求"或"立刻返回" ——
+           不再可能是"排在另一个 job 的重试机后面等两分钟"。
         """
-        with self._lock:
-            now = self._clock()
-            if now < self._until:
-                return self._board, self._size, False
-            def call():
-                # ⚠️⚠️ 三件事一个都不许改:
-                #   · BOARD_LIMIT = 150(服务端真实上限,别再夹回 100);
-                #   · auth_invalidate=False(401/403 绝不处置全进程共用的登录态);
-                #   · BOARD_PERIOD 与 BOARD_PNL_FIELD 成对(24h 榜里只有 pnl24h)。
-                return client.get_leaderboard(BOARD_PERIOD, BOARD_LIMIT,
-                                              auth_invalidate=False)
+        hit, board, size = self._cached()
+        if hit:
+            return board, size, False
 
+        # ⚠️⚠️ **不等**:拿不到就说明别的 job 正在拉这份全局榜单。
+        if not self._fetch.acquire(blocking=False):
+            logger.debug("盈利榜正被另一个 job 拉取,本轮这一块不显示(不等、也不写负缓存)")
+            return None, 0, False
+        try:
+            # 二次检查:排在前面那个 job 可能刚好在我们拿到闸之前填好了缓存。
+            hit, board, size = self._cached()
+            if hit:
+                return board, size, False
+
+            # ⚠️⚠️ 四件事一个都不许改:
+            #   · BOARD_LIMIT = 150(服务端真实上限,别再夹回 100);
+            #   · auth_invalidate=False(401/403 绝不处置全进程共用的登录态);
+            #   · fast_fail=True(装饰性调用**单次尝试、5 秒超时、不按 Retry-After 睡**,
+            #     见 client._DECORATIVE_TIMEOUT_SEC —— 复用主路径重试机时这一个请求
+            #     最坏能阻塞 140.3 秒,而这一段跑在发消息**之前**);
+            #   · BOARD_PERIOD 与 BOARD_PNL_FIELD 成对(24h 榜里只有 pnl24h)。
             try:
-                rows = call()
+                rows = client.get_leaderboard(BOARD_PERIOD, BOARD_LIMIT,
+                                              auth_invalidate=False, fast_fail=True)
             except Exception as e:  # noqa: BLE001
                 # ⚠️ AuthError 也在这里被吞掉:这一块绝不能把"登录态失效"这件事
                 #    捅到推送主路径去(poller 对 AuthError 的处置是**停机**)。
                 logger.warning("盈利榜拉取失败,这一块本轮不显示({}s 内不再重试) | {}",
                                int(self._error_ttl), e)
-                self._board, self._size = None, 0
-                self._until = now + self._error_ttl
+                with self._lock:
+                    self._board, self._size = None, 0
+                    self._until = self._clock() + self._error_ttl
                 return None, 0, True
             board = parse_board(rows)
             size = len(rows) if isinstance(rows, list) else 0
-            self._board, self._size = board, size
-            self._until = now + self._ttl
+            with self._lock:
+                self._board, self._size = board, size
+                self._until = self._clock() + self._ttl
             logger.debug("盈利榜已刷新 | 行数={} 可对齐={} TTL={}s", size, len(board),
                          int(self._ttl))
             return board, size, True
+        finally:
+            self._fetch.release()
 
     def reset(self) -> None:
         """只给测试用:把缓存清空。"""
@@ -379,7 +444,14 @@ class BoardHoldersLookup:
 
     # ---- 生命周期 ----------------------------------------------------------
     def begin_round(self) -> None:
-        """每 tick 开头调一次:次数与墙钟预算归零(与 tokeninfo / namecn 同一套)。"""
+        """
+        每 tick 开头调一次:**两本账都归零**(与 tokeninfo / namecn 同一套)。
+
+        ⚠️⚠️ 两行缺一不可,尤其是 `_spent`:少了它,墙钟账**跨 tick 累加** ——
+           几个 tick 之后 self._spent 就永远 >= _ROUND_WALL_CLOCK_SEC,
+           这一块从此**永久消失**,而且不会有任何报错、任何日志说它错了。
+           (变异跑证实过:删掉 `self._spent = 0.0`,上一版全量 4587 条一条都不红。)
+        """
         self._used = 0
         self._spent = 0.0
 
@@ -452,7 +524,14 @@ class BoardHoldersLookup:
         client = self._ensure_client()
         if client is None:
             return out
-        # ⚠️ 拉榜的耗时(含等锁)同样计入本轮墙钟账 —— 它跟持有人请求一样挂在 tick 上
+        # ⚠️⚠️ 拉榜那一次**也要在发出去之前**过墙钟闸。上一版只在事后记账 ——
+        #    墙钟闸只在"发下一个请求之前"检查,对**已经发出去的那一次**毫无约束,
+        #    而拉榜那一次**根本不在闸的管辖内**。
+        # ⚠️ 走 _wall_ok 而不是 _take:次数闸 _HOLDERS_PER_ROUND 数的是"为几个**币**
+        #    查了持有人",榜单与币无关,不该占掉其中一格。
+        if not self._wall_ok("leaderboard"):
+            return out
+        # ⚠️ 拉榜的耗时同样计入本轮墙钟账 —— 它跟持有人请求一样挂在 tick 上。
         t0 = self._clock()
         try:
             board, size, _ = self._board.get(client)
@@ -476,7 +555,7 @@ class BoardHoldersLookup:
             # ⚠️⚠️ networkId 传**数字**(NETWORK_CHAIN_ID),不是链名 —— 传链名 400。
             # ⚠️⚠️ auth_invalidate=False:401/403 绝不处置全进程共用的登录态(见模块头)。
             data = self._timed(lambda: client.get_top_holders(
-                addr, NETWORK_CHAIN_ID[net], auth_invalidate=False))
+                addr, NETWORK_CHAIN_ID[net], auth_invalidate=False, fast_fail=True))
         except Exception as e:  # noqa: BLE001
             logger.warning("持有人榜拉取失败,这个币的盈利榜持有人不显示 | {} {} | {}",
                            net, addr[:16], e)
@@ -501,11 +580,25 @@ class BoardHoldersLookup:
         return self._client
 
     # ---- 预算 --------------------------------------------------------------
-    def _take(self, tag: str) -> bool:
-        """次数闸 + 墙钟闸,任一触发就这一轮不再查(与 tokeninfo._take 同一套)。"""
+    def _wall_ok(self, tag: str) -> bool:
+        """
+        只判墙钟闸。⚠️ **拉榜那一次也要过这道**(它不占次数闸的格子,见 _lookup)。
+
+        ⚠️⚠️ 这道闸判的是"**在发之前**还剩不剩预算",它管不住**已经发出去的那一次**
+           要跑多久 —— 那一半由 client 那边的装饰性策略兜住(单次尝试 + 5 秒超时,
+           见 client._DECORATIVE_TIMEOUT_SEC)。两条合起来,这一整块每 tick 的
+           最坏阻塞 = _ROUND_WALL_CLOCK_SEC + 一次超时 = 6.0 + 5.0 = **11.0 秒**
+           (上一版是 3 次尝试 × 12 秒超时 + 最长 104 秒退避 = 140.3 秒/**单个请求**)。
+        """
         if self._spent >= self._wall:
             logger.debug("盈利榜持有人墙钟预算用尽({:.1f}s >= {:.1f}s),本轮跳过 | {}",
                          self._spent, self._wall, tag[:16])
+            return False
+        return True
+
+    def _take(self, tag: str) -> bool:
+        """次数闸 + 墙钟闸,任一触发就这一轮不再查(与 tokeninfo._take 同一套)。"""
+        if not self._wall_ok(tag):
             return False
         if self._used >= self._per_round:
             logger.debug("盈利榜持有人次数预算用尽({}/{}),本轮跳过 | {}",
