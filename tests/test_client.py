@@ -470,7 +470,12 @@ def test_关注列表分页上限与榜单上限不是同一个数():
 
 
 def test_榜单小于一的夹到一(monkeypatch):
-    """⚠️ limit **必传**,不带直接 400;传 0/负数同理。"""
+    """
+    ⚠️ 这里**不是**因为「不传 limit 会 400」—— 那句话 2026-09-06 实测是**错的**
+       (不带 limit 服务端返回 200 + 150 行,见 client.py 里 EP_LEADERBOARD 上方的更正)。
+       夹到 1 的真实理由:0 / 负数是**我们这边**算出来的荒谬值,
+       与其发出去看服务端心情,不如在本地收敛成一个有意义的最小值。
+    """
     c, box = _wired_http_client(monkeypatch, json.dumps(_BOARD_ENVELOPE))
 
     c.get_leaderboard("24h", 0)
@@ -883,3 +888,54 @@ def test_playwright不能并发这条约束还在():
     """⚠️ 与上一条同源:线程退出时浏览器不回收,所以 _fetch_snapshots 对它强制串行。"""
     assert C.PlaywrightFomoClient.supports_concurrency is False
     assert C.HttpFomoClient.supports_concurrency is True
+
+
+def test_playwright那半边的装饰性超时真的传进了页面(monkeypatch):
+    """
+    ⚠️⚠️ 补覆盖缺口:装饰性 5 秒超时在 **http 那半边**有测试钉着,
+       playwright 那半边一条都没有 —— 复验实测三条变异
+       (`ctl = null` / `timeoutMs: None` / 拿掉 `opts.signal`)
+       把它整个拿掉,全量 4654 条**一条都不红**。
+    ⚠️ 只驱动 `_request`、假掉 page,不启动任何浏览器。
+    """
+    seen = {}
+
+    class _FakePage:
+        def evaluate(self, js, payload):
+            seen["js"] = js
+            seen["payload"] = payload
+            return {"status": 200, "body": "{}", "headers": {}}
+
+    tokens = type("T", (), {"get_access_token": lambda s: "t",
+                            "invalidate": lambda s: None})()
+    c = C.PlaywrightFomoClient(tokens)
+    monkeypatch.setattr(c, "_ensure_page", lambda: _FakePage())
+
+    # 装饰性:5.0 秒 → 页面里拿到的是**毫秒**
+    c._request("/x", None, timeout=5.0)
+    assert seen["payload"]["timeoutMs"] == 5000, seen["payload"]
+
+    # 主路径:不传 → None,页面里那个 `timeoutMs > 0` 为假,一个 AbortController 都不建
+    c._request("/x", None)
+    assert seen["payload"]["timeoutMs"] is None, seen["payload"]
+
+
+def test_页面里那段js真的把超时接到了fetch上():
+    """
+    ⚠️⚠️ 这条**对 JS 源码本身断言**,不常见,理由写清楚:
+       那段 JS 跑在浏览器页面里,测试进程**执行不了它**,而它正是装饰性超时
+       在 playwright 那半边唯一的落点。要么对源码断言,要么零覆盖 ——
+       零覆盖的后果已经实测过了(三条变异全绿)。
+    ⚠️ 三条断言各钉住复验点名的一条变异:
+       建不建 AbortController / 定不定时 abort / 有没有接到 fetch 的 signal 上。
+    """
+    js = C._FETCH_JS
+    # 变异 N24:`const ctl = null;` —— 永远不建控制器
+    assert "new AbortController()" in js
+    assert "timeoutMs > 0" in js, "没了这个条件,主路径(不传超时)也会被装上控制器"
+    # 定时器真的会 abort
+    assert "setTimeout(() => ctl.abort(), timeoutMs)" in js
+    # 变异 D2:拿掉 `opts.signal` —— 控制器建了却没接到 fetch 上,abort 打不到请求
+    assert "opts.signal = ctl.signal" in js
+    # 收尾:定时器要清掉,否则页面里堆一堆待触发的 abort
+    assert "clearTimeout(timer)" in js
