@@ -1,0 +1,1 @@
+{"success": false, "message": "Invalid input: query.tokens.0.networkId - Expected number, received nan", "responseObject": {"errorCode": "ERR_VALIDATION_FAILED", "validationErrors": [{"field": "query.tokens.0.networkId", "message": "Expected number, received nan", "code": "invalid_type"}]}, "statusCode": 400, "errorCode": "ERR_VALIDATION_FAILED"}

@@ -1,0 +1,85 @@
+{
+  "success": true,
+  "message": "",
+  "responseObject": {
+    "leaderboard": [
+      {
+        "id": "36adb85a-c0fd-5fa8-916d-8fdc32fe4237",
+        "address": "FJDy9FDRy6bwGEUKuAC98bUtN8MkpE2pT7Dj7HE3Z7Q1",
+        "evmAddress": "0x2ac082e252143c89c6e3bcb972e49855f9f6711c",
+        "createdAt": "2026-05-18T12:45:58.832Z",
+        "displayName": "Unipcs",
+        "userHandle": "unipcs",
+        "following": 34,
+        "followers": 542169,
+        "activated": false,
+        "verified": false,
+        "isReferred": true,
+        "isRestricted": false,
+        "swapCount": 477,
+        "numTrades": 3086,
+        "totalVolume": 3246299.019065,
+        "private": false,
+        "twitter": null,
+        "pnl24h": 6002861.530720012,
+        "clan": {
+          "id": "715a68a6-657e-4424-8c65-68ad3af899b1",
+          "name": "Fantom Troupe",
+          "iconLink": "https://prod-fomo-profile-pics.s3.amazonaws.com/4d5de9da1d1b7ee43ce86588ce29119a.jpg?k=249q5IOHBsBBviVLJCD-Nk3Kw",
+          "iconThumbhash": "phgWJwJoh4iPd4Z0hmhneIh4l/xoB3sC"
+        },
+        "totalHoldings": 189
+      },
+      {
+        "id": "d676a05f-0b3e-57d1-86dc-d6986927c6c8",
+        "address": "2cYqR4qG4ebyghAc3jc8PCALNh1bHL4hYewmmkr3Jawq",
+        "evmAddress": "0x134cea2c8b270819320b73169d27bbf62f4d3ce2",
+        "createdAt": "2026-05-18T22:33:11.909Z",
+        "displayName": "Aurelius",
+        "userHandle": "Aurelius0121",
+        "following": 0,
+        "followers": 275827,
+        "activated": false,
+        "verified": false,
+        "isReferred": false,
+        "isRestricted": false,
+        "swapCount": 5321,
+        "numTrades": 2986,
+        "totalVolume": 10599490.195023,
+        "private": false,
+        "twitter": null,
+        "pnl24h": 579472.4723991062,
+        "clan": {
+          "id": "75cefc60-e6f6-4189-8073-18e7cb37db5d",
+          "name": "Dabal",
+          "iconLink": "https://prod-fomo-profile-pics.s3.amazonaws.com/4e06a6f1dfd20a96b96ee5e38c7e012a.jpg?k=249q5IOHBsBBviVLJCD-Nk3Kw",
+          "iconThumbhash": "BggKDwJYZ2eIh3dwimmHx1iJhnUIaIcA"
+        },
+        "totalHoldings": 99
+      },
+      {
+        "id": "716957e5-6177-5bb1-94e7-92364bb327b7",
+        "address": "4MMvVYoz2ieT48MDM1CXSoLm4uZQZM16PcvNSq9UsNvu",
+        "evmAddress": "0x23ceab776a29ab9f7178634afdd716924c5f30dc",
+        "createdAt": "2026-08-21T15:51:43.067Z",
+        "displayName": "Delivery Driver",
+        "userHandle": "deliveryydriver",
+        "following": 70,
+        "followers": 1051,
+        "activated": false,
+        "verified": false,
+        "isReferred": true,
+        "isRestricted": false,
+        "swapCount": 126,
+        "numTrades": 199,
+        "totalVolume": 81497.187587,
+        "private": false,
+        "twitter": null,
+        "pnl24h": 167937.1535139446,
+        "clan": null,
+        "totalHoldings": 34
+      }
+    ]
+  },
+  "statusCode": 200
+}

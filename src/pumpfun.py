@@ -61,6 +61,7 @@ from urllib.parse import quote
 from loguru import logger
 
 from src import store
+from src.boardholders import BoardHoldersLookup
 from src.config import get_settings
 from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
 from src.formatter import render_pump_callout, render_pump_trade
@@ -1110,6 +1111,12 @@ class PumpWatcher:
         # (与 poller 那个实例共用同一把闸 —— filterTokens 的限流按 IP 算)。
         # 同一条铁律:失败一律自己吞掉,绝不影响成交推送本身。
         self._token_extras = TokenExtraLookup()
+        # 🏅 盈利榜持有人。⚠️ 这个 watcher 手上只有 PumpClient,没有 FOMO client ——
+        #    BoardHoldersLookup 在**第一次真要发请求时**才自己 build_client(),
+        #    名单为空 / 本轮没有要推的成交时一个连接都不建。榜单本身是**进程级**缓存,
+        #    与 poller 那份共用同一份(见 boardholders._BOARD)。
+        #    同一条铁律:失败一律自己吞掉,绝不影响成交推送本身。
+        self._board_holders = BoardHoldersLookup()
 
     # ---- 对外唯一入口 ----------------------------------------------------
     def run_once(self) -> int:
@@ -1134,6 +1141,7 @@ class PumpWatcher:
             pass
         self._pool_lookup.close()
         self._token_extras.close()
+        self._board_holders.close()
 
     # ---- 内部 ------------------------------------------------------------
     def _check(self) -> int:
@@ -1217,6 +1225,13 @@ class PumpWatcher:
         except Exception:  # noqa: BLE001
             pass
         token_extras = self._token_extra_map(mints, by_mint)
+        # 🏅 盈利榜持有人:榜单进程级缓存 + 每个 mint 一个持有人请求,
+        # 次数与墙钟预算从这里起算(见 boardholders)。失败一律降级为空 dict。
+        try:
+            self._board_holders.begin_round()
+        except Exception:  # noqa: BLE001
+            pass
+        board_blocks = self._board_holder_map(mints, by_mint)
         # 币名/股票说明的每轮预算从这里起算(见 namecn.NameGlossary)
         try:
             self._names.begin_round()
@@ -1232,7 +1247,7 @@ class PumpWatcher:
                 break
             n, used = self._handle_mint(mint, by_mint[mint], by_addr, all_addrs,
                                         cutoff_ts, done, budget, observed, pool_quotes,
-                                        token_extras)
+                                        token_extras, board_blocks)
             sent += n
             budget -= used
         return sent
@@ -1293,6 +1308,32 @@ class PumpWatcher:
             logger.warning("pump.fun 发射台/持有人查询失败,本轮这两行不显示 | {}", e)
             return {}
 
+    def _board_holder_map(self, mints: list[str],
+                          by_mint: dict[str, list[tuple[_Watched, Position]]]) -> dict:
+        """
+        本轮这些 mint 的 🏅 盈利榜持有人 → {(链, 归一化地址): BoardBlock}。
+
+        ⚠️ 与 _token_extra_map 的差别是**请求形态**:/hodlers/top 一次只能问一个币,
+           所以这里是**每个 mint 一个请求**,靠 boardholders 自己的每轮次数上限 +
+           墙钟闸兜住(超了就后面那些 mint 这一块不显示)。
+        ⚠️⚠️ 整段包在 try 里:**绝不能出现"因为查不到盈利榜所以成交没推出去"**。
+        """
+        pairs: list[tuple[str, str]] = []
+        for mint in mints:
+            rows = by_mint.get(mint) or []
+            if not rows:
+                continue
+            net = (rows[0][1].network_id or "").strip()
+            if net:
+                pairs.append((net, mint))
+        if not pairs:
+            return {}
+        try:
+            return self._board_holders.lookup(pairs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pump.fun 盈利榜持有人查询失败,本轮这一块不显示 | {}", e)
+            return {}
+
     def _scan(self, w: _Watched) -> tuple[list[Position], list[Position]]:
         """
         一个人这一轮的 (本轮观测到的全部持仓行, 其中发生变动的那些)。
@@ -1330,7 +1371,8 @@ class PumpWatcher:
                      cutoff_ts: float, done: set, budget: int,
                      observed: dict[tuple[str, str], set[str]],
                      pool_quotes: dict[str, dict] | None = None,
-                     token_extras: dict | None = None) -> tuple[int, int]:
+                     token_extras: dict | None = None,
+                     board_blocks: dict | None = None) -> tuple[int, int]:
         """
         一个变动的 mint:问逐笔成交 → 过滤 → 推送 → 只对**推干净了**的人前移快照。
 
@@ -1395,8 +1437,11 @@ class PumpWatcher:
             # 发射台/持有人:本轮批量查好的那份;没有就没有(那两行消失)
             extra = (token_extras or {}).get(
                 ((rows[0].network_id or "").strip(), normalize_token_address(mint)))
+            # 🏅 盈利榜持有人:本轮查好的那份;没有就没有(那一块整块不出现)
+            blk = (board_blocks or {}).get(
+                ((rows[0].network_id or "").strip(), normalize_token_address(mint)))
             ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname,
-                                      tsoc, extra)
+                                      tsoc, extra, blk)
             sent += n
             used += tried
             if ok:
@@ -1440,7 +1485,8 @@ class PumpWatcher:
         """市值(带 TTL 缓存)。实现见 _coin_stats_cached —— 观点那个 watcher 共用同一份逻辑。"""
         return _coin_stats_cached(self._client, self._coin_cache, mint)
 
-    def _name_extras(self, symbol, pool_quote, name, socials=None, extra=None) -> dict:
+    def _name_extras(self, symbol, pool_quote, name, socials=None, extra=None,
+                     board=None) -> dict:
         """
         A/B/C 三段 → render_pump_trade 的关键字参数;缺哪段没哪个键(那一行整行消失)。
         与 poller._name_extras 同一套规矩:整段包在 try 里,**绝不能因为翻不出中文名
@@ -1464,6 +1510,11 @@ class PumpWatcher:
                 out["launchpad"] = extra.launchpad
             if extra.holders is not None:
                 out["token_holders"] = extra.holders
+        # 🏅 盈利榜持有人:同样是纯赋值(数据已在上游取好),放在 try 之前 ——
+        # 它不该被"翻不出中文名"那条路径的异常带走。
+        # ⚠️ 零命中时 render_args() 返回 {},那一块整块不出现(绝不打「0 人」)。
+        if board is not None:
+            out.update(board.render_args())
         try:
             if name is not None:
                 out["token_name"] = name
@@ -1491,7 +1542,8 @@ class PumpWatcher:
               stats: CoinStats | None = None,
               holders_in_list: int | None = None,
               pool_quote=None, token_name_en: str | None = None,
-              token_socials_raw=None, token_extra=None) -> tuple[bool, int, int]:
+              token_socials_raw=None, token_extra=None,
+              board_block=None) -> tuple[bool, int, int]:
         """
         逐笔推送。返回 (是否全都推成功了, 真正发出去的条数, 尝试发的条数)。
 
@@ -1519,7 +1571,7 @@ class PumpWatcher:
             fresh, all_ok = fresh[:budget], False
         # 英文全名(A)/ 中文名(C)/ 股票说明(B):一个币算一次,这几笔共用
         names = self._name_extras(pos.symbol, pool_quote, token_name_en,
-                                  token_socials_raw, token_extra)
+                                  token_socials_raw, token_extra, board_block)
         for t in fresh:
             text = render_pump_trade(
                 username=w.username,

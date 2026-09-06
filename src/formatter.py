@@ -52,6 +52,7 @@ from src.models import (
 #    safe_display,里面用的是全删版本 —— 两条路刻意分开,各自有测试。
 from src.nameguard import (
     safe_address,
+    safe_board_rows,
     safe_display,
     safe_exchange,
     safe_ident,
@@ -116,6 +117,12 @@ EMOJI_LAUNCHPAD = "🚀"       # 发射台(这个币是从哪个平台发出来�
 #    它由 ZWJ 粘合(U+1F9D1 U+200D U+1F91D U+200D U+1F9D1)—— 是本模块自己的常量,
 #    不经过任何"删 Cf 字符"的通道(那条只作用于外部文本,见 _esc)。
 EMOJI_TOKEN_HOLDERS = "🧑‍🤝‍🧑"
+# 🏅 盈利榜持有人(这个币的持有人里有谁挂在 24h 盈利榜上)。
+# ⚠️ 刻意**不用 🏆**:那个已经被 `/top` 榜单回执的标题占了。两个东西讲的都是"榜",
+#    共用同一个字符会让人以为这一块就是 /top 的节选 —— 而它其实是"榜 ∩ 这个币的持有人"。
+# ⚠️ 与 👥(名单内 N 人买过)、🧑‍🤝‍🧑(这个币有多少持有人)也都不同:
+#    那两条讲的是"人数",这一条讲的是"具体是谁、排第几"。
+EMOJI_BOARD = "🏅"
 
 # ============================================================
 # 固定文案
@@ -152,6 +159,23 @@ LABEL_PNL_UNREALIZED = "未实现盈亏"
 LABEL_POOL = "底池"
 LABEL_LAUNCHPAD = "发射台"
 LABEL_TOKEN_HOLDERS = "持有人"
+# 🏅 那一块的文案。⚠️「全平台24h」四个字**不许省**:同一条推送里紧挨着就有一个
+#    📈 未实现盈亏(**这个币上的**),两个数完全不是一回事 —— 实测 robinhood 的 MEME
+#    第一大持有人全平台 24h 是 **+$6.00M**,而他在这个币上是 **-$125,514**(符号都反)。
+#    去掉"全平台"三个字,这一行就变成一句错话。
+LABEL_BOARD = "盈利榜持有人"
+LABEL_BOARD_PNL = "全平台24h"
+LABEL_BOARD_AMOUNT = "枚"
+LABEL_BOARD_FOLLOWERS = "粉丝"
+# 一条推送最多列几行。⚠️ 数据层(boardholders.MAX_ROWS)已经截过一次,这里是第二道
+#    (与 nameguard._MAX_BOARD_ROWS 一起共三道)。
+# ⚠️ 这里曾经写着"实测一个币最多命中过 31 人" —— 那个数与同轮报告里的 42 对不上、
+#    而且两个都没有夹具兜底,已经统一成仓库里能证明的口径,见 boardholders.MAX_ROWS。
+_BOARD_MAX_ROWS = 3
+# handle 的限长。⚠️ 门禁(safe_username)已经把它收在 32 字符的封闭形状里,
+#    这里只是与其余文本字段同一条通道(_clip:叠平 → 限长 → 转义)。
+#    实测 150 行榜单里最长的 handle 是 15 字符。
+_BOARD_HANDLE_CHARS = 32
 # 持有人数的**上界**。⚠️ 这不是"防御性编程",它挡的是一个具体的形态:
 #    这个槽位收的是上游给的数,而"一串 10~11 位数字"正是手机号 / QQ 号的形态,
 #    印成「持有人 13,800,138,000」既是假事实、又是一条可拨可加的目标。
@@ -265,6 +289,17 @@ UNTRUSTED_FIELDS = {
     #    ⚠️ 也**不是** safe_ident:那一道允许空格,`Send SOL to my wallet now`
     #       整句穿过去 —— 见 nameguard.safe_username 顶上那段。
     "pump_username": safe_username,
+    # ⚠️⚠️ 🏅 那一块的**行**:((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。
+    #    它是**结构化**字段,所以门禁函数收整体、返回同形结构(与 token_socials /
+    #    safe_social_links 同一套路数),而不是一个字符串进一个字符串出。
+    # ⚠️⚠️ 里面那个 handle 是**本人可控**的:谁都能把自己的 FOMO 用户名改成
+    #    `已清仓 · 亏损 99%` 或 `t.me/scam`,而这一行长得像一条**记录**
+    #    (排名 · 名字 · 持仓 · 粉丝 · 盈亏),混进一句话就是一条伪造的记录 ——
+    #    与 /chips 的 pump 成员行同一个威胁模型,所以里面走的也是 **safe_username**
+    #    (封闭形状)。实测 24h 榜 150 行:safe_username 丢 0.00%、safe_display 丢 9.33%、
+    #    safe_ident 虽然也丢 0.00% 但**允许空格**(整句话能穿过去)。
+    #    详见 nameguard.safe_board_rows 上面那一大段。
+    "board_holders": safe_board_rows,
 }
 
 # 译文字段 → 它的**原文**是哪个字段。⚠️ safe_display 的"含 CJK 时不许有 ≥5 位 ASCII 串"
@@ -363,6 +398,11 @@ _REVIEWED_PARAMS = frozenset({
     #    (fmt_token_amount / fmt_signed_pct),两者都对非数字输入返回 None。
     # ⚠️ 那一行**唯一**的文本参数 pump_username 在 UNTRUSTED_FIELDS 里,不在这儿。
     "amount_held", "pnl_pct",
+    # 🏅 那一块的**口径**:(命中人数, 比对了前几名持有人, 服务端自报总数, 是否精确,
+    # 榜单行数)—— 五个都是数字/布尔,没有一个是文本。
+    # ⚠️ 那一块**唯一**的文本槽位(handle)在 board_holders 里,由 safe_board_rows 收口,
+    #    不在这份"已复核"的名单里。
+    "board_scope",
 })
 
 
@@ -906,6 +946,157 @@ def _token_holders_line(n) -> str | None:
     return f"{EMOJI_TOKEN_HOLDERS} {LABEL_TOKEN_HOLDERS} {v:,}"
 
 
+def _within_people_bound(v) -> bool:
+    """
+    人数类槽位的**上界**判据。⚠️⚠️ 复用 `_MAX_TOKEN_HOLDERS`(10 亿)—— 同一个
+    formatter 里**同样形态**的数必须**同样处置**,绝不写第二份阈值。
+
+    它挡的是一个具体的形态(见 _MAX_TOKEN_HOLDERS 那一段):这些槽位收的是上游给的数,
+    而"一串 10~11 位数字"正是手机号 / QQ 号的形态。上一版 🧑‍🤝‍🧑 那一行拦住了
+    `13,800,138,000`,而**同一份 formatter** 的 🏅 那一块两个槽位没拦:
+        totalHolders = 13800138000 → ⚠️ 只比对了前 1/13,800,138,000 名持有人…
+        followers    = 13800138000 → #1「unipcs」· 粉丝 13,800,138,000 …
+    两处处置不一致本身就是一个洞:攻击者只要换个槽位就行。
+
+    ⚠️ 取不到值返回 **True** —— "拿不到"是另一回事,由各自的格式化函数按既有规矩
+       处置(那一段消失);这里只回答"拿到的这个数是不是大得说不出口"。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return True
+    try:
+        return int(d) <= _MAX_TOKEN_HOLDERS
+    except (InvalidOperation, ValueError, OverflowError):
+        return False
+
+
+def _board_pnl_text(v) -> str | None:
+    """
+    全平台 24h 盈亏 → `+$323.15K` / `-$1.20M`。拿不到 None(那一段消失,绝不打 0)。
+
+    ⚠️ 符号与缩写的写法与 _pnl_line 完全一致(`sign + _fmt_usd_compact(abs)`),
+       **不另起一套记法**:同一条推送里两个金额用两种写法,读者会以为是两种量。
+    ⚠️ 正数带 `+`:这一块叫「盈利榜」,不带符号读者会以为那是持仓金额。
+    """
+    d = _to_decimal(v)
+    if d is None:
+        return None
+    usd = _fmt_usd_compact(abs(d))
+    if usd is None:
+        return None
+    return f"{'-' if d < 0 else '+'}{usd}"
+
+
+def _board_row(row) -> str | None:
+    """
+    一位盈利榜持有人:`#28 「frankdegods」 · 11,020,000 枚 · 粉丝 218,710 · 全平台24h +$323.15K`
+
+    ⚠️⚠️ handle 在这里**再过一次 safe_username**(收口已经过了一道,这是刻意保留的
+       第二道、幂等)。不合格 → 退回「未知用户」而**不是**丢掉整行:这一行的其余三段
+       (名次 / 持仓 / 盈亏)是真值,而 `#28` 本身就足以在榜上定位到人;
+       丢掉整行反而会让上面那句「N 人」与列出的行数对不上。
+       (与 render_pump_chip_row、_display_name 同一条既有规矩。)
+    ⚠️ 套 `「」` 视觉容器:handle 是自由文本槽位,与 pump 成员行同一条理由。
+       ⚠️ **不写成 `@handle`** —— Telegram 会把 `@xxx` 渲染成可点的用户名提及,
+          等于我们替一个陌生的 TG 账号做了个链接(nameguard 的 @提及 那条规则
+          防的就是这个)。
+    ⚠️ 四段各自独立:数量 / 粉丝 / 盈亏任一取不到就那一段消失,绝不补 0
+       (0 枚 = 清仓、0 粉丝 = 新号,都是有意义的真实值,不能拿来当"缺失")。
+    ⚠️ 名次不是正整数 → 整行 None:`#N` 是这一行的锚。
+    """
+    try:
+        rank, handle, amount, followers, pnl24h = row
+    except (TypeError, ValueError):
+        return None
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        return None
+    name = safe_username(handle)
+    who = _quoted(_clip(name, _BOARD_HANDLE_CHARS)) if name else TEXT_UNKNOWN_USER
+    seg = [f"#{rank:,} {who}"]
+    amount_text = fmt_token_amount(amount)
+    if amount_text is not None:
+        seg.append(f"{amount_text} {LABEL_BOARD_AMOUNT}")
+    # ⚠️⚠️ 粉丝数也有**上界**(与 🧑‍🤝‍🧑 那一行同一条 _MAX_TOKEN_HOLDERS):
+    #    `粉丝 13,800,138,000` 既是假事实、又是一条可拨可加的目标。
+    #    超界 → **那一段消失**(与"取不到"同一条既有规矩,见本函数上面那条 ⚠️)。
+    followers_text = (_fmt_count(followers) if _within_people_bound(followers)
+                      else None)
+    if followers_text is not None:
+        seg.append(f"{LABEL_BOARD_FOLLOWERS} {followers_text}")
+    pnl_text = _board_pnl_text(pnl24h)
+    if pnl_text is not None:
+        seg.append(f"{LABEL_BOARD_PNL} {pnl_text}")
+    return SEP.join(seg)
+
+
+def _board_note(covered, total, exact: bool, board_size) -> str | None:
+    """
+    这一块的**口径**那一行。**精确与下界必须是两套一眼可辨的写法** ——
+    与 /chips(bot._chips_platform_lines)同一条诚实点、同一套措辞逻辑。
+
+    ⚠️⚠️ 两个下界必须都说到:
+      a. 持有人只拿得到前 ~100 名(服务端条数硬钳 + 约 $2 的市值门槛);
+      b. 榜只有前 150 名,第 151 名开外的盈利大户认不出来。
+    ⚠️ `len(topHolders) == totalHolders` 时 (a) 消失,这时才敢说"全数比对过" ——
+       但 (b) **永远在**,所以精确那套写法里仍然要留着榜的那半句。
+    ⚠️ 总数拿不到 → 连分母都没有,那半句改口说清楚,绝不假装知道。
+    ⚠️⚠️ 总数有**上界**(与 🧑‍🤝‍🧑 那一行同一条 _MAX_TOKEN_HOLDERS):
+       `只比对了前 1/13,800,138,000 名持有人` 里那个数是上游给的,而"一串 10~11 位
+       数字"正是手机号的形态。超界 → **整行消失**(与 _token_holders_line 逐字同一条
+       处置:这一行**说不出口**,少一行是"我们没说",印出去是"我们说错了")。
+       ⚠️ 刻意**不**退回"(平台没给总数)"那半句 —— 平台给了,只是给的是个说不出口的数;
+          说"没给"是另一句假话。
+    """
+    if not _within_people_bound(total):
+        return None
+    board = (f",榜只到前 {board_size:,} 名" if isinstance(board_size, int)
+             and not isinstance(board_size, bool) and board_size > 0 else "")
+    if exact and isinstance(total, int) and not isinstance(total, bool):
+        return f"{EMOJI_WARN} {total:,} 名持有人已全数比对{board},榜外的不算"
+    if not isinstance(covered, int) or isinstance(covered, bool) or covered <= 0:
+        return None                       # 连"比对了几名"都说不出来,这句话就别说了
+    scope = (f"前 {covered:,}/{total:,} 名持有人"
+             if isinstance(total, int) and not isinstance(total, bool)
+             else f"前 {covered:,} 名持有人(平台没给总数)")
+    return f"{EMOJI_WARN} 只比对了{scope}{board} —— 没显示≠没有"
+
+
+def _board_holders_lines(rows, scope) -> list[str]:
+    """
+    🏅 这一整块。**零命中 → 返回 []**(整块不出现)。
+
+    ⚠️⚠️ 绝不打「0 人」:那句话是"我们查过了、确实没有"的断言,而我们手上只有
+       前 ~100 名持有人 × 榜前 150 名 —— 根本没有资格这么说(§10.3)。
+    ⚠️ 头一行的人数用 scope 里的**命中总数**,不是下面列出来的行数:行数被
+       _BOARD_MAX_ROWS 截断,而那句「N 人」说的必须是真值。
+    ⚠️ 精确 → `N 人`;截断 → `≥N 人`。两套写法一眼可辨(与 /chips 同一条口径)。
+    """
+    if not rows:
+        return []
+    try:
+        hits, covered, total, exact, board_size = scope
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(hits, int) or isinstance(hits, bool) or hits <= 0:
+        return []
+    body = []
+    for row in list(rows)[:_BOARD_MAX_ROWS]:
+        line = _board_row(row)
+        if line:
+            body.append(f"   {line}")
+    if not body:
+        # 一行都渲染不出来时整块消失 —— 光剩一句「N 人」什么都没说
+        return []
+    out = [f"{EMOJI_BOARD} {LABEL_BOARD} {'' if exact else '≥'}{hits:,} 人", *body]
+    more = hits - len(body)
+    if more > 0:
+        out.append(f"   另有 {more:,} 人在榜")
+    note = _board_note(covered, total, bool(exact), board_size)
+    if note is not None:
+        out.append(f"   {note}")
+    return out
+
+
 def _socials_line(pairs) -> str | None:
     """
     🔗 网站 · Twitter · Telegram
@@ -1248,6 +1439,8 @@ def render(
     launchpad: str | None = None,
     token_holders: int | None = None,
     token_socials=None,
+    board_holders=None,
+    board_scope=None,
 ) -> str:
     """
     渲染一条 Telegram HTML 消息。
@@ -1270,7 +1463,12 @@ def render(
         token_holders    这个币的持有人数(tokeninfo)→ 🧑‍🤝‍🧑 行;None 整行消失
         token_socials    ((类别, URL), …)(dexscreener 同一份响应)→ 🔗 社媒行;
                          空/None 整行消失
-        ⚠️ 上面这三个**各自独立**:任一拿不到只掉那一行,不影响另外两行,
+        board_holders / board_scope
+                         🏅 盈利榜持有人那一块(boardholders.BoardBlock.render_args())。
+                         board_holders 是 ((排名, handle, 数量, 粉丝, 全平台24h盈亏), …),
+                         board_scope 是 (命中数, 比对了前几名, 总数, 是否精确, 榜单行数)。
+                         ⚠️ 零命中时调用方**根本不传这两个键** → 整块不出现,绝不打「0 人」。
+        ⚠️ 上面这几个**各自独立**:任一拿不到只掉那一行/那一块,不影响其余,
            更不影响整条推送。
 
     ⚠️ 本函数**不得抛异常**。它在 poller 的发送循环里被调用,
@@ -1280,7 +1478,8 @@ def render(
         return _render(ev, buyers, watchlist, holders, baseline_pending, starred,
                        pool_quote_symbol, pool_quote_name,
                        token_name, token_name_zh, stock_company_zh, stock_exchange,
-                       launchpad, token_holders, token_socials)
+                       launchpad, token_holders, token_socials,
+                       board_holders, board_scope)
     except Exception as e:  # noqa: BLE001
         # 走到这里一定是本模块的 bug(所有字段级异常都已在下游吃掉),必须留痕
         logger.exception("消息渲染失败,降级为最简文本 | event_id={} | {}", getattr(ev, "event_id", "?"), e)
@@ -1303,6 +1502,8 @@ def _render(
     launchpad: str | None = None,
     token_holders: int | None = None,
     token_socials=None,
+    board_holders=None,
+    board_scope=None,
 ) -> str:
     # 行序固定,缺失的行整行消失。这个顺序逐条对齐设计文档 §10.2 的七个场景
     candidates = [
@@ -1332,6 +1533,10 @@ def _render(
         _stock_line(pool_quote_symbol, stock_company_zh, stock_exchange,
                     pool_quote_name),                                       # 🏢 紧跟 🌊
         _consensus_line(buyers, watchlist, holders),
+        # 🏅 盈利榜持有人:排在 👥 共识**之后**、🧬 链之前 —— 它与共识是同一族
+        # (都在回答"谁在拿这个币"),而共识讲的是"名单里几个人",这一块讲的是
+        # "全站盈利榜上的哪几个人"。⚠️ 零命中时它返回 [],整块不出现。
+        *_board_holders_lines(board_holders, board_scope),
         _network_line(ev),
         # ⚠️ 社媒排在平台链接(FOMO/GMGN)**之前**:它们是同一族(都是"点出去"),
         #    而项目自己的链接比平台页更具体。两行都用 🔗 是刻意的 —— 行首 emoji 的
@@ -1841,7 +2046,9 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
                              token_name_zh: str | None = None,
                              launchpad: str | None = None,
                              token_holders: int | None = None,
-                             token_socials=None) -> str:
+                             token_socials=None,
+                             board_holders=None,
+                             board_scope=None) -> str:
     """
     被 /tin 点名的人**收到**了一笔币 —— 逐条推送。
 
@@ -1892,6 +2099,9 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
         _counterparty_line(ev),      # 👤 来自 someone(名单内转账会自己标出来)
         _watch_sender_line(ev),      # 📮 发货地址 8FtY7n…cZx72
         _watch_ago_line(ev, now),    # ⏱ 3 分 20 秒前到账
+        # 🏅 盈利榜持有人。⚠️ 这条路径同样**只读缓存**(boardholders.cached),
+        #    缓存里没有就整块不出现 —— 转入推送从不为它新开请求。
+        *_board_holders_lines(board_holders, board_scope),
         _network_line(ev),           # 🧬 Solana
         _socials_line(token_socials),  # 🔗 网站 · Twitter(排在平台链接之前)
         _links_line(ev),             # 🔗 FOMO · GMGN(必须排在 CA 之前)
@@ -2122,6 +2332,8 @@ def render_pump_trade(
     launchpad: str | None = None,
     token_holders: int | None = None,
     token_socials=None,
+    board_holders=None,
+    board_scope=None,
 ) -> str:
     """
     「被盯的人在 pump.fun 上成交了一笔」的推送。
@@ -2208,6 +2420,9 @@ def render_pump_trade(
                   _pump_holders_line(holders_in_list)):
         if extra is not None:
             lines.append(extra)
+    # 🏅 盈利榜持有人:与 FOMO 那条推送同一个位置(共识之后、时间/链接之前)。
+    # ⚠️ 零命中时它返回 [],整块不出现。
+    lines.extend(_board_holders_lines(board_holders, board_scope))
     ts_line = _pump_time_line(traded_at, now)
     if ts_line is not None:
         lines.append(ts_line)
