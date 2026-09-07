@@ -2034,9 +2034,22 @@ def _watch_mcap_line(ev: FomoEvent, now: float | None) -> str | None:
 
 
 def _watch_sender_line(ev: FomoEvent) -> str | None:
-    """发货地址。截短只为好读,判定用的永远是完整地址(在 store 里比对)。"""
-    addr = _short_addr(ev.counterparty_address)
-    return None if addr is None else f"{EMOJI_SENDER} 发货地址 {addr}"
+    """
+    发货地址 —— **完整**印出,包在 `<code>` 里。
+
+    ⚠️⚠️ 2026-09-07 用户要求改成完整的:截短版(`0xa704…668ef`)看着好读,
+       但拿去链上浏览器查、或者跟别的记录比对时**一个字都用不上** ——
+       这一行存在的意义就是"可证",证据必须是能复制走的。
+       与 CA 那一行同一条处置(§10.3:点 `<code>` 一键复制是中国网络下
+       唯一 100% 可用的操作)。
+    ⚠️ 走 safe_address 而不是 _short_addr:地址是陌生人可控内容,
+       而 safe_address 正是"这个槽位就该是一个地址"的封闭形状门禁
+       (形状 + 长度 ≤128)。不合格 → 整行消失,绝不贴半个地址上去。
+    ⚠️ `<code>` 里仍要 _esc:safe_address 放行的字符集虽然不含 `<`/`&`,
+       但转义是这个文件的出口铁律,不在这里开特例。
+    """
+    addr = safe_address(ev.counterparty_address)
+    return None if addr is None else f"{EMOJI_SENDER} 发货地址 <code>{_esc(addr)}</code>"
 
 
 @_guard_untrusted
