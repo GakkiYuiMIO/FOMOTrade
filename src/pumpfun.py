@@ -64,7 +64,7 @@ from src import store
 from src.boardholders import BoardHoldersLookup
 from src.config import get_settings
 from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
-from src.formatter import render_pump_callout, render_pump_trade
+from src.formatter import describe_mcap_range, render_pump_callout, render_pump_trade
 from src.models import NETWORK_DISPLAY, normalize_token_address
 from src.namecn import NameGlossary
 from src.nameguard import safe_display
@@ -1097,6 +1097,12 @@ class PumpWatcher:
         self._min_usd = s.fomo_pump_min_usd
         self._max_mints = s.fomo_pump_max_mints
         self._max_age = s.fomo_pump_trade_max_age_sec
+        # 买入推送的市值区间。⚠️ 与 FOMO 那边(poller)**共用同一组配置、同一个判据**
+        #    (config.MarketCapRange.allows),理由见 config 里 fomo_buy_push_* 那段。
+        self._mcap_range = s.buy_push_mcap
+        # 本轮被市值区间筛掉的买入成交(每轮汇总一条 INFO,见 _check / _drop_buys_by_mcap)
+        self._mcap_skipped = 0
+        self._mcap_skipped_unknown = 0
         # mint → (取到的时刻, 市值)。⚠️ 挂在 watcher 而不是 client 上:
         #    cli 全程只建一个 watcher,缓存才跨得了轮;而 bot 侧那个 client 是另一个实例,
         #    两边共用一份缓存反而会让"这一轮打了几个请求"变得不可预测。
@@ -1240,6 +1246,7 @@ class PumpWatcher:
 
         sent = 0
         budget = MAX_PUSH_PER_ROUND
+        self._mcap_skipped = self._mcap_skipped_unknown = 0
         for mint in mints:
             if budget <= 0:
                 logger.warning("pump.fun 本轮已发满单轮上限 {} 条 —— 剩下的 mint "
@@ -1250,6 +1257,14 @@ class PumpWatcher:
                                         token_extras, board_blocks)
             sent += n
             budget -= used
+        if self._mcap_skipped:
+            # ⚠️ 一轮一条汇总,不是一笔一行:被筛掉是**预期内**的常态(设 500K 上限时
+            #    大半买入都会走这一支),逐笔打日志只会把真正的告警淹掉。
+            #    但也绝不能一条不打 —— 「推送为什么变少了」必须能从日志里看出来。
+            logger.info("pump.fun 本轮按市值区间跳过 {} 笔买入成交(其中无市值 {} 笔)| 区间 {} | "
+                        "已记台账不再重判,卖出照推",
+                        self._mcap_skipped, self._mcap_skipped_unknown,
+                        describe_mcap_range(self._mcap_range))
         return sent
 
     def _pool_quotes(self, mints: list[str],
@@ -1426,6 +1441,14 @@ class PumpWatcher:
             #    额度已经见底时同理 —— 那些成交要留到下一轮才推。
             need = bool(fresh) and room > 0
             stats = self._coin_stats(mint) if need else None
+            # 买入推送的市值区间。⚠️⚠️ 判定顺序是**刻意的**:$50 金额门槛在 _pick_fresh
+            #    里已经判过(免费),过不了的根本进不了 fresh,也就不会为它去问市值
+            #    (frontend-api-v3 限速 60 次/分)。这里用的 stats 就是上面那一次、
+            #    走 _coin_stats 的 TTL 缓存 —— **本功能不为判定新开任何请求**。
+            # ⚠️ 只在 need 时判:额度见底时市值根本没问(stats 必然是 None),
+            #    那时把买入当成「无市值」去筛,会把本该下一轮推的成交永久记进台账。
+            if need:
+                fresh = self._drop_buys_by_mcap(w, mint, fresh, stats)
             n_holders = len(observed.get(rows[0].key, ())) if need else None
             # ⚠️ 只有对手是**币股**时 notable 才给东西 —— 绝大多数 pump 币对着 SOL,
             #    那一行是噪音;而 pump 覆盖的这几条链目前都没有币股判据(见 dexscreener)
@@ -1480,6 +1503,39 @@ class PumpWatcher:
             seen.add(key)
             out.append(t)
         return sorted(out, key=lambda x: (x.traded_ts, x.tx))
+
+    def _drop_buys_by_mcap(self, w: _Watched, mint: str, fresh: list[Trade],
+                           stats: CoinStats | None) -> list[Trade]:
+        """
+        按市值区间筛掉**买入**成交,返回剩下该推的(顺序不变)。
+
+        ⚠️ 判据是 config.MarketCapRange.allows —— 与 FOMO 那边(poller._should_push_buy)
+           **同一个函数**,两个平台的「≤ 上限 / 0 是真实值 / 无市值推不推」口径不会漂移。
+        ⚠️⚠️ 只筛 side == "buy"。卖出、方向不明(None)一律照推:
+           100K 买入推了、涨到 200 万时卖出,这条卖出恰恰最该看到。
+        ⚠️⚠️ 被筛掉的**当场记进已推台账**(与 poller 的 mark_sent 同一个意思):
+           不记的话,这个人这个币下一次持仓变动时 swap-api 会把这笔成交再给一遍,
+           而那时拿的是**那时的**市值 —— 2M 时的买入跌到 300K 后被当成新买入推出去,
+           消息里的市值与成交时刻完全对不上。每笔成交只判一次。
+        ⚠️ 市值是 coins-v3 的 usd_market_cap(**现在**的市值,缓存 60 秒),
+           不是成交那一刻的 —— 新鲜窗口内两者差距有限,消息里印的也是这一个。
+        """
+        mcap = None if stats is None else stats.market_cap_usd
+        kept: list[Trade] = []
+        dropped: list[Trade] = []
+        for t in fresh:
+            if t.side == "buy" and not self._mcap_range.allows(mcap):
+                dropped.append(t)
+            else:
+                kept.append(t)
+        if dropped:
+            with store.get_conn() as conn, store.tx(conn):
+                store.record_pump_pushed(
+                    conn, [(w.user_id, mint, t.tx, t.slot_index_id, t.traded_at) for t in dropped])
+            self._mcap_skipped += len(dropped)
+            if mcap is None:
+                self._mcap_skipped_unknown += len(dropped)
+        return kept
 
     def _coin_stats(self, mint: str) -> CoinStats | None:
         """市值(带 TTL 缓存)。实现见 _coin_stats_cached —— 观点那个 watcher 共用同一份逻辑。"""

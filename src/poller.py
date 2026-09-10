@@ -42,6 +42,7 @@ from src.config import get_settings
 from src.copytrade import Candidate, decide
 from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
 from src.formatter import (
+    describe_mcap_range,
     render,
     render_copy_signal,
     render_transfer_in_signal,
@@ -1914,6 +1915,52 @@ class Poller:
         return ev.amount_usd >= self._tx_watch_min.get(
             ev.user_id, self.settings.fomo_transfer_watch_min_usd)
 
+    def _should_push_buy(self, event_type: str, market_cap: float | None) -> bool:
+        """
+        这条事件过不过「买入推送的市值区间」。**FOMO 这边唯一的判据**,
+        新事件与补发队列共用(照 _should_push_transfer_in 的模式,两处各写一遍迟早会漂移)。
+
+        ⚠️⚠️ 只筛 EVENT_BUY。卖出 / 转入 / 转出 / 观点一律 True:
+           100K 买入推了、涨到 200 万时卖出,这条卖出恰恰最该看到。
+        ⚠️ 数值口径(含边界、0 是真实值、无市值推不推、关闭时恒放行)全部在
+           config.MarketCapRange.allows —— 与 pump.fun 那边**同一个函数**。
+        ⚠️ 这里**只决定推不推**:调用它的地方在落库之后,被筛掉的买入早已入库、
+           计入共识与首次建仓判定;跟单信号(_check_copytrade)拿的是完整的 new_events。
+        """
+        if event_type != EVENT_BUY:
+            return True
+        return self.settings.buy_push_mcap.allows(market_cap)
+
+    def _drop_buys_by_mcap(self, conn, pending: list[FomoEvent],
+                           persisted_mcap: dict[str, float | None]) -> list[FomoEvent]:
+        """
+        按市值区间筛掉买入推送,返回剩下的(顺序不变)。本轮筛掉多少条汇总打一行 INFO。
+
+        ⚠️⚠️ 被筛掉的**当场 mark_sent**:只是"跳过发送"的话 sent 永远是 0,
+           补发队列会在下一轮把它捞出来 —— 那时它照样过这道判据、照样被筛,
+           但每 15 秒白捞一次、连捞 10 分钟;配置若在这 10 分钟内被改宽,还会被补推出去。
+        ⚠️ 补发行用落库的市值(persisted_mcap),新事件用 ev.market_cap。
+        """
+        kept: list[FomoEvent] = []
+        skipped = unknown = 0
+        for ev in pending:
+            mcap = persisted_mcap[ev.event_id] if ev.event_id in persisted_mcap else ev.market_cap
+            if self._should_push_buy(ev.event_type, mcap):
+                kept.append(ev)
+                continue
+            with suppress(Exception):
+                store.mark_sent(conn, ev.event_id, None, None)
+            skipped += 1
+            if mcap is None:
+                unknown += 1
+        if skipped:
+            # ⚠️ 一轮一条汇总,不是一条事件一行:设 500K 上限时每天要筛掉上千条,
+            #    逐条打会把真正的告警淹掉;但也绝不能不打 ——「推送怎么变少了」要能从日志里看出来。
+            logger.info("本轮按市值区间跳过 {} 条买入推送(其中无市值 {} 条)| 区间 {} | "
+                        "已入库、照常计入共识,只是不推",
+                        skipped, unknown, describe_mcap_range(self.settings.buy_push_mcap))
+        return kept
+
     def _pool_quotes(self, pending: list[FomoEvent]) -> dict[str, dict]:
         """
         本轮要推的这些币的底池对手资产 → {链: {归一化地址: PoolQuote}}。
@@ -2110,6 +2157,11 @@ class Poller:
 
         pending = list(new_events)
         seen = {e.event_id for e in new_events}
+        # 补发行**落库的**市值 {event_id: market_cap},只给下面的市值区间判定用。
+        # ⚠️ _event_from_row 刻意不还原展示字段(补发消息里没有市值行),
+        #    拿还原出来的 ev.market_cap(恒 None)去判,「无市值不推」时会把一条
+        #    区间内、只是 TG 抖了一下没发出去的买入在重试时永久筛掉。
+        persisted_mcap: dict[str, float | None] = {}
         # C-2 补发:落库成功但推送失败/进程崩溃的事件。只捞 10 分钟内的 ——
         # 更早的补出去已经没有交易价值,反而制造困惑
         try:
@@ -2119,8 +2171,14 @@ class Poller:
                 ev = _event_from_row(row)
                 if ev is not None:
                     pending.append(ev)
+                    persisted_mcap[ev.event_id] = _row_get(row, "market_cap")
         except Exception as e:  # noqa: BLE001
             logger.warning("补发队列加载失败(不影响本 tick 新事件): {}", e)
+
+        # 买入推送的市值区间。⚠️ 必须在下面三个批量外呼**之前**筛:
+        #    底池 / 发射台 / 盈利榜都按 pending 里的币发请求(盈利榜还是一个币一个请求、
+        #    有每 tick 次数上限)—— 不先筛,被筛掉的大盘币会把额度吃光,真正要推的小盘币反而没数据。
+        pending = self._drop_buys_by_mcap(conn, pending, persisted_mcap)
 
         if not pending:
             return

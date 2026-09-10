@@ -150,6 +150,25 @@ def _no_send_throttle(monkeypatch):
     yield
     get_settings.cache_clear()
 
+
+@pytest.fixture(autouse=True)
+def _no_mcap_filter_from_dotenv(monkeypatch):
+    """
+    整场测试不吃仓库根 .env 里的「买入推送市值区间」。
+
+    ⚠️ get_settings() 读的是真实 .env:用户一旦在本机设了 FOMO_BUY_PUSH_MAX_MARKET_CAP=500K,
+       既有用例里那些市值 $19.14M 的买入就会被筛掉 —— 测试结果取决于「这台机器怎么配的」,
+       而被测行为完全正常(test_cli 里 FOMO_PUMP_ENABLED 就这么恒红过)。
+    ⚠️ 设成空串而不是 delenv:环境变量优先级高于 .env,空串经 parse_market_cap 解析为 None(不限)。
+       要测这个功能的用例自己 setenv 覆盖。
+    """
+    monkeypatch.setenv("FOMO_BUY_PUSH_MIN_MARKET_CAP", "")
+    monkeypatch.setenv("FOMO_BUY_PUSH_MAX_MARKET_CAP", "")
+    monkeypatch.setenv("FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
 # ---- 测试用常量 ----------------------------------------------------------
 # Solana base58 CA:大小写敏感,任何 lower() 都会把它改坏
 CA_TOAD = "A13oRB9FFaiUjfi6LdCg6p9ka1u8SfGkUFs4SKvPpump"

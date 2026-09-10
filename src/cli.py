@@ -30,6 +30,7 @@ from loguru import logger
 from src import store
 from src.client import request_stop
 from src.config import PROBE_DIR, PROFILE_DIR, SESSION_FILE, get_settings, mask
+from src.formatter import describe_mcap_range
 from src.logger import setup_logger
 from src.models import (
     NETWORK_SLUG,
@@ -932,6 +933,17 @@ def cmd_run() -> int:
     if callout_watcher is not None:
         logger.info("pump.fun 观点监控已启用 | 巡检 {}s | 新鲜窗口 {}s",
                     s.fomo_pump_interval_sec, s.fomo_pump_callout_max_age_sec)
+    # 买入推送的市值区间。⚠️ 关闭时一个字都不打(启动日志逐字节不变);
+    #    开启时把**解析后**的区间印出来 —— 500K 写成 500 这种手滑只有在这里能一眼看出来。
+    mcap = s.buy_push_mcap
+    if mcap.enabled:
+        logger.info("买入推送市值区间 {} | 只筛买入(FOMO + pump.fun),卖出/转入/观点照推",
+                    describe_mcap_range(mcap))
+    elif not s.fomo_buy_push_unknown_market_cap:
+        # 单独设了「无市值不推」却没设区间:按规格功能是关闭的,但用户显然以为自己开了 ——
+        # 这正是「静默失效」,必须喊出来。
+        logger.warning("FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP=false 单独设置不生效 —— "
+                       "没设 FOMO_BUY_PUSH_MIN/MAX_MARKET_CAP,买入推送不做任何市值筛选")
     logger.info("=" * 60)
     try:
         sched.start()
