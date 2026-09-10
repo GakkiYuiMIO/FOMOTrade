@@ -6,6 +6,10 @@
    那个类对 binance_api_key 有"必填 + 长度 + 占位符"三重校验,
    本项目根本不碰币安,继承过来会导致没配币安 Key 的机器直接启动失败。
 """
+import math
+import re
+from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
@@ -29,6 +33,100 @@ PROBE_DIR = DATA_DIR / "fomo_probe"
 #   1) 全新 profile 本身就是"自动化"的特征之一,Google OAuth 会因此拒绝登录
 #   2) 登录态留在 profile 里,下次 --login 通常不用重新走一遍第三方授权
 PROFILE_DIR = DATA_DIR / "playwright_profile"
+
+
+# ============================================================
+# 买入推送的市值区间(FOMO 买入 + pump.fun 买入成交)
+# ============================================================
+# 市值写法的**白名单**正则。与 bot._TIN_MIN_RE 同一条理由:刻意不用裸 float() ——
+#    float("nan") / float("inf") / float("1e999") 全都不报错,而 `mcap <= nan` 恒为 False,
+#    配错一个字符 = 从此一条买入都不推,且没有任何报错。
+# ⚠️ 数字位写 [0-9] 而不是 \d:\d 连全角「５」都收,看不出区别的字符就能悄悄变成另一个值。
+_MCAP_RE = re.compile(
+    r"^\$?\s*(?P<int>[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+    r"(?:\.(?P<frac>[0-9]+))?\s*(?P<unit>[kKmMbBwW万])?$"
+)
+# ⚠️⚠️ 这里**收 M**,与 /tin 的金额(刻意不收 m)口径不同,理由是语境不同:
+#    /tin 是聊天框里敲的美元金额,M 在金融里既被写成 million 也被写成千(罗马数字),
+#    猜错一次就是差 1000 倍。而**市值**这个语境里 K/M/B 没有歧义 —— 本项目自己的推送
+#    就印成「💎 市值 $573.66K / $19.14M」,用户是照着推送里看到的写法填进来的;
+#    不收 M 反而逼人把 1.5M 写成 1500000,多敲一个 0 就是差 10 倍且同样静默。
+#    防手滑的兜底不靠拒收,靠**启动日志把解析后的区间原样印出来**(≤ $1.50M),一眼能对上。
+# ⚠️ 用 Decimal 相乘:float("1.1") * 1000 = 1100.0000000000002,
+#    边界「≤ 1.1K」会把市值恰好 1100 的币筛掉 —— 差一个 ulp 的静默漏推。
+_MCAP_UNITS = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000, "w": 10_000, "万": 10_000}
+
+
+def parse_market_cap(v) -> float | None:
+    """
+    市值配置值 → 美元数。None / 空串 = 不设(不限);写坏了**抛 ValueError**(启动即报错)。
+
+    认:500000 · 500,000 · $500000 · 500K · 1.5M · 2B · 50w · 50万 · 0。
+    ⚠️ 写坏了必须抛、不许回落成「不限」:一个拼错的上限静默变成不限,
+       用户会以为自己在看小盘,实际收的是全量 —— 反过来也一样糟。
+    ⚠️ 0 是合法值(下限 0 = 不限下限的显式写法;上限 0 = 只推市值恰好为 0 的),不是"没设"。
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"市值不能是布尔值: {v!r}")
+    if isinstance(v, int | float):
+        f = float(v)
+    else:
+        s = str(v).strip()
+        if s == "":
+            return None
+        m = _MCAP_RE.match(s)
+        if m is None:
+            raise ValueError(f"认不出的市值写法: {s!r}(例: 500K / 1.5M / 500000;不能为负)")
+        d = Decimal(m.group("int").replace(",", ""))
+        if m.group("frac"):
+            d += Decimal("0." + m.group("frac"))
+        unit = m.group("unit")
+        if unit:
+            d *= _MCAP_UNITS[unit.casefold()]
+        f = float(d)
+    if not math.isfinite(f) or f < 0:
+        raise ValueError(f"市值必须是 ≥ 0 的有限数: {v!r}")
+    return f
+
+
+@dataclass(frozen=True)
+class MarketCapRange:
+    """
+    买入推送的市值区间。**全项目唯一的判据**:FOMO 与 pump.fun 两边都只调 allows()。
+
+    ⚠️ 只管「这个市值在不在区间里」,**不管事件类型** —— 只筛买入这件事由两个调用方
+       各自在调用前判(两边的方向字段不是一个类型:EVENT_BUY 与 "buy")。
+    """
+
+    min_usd: float | None
+    max_usd: float | None
+    push_unknown: bool
+
+    @property
+    def enabled(self) -> bool:
+        """上下限都没设 = 功能关闭。⚠️ push_unknown 单独设不算开启(见 allows)。"""
+        return self.min_usd is not None or self.max_usd is not None
+
+    def allows(self, market_cap: float | None) -> bool:
+        """
+        这个市值的买入该不该推。
+
+        ⚠️ 关闭时恒 True —— 包括市值缺失:只设 push_unknown=false 不设区间时,
+           行为必须与没有这个功能逐字节一致(否则「没配区间」也会悄悄筛掉三成买入)。
+        ⚠️ 判空必须 is None:0 是真实值。0 < 下限就该筛掉,绝不能落进「无市值照推」那一支。
+        ⚠️ 两端**含边界**(≥ 下限、≤ 上限):中文「500K 以下」通常含 500K 本身。
+        """
+        if not self.enabled:
+            return True
+        if market_cap is None:
+            return self.push_unknown
+        if self.min_usd is not None and market_cap < self.min_usd:
+            return False
+        if self.max_usd is not None and market_cap > self.max_usd:
+            return False
+        return True
 
 
 class FomoSettings(BaseSettings):
@@ -238,6 +336,37 @@ class FomoSettings(BaseSettings):
         7200, ge=60, description="pump.fun 观点新鲜窗口(秒),超过此年龄的观点不推送"
     )
 
+    # ---------- 买入推送的市值区间(「只想看 500K 市值以下的」)----------
+    # ⚠️⚠️ **只筛买入**:FOMO 的 BUY 与 pump.fun 的买入成交。卖出一律照推 ——
+    #    跟的人 100K 买入(推了)、涨到 200 万时卖出,这条卖出恰恰最该看到。
+    #    转入(/tin)、转入聚合、观点、币安 Alpha、盈利榜……一律不受影响。
+    # ⚠️⚠️ **只抑制推送,不影响落库**:被筛掉的买入照常入库、照常计入「👥 名单内 N 人买过」
+    #    与首次建仓判定,只是不发那条消息(并当场标成已处理,补发队列不会再捞它)。
+    # ⚠️⚠️ **跟单信号不受影响**:它有自己的判据(CopyConfig),这组配置一行都不接进去。
+    # ⚠️⚠️ **FOMO 与 pump.fun 刻意共用这一组值**。这与 fomo_pump_min_usd 那段
+    #    「两个功能共用一个值 = 调一个会静默改另一个」并不矛盾:那条说的是两个功能
+    #    **各自的灵敏度**(金额门槛的量级与噪音来源完全不同),而这里表达的是
+    #    **同一个用户偏好**(我只关心小盘)—— 它跟着人走,不跟着平台走。
+    #    分成两组的话,调小一边忘了另一边,才是真正的静默漂移。
+    # ⚠️ 两个都不设 = 功能关闭,行为与没有这个功能逐字节一致(默认)。
+    # ⚠️ 写法见 parse_market_cap:500K / 1.5M / 500000 都认;写坏了、为负、下限 > 上限
+    #    一律**启动即报错** —— 绝不让一个配错的区间静默把所有买入筛没。
+    # ⚠️ 实测(2026-09-10 生产库只读):有市值的买入里 < $500K 占 27.6%,中位数 $2.02M;
+    #    设 500K 上限时有市值的买入推送从 ~1900 降到 ~300 条/天。
+    fomo_buy_push_min_market_cap: float | None = Field(
+        None, description="买入推送的市值下限(美元,含边界),不设=不限。例 50K"
+    )
+    fomo_buy_push_max_market_cap: float | None = Field(
+        None, description="买入推送的市值上限(美元,含边界),不设=不限。例 500K"
+    )
+    # 拿不到市值的买入推不推。默认推。
+    # ⚠️⚠️ 缺市值的比例很高(实测买入 31.6%),而且**新币/小币最容易缺** ——
+    #    它们恰恰是设 500K 上限的人最想看的,默认筛掉等于把目标人群一起扔了。
+    # ⚠️ 只在设了上下限时才生效;单独设它不开启任何筛选(启动日志会喊一句)。
+    fomo_buy_push_unknown_market_cap: bool = Field(
+        True, description="设了市值区间时,拿不到市值的买入是否照推"
+    )
+
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")
 
@@ -253,7 +382,43 @@ class FomoSettings(BaseSettings):
             raise ValueError(f"FOMO_CLIENT_IMPL 只能是 http / playwright,当前值: {v}")
         return v
 
+    @field_validator("fomo_buy_push_min_market_cap", "fomo_buy_push_max_market_cap", mode="before")
+    @classmethod
+    def _parse_mcap(cls, v):
+        """500K / 1.5M 这种写法在类型校验之前解析掉;空串 = 不设(.env 里写了键没写值)"""
+        return parse_market_cap(v)
+
+    @field_validator("fomo_buy_push_max_market_cap")
+    @classmethod
+    def _check_mcap_range(cls, hi, info):
+        """
+        下限 > 上限 = 空区间 = 所有买入静默筛没。启动就炸,不要跑起来才发现收不到推送。
+
+        ⚠️⚠️ 刻意写成**字段**校验器而不是 model_validator:后者报错时 pydantic 会把
+           **整份输入**(含 fomo_telegram_bot_token)的 repr 印进 ValidationError,
+           启动失败的那条栈就成了凭据泄漏(实测第一版就印出了 `{'fomo_telegram_bot_token…`)。
+           字段校验器的 input_value 只有上限这一个数。
+        ⚠️ 依赖字段声明顺序:min 声明在 max 之前,info.data 里才有它;
+           min 自己没通过校验时不在 info.data 里,这里跳过(那边已经报错了)。
+        """
+        lo = info.data.get("fomo_buy_push_min_market_cap")
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"FOMO_BUY_PUSH_MIN_MARKET_CAP({lo:,.2f}) 大于 "
+                f"FOMO_BUY_PUSH_MAX_MARKET_CAP({hi:,.2f}) —— 这个区间里一个币都没有"
+            )
+        return hi
+
     # ---------- 派生属性 ----------
+    @property
+    def buy_push_mcap(self) -> MarketCapRange:
+        """买入推送的市值区间。FOMO(poller)与 pump.fun(pumpfun)共用这一个对象的判据"""
+        return MarketCapRange(
+            min_usd=self.fomo_buy_push_min_market_cap,
+            max_usd=self.fomo_buy_push_max_market_cap,
+            push_unknown=self.fomo_buy_push_unknown_market_cap,
+        )
+
     @property
     def tg_token(self) -> str | None:
         return (

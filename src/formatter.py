@@ -568,6 +568,31 @@ def _fmt_usd_compact(v) -> str | None:
     return _fmt_usd(d)
 
 
+def describe_mcap_range(rng) -> str:
+    """
+    买入推送市值区间的一行说明,例「≤ $500.00K | 无市值照推」。
+    启动日志 / 每轮汇总日志 / /status 共用这一份,三处说法不会各写各的。
+
+    rng 是 config.MarketCapRange(这里不 import 它,只读三个字段 + enabled)。
+    ⚠️ 金额用推送里「💎 市值」同一套缩写:用户照着推送里看到的写法填配置,
+       启动日志印回同一种写法,手滑写成 1.5K 还是 1.5M 一眼就能对上。
+    ⚠️ 纯文本,不含 HTML 特殊字符;/status 那边照样过一次转义。
+    ⚠️ 刻意不叫 render_*:formatter 里 render 开头的函数有统一的展示门禁清点
+       (tests/test_nameguard_chokepoint.py),这里不渲染任何第三方字符串。
+    """
+    if not rng.enabled:
+        return "未启用"
+    lo = None if rng.min_usd is None else _fmt_usd_compact(rng.min_usd)
+    hi = None if rng.max_usd is None else _fmt_usd_compact(rng.max_usd)
+    if lo is not None and hi is not None:
+        span = f"{lo} ~ {hi}"
+    elif hi is not None:
+        span = f"≤ {hi}"
+    else:
+        span = f"≥ {lo}"
+    return f"{span} | 无市值{'照推' if rng.push_unknown else '不推'}"
+
+
 def _fmt_price(v) -> str | None:
     """
     单价:$0.016 / $1,234.56 / $0.0000012345

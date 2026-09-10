@@ -1476,6 +1476,12 @@ class CommandBot:
         ]
         if ready < active:
             lines.append(f"⏳ {active - ready} 人基线未就绪,其买入暂不打徽章、不计入共识")
+        # 买入推送的市值区间。⚠️ 只在开启时出现(关闭时 /status 逐字节不变)。
+        #    放这里的理由:设了 500K 上限之后买入推送会少掉大半,「怎么没推送了」的第一反应
+        #    就是敲 /status —— 这一行得让人当场看出是自己配的区间在筛,而不是监控挂了。
+        mcap = s.buy_push_mcap
+        if mcap.enabled:
+            lines.append(f"💎 买入推送市值 {_esc(formatter.describe_mcap_range(mcap))}(卖出照推)")
         return "\n".join(lines)
 
     def _cmd_who(self, arg: str) -> str:
