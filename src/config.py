@@ -366,6 +366,14 @@ class FomoSettings(BaseSettings):
     fomo_buy_push_unknown_market_cap: bool = Field(
         True, description="设了市值区间时,拿不到市值的买入是否照推"
     )
+    # 买入推送的**单笔金额**下限(美元,含边界)。不设 = 不限(默认)。例:只推 ≥ $100 的买入就写 100。
+    # ⚠️ 只筛 FOMO 的买入,卖出照推;被筛掉的照常入库、计入「👥 名单内 N 人买过」,只是不推。
+    # ⚠️ pump.fun 有自己的单笔门槛 fomo_pump_min_usd(买卖都管),不受这一项影响。
+    # ⚠️ 写法与市值那两项共用 parse_market_cap:100 / 1K / 1,000 都认,写坏了启动即报错。
+    # 实测(2026-09-11 生产库只读,近 7 天已推送买入 ≈1796 条/天,缺金额 0 条):≥$100 → ≈1453 条/天。
+    fomo_buy_push_min_usd: float | None = Field(
+        None, description="买入推送的单笔金额下限(美元,含边界),不设=不限。例 100"
+    )
 
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")
@@ -382,7 +390,8 @@ class FomoSettings(BaseSettings):
             raise ValueError(f"FOMO_CLIENT_IMPL 只能是 http / playwright,当前值: {v}")
         return v
 
-    @field_validator("fomo_buy_push_min_market_cap", "fomo_buy_push_max_market_cap", mode="before")
+    @field_validator("fomo_buy_push_min_market_cap", "fomo_buy_push_max_market_cap", "fomo_buy_push_min_usd",
+                     mode="before")
     @classmethod
     def _parse_mcap(cls, v):
         """500K / 1.5M 这种写法在类型校验之前解析掉;空串 = 不设(.env 里写了键没写值)"""

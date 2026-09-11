@@ -1482,6 +1482,10 @@ class CommandBot:
         mcap = s.buy_push_mcap
         if mcap.enabled:
             lines.append(f"💎 买入推送市值 {_esc(formatter.describe_mcap_range(mcap))}(卖出照推)")
+        # 买入推送的单笔金额门槛。⚠️ 只在设了时出现(不设时 /status 逐字节不变)。
+        if s.fomo_buy_push_min_usd is not None:
+            lines.append(f"💰 买入推送金额 {_esc(formatter.describe_buy_min_usd(s.fomo_buy_push_min_usd))}"
+                         "(卖出照推)")
         return "\n".join(lines)
 
     def _cmd_who(self, arg: str) -> str:

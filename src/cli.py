@@ -30,7 +30,7 @@ from loguru import logger
 from src import store
 from src.client import request_stop
 from src.config import PROBE_DIR, PROFILE_DIR, SESSION_FILE, get_settings, mask
-from src.formatter import describe_mcap_range
+from src.formatter import describe_buy_min_usd, describe_mcap_range
 from src.logger import setup_logger
 from src.models import (
     NETWORK_SLUG,
@@ -944,6 +944,10 @@ def cmd_run() -> int:
         # 这正是「静默失效」,必须喊出来。
         logger.warning("FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP=false 单独设置不生效 —— "
                        "没设 FOMO_BUY_PUSH_MIN/MAX_MARKET_CAP,买入推送不做任何市值筛选")
+    # 买入推送的单笔金额门槛。⚠️ 不设时一个字都不打(启动日志逐字节不变)。
+    if s.fomo_buy_push_min_usd is not None:
+        logger.info("买入推送金额门槛 {} | 只筛 FOMO 买入,卖出照推(pump.fun 另用 FOMO_PUMP_MIN_USD)",
+                    describe_buy_min_usd(s.fomo_buy_push_min_usd))
     logger.info("=" * 60)
     try:
         sched.start()

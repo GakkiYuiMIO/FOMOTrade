@@ -165,6 +165,8 @@ def _no_mcap_filter_from_dotenv(monkeypatch):
     monkeypatch.setenv("FOMO_BUY_PUSH_MIN_MARKET_CAP", "")
     monkeypatch.setenv("FOMO_BUY_PUSH_MAX_MARKET_CAP", "")
     monkeypatch.setenv("FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP", "true")
+    # ⚠️ 买入金额门槛同理:本机 .env 设了 100,既有用例里的小额买入就会被筛掉而莫名变红
+    monkeypatch.setenv("FOMO_BUY_PUSH_MIN_USD", "")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

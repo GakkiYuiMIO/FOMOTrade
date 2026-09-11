@@ -42,6 +42,7 @@ from src.config import get_settings
 from src.copytrade import Candidate, decide
 from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
 from src.formatter import (
+    describe_buy_min_usd,
     describe_mcap_range,
     render,
     render_copy_signal,
@@ -1915,7 +1916,8 @@ class Poller:
         return ev.amount_usd >= self._tx_watch_min.get(
             ev.user_id, self.settings.fomo_transfer_watch_min_usd)
 
-    def _should_push_buy(self, event_type: str, market_cap: float | None) -> bool:
+    def _should_push_buy(self, event_type: str, market_cap: float | None,
+                         amount_usd: float | None = None) -> bool:
         """
         这条事件过不过「买入推送的市值区间」。**FOMO 这边唯一的判据**,
         新事件与补发队列共用(照 _should_push_transfer_in 的模式,两处各写一遍迟早会漂移)。
@@ -1927,9 +1929,26 @@ class Poller:
         ⚠️ 这里**只决定推不推**:调用它的地方在落库之后,被筛掉的买入早已入库、
            计入共识与首次建仓判定;跟单信号(_check_copytrade)拿的是完整的 new_events。
         """
+        return self._buy_block_reason(event_type, market_cap, amount_usd) is None
+
+    def _buy_block_reason(self, event_type: str, market_cap: float | None,
+                          amount_usd: float | None) -> str | None:
+        """
+        买入推送被筛掉的原因:"amount"(单笔金额不够门槛)/ "mcap"(市值区间外)/ None(该推)。
+
+        ⚠️ 只筛 EVENT_BUY,其余一律 None(卖出 / 转入 / 观点照推)。
+        ⚠️ 先判金额再判市值:两道都不过时归到金额 —— 只影响汇总日志怎么归类,不影响推不推。
+        ⚠️ 金额判空必须 is None:拿不到金额证明不了它不够,照推(实测买入缺金额 0 条,纯防御)。
+        ⚠️ 门槛含边界:金额恰好等于门槛照推。
+        """
         if event_type != EVENT_BUY:
-            return True
-        return self.settings.buy_push_mcap.allows(market_cap)
+            return None
+        lo = self.settings.fomo_buy_push_min_usd
+        if lo is not None and amount_usd is not None and amount_usd < lo:
+            return "amount"
+        if not self.settings.buy_push_mcap.allows(market_cap):
+            return "mcap"
+        return None
 
     def _drop_buys_by_mcap(self, conn, pending: list[FomoEvent],
                            persisted_mcap: dict[str, float | None]) -> list[FomoEvent]:
@@ -1942,17 +1961,26 @@ class Poller:
         ⚠️ 补发行用落库的市值(persisted_mcap),新事件用 ev.market_cap。
         """
         kept: list[FomoEvent] = []
-        skipped = unknown = 0
+        skipped = unknown = by_amount = 0
         for ev in pending:
             mcap = persisted_mcap[ev.event_id] if ev.event_id in persisted_mcap else ev.market_cap
-            if self._should_push_buy(ev.event_type, mcap):
+            reason = self._buy_block_reason(ev.event_type, mcap, ev.amount_usd)
+            if reason is None:
                 kept.append(ev)
                 continue
             with suppress(Exception):
                 store.mark_sent(conn, ev.event_id, None, None)
+            if reason == "amount":
+                by_amount += 1
+                continue
             skipped += 1
             if mcap is None:
                 unknown += 1
+        if by_amount:
+            # 与下面市值那条同一个口径:一轮一条汇总。
+            # ⚠️ 补发行的金额 _event_from_row 会从库里还原,不用像市值那样另取落库值。
+            logger.info("本轮按买入金额跳过 {} 条买入推送 | 门槛 {} | 已入库、照常计入共识,只是不推",
+                        by_amount, describe_buy_min_usd(self.settings.fomo_buy_push_min_usd))
         if skipped:
             # ⚠️ 一轮一条汇总,不是一条事件一行:设 500K 上限时每天要筛掉上千条,
             #    逐条打会把真正的告警淹掉;但也绝不能不打 ——「推送怎么变少了」要能从日志里看出来。

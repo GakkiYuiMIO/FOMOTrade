@@ -568,6 +568,14 @@ def _fmt_usd_compact(v) -> str | None:
     return _fmt_usd(d)
 
 
+def describe_buy_min_usd(v) -> str:
+    """
+    买入推送单笔金额门槛的一行说明,例「≥ $100.00」;不设返回「未启用」。
+    启动日志 / 每轮汇总日志 / /status 共用这一份。纯文本,/status 那边照样过一次转义。
+    """
+    return "未启用" if v is None else f"≥ {_fmt_usd_compact(v)}"
+
+
 def describe_mcap_range(rng) -> str:
     """
     买入推送市值区间的一行说明,例「≤ $500.00K | 无市值照推」。
