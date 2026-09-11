@@ -1916,31 +1916,25 @@ class Poller:
         return ev.amount_usd >= self._tx_watch_min.get(
             ev.user_id, self.settings.fomo_transfer_watch_min_usd)
 
-    def _should_push_buy(self, event_type: str, market_cap: float | None,
-                         amount_usd: float | None = None) -> bool:
+    def _push_block_reason(self, event_type: str, market_cap: float | None,
+                           amount_usd: float | None) -> str | None:
         """
-        这条事件过不过「买入推送的市值区间」。**FOMO 这边唯一的判据**,
-        新事件与补发队列共用(照 _should_push_transfer_in 的模式,两处各写一遍迟早会漂移)。
+        这条事件的推送被哪道配置筛掉:"sell"(卖出推送已关)/ "amount"(买入金额不够门槛)/
+        "mcap"(买入市值区间外)/ None(该推)。**FOMO 这边唯一的判据**,新事件与补发队列共用
+        (照 _should_push_transfer_in 的模式,两处各写一遍迟早会漂移)。
 
-        ⚠️⚠️ 只筛 EVENT_BUY。卖出 / 转入 / 转出 / 观点一律 True:
-           100K 买入推了、涨到 200 万时卖出,这条卖出恰恰最该看到。
-        ⚠️ 数值口径(含边界、0 是真实值、无市值推不推、关闭时恒放行)全部在
+        ⚠️⚠️ 卖出只看开关;金额与市值只筛 EVENT_BUY —— 卖出开着时一律照推:
+           100K 买入推了、涨到 200 万时卖出,这条卖出恰恰最该看到。转入 / 转出 / 观点永远 None。
+        ⚠️ 市值口径(含边界、0 是真实值、无市值推不推、关闭时恒放行)全部在
            config.MarketCapRange.allows —— 与 pump.fun 那边**同一个函数**。
-        ⚠️ 这里**只决定推不推**:调用它的地方在落库之后,被筛掉的买入早已入库、
-           计入共识与首次建仓判定;跟单信号(_check_copytrade)拿的是完整的 new_events。
-        """
-        return self._buy_block_reason(event_type, market_cap, amount_usd) is None
-
-    def _buy_block_reason(self, event_type: str, market_cap: float | None,
-                          amount_usd: float | None) -> str | None:
-        """
-        买入推送被筛掉的原因:"amount"(单笔金额不够门槛)/ "mcap"(市值区间外)/ None(该推)。
-
-        ⚠️ 只筛 EVENT_BUY,其余一律 None(卖出 / 转入 / 观点照推)。
         ⚠️ 先判金额再判市值:两道都不过时归到金额 —— 只影响汇总日志怎么归类,不影响推不推。
         ⚠️ 金额判空必须 is None:拿不到金额证明不了它不够,照推(实测买入缺金额 0 条,纯防御)。
         ⚠️ 门槛含边界:金额恰好等于门槛照推。
+        ⚠️ 这里**只决定推不推**:调用它的地方在落库之后,被筛掉的事件早已入库、
+           计入共识与首次建仓判定;跟单信号(_check_copytrade)拿的是完整的 new_events。
         """
+        if event_type == EVENT_SELL:
+            return None if self.settings.fomo_sell_push_enabled else "sell"
         if event_type != EVENT_BUY:
             return None
         lo = self.settings.fomo_buy_push_min_usd
@@ -1950,10 +1944,11 @@ class Poller:
             return "mcap"
         return None
 
-    def _drop_buys_by_mcap(self, conn, pending: list[FomoEvent],
-                           persisted_mcap: dict[str, float | None]) -> list[FomoEvent]:
+    def _apply_push_filters(self, conn, pending: list[FomoEvent],
+                            persisted_mcap: dict[str, float | None]) -> list[FomoEvent]:
         """
-        按市值区间筛掉买入推送,返回剩下的(顺序不变)。本轮筛掉多少条汇总打一行 INFO。
+        按推送筛选配置(卖出开关 / 买入金额 / 买入市值)筛掉不推的事件,返回剩下的(顺序不变)。
+        本轮筛掉多少条按原因各汇总打一行 INFO。
 
         ⚠️⚠️ 被筛掉的**当场 mark_sent**:只是"跳过发送"的话 sent 永远是 0,
            补发队列会在下一轮把它捞出来 —— 那时它照样过这道判据、照样被筛,
@@ -1961,21 +1956,28 @@ class Poller:
         ⚠️ 补发行用落库的市值(persisted_mcap),新事件用 ev.market_cap。
         """
         kept: list[FomoEvent] = []
-        skipped = unknown = by_amount = 0
+        skipped = unknown = by_amount = by_sell = 0
         for ev in pending:
             mcap = persisted_mcap[ev.event_id] if ev.event_id in persisted_mcap else ev.market_cap
-            reason = self._buy_block_reason(ev.event_type, mcap, ev.amount_usd)
+            reason = self._push_block_reason(ev.event_type, mcap, ev.amount_usd)
             if reason is None:
                 kept.append(ev)
                 continue
             with suppress(Exception):
                 store.mark_sent(conn, ev.event_id, None, None)
+            if reason == "sell":
+                by_sell += 1
+                continue
             if reason == "amount":
                 by_amount += 1
                 continue
             skipped += 1
             if mcap is None:
                 unknown += 1
+        if by_sell:
+            # 与下面两条同一个口径:一轮一条汇总。「卖出怎么不推了」要能从日志里看出来。
+            logger.info("本轮按开关跳过 {} 条卖出推送 | FOMO_SELL_PUSH_ENABLED=false | 已入库,只是不推",
+                        by_sell)
         if by_amount:
             # 与下面市值那条同一个口径:一轮一条汇总。
             # ⚠️ 补发行的金额 _event_from_row 会从库里还原,不用像市值那样另取落库值。
@@ -2203,10 +2205,10 @@ class Poller:
         except Exception as e:  # noqa: BLE001
             logger.warning("补发队列加载失败(不影响本 tick 新事件): {}", e)
 
-        # 买入推送的市值区间。⚠️ 必须在下面三个批量外呼**之前**筛:
+        # 推送筛选(卖出开关 / 买入金额 / 买入市值)。⚠️ 必须在下面三个批量外呼**之前**筛:
         #    底池 / 发射台 / 盈利榜都按 pending 里的币发请求(盈利榜还是一个币一个请求、
-        #    有每 tick 次数上限)—— 不先筛,被筛掉的大盘币会把额度吃光,真正要推的小盘币反而没数据。
-        pending = self._drop_buys_by_mcap(conn, pending, persisted_mcap)
+        #    有每 tick 次数上限)—— 不先筛,被筛掉的币会把额度吃光,真正要推的币反而没数据。
+        pending = self._apply_push_filters(conn, pending, persisted_mcap)
 
         if not pending:
             return

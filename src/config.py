@@ -374,6 +374,16 @@ class FomoSettings(BaseSettings):
     fomo_buy_push_min_usd: float | None = Field(
         None, description="买入推送的单笔金额下限(美元,含边界),不设=不限。例 100"
     )
+    # 卖出推不推。默认 true(= 改造前的行为);不想看卖出就写 false。
+    # ⚠️⚠️ 一个开关管两边:FOMO 的卖出 + pump.fun 的卖出成交 —— 「不想看卖出」跟着人走,
+    #    分成两个开关的话关了一边忘了另一边,照样在刷卖出(与上面市值区间共用一组值同一个理由)。
+    # ⚠️⚠️ 只抑制推送,不影响落库:关掉的卖出照常入库(网页看板等读库的地方照旧看得到)并当场标成
+    #    已处理,补发队列不会再捞;pump.fun 那边记进已推台账,之后再打开也不会把旧卖出补推出来。
+    # ⚠️ 跟单信号、转入 / 转出、观点、停机汇总里的计数一律不受影响。
+    # 实测(2026-09-11 生产库只读,近 7 天):FOMO 卖出 ≈1800 条/天,与买入量级相当。
+    fomo_sell_push_enabled: bool = Field(
+        True, description="卖出是否推送(FOMO + pump.fun),false = 卖出只入库不推"
+    )
 
     # ---------- 网络 ----------
     fomo_proxy: str | None = Field(None, description="代理 URL,例 http://127.0.0.1:7897")

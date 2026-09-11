@@ -86,12 +86,13 @@
 
 币安 Alpha 有新代币上架时推送提醒（默认开启）。
 
-### 买入过滤
+### 推送过滤
 
 - **只看小盘**：在 `.env` 里设 `FOMO_BUY_PUSH_MAX_MARKET_CAP=500K`，只推市值 50 万美元以下的买入
 - **只看大额**：设 `FOMO_BUY_PUSH_MIN_USD=100`，只推单笔 100 美元及以上的买入
+- **不看卖出**：设 `FOMO_SELL_PUSH_ENABLED=false`，FOMO 和 pump.fun 的卖出都不推
 
-两个可以同时用。卖出不受影响，照常推送。
+可以同时用，改完重启生效。前两项只筛买入；被筛掉的交易照常记录，只是不发消息。
 
 ### Telegram 命令
 
@@ -313,6 +314,7 @@ cp .env.example .env        # 然后用编辑器填写 Token 和 chat_id
 | `FOMO_BUY_PUSH_MIN_MARKET_CAP` | 空 | 只推市值高于此值的买入，如 `50K` |
 | `FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP` | `true` | 设了上面两项时，拿不到市值的买入是否照推 |
 | `FOMO_BUY_PUSH_MIN_USD` | 空 | 只推单笔金额不低于此值的买入（美元），如 `100` |
+| `FOMO_SELL_PUSH_ENABLED` | `true` | 卖出是否推送（FOMO 和 pump.fun 都算），不想看卖出改成 `false` |
 | `FOMO_TRANSFER_ALERT_RECEIVERS` | `3` | 筹码分发预警：几个人收到同一个币才预警 |
 | `FOMO_TRANSFER_ALERT_MIN_USD` | `500` | 筹码分发预警：单人到账金额门槛（美元） |
 | `FOMO_ALPHA_ENABLED` | `true` | 币安 Alpha 上新提醒 |

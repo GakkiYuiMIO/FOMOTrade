@@ -935,10 +935,12 @@ def cmd_run() -> int:
                     s.fomo_pump_interval_sec, s.fomo_pump_callout_max_age_sec)
     # 买入推送的市值区间。⚠️ 关闭时一个字都不打(启动日志逐字节不变);
     #    开启时把**解析后**的区间印出来 —— 500K 写成 500 这种手滑只有在这里能一眼看出来。
+    # ⚠️ 卖出推送关掉时,「卖出照推」就成了假话 —— 下面两行跟着改口。
+    sells = s.fomo_sell_push_enabled
     mcap = s.buy_push_mcap
     if mcap.enabled:
-        logger.info("买入推送市值区间 {} | 只筛买入(FOMO + pump.fun),卖出/转入/观点照推",
-                    describe_mcap_range(mcap))
+        logger.info("买入推送市值区间 {} | 只筛买入(FOMO + pump.fun),{}照推",
+                    describe_mcap_range(mcap), "卖出/转入/观点" if sells else "转入/观点")
     elif not s.fomo_buy_push_unknown_market_cap:
         # 单独设了「无市值不推」却没设区间:按规格功能是关闭的,但用户显然以为自己开了 ——
         # 这正是「静默失效」,必须喊出来。
@@ -946,8 +948,12 @@ def cmd_run() -> int:
                        "没设 FOMO_BUY_PUSH_MIN/MAX_MARKET_CAP,买入推送不做任何市值筛选")
     # 买入推送的单笔金额门槛。⚠️ 不设时一个字都不打(启动日志逐字节不变)。
     if s.fomo_buy_push_min_usd is not None:
-        logger.info("买入推送金额门槛 {} | 只筛 FOMO 买入,卖出照推(pump.fun 另用 FOMO_PUMP_MIN_USD)",
-                    describe_buy_min_usd(s.fomo_buy_push_min_usd))
+        logger.info("买入推送金额门槛 {} | 只筛 FOMO 买入{}(pump.fun 另用 FOMO_PUMP_MIN_USD)",
+                    describe_buy_min_usd(s.fomo_buy_push_min_usd), ",卖出照推" if sells else "")
+    # 卖出推送开关。⚠️ 开着(默认)时一个字都不打;关掉时必须说出来 ——
+    #    「卖出怎么不推了」第一反应是翻启动日志,这里得让人当场看出是自己关的。
+    if not sells:
+        logger.info("卖出推送已关闭(FOMO_SELL_PUSH_ENABLED=false)| FOMO + pump.fun 的卖出照常入库,只是不推")
     logger.info("=" * 60)
     try:
         sched.start()

@@ -1479,13 +1479,18 @@ class CommandBot:
         # 买入推送的市值区间。⚠️ 只在开启时出现(关闭时 /status 逐字节不变)。
         #    放这里的理由:设了 500K 上限之后买入推送会少掉大半,「怎么没推送了」的第一反应
         #    就是敲 /status —— 这一行得让人当场看出是自己配的区间在筛,而不是监控挂了。
+        # ⚠️ 卖出推送关掉时「(卖出照推)」就成了假话:下面两行去掉这句,改由单独一行说清楚。
+        sell_note = "(卖出照推)" if s.fomo_sell_push_enabled else ""
         mcap = s.buy_push_mcap
         if mcap.enabled:
-            lines.append(f"💎 买入推送市值 {_esc(formatter.describe_mcap_range(mcap))}(卖出照推)")
+            lines.append(f"💎 买入推送市值 {_esc(formatter.describe_mcap_range(mcap))}{sell_note}")
         # 买入推送的单笔金额门槛。⚠️ 只在设了时出现(不设时 /status 逐字节不变)。
         if s.fomo_buy_push_min_usd is not None:
             lines.append(f"💰 买入推送金额 {_esc(formatter.describe_buy_min_usd(s.fomo_buy_push_min_usd))}"
-                         "(卖出照推)")
+                         f"{sell_note}")
+        # 卖出推送开关。⚠️ 只在关掉时出现(默认开着时 /status 逐字节不变)。
+        if not s.fomo_sell_push_enabled:
+            lines.append("🔕 卖出推送已关闭(FOMO + pump.fun)")
         return "\n".join(lines)
 
     def _cmd_who(self, arg: str) -> str:

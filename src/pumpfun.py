@@ -1103,6 +1103,10 @@ class PumpWatcher:
         # 本轮被市值区间筛掉的买入成交(每轮汇总一条 INFO,见 _check / _drop_buys_by_mcap)
         self._mcap_skipped = 0
         self._mcap_skipped_unknown = 0
+        # 卖出推送开关。⚠️ 与 FOMO 那边共用 fomo_sell_push_enabled,理由见 config。
+        self._sell_push = s.fomo_sell_push_enabled
+        # 本轮因开关跳过的卖出成交(每轮汇总一条 INFO,见 _drop_sells)
+        self._sell_skipped = 0
         # mint → (取到的时刻, 市值)。⚠️ 挂在 watcher 而不是 client 上:
         #    cli 全程只建一个 watcher,缓存才跨得了轮;而 bot 侧那个 client 是另一个实例,
         #    两边共用一份缓存反而会让"这一轮打了几个请求"变得不可预测。
@@ -1246,7 +1250,7 @@ class PumpWatcher:
 
         sent = 0
         budget = MAX_PUSH_PER_ROUND
-        self._mcap_skipped = self._mcap_skipped_unknown = 0
+        self._mcap_skipped = self._mcap_skipped_unknown = self._sell_skipped = 0
         for mint in mints:
             if budget <= 0:
                 logger.warning("pump.fun 本轮已发满单轮上限 {} 条 —— 剩下的 mint "
@@ -1265,6 +1269,9 @@ class PumpWatcher:
                         "已记台账不再重判,卖出照推",
                         self._mcap_skipped, self._mcap_skipped_unknown,
                         describe_mcap_range(self._mcap_range))
+        if self._sell_skipped:
+            logger.info("pump.fun 本轮按开关跳过 {} 笔卖出成交 | FOMO_SELL_PUSH_ENABLED=false | "
+                        "已记台账不再重判", self._sell_skipped)
         return sent
 
     def _pool_quotes(self, mints: list[str],
@@ -1434,6 +1441,9 @@ class PumpWatcher:
             #    (swap-api 的 URL 里只有 mint、没有 chainId,它自己也不区分)。
             #    那时逐行推等于把同一笔成交说两遍,所以只推一次。
             fresh = self._pick_fresh(per_user.get(w.user_id, []), w, mint, cutoff_ts, done)
+            # 卖出推送开关。⚠️ 在 need 之前判:它不依赖任何外呼数据,
+            #    只剩卖出的 mint 就不必为它去问 coins-v3 的市值。
+            fresh = self._drop_sells(w, mint, fresh)
             room = budget - used
             # ⚠️ 市值与人数**只在真要发消息时才求**:变动的 mint 里有相当一部分
             #    最后一条都推不出来(金额没过门槛 / 台账里已推过 / 掉出新鲜窗口),
@@ -1504,12 +1514,32 @@ class PumpWatcher:
             out.append(t)
         return sorted(out, key=lambda x: (x.traded_ts, x.tx))
 
+    def _drop_sells(self, w: _Watched, mint: str, fresh: list[Trade]) -> list[Trade]:
+        """
+        卖出推送关掉时(fomo_sell_push_enabled=false)筛掉卖出成交,返回剩下该推的(顺序不变)。
+
+        ⚠️ 只筛 side == "sell"。方向不明(None)照推 —— 证明不了它是卖出。
+        ⚠️⚠️ 被筛掉的**当场记进已推台账**(与 _drop_buys_by_mcap 同一个理由):不记的话,
+           这笔成交在新鲜窗口内每次持仓变动都会被重判;开关若在这期间被打开并重启,
+           它还会被当成新卖出补推出来。每笔成交只判一次。
+        """
+        if self._sell_push:
+            return fresh
+        kept = [t for t in fresh if t.side != "sell"]
+        dropped = [t for t in fresh if t.side == "sell"]
+        if dropped:
+            with store.get_conn() as conn, store.tx(conn):
+                store.record_pump_pushed(
+                    conn, [(w.user_id, mint, t.tx, t.slot_index_id, t.traded_at) for t in dropped])
+            self._sell_skipped += len(dropped)
+        return kept
+
     def _drop_buys_by_mcap(self, w: _Watched, mint: str, fresh: list[Trade],
                            stats: CoinStats | None) -> list[Trade]:
         """
         按市值区间筛掉**买入**成交,返回剩下该推的(顺序不变)。
 
-        ⚠️ 判据是 config.MarketCapRange.allows —— 与 FOMO 那边(poller._should_push_buy)
+        ⚠️ 判据是 config.MarketCapRange.allows —— 与 FOMO 那边(poller._push_block_reason)
            **同一个函数**,两个平台的「≤ 上限 / 0 是真实值 / 无市值推不推」口径不会漂移。
         ⚠️⚠️ 只筛 side == "buy"。卖出、方向不明(None)一律照推:
            100K 买入推了、涨到 200 万时卖出,这条卖出恰恰最该看到。
