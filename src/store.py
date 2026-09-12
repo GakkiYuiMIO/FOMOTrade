@@ -2235,6 +2235,14 @@ def pump_positions(conn, user_id: str) -> dict[tuple[str, str], sqlite3.Row]:
     return {(r["chain_id"], r["coin_mint"]): r for r in rows}
 
 
+def pump_position(conn, user_id: str, chain_id: str, coin_mint: str) -> sqlite3.Row | None:
+    """这个人某一个 (链, mint) 的上一轮快照行;快照里没有返回 None。"""
+    return conn.execute(
+        "SELECT * FROM pump_positions WHERE user_id = ? AND chain_id = ? AND coin_mint = ?",
+        (user_id, str(chain_id), coin_mint),
+    ).fetchone()
+
+
 # ⚠️⚠️ 这里**曾经有一个 pump_mint_holders(conn, chain_id, coin_mint)**,
 #    用「快照表里 amount_held > 0 的行」去数「名单内 N 人持有」。已删,不要再加回来。
 #    删除的理由是它数出来的那个数**会多报,而多报是主动说假话**:

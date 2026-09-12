@@ -169,6 +169,8 @@ def _no_mcap_filter_from_dotenv(monkeypatch):
     monkeypatch.setenv("FOMO_BUY_PUSH_MIN_USD", "")
     # ⚠️ 卖出开关同理:本机 .env 关了卖出,既有用例里的卖出推送就全没了
     monkeypatch.setenv("FOMO_SELL_PUSH_ENABLED", "true")
+    # ⚠️ pump 持仓变动补推同理:本机 .env 关掉它,专测它的用例就会莫名变红
+    monkeypatch.setenv("FOMO_PUMP_UNTRACKED_PUSH_ENABLED", "true")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

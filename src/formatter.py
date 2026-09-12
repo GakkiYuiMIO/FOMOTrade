@@ -403,6 +403,9 @@ _REVIEWED_PARAMS = frozenset({
     # ⚠️ 那一块**唯一**的文本槽位(handle)在 board_holders 里,由 safe_board_rows 收口,
     #    不在这份"已复核"的名单里。
     "board_scope",
+    # 「🟦 持仓变动」补推(render_pump_untracked)的两个参数:增加的数量(float)与
+    # 「快照里原本没有这一行」(bool)—— 都不是文本。
+    "added_amount", "first_seen",
 })
 
 
@@ -2344,6 +2347,15 @@ LABEL_PUMP_CLEARED = "已清仓"
 # 「距最高 -X%」。ath_market_cap 与 usd_market_cap 同为**美元**(见 pumpfun.parse_coin
 # 里那段实测推导),所以两者可以直接相比。
 LABEL_PUMP_DRAWDOWN = "距最高"
+# 「持仓涨了、却查不到 pump.fun 成交」那条补推(render_pump_untracked)。
+# ⚠️ 行首锚点全局唯一(铁律 1):🟩/🟥 是 pump 的买/卖,这条**不是成交**,必须一眼分得开 ——
+#    认成 🟩 就是把一件没有成交记录的事读成了"他在 pump.fun 上买了"。
+EMOJI_PUMP_UNTRACKED = "🟦"
+LABEL_PUMP_UNTRACKED = "持仓变动"
+EMOJI_PUMP_ADDED = "➕"
+# ⚠️ 措辞铁律:只说可证的事实。「查不到对应成交」是我们亲手查过的;
+#    「站外买入、转入」只作为**会出现这种情况的原因**列出来,不断言是哪一种。
+LABEL_PUMP_UNTRACKED_NOTE = "🔍 pump.fun 查不到对应成交(站外买入、转入都会这样)"
 
 
 @_guard_untrusted
@@ -2494,6 +2506,97 @@ def render_pump_trade(
 
     # CA 独占最后一行、纯 <code>(铁律 6)。拿不到就没有这一行 ——
     # 空的 <code></code> 是个点了复制不出东西的假区域,比没有更糟
+    anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
+    return _fit_signal(lines, anchor)
+
+
+@_guard_untrusted
+def render_pump_untracked(
+    *,
+    username: str | None,
+    token_symbol: str | None,
+    coin_mint: str | None,
+    added_amount=None,
+    first_seen: bool = False,
+    amount_usd=None,
+    holding_usd=None,
+    market_cap_usd=None,
+    ath_market_cap_usd=None,
+    holders_in_list: int | None = None,
+    network_id: str | None = None,
+    chain_display: str | None = None,
+    pool_quote_symbol: str | None = None,
+    pool_quote_name: str | None = None,
+    token_name: str | None = None,
+    token_name_zh: str | None = None,
+    stock_company_zh: str | None = None,
+    stock_exchange: str | None = None,
+    launchpad: str | None = None,
+    token_holders: int | None = None,
+    token_socials=None,
+    board_holders=None,
+    board_scope=None,
+) -> str:
+    """
+    「被盯的人 pump.fun 持仓涨了,但 pump.fun 查不到对应成交」的补推。
+
+    参数与 render_pump_trade 同名同义,另加:
+        added_amount   增加的代币数量(first_seen 时是本轮看到的全部持有量)
+        first_seen     快照里原本没有这一行。⚠️ 这时**不能**说「增加」:我们只知道
+                       "第一次看到",不知道他之前有没有(portfolio 只拉 page 0,之外看不见)
+        amount_usd     估值 = 数量 × 持仓单价(valueUsd / amountHeld),**不是成交金额**,
+                       所以前面带「≈」
+
+    ⚠️⚠️ 措辞铁律同 render_pump_trade:这里**没有成交**,绝不能出现「买入」二字 ——
+       手上唯一的事实是"持仓数变了、成交接口里没有"。
+    ⚠️ 没有成交时刻、没有签名:那两行整行不出现。portfolio 的 updatedAt 会被发观点之类的
+       动作刷新(实测 0xSun 那行的 updatedAt 就是他发观点的那一秒),拿它冒充"成交时刻"是假话。
+    ⚠️ 纯函数;出口不变式与 render_pump_trade 相同(_fit_signal、CA 独占最后一行)。
+    """
+    title = f"{EMOJI_PUMP_UNTRACKED} <b>{LABEL_PUMP}</b>{SEP}{LABEL_PUMP_UNTRACKED}"
+    name = _clip(username or "", _PUMP_NAME_CHARS)
+    if name:
+        title += f"{SEP}<b>{name}</b>"
+    sym = _clip((token_symbol or "").lstrip("$"), _SIG_SYMBOL_CHARS)
+    if sym:
+        title += f"{SEP}<b>${sym}</b>"
+    suffix = _name_suffix(token_symbol, token_name)
+    if suffix:
+        title += f"{SEP}{suffix}"
+
+    lines = [title]
+    zh_line = _token_zh_line(token_name, token_name_zh)
+    if zh_line is not None:
+        lines.append(zh_line)
+    qty = fmt_token_amount(added_amount)
+    if qty is not None:
+        verb = "首次看到持有" if first_seen else "增加"
+        usd = _fmt_usd_tiny(amount_usd)
+        lines.append(f"{EMOJI_PUMP_ADDED} {verb} {qty} 枚" + (f" ≈ {usd}" if usd else ""))
+    lines.append(LABEL_PUMP_UNTRACKED_NOTE)
+    # 行序与 render_pump_trade 对齐(持仓 → 市值 → 发射台/持有人 → 底池 → 共识 → 🏅)
+    for extra in (_pump_holding_line(holding_usd, False, "buy"),
+                  _pump_mcap_line(market_cap_usd, ath_market_cap_usd),
+                  _launchpad_line(launchpad),
+                  _token_holders_line(token_holders),
+                  _pool_quote_line(pool_quote_symbol, pool_quote_name),
+                  _stock_line(pool_quote_symbol, stock_company_zh, stock_exchange),
+                  _pump_holders_line(holders_in_list)):
+        if extra is not None:
+            lines.append(extra)
+    lines.extend(_board_holders_lines(board_holders, board_scope))
+
+    net = (network_id or "").strip()
+    disp = NETWORK_DISPLAY.get(net) or " ".join(str(chain_display or "").split()) or None
+    if disp:
+        lines.append(f"{EMOJI_NETWORK} {_esc(disp)}")
+    ca = " ".join(str(coin_mint or "").split())
+    social = _socials_line(token_socials)
+    if social:
+        lines.append(social)
+    link = _links_line(_fake_ev(net, ca))
+    if link:
+        lines.append(link)
     anchor = f"<code>{_clip(ca, _SIG_CA_CHARS)}</code>" if ca else None
     return _fit_signal(lines, anchor)
 

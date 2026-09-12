@@ -101,6 +101,8 @@ FOMO_FETCH_WORKERS=12
 
 监控 pump.fun 上指定用户的**每一笔成交**和**发的观点（callout）**。需要在 `.env` 里打开，再用 `/pump add <用户名>` 添加。
 
+如果他的持仓涨了，但 pump.fun 查不到对应成交（比如在别的平台买的、别人转给他的），会补推一条 🟦「持仓变动」，写明增加了多少枚、估值多少。估值低于 `FOMO_PUMP_MIN_USD` 的不推。
+
 ### 币安 Alpha 上新
 
 币安 Alpha 有新代币上架时推送提醒（默认开启）。
@@ -339,6 +341,7 @@ cp .env.example .env        # 然后用编辑器填写 Token 和 chat_id
 | `FOMO_ALPHA_ENABLED` | `true` | 币安 Alpha 上新提醒 |
 | `FOMO_PUMP_ENABLED` | `false` | pump.fun 买卖监控 |
 | `FOMO_PUMP_MIN_USD` | `50` | pump.fun 单笔成交低于此金额不推 |
+| `FOMO_PUMP_UNTRACKED_PUSH_ENABLED` | `true` | 持仓涨了但 pump.fun 查不到成交时，补推一条 🟦 持仓变动 |
 | `FOMO_PUMP_CALLOUT_ENABLED` | `false` | pump.fun 观点推送 |
 
 ---

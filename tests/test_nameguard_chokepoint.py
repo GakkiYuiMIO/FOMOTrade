@@ -42,6 +42,7 @@ from src.formatter import (
     render_pump_callout,
     render_pump_chip_row,
     render_pump_trade,
+    render_pump_untracked,
     render_transfer_in_signal,
     render_transfer_in_watch,
 )
@@ -50,7 +51,7 @@ from src.formatter import (
 #    所以下面另有一条断言:formatter 里所有 `render*` 公开函数都必须出现在这个元组里。
 _RENDERERS = (render, render_pump_trade, render_transfer_in_watch,
               render_transfer_in_signal, render_alpha_listing, render_pump_callout,
-              render_pump_chip_row)
+              render_pump_chip_row, render_pump_untracked)
 
 # ============================================================
 # 写死在**测试这一侧**的字段清单 —— D1 不变量的判卷依据
@@ -148,6 +149,8 @@ _EXPECT_REVIEWED = {
     # ⚠️ 那一块唯一的文本槽位(handle)在 board_holders 里,由 safe_board_rows 收口,
     #    不在这份"已复核"的名单里。
     "board_scope",
+    # 「🟦 持仓变动」补推:增加的数量(float)与「快照里原本没有这一行」(bool)。
+    "added_amount", "first_seen",
 }
 
 

@@ -64,7 +64,12 @@ from src import store
 from src.boardholders import BoardHoldersLookup
 from src.config import get_settings
 from src.dexscreener import PoolQuoteLookup, notable, token_name, token_socials
-from src.formatter import describe_mcap_range, render_pump_callout, render_pump_trade
+from src.formatter import (
+    describe_mcap_range,
+    render_pump_callout,
+    render_pump_trade,
+    render_pump_untracked,
+)
 from src.models import NETWORK_DISPLAY, normalize_token_address
 from src.namecn import NameGlossary
 from src.nameguard import safe_display
@@ -94,6 +99,12 @@ PORTFOLIO_PAGE_SIZE = 50
 #    那个 mint 内部每个人还能各发满 20 条 —— 实测两个 mint 发了 39 条、
 #    一个 mint 上两个人发了 40 条,而日志还在说「本轮先推最早的 20 笔」。
 MAX_PUSH_PER_ROUND = 20
+
+# 「持仓涨了却查不到成交」判定的「先别判」信号:变动太新,swap-api 可能还没收录那笔成交。
+# 见 PumpWatcher._untracked_increase 第 6 条。
+_UNTRACKED_DEFER = "defer"
+# 补推估值的绝对下限(美元)。见 _untracked_increase 第 5 条。
+_UNTRACKED_MIN_EST_USD = 0.01
 
 # 市值缓存的存活时间(秒)。
 # ⚠️ 它的**主职责是"同一轮里同一个 mint 只查一次"**:一轮最长十几秒(全是网络 IO),
@@ -1107,6 +1118,10 @@ class PumpWatcher:
         self._sell_push = s.fomo_sell_push_enabled
         # 本轮因开关跳过的卖出成交(每轮汇总一条 INFO,见 _drop_sells)
         self._sell_skipped = 0
+        # 持仓涨了却查不到 pump.fun 成交时的补推开关(见 _untracked_increase)
+        self._untracked_push = s.fomo_pump_untracked_push_enabled
+        # 变动距今不到这么久先不判(给 swap-api 留一轮收录时间),取巡检间隔
+        self._untracked_settle_sec = s.fomo_pump_interval_sec
         # mint → (取到的时刻, 市值)。⚠️ 挂在 watcher 而不是 client 上:
         #    cli 全程只建一个 watcher,缓存才跨得了轮;而 bot 侧那个 client 是另一个实例,
         #    两边共用一份缓存反而会让"这一轮打了几个请求"变得不可预测。
@@ -1415,15 +1430,20 @@ class PumpWatcher:
         # ⚠️⚠️ 这道闸是"未被盯的人的成交绝不外泄"的唯一保障 —— batch 响应里
         #    出现任何我们没问过/不认识的地址,一律丢弃并留痕。
         per_user: dict[str, list[Trade]] = {}
+        # 本 mint 有没有成交在归属阶段被丢弃。有 → 本 mint 一律不补推「持仓变动」:
+        # 被丢掉的那几笔可能恰恰就是解释这次变动的成交,不能说成「查不到」。
+        tainted = False
         for addr, trades in batch.items():
             ws = by_addr.get(addr)
             if not ws:
                 logger.warning("pump.fun trades/batch 返回了名单外的地址 {} —— 已丢弃", addr)
+                tainted = tainted or bool(trades)
                 continue
             for t in trades:
                 # 报文自己带的 userAddress 与分组键对不上 = 上游把数据串了,同样丢弃
                 if t.user_address and t.user_address != addr:
                     logger.warning("pump.fun 成交 {} 的 userAddress 与分组键不符,已丢弃", t.tx)
+                    tainted = True
                     continue
                 # 共用这个地址的人各拿一份(绝大多数情况 ws 就一个人)
                 for w in ws:
@@ -1444,12 +1464,26 @@ class PumpWatcher:
             # 卖出推送开关。⚠️ 在 need 之前判:它不依赖任何外呼数据,
             #    只剩卖出的 mint 就不必为它去问 coins-v3 的市值。
             fresh = self._drop_sells(w, mint, fresh)
+            # 持仓涨了却查不到 pump.fun 成交(站外买入 / 转入)。纯判定,不发请求。
+            # ⚠️⚠️ 必须拿**原始**成交列表判:没过 $50 的、台账里推过的、被开关筛掉的卖出,
+            #    同样"解释得了"这次变动 —— 拿筛完的 fresh 判,每一笔小额成交都会再补推一条。
+            # ⚠️ 逐行判,不只看 rows[0]:同一个地址串在两条链上时,涨的可能是第二行。
+            #    任何一行要「先别判」→ 整个人这个 mint 本轮都不处理(快照一起不前移)。
+            untracked, head = None, rows[0]
+            if not fresh and not tainted:
+                found = [(r, self._untracked_increase(w, r, per_user.get(w.user_id, []), cutoff_ts))
+                         for r in rows]
+                if any(f == _UNTRACKED_DEFER for _, f in found):
+                    untracked = _UNTRACKED_DEFER
+                else:
+                    untracked, head = next(((f, r) for r, f in found if f is not None),
+                                           (None, rows[0]))
             room = budget - used
             # ⚠️ 市值与人数**只在真要发消息时才求**:变动的 mint 里有相当一部分
             #    最后一条都推不出来(金额没过门槛 / 台账里已推过 / 掉出新鲜窗口),
             #    无条件先问一次 coins-v3 就是拿限流额度换一个没人会看到的数。
             #    额度已经见底时同理 —— 那些成交要留到下一轮才推。
-            need = bool(fresh) and room > 0
+            need = (bool(fresh) or isinstance(untracked, tuple)) and room > 0
             stats = self._coin_stats(mint) if need else None
             # 买入推送的市值区间。⚠️⚠️ 判定顺序是**刻意的**:$50 金额门槛在 _pick_fresh
             #    里已经判过(免费),过不了的根本进不了 fresh,也就不会为它去问市值
@@ -1459,22 +1493,29 @@ class PumpWatcher:
             #    那时把买入当成「无市值」去筛,会把本该下一轮推的成交永久记进台账。
             if need:
                 fresh = self._drop_buys_by_mcap(w, mint, fresh, stats)
-            n_holders = len(observed.get(rows[0].key, ())) if need else None
+            n_holders = len(observed.get(head.key, ())) if need else None
             # ⚠️ 只有对手是**币股**时 notable 才给东西 —— 绝大多数 pump 币对着 SOL,
             #    那一行是噪音;而 pump 覆盖的这几条链目前都没有币股判据(见 dexscreener)
-            pq = notable((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            pq = notable((pool_quotes or {}).get(head.network_id or "", {}), mint)
             # 这个币自己的英文全名(同一份响应,与对手是谁无关)
-            tname = token_name((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            tname = token_name((pool_quotes or {}).get(head.network_id or "", {}), mint)
             # 社媒:**同一份响应**里的 pair.info,零新增请求(见 dexscreener._socials)
-            tsoc = token_socials((pool_quotes or {}).get(rows[0].network_id or "", {}), mint)
+            tsoc = token_socials((pool_quotes or {}).get(head.network_id or "", {}), mint)
             # 发射台/持有人:本轮批量查好的那份;没有就没有(那两行消失)
             extra = (token_extras or {}).get(
-                ((rows[0].network_id or "").strip(), normalize_token_address(mint)))
+                ((head.network_id or "").strip(), normalize_token_address(mint)))
             # 🏅 盈利榜持有人:本轮查好的那份;没有就没有(那一块整块不出现)
             blk = (board_blocks or {}).get(
-                ((rows[0].network_id or "").strip(), normalize_token_address(mint)))
-            ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname,
-                                      tsoc, extra, blk)
+                ((head.network_id or "").strip(), normalize_token_address(mint)))
+            if untracked == _UNTRACKED_DEFER:
+                # 先别判:给 swap-api 留一轮收录时间。快照不前移,下一轮它仍是变动行、重新判
+                ok, n, tried = False, 0, 0
+            elif untracked is not None:
+                ok, n, tried = self._push_untracked(w, head, untracked, room, stats, n_holders,
+                                                    pq, tname, tsoc, extra, blk)
+            else:
+                ok, n, tried = self._push(w, rows[0], fresh, room, stats, n_holders, pq, tname,
+                                          tsoc, extra, blk)
             sent += n
             used += tried
             if ok:
@@ -1513,6 +1554,131 @@ class PumpWatcher:
             seen.add(key)
             out.append(t)
         return sorted(out, key=lambda x: (x.traded_ts, x.tx))
+
+    def _untracked_increase(self, w: _Watched, pos: Position, trades: list[Trade],
+                            cutoff_ts: float) -> tuple[float, float, bool] | str | None:
+        """
+        这一行是不是「持仓涨了、却查不到 pump.fun 成交」。
+        是 → (增加的数量, 估值美元, 是否首次看到);否 → None;
+        「看着像,但变动太新、swap-api 可能还没收录」→ _UNTRACKED_DEFER(本轮不处理,快照不前移)。
+        纯判定:只读快照表这一行,不发请求。
+
+        ⚠️⚠️ 存在的理由见 config.fomo_pump_untracked_push_enabled(0xSun 经 Relay 收进的 760 万枚)。
+        闸按「先便宜后贵」排,每一道都有依据:
+          1. 持仓行的 updatedAt 必须在新鲜窗口内。停机期间攒下的变动带的是**当时**的 updatedAt
+             (2026-09-12 生产库实测:近 24h 被重写的 977 行快照里 342 行 updatedAt 比写入时刻早 2h 以上,
+             集中在重启之后那几分钟)—— 那些不是"刚刚",不补推。
+          2. 调用方保证:成交请求**成功**、且本 mint 没有成交在归属阶段被丢弃 ——
+             请求失败 / 被丢弃的成交绝不能读成「查不到成交」。
+          3. 哪些成交「解释得了」这次变动(解释得了就不补推):
+             · 快照里没有这一行(首次看到):**整段历史**里任何一笔 —— 在 pump.fun 上买过的老仓位
+               滑进 page 0 时,swap-api 会给出它的旧成交。
+             · 快照里有:**上一轮观测到的 updatedAt 之后**的任何一笔(不分买卖、不看金额、不看台账)。
+               ⚠️⚠️ 刻意不用新鲜窗口、也不用快照写入时刻(复审实测过两个反例):
+               - 用新鲜窗口:30 分钟前刚推过的一笔买入会把之后经 Relay 收进来的 800 万枚"解释"掉,永久丢失;
+                 快照停在旧值时,3 小时前真实的成交又会被说成「查不到」。
+               - 用写入时刻:同一轮里 portfolio 拉完之后才成交、当轮就推了的那一笔,
+                 下一轮会被当成解释不了,活跃交易的人每拆一单就多一条假 🟦。
+               updatedAt 是 pump 自己按「最近动过」排序的键(实测 page 0 严格按它倒序),
+               上一轮的数量恰好反映到它为止的变动。上一轮的 updatedAt 解析不出 → 有任何成交就不补推。
+          4. 数量真的变多了;快照里上一轮的数量是 None 就判不了,不推。
+          5. 估值 = 增加的数量 × (valueUsd / amountHeld),必须 ≥ max(fomo_pump_min_usd, $0.01);
+             估不出来就证明不了它过线,不推并留痕。$0.01 那道是给门槛设成 0 的人兜的:
+             浮点抖动出来的 1e-9 枚不是增加,更不能印成「≈ $0.00」。
+          6. updatedAt 距今不到一个巡检间隔 → 先不判(_UNTRACKED_DEFER):给 swap-api 留一轮收录时间。
+             否则一笔还没被收录的正常买入会先被说成 🟦,快照前移之后真正的 🟩 再也不会去问。
+             (实测已推成交从成交到推出 p50 37s / max 53s,一轮 60s 够用。)
+        ⚠️ 已知局限(实测):updatedAt 也会被非持仓事件刷新(page 0 里 448 行数量没变的持仓,40 行
+           updatedAt 变了,发观点就是其一)。于是一个**从没进过 page 0**、在 pump.fun 上也没有任何成交的
+           老仓位(分配、很久以前的转入),被刷新顶进 page 0 时会推一次「首次看到持有」——
+           那句话本身是真的(我们确实第一次看到),措辞不说"新买"。
+        """
+        if not self._untracked_push:
+            return None
+        held = pos.amount_held
+        if held is None or held <= 0 or pos.is_cleared:
+            return None
+        upd = _parse_ts(pos.updated_at)
+        if upd is None or upd <= cutoff_ts:
+            return None
+        with store.get_conn() as conn:
+            prev = store.pump_position(conn, w.user_id, pos.chain_id, pos.coin_mint)
+        first_seen = prev is None
+        if first_seen:
+            if trades:
+                return None
+            added = held
+        else:
+            since = _parse_ts(prev["updated_at"])
+            if any(since is None or t.traded_ts > since for t in trades):
+                return None
+            before = prev["amount_held"]
+            if before is None:
+                return None
+            added = held - before
+        if added <= 0:
+            return None
+        if pos.value_usd is None:
+            logger.info("pump.fun {} 的 {} 持仓{}但查不到 pump.fun 成交;拿不到估值,不推",
+                        w.username or w.user_id, pos.symbol or pos.coin_mint,
+                        "首次出现" if first_seen else "增加")
+            return None
+        est = added * (pos.value_usd / held)
+        if est < max(self._min_usd, _UNTRACKED_MIN_EST_USD):
+            return None
+        if time.time() - upd < self._untracked_settle_sec:
+            return _UNTRACKED_DEFER
+        return added, est, first_seen
+
+    def _push_untracked(self, w: _Watched, pos: Position, found: tuple[float, float, bool],
+                        budget: int, stats: CoinStats | None = None,
+                        holders_in_list: int | None = None, pool_quote=None,
+                        token_name_en: str | None = None, token_socials_raw=None,
+                        token_extra=None, board_block=None) -> tuple[bool, int, int]:
+        """
+        补推一条「🟦 持仓变动」。返回值与 _push 同形:(是否处理干净, 发出去的条数, 尝试发的条数)。
+
+        ⚠️ 额度见底 → (False, 0, 0):快照不前移,下一轮它仍是变动行、会被重新判定。
+        ⚠️ 买入推送的市值区间照样管它(说的是"他手上多了这个币",与买入是同一类偏好);
+           区间外 → 处理干净、不推、留一行 INFO,快照前移,不会每轮重判。
+        ⚠️ 推送失败 → 快照不前移、下一轮重试(与 _push 同一条铁律)。这里没有 tx,不记台账 ——
+           去重靠的就是推成功之后快照前移。
+        """
+        if budget <= 0:
+            return False, 0, 0
+        added, est, first_seen = found
+        mcap = None if stats is None else stats.market_cap_usd
+        who = w.username or w.user_id
+        if not self._mcap_range.allows(mcap):
+            logger.info("pump.fun {} 的 {} 持仓变动查不到成交(≈ ${:,.2f}),市值不在买入推送区间 {},不推",
+                        who, pos.symbol or pos.coin_mint, est, describe_mcap_range(self._mcap_range))
+            return True, 0, 0
+        names = self._name_extras(pos.symbol, pool_quote, token_name_en,
+                                  token_socials_raw, token_extra, board_block)
+        text = render_pump_untracked(
+            username=w.username,
+            token_symbol=pos.symbol,
+            coin_mint=pos.coin_mint,
+            added_amount=added,
+            first_seen=first_seen,
+            amount_usd=est,
+            holding_usd=pos.value_usd,
+            market_cap_usd=mcap,
+            ath_market_cap_usd=None if stats is None else stats.ath_market_cap_usd,
+            holders_in_list=holders_in_list,
+            network_id=pos.network_id,
+            chain_display=pos.chain_display,
+            pool_quote_symbol=None if pool_quote is None else pool_quote.symbol,
+            **names,
+        )
+        if not self._notifier.send(text):
+            logger.error("pump.fun 持仓变动推送失败(下一轮重试) | user={} mint={}", who, pos.coin_mint)
+            return False, 0, 1
+        # ⚠️ 推成功**当场**把这一行快照前移(与 _push 推成功当场记台账同一个意思):
+        #    调用方末尾那次 upsert 若抛异常(库被占用),没有这一步下一轮就会再推一条。
+        with store.get_conn() as conn, store.tx(conn):
+            store.upsert_pump_positions(conn, w.user_id, [_snap_row(pos)])
+        return True, 1, 1
 
     def _drop_sells(self, w: _Watched, mint: str, fresh: list[Trade]) -> list[Trade]:
         """

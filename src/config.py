@@ -309,6 +309,15 @@ class FomoSettings(BaseSettings):
     fomo_pump_trade_max_age_sec: int = Field(
         7200, ge=60, description="pump.fun 成交新鲜窗口(秒),超过此年龄的成交不推送"
     )
+    # 持仓涨了、却查不到 pump.fun 成交时,补推一条「🟦 持仓变动」。默认开。
+    # ⚠️⚠️ 存在的理由(2026-09-12 实测):0xSun 在 Robinhood 链上经 Relay 路由合约收进
+    #    7,601,172.86 枚 OPENAITOKEN,portfolio 看得见,swap-api 用他 SVM / EVM 两个钱包
+    #    都查不到一笔成交 —— 原来只按成交推,这种变动被**静默吃掉**,连一行日志都没有。
+    # ⚠️ 站外买入、转入、空投都会触发;估值过不了 fomo_pump_min_usd 的不推,
+    #    买入推送的市值区间照样管它。防误报的几道闸见 pumpfun.PumpWatcher._untracked_increase。
+    fomo_pump_untracked_push_enabled: bool = Field(
+        True, description="pump.fun 持仓增加却查不到成交时,是否补推一条提醒"
+    )
 
     # ---------- pump.fun 观点(callout)监控 ----------
     # ⚠️⚠️ **与买卖那个开关刻意分开,不共用 fomo_pump_enabled。**
