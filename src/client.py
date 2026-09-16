@@ -106,12 +106,16 @@ EP_ACTIVITY_FEED = "/feed/tradingActivity"
 # TODO(probe #15): 取值格式未实测。前端是 getChains() 的返回值,可能是逗号分隔 slug、
 #                  也可能是 JSON 数组或链 ID。改这个值还可能影响响应里 networkId 的表示(同 probe #10)。
 # ⚠️ 必须是**数字链 ID**,不是链名。实测(2026-08-11 抓 fomo.family 网页版真实请求头):
-#     x-supported-chains: 1,56,143,4663,8453,1399811149
+#     x-supported-chains: 1,56,143,4663,5042,8453,1399811149
 # 写成 "solana,base,bsc" 时服务端解析不了,**不报错、直接把结果全过滤成空数组** ——
 # /trades /watchlist /v2/users/{id}/swaps /feed/tradingActivity 全部返回 0 条,
 # 看起来像"这些端点没数据"或"权限不够",极难定位。踩过一次,别再改回链名。
-#   1=Ethereum  56=BSC  143=Monad  4663=?  8453=Base  1399811149=Solana
-SUPPORTED_CHAINS = "1,56,143,4663,8453,1399811149"
+#   1=Ethereum  56=BSC  143=Monad  4663=Robinhood  5042=Arc  8453=Base  1399811149=Solana
+# ⚠️⚠️ 新链上线必须往这里补一条,否则那条链**静默不存在**。实测(2026-09-16,真实接口):
+#    filterTokens 查 Arc 的 ARCGUY,头里没有 5042 → HTTP 200 + 空数组;补上 5042 → 正常返回
+#    (holders 263 / totalSupply 10 亿)。也就是 /chips 的分母、🧑‍🤝‍🧑 持有人那行,
+#    在补进来之前对 Arc 全都是静默取不到,日志里一个字都没有。
+SUPPORTED_CHAINS = "1,56,143,4663,5042,8453,1399811149"
 
 # TODO(probe #5): 分页参数名(limit/offset/cursor/before)与单页上限全是猜的
 _PAGE_SIZE = 50

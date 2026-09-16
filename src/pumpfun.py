@@ -135,6 +135,7 @@ _CHAIN_ID_TO_NETWORK = {
     "1": "ethereum",
     "143": "monad",
     "4663": "robinhood",
+    "5042": "arc",
     "999": "hyperliquid",
 }
 # models 不认识的链:只给一个展示名,**不给链接**(拼一个 GMGN 不支持的链只会 404,

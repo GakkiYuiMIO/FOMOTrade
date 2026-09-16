@@ -8,7 +8,7 @@
 ■ FOMO 的 filterTokens(发射台 + 持有人,跨链混批)
     POST https://prod-api.fomo.family/public/proxy/filterTokens
     headers: Content-Type: application/json
-             X-Supported-Chains: 1,56,143,4663,8453,1399811149
+             X-Supported-Chains: 1,56,143,4663,5042,8453,1399811149
     body:    ["<address>:<chainId>", …]      ← 顺序是 address:chainId
     ⚠️⚠️ **X-Supported-Chains 这个头是关键**:不带它,EVM 链返回
        HTTP 200 + responseObject: [](成功状态码 + 空数组,最阴的失败形态)。

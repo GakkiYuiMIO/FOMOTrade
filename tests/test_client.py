@@ -392,7 +392,7 @@ def test_元数据请求必须带X_Supported_Chains头(monkeypatch):
     C.fetch_token_meta(_CHIPS_CA, _SOLANA_NET_ID)
 
     headers = {k.lower(): v for k, v in (box.get("headers") or {}).items()}
-    assert headers.get("x-supported-chains") == "1,56,143,4663,8453,1399811149", headers
+    assert headers.get("x-supported-chains") == "1,56,143,4663,5042,8453,1399811149", headers
 
 
 def test_元数据请求用的是chrome指纹(monkeypatch):

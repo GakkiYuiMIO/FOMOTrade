@@ -465,7 +465,8 @@ def tx(conn: sqlite3.Connection):
 # 链标识重命名。早期版本对未收录的链直接存原始数字 ID,后来补上了名称。
 # ⚠️ 不迁移的话同一条链会裂成两个聚合键("4663" 和 "robinhood" 各算一份):
 #    已经建过仓的币会被重新判成「首次建仓」,而徽章落库即冻结、错了就是永久的。
-_NETWORK_RENAMES = {"4663": "robinhood", "143": "monad", "1337": "hyperliquid"}
+_NETWORK_RENAMES = {"4663": "robinhood", "143": "monad", "1337": "hyperliquid",
+                    "5042": "arc"}
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

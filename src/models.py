@@ -63,6 +63,7 @@ _NETWORK_ALIASES = {
     "ethereum": "ethereum", "eth": "ethereum", "1": "ethereum",
     "monad": "monad", "143": "monad",
     "robinhood": "robinhood", "4663": "robinhood",
+    "arc": "arc", "5042": "arc",
     "hyperliquid": "hyperliquid", "1337": "hyperliquid",
 }
 
@@ -75,11 +76,17 @@ _NETWORK_ALIASES = {
 NETWORK_DISPLAY = {
     "solana": "Solana", "base": "Base", "monad": "Monad", "bsc": "BNB Chain",
     "ethereum": "Ethereum", "hyperliquid": "Hyperliquid", "robinhood": "Robinhood Chain",
+    "arc": "Arc",
 }
 # fomo.family 代币页的路径片段:https://fomo.family/tokens/{slug}/{address}
 NETWORK_SLUG = {
     "solana": "solana", "base": "base", "monad": "monad", "bsc": "bnb",
     "ethereum": "ethereum", "hyperliquid": "hyperliquid", "robinhood": "robinhood",
+    # ⚠️ 实测(2026-09-16)不是靠猜:代币页是单页应用,随便编一个 slug 也回 200,
+    #    分不出真假。用它自己的 og 卡片渲染器验的 ——
+    #    /og/token/arc/<Arc 的币>/card.png 出的是真卡片(103KB),
+    #    而任何无效的「链+币」组合出的都是同一张兜底图(275KB)。
+    "arc": "arc",
 }
 # FOMO 原生的**数字链 ID**。⚠️ 与 client.SUPPORTED_CHAINS 是同一组数字的两种形态:
 # 那边是请求头里的逗号串(一次性给全),这里是"内部链标识 → 数字"的映射
@@ -93,6 +100,7 @@ NETWORK_CHAIN_ID = {
     "bsc": 56,
     "monad": 143,
     "robinhood": 4663,
+    "arc": 5042,
     "base": 8453,
     "solana": 1399811149,
 }
@@ -122,6 +130,13 @@ QUOTE_TOKENS: frozenset[tuple[str, str]] = frozenset({
     ("monad", "0x3bd359c1119da7da1d913d1c4d2b7c461115433a"),      # WETH
     ("robinhood", "0x5fc5360d0400a0fd4f2af552add042d716f1d168"),  # USDG
     ("robinhood", "0x0bd7d308f8e1639fab988df18a8011f41eacad73"),  # WETH
+    # ---- Arc(5042):这条链的计价资产是 USDC ----
+    # ⚠️ 实测(2026-09-16,DexScreener):Arc 上 ARCGUY / CINU 的 Uniswap 池**全部**
+    #    对 0x3600…0000 计价。漏了它,以后 Arc 上每一笔买入都会被拆成
+    #    「卖 USDC + 买 X」两条事件,而且 USDC 会进共识计数。
+    #    ⚠️ 截至补进来时 Arc 上还只有转入事件、一笔买卖都没有,所以这条是**先行配置**:
+    #       配错的代价是多一条噪音,漏配的代价是每笔买入都错,两者不对称。
+    ("arc", "0x3600000000000000000000000000000000000000"),           # USDC(原生计价资产)
     # ---- Base (8453) ----
     ("base", "0x4200000000000000000000000000000000000006"),       # WETH
     ("base", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),       # USDC

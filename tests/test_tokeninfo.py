@@ -625,7 +625,7 @@ def test_filterTokens必须带X_Supported_Chains头(monkeypatch):
     box = _wire(monkeypatch, _Resp(json.dumps({"responseObject": []})))
     tokeninfo.FilterTokensClient().fetch([f"{CUM}:4663"])
     headers = {k.lower(): v for k, v in box["headers"].items()}
-    assert headers.get("x-supported-chains") == "1,56,143,4663,8453,1399811149", headers
+    assert headers.get("x-supported-chains") == "1,56,143,4663,5042,8453,1399811149", headers
     assert headers.get("Content-Type".lower()) == "application/json"
 
 

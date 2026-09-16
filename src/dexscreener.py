@@ -124,6 +124,7 @@ DEX_CHAIN_SLUG = {
     "bsc": "bsc",             # 实测 MarsCoin/XAUt/WBNB   → chainId=bsc
     "base": "base",           # 实测 BLUECHIP/Bots/WETH   → chainId=base
     "robinhood": "robinhood",  # 实测 AI/CASHCAT/PONS      → chainId=robinhood
+    "arc": "arc",             # 实测 ARCGUY/CINU          → chainId=arc
 }
 
 # ============================================================

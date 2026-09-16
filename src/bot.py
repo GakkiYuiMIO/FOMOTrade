@@ -389,7 +389,7 @@ CA_LOCAL_LOOKBACK_DAYS = 3650
 #    绝不会拿到别的币的数据(服务端按 tokenAddress+networkId 精确过滤,不做模糊匹配)——
 #    所以"按顺序试、命中就停"这个策略是安全的,不存在"静默显示错链数据"的风险。
 #    本地已经认识这个地址时完全不走这条路(见 _cmd_ca),这里只覆盖真正陌生的地址。
-CA_EVM_GUESS_ORDER = ("bsc", "base", "ethereum", "monad", "hyperliquid", "robinhood")
+CA_EVM_GUESS_ORDER = ("bsc", "base", "ethereum", "monad", "hyperliquid", "robinhood", "arc")
 # ⚠️ 实测(2026-08-24,真实 API):/feed/token/thesis 的 networkId 参数要的是 FOMO 原生的
 #    **数字链 ID**(56 = BSC),不是我们本地聚合用的归一化别名 —— 直接传 "bsc" 会 400:
 #    `{"message":"Invalid input: query.networkId - Expected number, received nan"}`。
@@ -398,7 +398,7 @@ CA_EVM_GUESS_ORDER = ("bsc", "base", "ethereum", "monad", "hyperliquid", "robinh
 #    (与 normalize_network 对未知链的兜底策略一致,不吞掉、让服务端的报错说话)。
 _NETWORK_RAW_ID = {
     "solana": "1399811149", "base": "8453", "bsc": "56", "ethereum": "1",
-    "monad": "143", "robinhood": "4663", "hyperliquid": "1337",
+    "monad": "143", "robinhood": "4663", "hyperliquid": "1337", "arc": "5042",
 }
 _CA_WS_RUN = re.compile(r"\s+")
 # "除普通空格之外的一切空白" —— 换行、制表、NEL、U+2028 行分隔符……

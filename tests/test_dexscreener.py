@@ -290,13 +290,14 @@ class Test链过滤:
         got = dx.parse_pool_quotes([alien, mine], "robinhood", {CA_AI})
         assert got[CA_AI].symbol == "NVDA", "把别的链的池子当成了最深的池"
 
-    def test_四条链的chainId都是实测过的值(self):
+    def test_五条链的chainId都是实测过的值(self):
         """
         ⚠️⚠️ 写错一个字母的后果:该链每一条 pair 都被过滤掉 → 每条推送静默少一行,
            日志里一个字都没有。**绝不能**复用 models.NETWORK_SLUG(那里 bsc 是 `bnb`)。
         """
         for net, chain_id in (("solana", "solana"), ("bsc", "bsc"),
-                              ("base", "base"), ("robinhood", "robinhood")):
+                              ("base", "base"), ("robinhood", "robinhood"),
+                              ("arc", "arc")):
             p = _pair("0x" + "1" * 40, "0x" + "2" * 40, chain=chain_id)
             assert dx.parse_pool_quotes([p], net, {"0x" + "1" * 40}), \
                 f"{net} 的 chainId 不是实测过的那个"
