@@ -89,6 +89,10 @@ _ALL_LAUNCHPADS = [
     ("Moonit", "Moonit", "solana"), ("DubDub", "DubDub", "solana"),
     ("Believe", "Believe", "solana"), ("Blowfish", "Blowfish", "solana"),
     ("Vertigo", "Vertigo", "solana"), ("Metaplex", "Metaplex", "solana"),
+    # 2026-09-16 第三轮:Arc 接进来后重跑 Arc 全部 65 个去重代币,新增这 5 个
+    ("Argus", "Argus", "arc"), ("long.supply", "long.supply", "arc"),
+    ("Tolly Pad", "Tolly Pad", "arc"), ("DYORSwap", "DYORSwap", "arc"),
+    ("Bozo", "Bozo", "arc"),
     # 本仓库自己产出的值(tokeninfo 按创建工厂把 pons 分成 V1/V2)
     ("Pons V2", "Pons V2", "robinhood"),
 ]
@@ -96,18 +100,31 @@ _ALL_LAUNCHPADS = [
 
 def test_封闭表的条数写死在测试这一侧():
     """
-    ⚠️ 45 这个数字是**实测结论**(六条链 9810~9882 个去重代币,fixer 与两个复验者
-       各自独立枚举都得 44 个上游名,加上我们自产的 Pons V2)。写死在这一侧,
+    ⚠️ 50 这个数字是**实测结论**:六条链 9810~9882 个去重代币,fixer 与两个复验者
+       各自独立枚举都得 44 个上游名,加上我们自产的 Pons V2 = 45;
+       2026-09-16 Arc 接进来后重跑 Arc 全部 65 个去重代币,新增 5 个 = 50。写死在这一侧,
        是为了让"有人往 _LAUNCHPADS 里加了一条却没有对应实测依据"当场变红:
        加表项必须同时把它加进上面那张实测表。
     """
-    assert len(_ALL_LAUNCHPADS) == 45
-    assert len({d for _, d, _ in _ALL_LAUNCHPADS}) == 45
+    assert len(_ALL_LAUNCHPADS) == 50
+    assert len({d for _, d, _ in _ALL_LAUNCHPADS}) == 50
+
+
+def test_long_supply不并进LONG_o1_Launchpad不收():
+    """
+    ⚠️ 两个都是 2026-09-16 实测之后**刻意**的决定(理由见 nameguard._LAUNCHPADS 上面那段):
+       · long.supply 与 robinhood 的 LONG 名字相近,但平台链接/图标来源都不同,并起来就是猜;
+       · o1 Launchpad 上游已不再返回,唯一的并入依据是地址靓号前缀(间接证据)。
+    """
+    assert "🚀 发射台 · long.supply" in _lines(launchpad="long.supply")
+    assert "🚀 发射台 · LONG" not in _lines(launchpad="long.supply")
+    assert "🚀 发射台 · long.supply" not in _lines(launchpad="LONG")
+    assert not any("发射台" in ln for ln in _lines(launchpad="o1 Launchpad"))
 
 
 @pytest.mark.parametrize(("raw", "shown", "chain"), _ALL_LAUNCHPADS,
                          ids=[d for _, d, _ in _ALL_LAUNCHPADS])
-def test_六条链全量枚举出来的发射台名一个不漏(raw, shown, chain):
+def test_七条链全量枚举出来的发射台名一个不漏(raw, shown, chain):
     """⚠️ 大小写也钉住:显示的是**我们的规范写法**,不是上游原串的任意变体。"""
     assert f"🚀 发射台 · {shown}" in _lines(launchpad=raw), (raw, shown, chain)
     assert f"🚀 发射台 · {shown}" in _lines(launchpad=raw.upper()), (raw, shown, chain)

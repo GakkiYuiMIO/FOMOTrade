@@ -1111,6 +1111,20 @@ def safe_social_links(items) -> tuple[tuple[str, str], ...] | None:
 #    也就是说 monad 链的 🚀 那一行在上一版里**永远不会显示**,而唯一的痕迹只有一条
 #    DEBUG 日志。少一条链 = 那条链整条功能静默失效。**加链就得重跑这张表。**
 #
+# 2026-09-16(第三轮,Arc 接进来):按上面「加链就得重跑这张表」,把生产库里 **Arc 全部**
+# 65 个去重代币走了一次 filterTokens(一批,65/65 全回),launchpadName 全集是
+# Argus 38 / long.supply 3 / Tolly Pad 3 / DYORSwap 1 / Bozo 1(另 19 个没有发射台)。
+# 五个全是新名字 —— 补进来之前 Arc 上 **46/65 = 71%** 的币 🚀 那一行被挡掉,
+# 痕迹只有 WARNING(当天光 Argus 一个名字就报了 135 次)。
+# 每个都有 FOMO 给的平台链接对得上:argus.world / long.supply / tollylabs.com /
+# dyorv3.org / bozo.fun。
+# ⚠️ **long.supply 不并进 LONG**:robinhood 上的 LONG 没有平台链接、图标来自 FOMO 自己的图库;
+#    arc 上的 long.supply 链接与图标都在 long.supply 域名下。名字相近不是同一个平台的证据,
+#    并起来就是猜 —— 原样收。
+# ⚠️ **o1 Launchpad 不收**:它出现在 base(0xb2000… 靓号地址,与 o1.exchange 的币同一批),
+#    但当天复查时上游对那几个币回的已经是 launchpadName = None,缓存里那条是旧值;
+#    唯一能把它并进 o1.exchange 的依据是地址靓号前缀,那是间接证据,不收。
+#
 # ============ 代价(明写)============
 # **上游出现一个新发射台时,🚀 那一行不显示,直到有人把它加进这张表。**
 # 这正是本项目"宁可缺失整行,绝不印错"的既有取舍(与 safe_exchange、
@@ -1170,6 +1184,12 @@ _LAUNCHPADS = {
     "blowfish": "Blowfish",               # 1    solana
     "vertigo": "Vertigo",                 # 1    solana
     "metaplex": "Metaplex",               # 1    solana
+    # ---- Arc(2026-09-16 第三轮实测,依据见上面那段)----
+    "argus": "Argus",                     # 38   arc(argus.world)
+    "long.supply": "long.supply",         # 3    arc ⚠️ 域名形态;**不是** robinhood 的 LONG
+    "tolly pad": "Tolly Pad",             # 3    arc(tollylabs.com)
+    "dyorswap": "DYORSwap",               # 1    arc(dyorv3.org)
+    "bozo": "Bozo",                       # 1    arc(bozo.fun)
     # ---- 本仓库自己产出的值 ----
     "pons v2": "Pons V2",                 # robinhood 上按创建工厂分出来的版本
 }
@@ -1183,7 +1203,7 @@ def safe_launchpad(s) -> str | None:
 
     ⚠️ 返回**表里的规范写法**,不是上游原串:大小写也不受上游摆布。
     ⚠️ bidi 控制符与 safe_display / safe_exchange 同一条口径:来过就整段丢弃。
-    ⚠️ 因为返回值只可能是表里那 45 个之一,它**不可能**含分隔符、`「」`、域名路径、
+    ⚠️ 因为返回值只可能是表里那 50 个之一,它**不可能**含分隔符、`「」`、域名路径、
        scheme、@提及 —— 所以渲染时**不套 `「」` 容器**(与 safe_exchange 同一条理由:
        它已经不是自由文本了),这也正好对上用户样例里的 `🚀 发射台 · LONG`。
     """
