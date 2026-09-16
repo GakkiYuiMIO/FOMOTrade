@@ -146,10 +146,14 @@ def _poller(client, notifier, dex, *, extras_payload=None, bs=None, gate=None):
     return p
 
 
-def _extras_item(addr, launchpad, holders, net=4663):
-    return {"holders": holders,
+def _extras_item(addr, launchpad, holders, net=4663, mcap=None):
+    """⚠️ mcap=None 时 marketCap 这个键**整个不出现**(= 上游没给),既有用例的推送逐字不变"""
+    item = {"holders": holders,
             "token": {"address": addr, "networkId": net, "symbol": "AI",
                       "launchpad": None if launchpad is None else {"launchpadName": launchpad}}}
+    if mcap is not None:
+        item["marketCap"] = mcap
+    return item
 
 
 def test_买入推送带全三行(db):
@@ -434,3 +438,76 @@ def test_转入推送带发射台但过了内存TTL就没有持有人(db, monkey
     assert "token_holders" not in stale, "持有人只有 90 秒内存缓存,过期就该整行消失"
     assert len(p._fake_filter.calls) == n_fc, "只读缓存路径却发了 filterTokens"
     assert len(p._token_extras._bs.calls) == n_bs, "只读缓存路径却打了 Blockscout"
+
+
+# ============================================================
+# 💎 市值兜底:balances/trades 两张索引没给市值时,用查持有人那一次的返回补
+# ============================================================
+def _mcap_poller(tg, *, mcap=None, swap=None):
+    dex = _FakeDex([[_pair(_CA_AI_CHECKSUM, _CA_NVDA, _INFO)]])
+    return _poller(_one_buy(swap), tg, dex,
+                   extras_payload=[_extras_item(_CA_AI, "LONG", 35405, mcap=mcap)],
+                   bs=FakeBS(holders={_CA_AI: {"holders_count": "35405"}}))
+
+
+def test_索引里没有市值时用filterTokens的补上(db):
+    """
+    ⚠️⚠️ **零新增请求**:marketCap 与 🧑‍🤝‍🧑 持有人来自同一份响应,本轮早就取回来了。
+    ⚠️ 实测 2026-09-16(Arc 刚接进来那一小时):256 条买入只有 23 条从索引拿到市值,
+       而同一批币在 filterTokens 里当场就有。
+    """
+    tg = FakeNotifier()
+    _mcap_poller(tg, mcap="43264.41506541945").tick()
+    assert len(tg.sent) == 1
+    assert "💎 市值 $43.26K" in tg.sent[0].split("\n"), tg.sent[0]
+
+
+def test_两边都没有市值时那一行整行消失(db):
+    """⚠️ 铁律:拿不到就不显示,绝不本地推算"""
+    tg = FakeNotifier()
+    _mcap_poller(tg).tick()
+    assert len(tg.sent) == 1
+    assert "💎" not in tg.sent[0], tg.sent[0]
+
+
+def test_事件自带市值时不被兜底覆盖(db):
+    """⚠️ 索引里的值优先:那是「这个人这个币」的实时口径,filterTokens 只是全局快照"""
+    swap = _rh_swap("a1")
+    swap["marketCap"] = 12_345_678.0
+    tg = FakeNotifier()
+    _mcap_poller(tg, mcap="43264.41506541945", swap=swap).tick()
+    lines = tg.sent[0].split("\n")
+    assert "💎 市值 $12.35M" in lines, tg.sent[0]
+    assert not any("$43.26K" in ln for ln in lines), "兜底值把事件自己的市值盖掉了"
+
+
+def test_兜底的市值不写回库(db):
+    """
+    ⚠️ 落库的 market_cap 是「事件发生时」的值。用一个更晚的全局快照覆盖它,
+       /hot 的「买入时市值 → 现在市值」倍数就不成立了。
+    """
+    tg = FakeNotifier()
+    _mcap_poller(tg, mcap="43264.41506541945").tick()
+    with store.get_conn() as conn:
+        row = conn.execute("SELECT market_cap FROM fomo_events").fetchone()
+    assert row["market_cap"] is None
+
+
+def test_robinhood发射台已缓存时不打请求_也就没有市值兜底(db):
+    """
+    ⚠️⚠️ 钉住一个**已知局限**,不是 bug:robinhood 的持有人走 Blockscout、发射台查到就永久缓存,
+       于是它多数轮次根本不打 filterTokens —— 没有那一次请求,就没有市值可兜。
+       要让它也有,就得为「只差市值」多打一个请求,与「零新增请求」的前提冲突,所以不做。
+    ⚠️ 第二个 poller 是**新实例**(内存缓存空的),但发射台缓存在库里 —— 与重启后的真实情形一致。
+    """
+    tg1 = FakeNotifier()
+    _mcap_poller(tg1, mcap="43264.41506541945").tick()
+    assert "💎 市值 $43.26K" in tg1.sent[0], "前提不成立:第一轮就该有市值"
+
+    tg2 = FakeNotifier()
+    # ⚠️ 换一条 swap:同一个 id 会被事件去重挡掉,第二轮就什么都不推了
+    p2 = _mcap_poller(tg2, mcap="43264.41506541945", swap=_rh_swap("a2"))
+    p2.tick()
+    assert len(tg2.sent) == 1
+    assert p2._fake_filter.calls == [], "发射台已缓存,这一轮不该再打 filterTokens"
+    assert "💎" not in tg2.sent[0], tg2.sent[0]

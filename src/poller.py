@@ -23,6 +23,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from loguru import logger
@@ -1991,6 +1992,40 @@ class Poller:
                         skipped, unknown, describe_mcap_range(self.settings.buy_push_mcap))
         return kept
 
+    def _fill_market_cap(self, ev: FomoEvent, extras: dict | None) -> FomoEvent:
+        """
+        这条事件没拿到市值时,用本轮查持有人那一次(filterTokens)返回里的 marketCap 补上。
+        补不了就原样返回(💎 那一行整行消失,绝不本地推算)。
+
+        ⚠️⚠️ **零新增请求**:marketCap 与 🧑‍🤝‍🧑 持有人、🚀 发射台来自**同一份**响应,
+           本轮早就取回来了(见 _token_extra_map)。
+        ⚠️ 为什么需要它:市值本来只来自 balances/trades 那两张索引,而它们对**新链**要慢一拍。
+           实测 2026-09-16 Arc 刚接进来那一小时:256 条买入里只有 23 条从索引里拿到市值(9%),
+           而同一批币在 filterTokens 里当场就有。
+        ⚠️⚠️ **对 robinhood 基本不生效**,这是实现决定的、不是遗漏:那条链的持有人走 Blockscout、
+           发射台一旦查到就永久缓存,于是它多数轮次**根本不打 filterTokens**,也就没有市值可兜。
+           要让它也有,就得为「只差市值」去多打一个请求 —— 那与本函数「零新增请求」的前提冲突,
+           所以不做。其余链(solana / bsc / base / ethereum / arc)的持有人本来就按 TTL 打这个请求,
+           顺手就带回来了。
+        ⚠️ **索引里的值优先**:那是「这个人这个币」的实时口径,filterTokens 只是全局快照。
+        ⚠️⚠️ 只补**显示**,不参与筛选:市值区间那道闸排在批量外呼**之前**
+           (见 _apply_push_filters 的注释 —— 先筛掉才不会把外呼额度喂给不推的币),
+           那时这个值还没取回来。于是「拿不到市值」的买入仍按 FOMO_BUY_PUSH_UNKNOWN_MARKET_CAP
+           那条规则走,只是推出去的消息里能多一行市值。两者口径不同是**刻意**的,
+           反过来(为了筛选提前外呼)代价是每轮给不推的币白打请求。
+        ⚠️ 不写回库:落库的 market_cap 是「事件发生时」的值,事后拿一个更晚的快照去覆盖它,
+           /hot 的「买入时市值 → 现在市值」倍数就不成立了。
+        """
+        if ev.market_cap is not None or not extras:
+            return ev
+        net = (ev.network_id or "").strip()
+        ca = normalize_token_address(ev.token_address)
+        if not net or ca is None:
+            return ev
+        extra = extras.get((net, ca))
+        mc = None if extra is None else extra.market_cap
+        return ev if mc is None else replace(ev, market_cap=mc)
+
     def _pool_quotes(self, pending: list[FomoEvent]) -> dict[str, dict]:
         """
         本轮要推的这些币的底池对手资产 → {链: {归一化地址: PoolQuote}}。
@@ -2270,6 +2305,9 @@ class Poller:
             names = self._name_extras(pool_quotes, ev.network_id, ev.token_address,
                                       ev.token_symbol, pq, cached_only=is_transfer_in,
                                       extras=token_extras, boards=board_blocks)
+            # 💎 市值兜底(零新增请求,详见 _fill_market_cap)。⚠️ 只影响这条消息怎么渲染:
+            #    replace 产出的是**副本**,落库/共识/跟单拿到的仍是原来那条事件。
+            ev = self._fill_market_cap(ev, token_extras)
             try:
                 text = (
                     # ⚠️ 转入逐条推送同样带三行,但**只读缓存**(cached_only=True):

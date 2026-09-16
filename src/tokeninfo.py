@@ -87,6 +87,7 @@ Blockscout 未观察到限速(6 并发 1680 次请求 0 个 429),但仍设每轮
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -175,6 +176,10 @@ class TokenExtra:
 
     launchpad: str | None = None
     holders: int | None = None
+    # 当前市值(美元)。⚠️ 它是**兜底**:买卖推送的市值优先用 balances/trades 那张索引
+    #    (那是「这个人这个币」的实时口径),两边都没有时才用这一个。
+    #    ⚠️ 零新增请求 —— 与 holders / launchpad 来自**同一份** filterTokens 响应。
+    market_cap: float | None = None
 
 
 EMPTY = TokenExtra()
@@ -231,6 +236,28 @@ def parse_launchpad_name(item) -> str | None:
     return name or None
 
 
+def parse_market_cap_usd(raw) -> float | None:
+    """
+    filterTokens 的 marketCap → 美元数;拿不到一律 None(那一行整行消失,绝不打 0)。
+
+    ⚠️ 上游给的是**字符串**("43264.41506541945"),不是数字。
+    ⚠️⚠️ **0 与负数按「拿不到」处理**,与 parse_holders 的 0 是同一个道理:
+       一个刚被人花几千美元买进的币,市值不可能是 0 —— 那是上游没算出来。
+       真把它印成「💎 市值 $0.00」,读者只会读成"这币归零了",那是主动说了句假话。
+    ⚠️ bool **不需要**单独挡:这里走的是 float(str(raw)),str(True) 是 "True"、解析不出来,
+       自然落进 None。(parse_holders 那边挡了,是因为它另有一条 isinstance(raw, int) 的分支。)
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
+
+
 def parse_filter_tokens(payload) -> dict[tuple[str, str], TokenExtra]:
     """
     filterTokens 的响应 → {(内部链标识, 归一化地址): TokenExtra}。
@@ -254,7 +281,8 @@ def parse_filter_tokens(payload) -> dict[tuple[str, str], TokenExtra]:
         if net is None or key is None:
             continue
         out[(net, key)] = TokenExtra(launchpad=parse_launchpad_name(item),
-                                     holders=parse_holders(item.get("holders")))
+                                     holders=parse_holders(item.get("holders")),
+                                     market_cap=parse_market_cap_usd(item.get("marketCap")))
     return out
 
 
@@ -492,6 +520,10 @@ class TokenExtraLookup:
         self._wall = float(wall_clock_sec)
         # (net, addr) → (取到的时刻, 持有人数 或 None)
         self._holders: dict[tuple[str, str], tuple[float, int | None]] = {}
+        # 市值的内存缓存,与持有人共用同一个 TTL。⚠️ **刻意不进 name_glossary**:
+        #    发射台是出生时定死的、可以永久缓存,而市值每分钟都在动,落库只会把
+        #    一个过期数字长期当成事实印出去。
+        self._mcaps: dict[tuple[str, str], tuple[float, float | None]] = {}
         self._used = {"holders": 0, "pons": 0}
         self._spent = 0.0
 
@@ -531,7 +563,8 @@ class TokenExtraLookup:
             if key is None:
                 return EMPTY
             lp = self._cached_launchpad(net, key)
-            return TokenExtra(launchpad=lp, holders=self._cached_holders(net, key))
+            return TokenExtra(launchpad=lp, holders=self._cached_holders(net, key),
+                              market_cap=self._mcap_cache_get((net, key))[1])
         except Exception as e:  # noqa: BLE001
             logger.warning("发射台/持有人读缓存失败 | {} | {}", network_id, e)
             return EMPTY
@@ -589,8 +622,11 @@ class TokenExtraLookup:
         for nk in keys:
             lp = launchpad.get(nk)
             h = holders.get(nk)
-            if lp is not None or h is not None:
-                out[nk] = TokenExtra(launchpad=lp, holders=h)
+            # ⚠️ 市值单独从缓存取:它不参与 need_fomo 的判定(那是发射台与持有人的事),
+            #    本轮打过 filterTokens 就有,没打就没有 —— 绝不为它多打一个请求。
+            mc = self._mcap_cache_get(nk)[1]
+            if lp is not None or h is not None or mc is not None:
+                out[nk] = TokenExtra(launchpad=lp, holders=h, market_cap=mc)
         return out
 
     def _fetch_fomo(self, need: list[tuple[str, str]], launchpad: dict, holders: dict) -> None:
@@ -633,6 +669,8 @@ class TokenExtraLookup:
                 if nk[0] != BLOCKSCOUT_NETWORK:
                     # robinhood 的先不入缓存 —— 它要等 Blockscout 那一步(见 _lookup)
                     self._holders_cache_put(nk, extra.holders)
+                # 市值:四条链一视同仁(robinhood 的持有人虽然另有来源,市值仍只有这一份)
+                self._mcap_cache_put(nk, extra.market_cap)
 
     # ---- Blockscout --------------------------------------------------------
     def _blockscout_holders(self, nk: tuple[str, str]) -> int | None:
@@ -701,6 +739,18 @@ class TokenExtraLookup:
         if len(self._holders) > 4000:
             for k, _ in sorted(self._holders.items(), key=lambda kv: kv[1][0])[:1000]:
                 del self._holders[k]
+
+    def _mcap_cache_get(self, nk) -> tuple[bool, float | None]:
+        hit = self._mcaps.get(nk)
+        if hit is None or time.time() - hit[0] >= self._holders_ttl:
+            return False, None
+        return True, hit[1]
+
+    def _mcap_cache_put(self, nk, value: float | None) -> None:
+        self._mcaps[nk] = (time.time(), value)
+        if len(self._mcaps) > 4000:
+            for k, _ in sorted(self._mcaps.items(), key=lambda kv: kv[1][0])[:1000]:
+                del self._mcaps[k]
 
     def _cached_holders(self, net: str, key: str) -> int | None:
         return self._holders_cache_get((net, key))[1]

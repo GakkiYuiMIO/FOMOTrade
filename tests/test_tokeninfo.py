@@ -987,3 +987,48 @@ def test_外呼超时的默认值就是12秒(monkeypatch):
     tokeninfo.FilterTokensClient(proxy="")._session()
     assert seen["timeout"] == 12.0, f"外呼超时被改成了 {seen.get('timeout')}"
     assert seen["impersonate"] == "chrome", "没了 impersonate 会被 Cloudflare 回 430"
+
+
+# ============================================================
+# 💎 市值:与 holders / launchpad 来自**同一份** filterTokens 响应
+# ============================================================
+@pytest.mark.parametrize(("raw", "want"), [
+    ("43264.41506541945", 43264.41506541945),   # 上游给的是**字符串**
+    (43264.5, 43264.5),
+    (" 1000 ", 1000.0),
+    (1, 1.0),
+])
+def test_市值解析认得的写法(raw, want):
+    assert tokeninfo.parse_market_cap_usd(raw) == want
+
+
+@pytest.mark.parametrize("raw", [None, "", "abc", "nan", "inf", "-1", -1, "0", 0, 0.0, True, False, {}])
+def test_市值拿不到一律None(raw):
+    """
+    ⚠️⚠️ 0 与负数按「拿不到」处理(与 parse_holders 的 0 同一个道理):
+       一个刚被人花几千美元买进的币市值不可能是 0,那是上游没算出来。
+       印成「💎 市值 $0.00」读者只会读成"这币归零了"。
+    ⚠️ bool 也要挡:isinstance(True, int) 为真、float(True) 是 1.0。
+    """
+    assert tokeninfo.parse_market_cap_usd(raw) is None
+
+
+def test_解析filterTokens时把市值一起带出来():
+    got = tokeninfo.parse_filter_tokens([{
+        "holders": 263,
+        "marketCap": "43264.41506541945",
+        "token": {"address": "0x3CA1Fcfd26ceFbB1339CE42cAFE1a9Dc6107fa12", "networkId": 5042,
+                  "symbol": "ARCGUY", "launchpad": {"launchpadName": "LONG"}},
+    }])
+    extra = got[("arc", "0x3ca1fcfd26cefbb1339ce42cafe1a9dc6107fa12")]
+    assert extra.market_cap == 43264.41506541945
+    assert extra.holders == 263 and extra.launchpad == "LONG"
+
+
+def test_没给市值的项市值是None():
+    """⚠️ 缺键 ≠ 0:那一行整行消失,不能打 $0.00"""
+    got = tokeninfo.parse_filter_tokens([{
+        "holders": 10,
+        "token": {"address": "0x3CA1Fcfd26ceFbB1339CE42cAFE1a9Dc6107fa12", "networkId": 5042},
+    }])
+    assert got[("arc", "0x3ca1fcfd26cefbb1339ce42cafe1a9dc6107fa12")].market_cap is None
