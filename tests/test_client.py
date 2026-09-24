@@ -939,3 +939,40 @@ def test_页面里那段js真的把超时接到了fetch上():
     assert "opts.signal = ctl.signal" in js
     # 收尾:定时器要清掉,否则页面里堆一堆待触发的 abort
     assert "clearTimeout(timer)" in js
+
+
+# ============================================================
+# /chips 前 10 名的两个资产接口(src/holdercard.py 用)
+# ============================================================
+# ⚠️ 路径与参数名写死字面量:这个 API 对不认识的参数一律静默忽略,
+#    snapshotId 拼成 snapshotID 不会报错,只会让 7 天盈亏永远是空的。
+def test_完整balances打的是用户balances路径_返回整个responseObject(monkeypatch):
+    env = {"success": True, "statusCode": 200,
+           "responseObject": {"balances": [], "otherEquity": 12.5, "otherPnlV2": 3.0}}
+    c, box = _wired_http_client(monkeypatch, json.dumps(env))
+
+    got = c.get_balances_raw("u-1", auth_invalidate=False, fast_fail=True)
+
+    assert box["gets"][0]["url"] == "https://prod-api.fomo.family/v2/users/u-1/balances"
+    assert box["gets"][0]["params"] == {}, "前端也是不带参数打这个路径"
+    assert got == {"balances": [], "otherEquity": 12.5, "otherPnlV2": 3.0},         "otherEquity / otherPnlV2 是和 balances 同级的,只抠数组就丢了"
+
+
+def test_盈亏快照的路径与参数名(monkeypatch):
+    env = {"success": True, "statusCode": 200,
+           "responseObject": {"snapshotId": "1789646400", "pnl": -1.5, "equity": 9.0}}
+    c, box = _wired_http_client(monkeypatch, json.dumps(env))
+
+    got = c.get_pnl_snapshot("u-1", 1789646400, auth_invalidate=False, fast_fail=True)
+
+    assert box["gets"][0]["url"] ==         "https://prod-api.fomo.family/v2/userTokens/aggregatedSnapshotById"
+    assert box["gets"][0]["params"] == {"userId": "u-1", "snapshotId": 1789646400}
+    assert got["pnl"] == -1.5
+
+
+@pytest.mark.parametrize("ro", [[1, 2], None, "x"])
+def test_资产接口返回的不是对象时给空dict(monkeypatch, ro):
+    env = {"success": True, "statusCode": 200, "responseObject": ro}
+    c, _ = _wired_http_client(monkeypatch, json.dumps(env))
+    assert c.get_balances_raw("u-1") == {}
+    assert c.get_pnl_snapshot("u-1", 1) == {}

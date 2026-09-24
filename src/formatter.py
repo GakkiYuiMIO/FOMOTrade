@@ -289,6 +289,10 @@ UNTRUSTED_FIELDS = {
     #    ⚠️ 也**不是** safe_ident:那一道允许空格,`Send SOL to my wallet now`
     #       整句穿过去 —— 见 nameguard.safe_username 顶上那段。
     "pump_username": safe_username,
+    # ⚠️⚠️ /chips 前 10 名持有人那一行的 **FOMO 用户名**(/hodlers/top 的 user.userHandle)。
+    #    与 pump_username 同一个威胁模型、同一道门:本人可改,而那一行长得像一条记录。
+    #    🏅 盈利榜那一行的 handle 也是走 safe_username(在 safe_board_rows 里)。
+    "fomo_handle": safe_username,
     # ⚠️⚠️ 🏅 那一块的**行**:((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。
     #    它是**结构化**字段,所以门禁函数收整体、返回同形结构(与 token_socials /
     #    safe_social_links 同一套路数),而不是一个字符串进一个字符串出。
@@ -406,6 +410,9 @@ _REVIEWED_PARAMS = frozenset({
     # 「🟦 持仓变动」补推(render_pump_untracked)的两个参数:增加的数量(float)与
     # 「快照里原本没有这一行」(bool)—— 都不是文本。
     "added_amount", "first_seen",
+    # /chips 前 10 名持有人那一行(render_chips_top_row)的**数字**参数:名次、占比(百分数)、
+    # 粉丝数、投资组合、7 天盈亏。⚠️ 那一行唯一的文本参数 fomo_handle 在 UNTRUSTED_FIELDS 里。
+    "rank", "share_pct", "followers", "portfolio_usd", "pnl_7d_usd",
 })
 
 
@@ -2954,6 +2961,43 @@ def fmt_token_amount(v) -> str | None:
     return f"{f:,.0f}"
 
 
+# 占比小到这个量级以下就不再报数字 —— 再往下全是量化噪声,写出来只是假精确
+SHARE_PCT_FLOOR = 0.0001
+
+
+def fmt_share_pct(p) -> str | None:
+    """
+    占比(百分数)→ 展示串;拿不到(None / 非数 / 非有限)返回 None。
+
+    ⚠️ /chips 的名单区与前 10 名那一行共用这**一份**。原来在 bot._chips_pct,前 10 名那一行
+       要在 formatter 里渲染(收口),于是搬过来,bot 那个名字留一行转调 ——
+       与 fmt_token_amount 当年从 bot._chips_qty 搬过来是同一个先例。同一条回执里两种占比记法,
+       读者会以为是两种量。
+    ⚠️ 量级越小给的小数位越多:固定两位会把 0.0034% 压成 0.00%,等于告诉用户「没有仓位」,
+       而真相是「有,但很小」。小到 SHARE_PCT_FLOOR 以下就不再报数字(量化噪声)。
+    """
+    if p is None or isinstance(p, bool):
+        return None
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(p):
+        return None
+    a = abs(p)
+    if a == 0:
+        return "0%"                       # 0 是真实值(确实一枚都不剩),照实写
+    if a < SHARE_PCT_FLOOR:
+        return f"&lt;{SHARE_PCT_FLOOR:g}%"
+    if a >= 10:
+        return f"{p:.1f}%"
+    if a >= 1:
+        return f"{p:.3f}%"
+    if a >= 0.01:
+        return f"{p:.2f}%"
+    return f"{p:.4f}%"
+
+
 def fmt_signed_pct(v) -> str | None:
     """
     带正负号的百分比 → 展示串。取不到返回 None(那一段消失)。
@@ -3012,4 +3056,66 @@ def render_pump_chip_row(*, pump_username: str | None = None,
     pct_text = fmt_signed_pct(pnl_pct)
     if pct_text is not None:
         seg.append(pct_text)
+    return SEP.join(seg)
+
+
+# /chips 前 10 名持有人那一行(render_chips_top_row)
+_CHIPS_TOP_NAME_CHARS = 32
+LABEL_CHIPS_FOLLOWERS = "粉丝"
+LABEL_CHIPS_PORTFOLIO = "投资组合"
+LABEL_CHIPS_PNL_7D = "7天盈亏"
+
+
+def _nonneg_int(v) -> int | None:
+    """非负整数(粉丝数这类计数)。拿不到 / 负数 / 非有限一律 None —— 绝不退化成 0。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0:
+        return None
+    return int(f)
+
+
+@_guard_untrusted
+def render_chips_top_row(*, rank: int | None = None, fomo_handle: str | None = None,
+                         share_pct=None, amount_held=None, followers=None,
+                         portfolio_usd=None, pnl_7d_usd=None) -> str:
+    """
+    /chips 里 FOMO 平台前 10 名持有人的一行:
+    `#1 「badabeepp」 · 2.150% · 粉丝 15,904 · 投资组合 $180.72K · 7天盈亏 +$51.14K`
+
+    ⚠️⚠️ 存在的理由与 render_pump_chip_row 一样是**收口**:fomo_handle 是本人可改的 FOMO 用户名,
+       而这一行长得像一条**记录**(名字 · 占比 · 数字),混进 `已清仓 · 亏损 99%` / `t.me/scam`
+       就是一条伪造的记录。走 safe_username(封闭形状)+「」容器 —— 与 🏅 盈利榜那一行
+       同一道门、同一种写法。过不了门禁退回「未知用户」:其余几段是真值,整行删掉等于谎报"没这个人"。
+    ⚠️ 占比与名单区同一种记法(fmt_share_pct);分母拿不到时退回数量(`枚`)。
+    ⚠️ 金额与 🏅 那一行同一套缩写($180.72K / +$51.14K),同一条回执里不另起一套记法。
+       7 天盈亏正数带 `+`:不带符号读者会以为那是持仓金额。
+    ⚠️ 每一段各自独立,取不到的那段消失;粉丝 0 是真实值(新号),照实写。
+    ⚠️ 返回值**已转义**,调用方直接拼行,不要再 escape 一遍。
+    """
+    name = _clip(fomo_handle or "", _CHIPS_TOP_NAME_CHARS)
+    who = _quoted(name) if name else TEXT_UNKNOWN_USER
+    if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+        who = f"#{rank} {who}"
+    seg = [who]
+    share = fmt_share_pct(share_pct)
+    if share is not None:
+        seg.append(share)
+    else:
+        amount_text = fmt_token_amount(amount_held)
+        if amount_text is not None:
+            seg.append(f"{amount_text} 枚")
+    n = _nonneg_int(followers)
+    if n is not None:
+        seg.append(f"{LABEL_CHIPS_FOLLOWERS} {n:,}")
+    port = _fmt_usd_compact(portfolio_usd) if portfolio_usd is not None else None
+    if port is not None:
+        seg.append(f"{LABEL_CHIPS_PORTFOLIO} {port}")
+    week = _board_pnl_text(pnl_7d_usd) if pnl_7d_usd is not None else None
+    if week is not None:
+        seg.append(f"{LABEL_CHIPS_PNL_7D} {week}")
     return SEP.join(seg)

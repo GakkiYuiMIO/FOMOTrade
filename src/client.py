@@ -41,6 +41,9 @@ EP_CURRENT_USER = "/v2/users/current"
 EP_USER = "/v2/users/{uid}"
 EP_SWAPS = "/v2/users/{uid}/swaps"
 EP_BALANCES = "/v2/users/{uid}/balances"
+# 某个整点的累计盈亏快照({snapshotId, pnl, equity})。/chips 算「7 天盈亏」用(见 holdercard)。
+# ⚠️ snapshotId 是**整点的 unix 秒**(前端 config.K 向下取整到小时),不是随便一个时间戳。
+EP_PNL_SNAPSHOT = "/v2/userTokens/aggregatedSnapshotById"
 # 持仓单(含已平仓的)。orderBy 只接受 'closedAt' / 'realizedPnlUsd' 两个值
 EP_TRADES = "/trades"
 EP_FOLLOWING = "/v2/users/{uid}/followingPaginate"
@@ -293,6 +296,10 @@ class FomoClient(Protocol):
                         fast_fail: bool = False) -> dict: ...
     def get_token_meta(self, token_address: str, network_id) -> dict: ...
     def get_balances(self, user_id: str) -> list[dict]: ...
+    def get_balances_raw(self, user_id: str, *, auth_invalidate: bool = True,
+                         fast_fail: bool = False) -> dict: ...
+    def get_pnl_snapshot(self, user_id: str, snapshot_id: int, *, auth_invalidate: bool = True,
+                         fast_fail: bool = False) -> dict: ...
     def get_trades(self, user_id: str) -> list[dict]: ...
     def get_activity_feed(self, limit: int = 100) -> list[dict]: ...
     def get_following(self, user_id: str, max_items: int = 300) -> list[dict]: ...
@@ -801,6 +808,28 @@ class _BaseFomoClient:
 
     def get_balances(self, user_id: str) -> list[dict]:
         return _as_list(self._get(EP_BALANCES.format(uid=quote(user_id, safe=""))))
+
+    def get_balances_raw(self, user_id: str, *, auth_invalidate: bool = True,
+                         fast_fail: bool = False) -> dict:
+        """
+        balances 的**完整** responseObject(含同级的 otherEquity / otherPnlV2 / livePerpPnl)。
+        拿不到返回 {}。
+
+        ⚠️ get_balances 只把 balances 那个数组抠出来;/chips 的投资组合与 7 天盈亏还要同级的
+           另外三个数(见 holdercard),所以单开一个。请求本身一模一样 —— 前端也是不带参数打这个路径。
+        auth_invalidate / fast_fail:见 _fetch_ok。命令路径上的附加请求一律传 False / True。
+        """
+        ro = _unwrap(self._get(EP_BALANCES.format(uid=quote(user_id, safe="")),
+                               auth_invalidate=auth_invalidate, fast_fail=fast_fail))
+        return ro if isinstance(ro, dict) else {}
+
+    def get_pnl_snapshot(self, user_id: str, snapshot_id: int, *, auth_invalidate: bool = True,
+                         fast_fail: bool = False) -> dict:
+        """某个整点的累计盈亏快照 {snapshotId, pnl, equity}。拿不到返回 {}。"""
+        ro = _unwrap(self._get(EP_PNL_SNAPSHOT,
+                               {"userId": user_id, "snapshotId": int(snapshot_id)},
+                               auth_invalidate=auth_invalidate, fast_fail=fast_fail))
+        return ro if isinstance(ro, dict) else {}
 
     def get_leaderboard(self, period: str = "24h", limit: int = 20, *,
                         auth_invalidate: bool = True,

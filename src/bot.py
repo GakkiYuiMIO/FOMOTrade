@@ -36,6 +36,7 @@ from src.client import total_supply_of
 from src.config import PROBE_DIR, get_settings
 from src.copytrade import auto_blockers, pnl
 from src.executor import buy as execute_buy
+from src.holdercard import HolderCardLookup
 from src.models import (
     COUNTABLE_REASONS,
     EVENT_TRANSFER_IN,
@@ -441,8 +442,10 @@ _CA_MONEY_SCI = 1e15
 #    一条命令十几秒还抢监控进程的会话,不可接受。
 # 名单区最多展开几个人,超出的由 _ca_assemble 收口成"还有 N 人未显示"
 MAX_CHIPS_MEMBER_ROWS = 10
-# 占比小到这个量级以下就不再报数字 —— 再往下全是量化噪声,写出来只是假精确
-_CHIPS_PCT_FLOOR = 0.0001
+# 🔝 FOMO 前几名持有人(名字 · 占比 · 粉丝 · 投资组合 · 7天盈亏)
+MAX_CHIPS_TOP_ROWS = 10
+# 占比记法的下限。实现已搬进 formatter.fmt_share_pct,这里留一个别名给旧引用
+_CHIPS_PCT_FLOOR = formatter.SHARE_PCT_FLOOR
 
 # ============ 💊 pump.fun 平台那半边 ============
 # ⚠️⚠️ 它与上面 🏦 FOMO 那半边是**两个平台的两份数据**,只是印在同一条回执里:
@@ -482,6 +485,8 @@ class CommandBot:
         self._settings = get_settings()
         self._offset: int | None = None
         self._pump_client = pump_client
+        # /chips 前 10 名的投资组合 / 7 天盈亏(带 60 秒缓存,见 holdercard)
+        self._cards = HolderCardLookup(client)
 
     # ============================================================
     # 主循环
@@ -1887,6 +1892,9 @@ class CommandBot:
         head = [f"<b>${_ca_clip(symbol, CA_TICKER_CHARS)}</b> · "
                 f"{_ca_clip(_chain_name(net), CA_CHAIN_CHARS)}"]
         head += _chips_platform_lines(st, err)
+        # 🔝 前 10 名:⚠️ 必须在名单表头**之前**(理由见 _chips_top_lines)
+        if err is None and not st["empty"]:
+            head += self._chips_top_lines(data, supply)
         head += _chips_watch_lines(st, err)
         # ⚠️⚠️ 💊 pump 那半边**只接在这条成功路径上**:上面几条早退分支
         #    (一条链都没定下来 / 接口挂了)返回的是**诊断消息**,在一条"没查到、
@@ -1969,6 +1977,49 @@ class CommandBot:
         except Exception as e:  # noqa: BLE001
             logger.warning("/chips 取总供应量失败(降级为本地推算) | {} | {}", ca[:16], e)
             return {}
+
+    def _chips_top_lines(self, data: dict, supply: float | None) -> list[str]:
+        """
+        🔝 FOMO 平台前 10 名持有人:名字 · 占比 · 粉丝 · 投资组合 · 7天盈亏(用户 2026-09-24 要的)。
+
+        ⚠️⚠️ 排在「🏦 FOMO 平台」之后、「👥 你的名单」之前,**不能**排在名单表头后面:
+           名单表头下面紧跟的是成员明细(_ca_assemble 的 body),插到那里就会把前 10 名
+           读成"你名单里的人" —— 与 J1 那次 pump 行挤进 FOMO 名单是同一类错。
+        ⚠️ 名字、占比、粉丝都来自已经拿到的持有人榜,**零新增请求**;投资组合与 7 天盈亏
+           每人 2 个请求,算法照搬 FOMO 前端的用户卡片(见 holdercard),口径能对上界面。
+        ⚠️ 标了 private 的人不去拉资产,那两段不显示,也不算进"没取到"。
+        ⚠️ 这一块整个挂了也只少这几行:异常全在这里兜住,绝不让 /chips 整条失败。
+        """
+        try:
+            holders = [h for h in (data.get("topHolders") or []) if isinstance(h, dict)]
+            if not holders:
+                return []
+            top = sorted(holders, key=lambda h: -(_f(h.get("humanAmount")) or 0.0))
+            top = top[:MAX_CHIPS_TOP_ROWS]
+            users = [h.get("user") if isinstance(h.get("user"), dict) else {} for h in top]
+            want = [u["id"] for u in users
+                    if isinstance(u.get("id"), str) and u["id"] and not u.get("private")]
+            queried = self._cards.supported()
+            cards = self._cards.lookup(want) if queried else {}
+            lines = [f"🔝 FOMO 前 {len(top)} 名持有人(按持仓数量)"]
+            for rank, (h, u) in enumerate(zip(top, users, strict=True), 1):
+                card = None if u.get("private") else cards.get(u.get("id"))
+                amount = _f(h.get("humanAmount"))
+                lines.append("   " + formatter.render_chips_top_row(
+                    rank=rank, fomo_handle=u.get("userHandle"),
+                    share_pct=_chips_ratio(amount, supply), amount_held=amount,
+                    followers=u.get("followers"),
+                    portfolio_usd=None if card is None else card.portfolio_usd,
+                    pnl_7d_usd=None if card is None else card.pnl_7d_usd))
+            # 没取到 = 两个请求有一个**失败**(超时 / 报错);新用户没有 7 天记录不算
+            missing = (sum(1 for uid in want if uid not in cards or not cards[uid].complete)
+                       if queried else 0)
+            if missing:
+                lines.append(f"   ⚠️ 有 {missing} 人的投资组合/7天盈亏没取到(接口超时或失败)")
+            return lines
+        except Exception as e:  # noqa: BLE001
+            logger.warning("/chips 前 10 名持有人那一块渲染失败,整块不显示 | {}", e)
+            return []
 
     def _chips_error(self, ca: str, e: Exception) -> str:
         """把 client 层异常翻成人话。与 _ca_error 同一套分类,只是换了端点名"""
@@ -2498,22 +2549,10 @@ def _chips_ratio(amount: float | None, supply: float | None) -> float | None:
 
 def _chips_pct(p: float) -> str:
     """
-    占比展示。量级越小给的小数位越多 —— 固定两位会把 0.0034% 压成 0.00%,
-    那等于告诉用户「没有仓位」,而真相是「有,但很小」。
-    小到 _CHIPS_PCT_FLOOR 以下就不再报数字:再往下全是量化噪声,写出来只是假精确。
+    占比展示。实现已搬进 formatter.fmt_share_pct:🔝 前 10 名那一行在 formatter 里渲染,
+    两边必须是同一种记法(同一条回执里两种占比写法,读者会以为是两种量)。
     """
-    a = abs(p)
-    if a == 0:
-        return "0%"                       # 0 是真实值(确实一枚都不剩),照实写
-    if a < _CHIPS_PCT_FLOOR:
-        return f"&lt;{_CHIPS_PCT_FLOOR:g}%"
-    if a >= 10:
-        return f"{p:.1f}%"
-    if a >= 1:
-        return f"{p:.3f}%"
-    if a >= 0.01:
-        return f"{p:.2f}%"
-    return f"{p:.4f}%"
+    return formatter.fmt_share_pct(p) or "?"
 
 
 def _chips_ge_pct(p: float, sep: str = "") -> str:

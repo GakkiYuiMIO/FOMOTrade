@@ -39,6 +39,7 @@ from src.formatter import (
     URL_FIELDS,
     render,
     render_alpha_listing,
+    render_chips_top_row,
     render_pump_callout,
     render_pump_chip_row,
     render_pump_trade,
@@ -51,7 +52,7 @@ from src.formatter import (
 #    所以下面另有一条断言:formatter 里所有 `render*` 公开函数都必须出现在这个元组里。
 _RENDERERS = (render, render_pump_trade, render_transfer_in_watch,
               render_transfer_in_signal, render_alpha_listing, render_pump_callout,
-              render_pump_chip_row, render_pump_untracked)
+              render_pump_chip_row, render_pump_untracked, render_chips_top_row)
 
 # ============================================================
 # 写死在**测试这一侧**的字段清单 —— D1 不变量的判卷依据
@@ -87,6 +88,9 @@ _EXPECT_UNTRUSTED = {
     #        它把 4.24% 打成「未知用户」(`AR_04` / `Bart_da_charts` / `_togi_`),
     #        而 safe_username 同一份语料丢 0.00%、45 条 _MUST_BLOCK 仍然零泄漏。
     "pump_username": "safe_username",
+    # /chips 前 10 名持有人那一行的 FOMO 用户名:与 pump_username 同一个威胁模型、同一道门。
+    #    换成 safe_ident(允许空格,一句话能穿过去)或 safe_display(丢带 `_` 的真实名字)这条当场红。
+    "fomo_handle": "safe_username",
     # ⚠️⚠️ 本轮新增:🏅 盈利榜持有人那一块的**行**
     #    ((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。它是**结构化**字段,
     #    门禁收整体、返回同形结构(与 token_socials / safe_social_links 同一套路数)。
@@ -151,6 +155,8 @@ _EXPECT_REVIEWED = {
     "board_scope",
     # 「🟦 持仓变动」补推:增加的数量(float)与「快照里原本没有这一行」(bool)。
     "added_amount", "first_seen",
+    # /chips 前 10 名那一行:名次 / 占比 / 粉丝数 / 投资组合 / 7 天盈亏,全是数字。
+    "rank", "share_pct", "followers", "portfolio_usd", "pnl_7d_usd",
 }
 
 
