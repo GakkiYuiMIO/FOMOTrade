@@ -1283,3 +1283,68 @@ def safe_board_rows(items) -> tuple[tuple, ...] | None:
         if len(out) >= _MAX_BOARD_ROWS:
             break
     return tuple(out) or None
+
+
+# ============================================================
+# 用户标签(/tag)的门禁 —— 封闭形状。**写入时与渲染时是同一道**
+# ============================================================
+# 一个标签最多几个字、一个人最多几个标签。
+# ⚠️ 标签渲染在推送**标题**里(名字后面),标题是聊天列表预览与通知横幅里唯一看得见的那一行 ——
+#    5 × 16 已经是能塞进去而不把「首次建仓 · 币名」挤出预览的上限。
+TAG_MAX_CHARS = 16
+TAGS_MAX_PER_USER = 5
+
+
+def safe_tag(s) -> str | None:
+    """
+    一个用户标签 → 规范写法;不合格返回 None。
+
+    规则:去掉开头的 `#`;只许 **Unicode 字母 / 数字 / 下划线**;1~16 个字;不能全是数字和下划线。
+    ⚠️ 形状照 **Telegram 话题(hashtag)** 定:推送标题里渲染成 `#底部选手`,Telegram 只把
+       「# + 字母数字下划线」认成可点击的话题 —— 混进空格、%、$ 话题就断在那里,
+       后半截成了普通文字,点击筛选也就筛错了。全数字的 `#100` Telegram 不认成话题。
+    ⚠️ 这条白名单顺带挡掉了 HTML 特殊字符、零宽字符、双向控制符、emoji ——
+       它们都不是字母数字。标签虽然只有管理员自己能写,落库之后一样要按不可信文本对待
+       (库可能被手改、老数据可能是别的规则写进去的),所以渲染入口再过一次同一道门。
+    ⚠️ 组合附加符(Mn,泰文/印地文的声调符号)也不收:它们在 Telegram 话题里会把话题截断。
+    """
+    if not isinstance(s, str):
+        return None
+    t = unicodedata.normalize("NFC", s.strip()).lstrip("#")
+    if not t or len(t) > TAG_MAX_CHARS:
+        return None
+    for ch in t:
+        if ch != "_" and not unicodedata.category(ch).startswith(("L", "Nd")):
+            return None
+    if all(ch == "_" or unicodedata.category(ch) == "Nd" for ch in t):
+        return None
+    return t
+
+
+def safe_tags(items) -> tuple[str, ...]:
+    """
+    标签序列 → 合格的、去重后的前 TAGS_MAX_PER_USER 个(保持原顺序)。
+
+    ⚠️ 不合格的**逐个丢**,不连累同一个人的其他标签。
+    ⚠️ 去重按 casefold:`#Degen` 与 `#degen` 在 Telegram 里是同一个话题,印两遍只是噪音。
+    ⚠️ 给了单个字符串也按一个标签处理(而不是把字符串当成字符序列逐字拆开)。
+    """
+    if items is None:
+        return ()
+    if isinstance(items, str):
+        items = (items,)
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        seq = list(items)
+    except TypeError:
+        return ()
+    for it in seq:
+        t = safe_tag(it)
+        if t is None or t.casefold() in seen:
+            continue
+        seen.add(t.casefold())
+        out.append(t)
+        if len(out) >= TAGS_MAX_PER_USER:
+            break
+    return tuple(out)

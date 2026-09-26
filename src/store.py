@@ -78,7 +78,11 @@ CREATE TABLE IF NOT EXISTS watch_users (
     --       会被静默解释成"这个人不推"。
     --    开关归开关、门槛归门槛,两件事就是两列。
     transfer_in_min_usd REAL,
-    note         TEXT
+    note         TEXT,
+    -- 用户标签(/tag),JSON 数组,例 ["底部选手","盈利10w"]。NULL = 没打过。**纯展示**:
+    -- 推送标题里名字后面显示成 #话题,不影响任何判定。形状规则在 nameguard.safe_tag。
+    -- ⚠️ 刻意不挪用上面的 note:那是「备注」(自由文本),标签是一组有形状约束的短词。
+    tags         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_watch_users_active ON watch_users(active);
 CREATE INDEX IF NOT EXISTS idx_watch_users_handle ON watch_users(handle);
@@ -507,6 +511,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE watch_users ADD COLUMN transfer_in_min_usd REAL")
         logger.info("迁移:watch_users 补列 transfer_in_min_usd(每人各自的转入门槛,NULL=跟全局)")
 
+    if wcols and "tags" not in wcols:
+        # 可空、无 DEFAULT:老库升级后谁都没有标签,推送逐字节不变
+        conn.execute("ALTER TABLE watch_users ADD COLUMN tags TEXT")
+        logger.info("迁移:watch_users 补列 tags(用户标签)")
+
     pcols = {r["name"] for r in conn.execute("PRAGMA table_info(pump_watch_users)").fetchall()}
     if pcols and "callout_seeded" not in pcols:
         # ⚠️ 默认 0 —— 老库升级后行为与升级前**逐字节相同**:名单里的人一律当成
@@ -652,6 +661,46 @@ def starred_user_ids(conn) -> set[str]:
         "SELECT user_id FROM watch_users WHERE active = 1 AND starred = 1"
     ).fetchall()
     return {r["user_id"] for r in rows}
+
+
+def watch_tags(conn) -> dict[str, tuple[str, ...]]:
+    """
+    名单里(active)打过标签的人 → 他的标签。纯展示用途,拿不到就当没有 —— 绝不能因此挡住推送。
+
+    ⚠️ 这里只做 JSON 解析,**不做形状校验** —— 形状由 nameguard.safe_tags 在渲染入口统一收口
+       (与其它不可信字段同一个收口点),这里再判一遍就是两份规则,迟早走岔。
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for r in conn.execute(
+        "SELECT user_id, tags FROM watch_users WHERE active = 1 AND tags IS NOT NULL"
+    ).fetchall():
+        try:
+            v = json.loads(r["tags"])
+        except (TypeError, ValueError):
+            logger.warning("用户标签不是合法 JSON,忽略 | user_id={}", r["user_id"])
+            continue
+        if isinstance(v, list) and v:
+            out[r["user_id"]] = tuple(x for x in v if isinstance(x, str))
+    return out
+
+
+def find_active_watch_user(conn, handle_or_id: str):
+    """按 handle(大小写不敏感)或 user_id 找**名单里**(active)的人;找不到返回 None。"""
+    key = (handle_or_id or "").strip()
+    if not key:
+        return None
+    return conn.execute(
+        "SELECT user_id, handle, display_name, tags FROM watch_users "
+        "WHERE active = 1 AND (lower(handle) = ? OR user_id = ?)",
+        (normalize_handle(key), key),
+    ).fetchone()
+
+
+def set_watch_tags(conn, user_id: str, tags) -> None:
+    """覆盖写这个人的标签。空 = 清空(存 NULL,不存 "[]")。"""
+    payload = json.dumps(list(tags), ensure_ascii=False) if tags else None
+    with tx(conn):
+        conn.execute("UPDATE watch_users SET tags = ? WHERE user_id = ?", (payload, user_id))
 
 
 def set_starred(conn, handle_or_id: str, on: bool) -> tuple[bool, str]:

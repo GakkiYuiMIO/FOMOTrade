@@ -19,6 +19,7 @@ Telegram 命令层 —— getUpdates 长轮询 + 命令分发(设计文档 §3.4
 from __future__ import annotations
 
 import html
+import json
 import math
 import re
 import threading
@@ -45,6 +46,7 @@ from src.models import (
     normalize_network,
     normalize_token_address,
 )
+from src.nameguard import TAG_MAX_CHARS, TAGS_MAX_PER_USER, safe_tag, safe_tags
 
 # ⚠️ 只借 MAX_MESSAGE_LEN 这个常量:/ca 要自己算长度预算,而"上限是多少"必须与真正
 #    动手截断的那一方同源 —— 抄一个 4000 过来,哪天 notifier 改了这边就悄悄失效。
@@ -103,6 +105,8 @@ _COMMAND_MENU = [
     ("paper", "跟单台账:纸上建的仓现在赚亏多少"),
     ("star", "特别关注:/star <handle> — 推送加 ⭐ 醒目标识"),
     ("unstar", "取消特别关注:/unstar <handle>"),
+    ("tag", "打标签:/tag <handle> <标签…> · /tag 看全部标签"),
+    ("untag", "去标签:/untag <handle> [标签…] — 不写标签=全部清空"),
     ("tin", "转入推送:/tin <handle> <金额> 设他自己的门槛 · /tin 看名单"),
     ("pump", "pump.fun 名单:/pump 看名单 · /pump add|del <名字或钱包>"),
     ("del", "移出监控:/del <handle>"),
@@ -137,6 +141,9 @@ _HELP = (
     "/paper — 跟单台账:每一单现在赚亏多少\n"
     "/star &lt;handle&gt; — 特别关注:他的推送带 ⭐、币名加【】\n"
     "/unstar &lt;handle&gt; — 取消特别关注\n"
+    "/tag &lt;handle&gt; &lt;标签…&gt; — 给这个人打标签(如 底部选手 盈利10w),"
+    "推送标题里显示成 #话题,点一下能筛出同标签的推送;/tag 不带参数=看全部\n"
+    "/untag &lt;handle&gt; [标签…] — 去掉标签;不写标签=全部清空\n"
     "/tin &lt;handle&gt; &lt;金额&gt; — 开这个人的<b>转入逐条推送</b>并设"
     "<b>他自己的</b>门槛(已开着就只改门槛,每人可以完全不同);"
     "不带金额=开/关切换;/tin 不带参数=看名单与各自门槛\n"
@@ -444,6 +451,8 @@ _CA_MONEY_SCI = 1e15
 MAX_CHIPS_MEMBER_ROWS = 10
 # 🔝 FOMO 前几名持有人(名字 · 占比 · 粉丝 · 投资组合 · 7天盈亏)
 MAX_CHIPS_TOP_ROWS = 10
+# /tag 总览里每个标签最多列出几个人(再多就「等 N 人」)
+MAX_TAG_OVERVIEW_NAMES = 8
 # 占比记法的下限。实现已搬进 formatter.fmt_share_pct,这里留一个别名给旧引用
 _CHIPS_PCT_FLOOR = formatter.SHARE_PCT_FLOOR
 
@@ -706,6 +715,10 @@ class CommandBot:
             return self._cmd_star(arg, on=True)
         if cmd in ("/unstar", "/unfav"):
             return self._cmd_star(arg, on=False)
+        if cmd == "/tag":
+            return self._cmd_tag(arg)
+        if cmd == "/untag":
+            return self._cmd_untag(arg)
         if cmd == "/tin":
             return self._cmd_tin(arg)
         # ⚠️ 刻意**只烧一个命令名 + 子命令**,不做 /padd /pdel /plist:
@@ -1442,12 +1455,105 @@ class CommandBot:
                 n_token = store.stats_row_count(conn, r["user_id"])
                 name = r["display_name"] or r["handle"]
                 star = "⭐ " if r["starred"] else ""
+                tags = _row_tags(r)
+                tag_text = f" {_tags_html(tags)}" if tags else ""
                 lines.append(
-                    f"{i}. {star}<b>{_esc(name)}</b> @{_esc(r['handle'])} · {ready} · "
+                    f"{i}. {star}<b>{_esc(name)}</b> @{_esc(r['handle'])}{tag_text} · {ready} · "
                     f"{n_token} 币 · {_day_str(r['added_at'])}"
                 )
             if len(rows) > MAX_LIST_ROWS:
                 lines.append(f"…另有 {len(rows) - MAX_LIST_ROWS} 人未显示")
+        return "\n".join(lines)
+
+    def _cmd_tag(self, arg: str) -> str:
+        """
+        /tag                     —— 全部标签:按标签分组,谁打了什么一目了然
+        /tag <handle>            —— 看这个人的标签
+        /tag <handle> <标签…>    —— 给这个人加标签(追加,已有的不重复)
+
+        标签是**纯展示**:推送标题里名字后面显示成 #话题(点一下能筛出同标签的所有推送),
+        不影响徽章、共识、采集、跟单的任何判定 —— 与 ⭐ 特别关注同一个性质。
+        ⚠️ 形状规则只有一份:nameguard.safe_tag(推送渲染时也是它)。
+        """
+        parts = (arg or "").split()
+        if not parts:
+            return self._tag_overview()
+        with store.get_conn() as conn:
+            row = store.find_active_watch_user(conn, parts[0])
+            if row is None:
+                return f"❓ 名单里没有 {_esc(store.clean_handle(parts[0]))}(先 /add 加进来)"
+            who = _esc(row["display_name"] or row["handle"])
+            cur = list(_row_tags(row))
+            if len(parts) == 1:
+                return (f"🏷 {who}:{_tags_html(cur)}" if cur
+                        else f"🏷 {who} 还没有标签。用法:/tag {_esc(row['handle'])} 底部选手 盈利10w")
+            bad = [p for p in parts[1:] if safe_tag(p) is None]
+            want = [safe_tag(p) for p in parts[1:] if safe_tag(p) is not None]
+            have = {t.casefold() for t in cur}
+            added, full = [], []
+            for t in want:
+                if t.casefold() in have:
+                    continue
+                if len(cur) >= TAGS_MAX_PER_USER:
+                    full.append(t)
+                    continue
+                cur.append(t)
+                have.add(t.casefold())
+                added.append(t)
+            if added:
+                store.set_watch_tags(conn, row["user_id"], cur)
+        lines = [f"🏷 已给 {who} 加上 {_tags_html(added)}" if added
+                 else f"ℹ️ {who} 的标签没有变化"]
+        if bad:
+            lines.append(f"⚠️ 这些不合格,没加:{_esc(' '.join(bad))}\n"
+                         f"   标签只能用中英文、数字和下划线,1~{TAG_MAX_CHARS} 个字,不能全是数字")
+        if full:
+            lines.append(f"⚠️ 每人最多 {TAGS_MAX_PER_USER} 个标签,这些没加上:{_tags_html(full)}"
+                         f"(先 /untag 去掉不要的)")
+        lines.append(f"现在:{_tags_html(cur)}" if cur else "现在:没有标签")
+        return "\n".join(lines)
+
+    def _cmd_untag(self, arg: str) -> str:
+        """/untag <handle> [标签…] —— 去掉这几个标签;不写标签 = 全部清空"""
+        parts = (arg or "").split()
+        if not parts:
+            return "用法:/untag &lt;handle&gt; [标签…] —— 不写标签就全部清空"
+        with store.get_conn() as conn:
+            row = store.find_active_watch_user(conn, parts[0])
+            if row is None:
+                return f"❓ 名单里没有 {_esc(store.clean_handle(parts[0]))}"
+            who = _esc(row["display_name"] or row["handle"])
+            cur = list(_row_tags(row))
+            if not cur:
+                return f"ℹ️ {who} 本来就没有标签"
+            if len(parts) == 1:
+                store.set_watch_tags(conn, row["user_id"], ())
+                return f"🏷 已清空 {who} 的标签(原来是 {_tags_html(cur)})"
+            drop = {p.lstrip("#").casefold() for p in parts[1:]}
+            keep = [t for t in cur if t.casefold() not in drop]
+            gone = [t for t in cur if t.casefold() in drop]
+            if not gone:
+                return f"ℹ️ {who} 没有这些标签。现在:{_tags_html(cur)}"
+            store.set_watch_tags(conn, row["user_id"], keep)
+        return (f"🏷 已去掉 {who} 的 {_tags_html(gone)}\n"
+                f"现在:{_tags_html(keep) if keep else '没有标签'}")
+
+    def _tag_overview(self) -> str:
+        """/tag 不带参数:按标签分组列出谁打了什么。人多的标签排前面。"""
+        with store.get_conn() as conn:
+            rows = [r for r in store.list_active_users(conn) if _row_tags(r)]
+        if not rows:
+            return "🏷 还没有人打过标签。用法:/tag &lt;handle&gt; 底部选手 盈利10w"
+        by_tag: dict[str, list[str]] = {}
+        for r in rows:
+            name = r["display_name"] or r["handle"]
+            for t in _row_tags(r):
+                by_tag.setdefault(t, []).append(name)
+        lines = [f"🏷 <b>标签</b>({len(rows)} 人 · {len(by_tag)} 个标签)"]
+        for t, names in sorted(by_tag.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            shown = "、".join(_esc(n) for n in names[:MAX_TAG_OVERVIEW_NAMES])
+            more = f" 等 {len(names)} 人" if len(names) > MAX_TAG_OVERVIEW_NAMES else ""
+            lines.append(f"{_tags_html([t])} · {shown}{more}")
         return "\n".join(lines)
 
     def _cmd_status(self) -> str:
@@ -2506,6 +2612,25 @@ def _ca_assemble(head: list[str], rows: list[dict], tail: list[str], anchor: str
 # ============================================================
 # /chips 辅助(纯函数 + 两条只读 SELECT)
 # ============================================================
+def _row_tags(row) -> tuple[str, ...]:
+    """库里一行 watch_users 的标签(已过 nameguard.safe_tags)。列不存在 / 解析不出来都当没有。"""
+    try:
+        raw = row["tags"]
+    except (IndexError, KeyError):
+        return ()
+    if not raw:
+        return ()
+    try:
+        return safe_tags(json.loads(raw))
+    except (TypeError, ValueError):
+        return ()
+
+
+def _tags_html(tags) -> str:
+    """标签 → `#底部选手 #盈利10w`(已转义)。与推送标题同一种写法,点一下能在 TG 里按话题筛。"""
+    return " ".join(f"#{_esc(t)}" for t in safe_tags(tags))
+
+
 def _chips_int(v) -> int | None:
     """转 int,转不出来返回 None。⚠️ 绝不退化成 0 —— 0 是「真的一个持有人都没有」这个真实值"""
     n = _f(v)

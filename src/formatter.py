@@ -58,6 +58,7 @@ from src.nameguard import (
     safe_ident,
     safe_launchpad,
     safe_social_links,
+    safe_tags,
     safe_username,
 )
 from src.nameguard import strip_controls_keep_emoji as _no_controls
@@ -293,6 +294,10 @@ UNTRUSTED_FIELDS = {
     #    与 pump_username 同一个威胁模型、同一道门:本人可改,而那一行长得像一条记录。
     #    🏅 盈利榜那一行的 handle 也是走 safe_username(在 safe_board_rows 里)。
     "fomo_handle": safe_username,
+    # ⚠️ 用户标签(/tag)。只有管理员自己能写,但落库之后一样按不可信对待
+    #    (库可能被手改、老数据可能按别的规则写进去)—— 渲染入口统一再过一次同一道门。
+    #    结构化字段:收一个序列、还一个元组(与 board_holders / safe_board_rows 同路数)。
+    "tags": safe_tags,
     # ⚠️⚠️ 🏅 那一块的**行**:((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。
     #    它是**结构化**字段,所以门禁函数收整体、返回同形结构(与 token_socials /
     #    safe_social_links 同一套路数),而不是一个字符串进一个字符串出。
@@ -786,14 +791,28 @@ def _title_anchor(ev: FomoEvent) -> tuple[str, str]:
     return EMOJI_ADD, LABEL_ADD
 
 
-def _title_line(ev: FomoEvent, starred: bool = False, token_name=None) -> str:
+def _tags_suffix(tags) -> str:
+    """
+    标题里名字后面的 ` #底部选手 #盈利10w`;没有标签返回空串(标题逐字节不变)。
+
+    ⚠️ 写成 #话题 是用户选的(2026-09-26):Telegram 会把它变成可点击的话题,
+       点一下就能筛出同一个标签的所有推送。形状规则(只许字母数字下划线)就是为这个定的。
+    ⚠️ 放在名字/@handle **之后**、「首次建仓」之前:行首 emoji 是列表预览的扫描锚点,
+       标签绝不能顶到前面去(与 ⭐ 同一条铁律)。
+    """
+    tags = safe_tags(tags)
+    return (" " + " ".join(f"#{_esc(t)}" for t in tags)) if tags else ""
+
+
+def _title_line(ev: FomoEvent, starred: bool = False, token_name=None, tags=None) -> str:
     emoji, label = _title_anchor(ev)
     # ⚠️ 星标只能放在**事件 emoji 之后**,绝不能顶到行首(铁律 1):
     #    行首那个字符是聊天列表预览里唯一的扫描锚点。被 ⭐ 顶掉之后,
     #    所有特别关注的消息在列表预览里长得一模一样,买入卖出当场分不出来。
     mark = f"{STAR_MARK} " if starred else ""
     # 只给展示名加粗:@handle 是辅助信息,一起加粗会把行首锚点的视觉重量冲散
-    parts = [f"{emoji} {mark}<b>{_display_name(ev)}</b>{_handle_suffix(ev)}", label]
+    parts = [f"{emoji} {mark}<b>{_display_name(ev)}</b>{_handle_suffix(ev)}{_tags_suffix(tags)}",
+             label]
     sym = _symbol_plain(ev)
     if sym is not None:
         parts.append(_style_symbol(sym, starred))
@@ -1484,6 +1503,7 @@ def render(
     token_socials=None,
     board_holders=None,
     board_scope=None,
+    tags=None,
 ) -> str:
     """
     渲染一条 Telegram HTML 消息。
@@ -1511,6 +1531,7 @@ def render(
                          board_holders 是 ((排名, handle, 数量, 粉丝, 全平台24h盈亏), …),
                          board_scope 是 (命中数, 比对了前几名, 总数, 是否精确, 榜单行数)。
                          ⚠️ 零命中时调用方**根本不传这两个键** → 整块不出现,绝不打「0 人」。
+        tags             这个人的用户标签(/tag)→ 标题里名字后面的 #话题。**纯展示**
         ⚠️ 上面这几个**各自独立**:任一拿不到只掉那一行/那一块,不影响其余,
            更不影响整条推送。
 
@@ -1522,7 +1543,7 @@ def render(
                        pool_quote_symbol, pool_quote_name,
                        token_name, token_name_zh, stock_company_zh, stock_exchange,
                        launchpad, token_holders, token_socials,
-                       board_holders, board_scope)
+                       board_holders, board_scope, tags)
     except Exception as e:  # noqa: BLE001
         # 走到这里一定是本模块的 bug(所有字段级异常都已在下游吃掉),必须留痕
         logger.exception("消息渲染失败,降级为最简文本 | event_id={} | {}", getattr(ev, "event_id", "?"), e)
@@ -1547,10 +1568,11 @@ def _render(
     token_socials=None,
     board_holders=None,
     board_scope=None,
+    tags=None,
 ) -> str:
     # 行序固定,缺失的行整行消失。这个顺序逐条对齐设计文档 §10.2 的七个场景
     candidates = [
-        _title_line(ev, starred, token_name),
+        _title_line(ev, starred, token_name, tags),
         _token_zh_line(token_name, token_name_zh),   # 📝 中文名紧跟标题
         _thesis_line(ev),
         _amount_line(ev),
@@ -2104,7 +2126,8 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
                              token_holders: int | None = None,
                              token_socials=None,
                              board_holders=None,
-                             board_scope=None) -> str:
+                             board_scope=None,
+                             tags=None) -> str:
     """
     被 /tin 点名的人**收到**了一笔币 —— 逐条推送。
 
@@ -2133,6 +2156,7 @@ def render_transfer_in_watch(ev: FomoEvent, *, starred: bool = False,
     # @handle 与展示名相同时不重复显示(有人没设展示名,handle 会被当展示名用)
     if h and h.lower() != name.lower():
         head += f" (@{_clip(h, _SIG_HANDLE_CHARS)})"
+    head += _tags_suffix(tags)            # 与买卖推送同一个位置、同一种写法
     parts = [head, label]
     sym = _symbol_plain(ev)
     if sym is not None:

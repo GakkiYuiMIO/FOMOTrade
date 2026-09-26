@@ -2255,6 +2255,12 @@ class Poller:
         except Exception as e:  # noqa: BLE001
             logger.warning("特别关注名单读取失败,本轮不打星标 | {}", e)
             starred = set()
+        # 用户标签(/tag):与星标同一个性质,纯展示,查不出来就当没有
+        try:
+            tags_by_user = store.watch_tags(conn)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("用户标签读取失败,本轮不显示标签 | {}", e)
+            tags_by_user = {}
         pool_quotes = self._pool_quotes(pending)
         # 发射台/持有人:整轮**一个批次**(跨链混批)。见 _token_extra_map。
         with suppress(Exception):
@@ -2319,7 +2325,8 @@ class Poller:
                                              token_holders=names.get("token_holders"),
                                              token_socials=names.get("token_socials"),
                                              board_holders=names.get("board_holders"),
-                                             board_scope=names.get("board_scope"))
+                                             board_scope=names.get("board_scope"),
+                                             tags=tags_by_user.get(ev.user_id))
                     if is_transfer_in else
                     render(
                         ev,
@@ -2328,6 +2335,7 @@ class Poller:
                         holders=holders,
                         baseline_pending=baseline_pending,
                         starred=ev.user_id in starred,
+                        tags=tags_by_user.get(ev.user_id),
                         pool_quote_symbol=None if pq is None else pq.symbol,
                         # ⚠️ pool_quote_name 在 names 里(Yahoo 的 longName 优先),
                         #    别在这里再传一份 —— 重复关键字会当场 TypeError。

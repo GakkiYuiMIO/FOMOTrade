@@ -91,6 +91,8 @@ _EXPECT_UNTRUSTED = {
     # /chips 前 10 名持有人那一行的 FOMO 用户名:与 pump_username 同一个威胁模型、同一道门。
     #    换成 safe_ident(允许空格,一句话能穿过去)或 safe_display(丢带 `_` 的真实名字)这条当场红。
     "fomo_handle": "safe_username",
+    # 用户标签(/tag):管理员写的,但落库之后按不可信对待,渲染入口统一过 safe_tags。
+    "tags": "safe_tags",
     # ⚠️⚠️ 本轮新增:🏅 盈利榜持有人那一块的**行**
     #    ((排名, handle, 持仓数量, 粉丝数, 全平台24h盈亏), …)。它是**结构化**字段,
     #    门禁收整体、返回同形结构(与 token_socials / safe_social_links 同一套路数)。
