@@ -49,6 +49,9 @@ _FALLBACK_TTL_SEC = 900
 
 LOGIN_TIMEOUT_SEC = 300
 _LOGIN_POLL_SEC = 2.0
+# --login 只收**至少还剩这么久**的 access token。与续期余量同一个数:剩得更少的,
+# --run 一启动就要续期,而续期靠的 refresh token 很可能就是跟着它一起放旧了的那个。
+_LOGIN_MIN_REMAINING_SEC = REFRESH_MARGIN_SEC
 
 # ============================================================
 # 反自动化检测(给 Google / X 这类第三方登录用)
@@ -356,6 +359,19 @@ def _unquote(v) -> str | None:
     return s or None
 
 
+def _login_token_fresh(access: str, now: float | None = None) -> bool:
+    """
+    --login 抓到的 access token 能不能收:至少还剩 _LOGIN_MIN_REMAINING_SEC 才算。
+
+    ⚠️ 解不出 exp 的照收(与 save_session 的保守 TTL 同一个口径)—— 判不了就不拦,
+       拦了反而让一个格式稍有不同的新令牌永远登录不上。
+    """
+    exp = decode_jwt_exp(access)
+    if exp is None:
+        return True
+    return exp - (time.time() if now is None else now) > _LOGIN_MIN_REMAINING_SEC
+
+
 def _looks_like_jwt(v: str | None) -> bool:
     """三段式且够长才算 —— 避免把 'true' / 'null' 这类占位值当成 token 存下来"""
     return bool(v) and v.count(".") == 2 and len(v) > 60
@@ -509,6 +525,7 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
     deadline = time.time() + timeout_sec
     access = refresh = None
     source = "none"
+    stale_seen: str | None = None      # 已经提示过的那份旧令牌,同一份不重复刷日志
 
     with sync_playwright() as p:
         try:
@@ -540,8 +557,20 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
             access, refresh, source = _extract_tokens(context)
             # access 必须像 JWT 才算数:登录中途 Privy 可能先写一个空壳值
             if _looks_like_jwt(access):
-                logger.info("已检测到登录态 | 来源={} access={}", source, mask(access))
-                break
+                if _login_token_fresh(access):
+                    logger.info("已检测到登录态 | 来源={} access={}", source, mask(access))
+                    break
+                # ⚠️⚠️ 2026-10-07 实测:登录浏览器用的是**常驻**配置目录,localStorage 里留着上一次
+                #    登录的令牌。页面一打开就读得到它,旧写法当场收下、关窗、存盘 —— 用户还没来得及
+                #    动手,存进去的 access 两个半小时前就过期了,配套的 refresh token 也早被机器人
+                #    续期时换掉(Privy 的 refresh token 用一次换一次),--run 一续期就 401、轮询停摆。
+                #    所以:过期 / 快过期的一律不收,等页面里的 Privy 自己续期,或者等用户重新登录。
+                if access != stale_seen:
+                    stale_seen = access
+                    exp = decode_jwt_exp(access)
+                    logger.info("浏览器里留着一份旧登录态(过期于 {}),不能用 —— 等页面自动续期,"
+                                "或者请在窗口里重新登录一次",
+                                time.strftime("%m-%d %H:%M:%S", time.localtime(exp)) if exp else "未知")
             access = None
             time.sleep(_LOGIN_POLL_SEC)
 
