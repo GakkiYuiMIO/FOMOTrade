@@ -389,6 +389,10 @@ cp .env.example .env        # 然后用编辑器填写 Token 和 chat_id
 
 如果提示被 Cloudflare 拦截，在 `.env` 里改成 `FOMO_CLIENT_IMPL=playwright` 再试。需要代理的话填写 `FOMO_PROXY`。
 
+**收到「pump.fun 连不上了」**
+
+某个 pump.fun 域名连续 10 分钟连不上（日志里是 `SSL_ERROR_SYSCALL` / 超时一类的报错），pump.fun 的推送会暂停。多半是代理节点连不上这个域名，在代理软件里换个节点即可，不用重启程序。连上后会再推一条「已恢复」，中断期间的成交和观点会在补推窗口（`FOMO_PUMP_TRADE_MAX_AGE_SEC` / `FOMO_PUMP_CALLOUT_MAX_AGE_SEC`）内补推。
+
 **怎么更新到最新版本？**
 
 ```powershell

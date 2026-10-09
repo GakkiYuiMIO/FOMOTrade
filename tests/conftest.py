@@ -94,6 +94,10 @@ def _no_tokeninfo_network(monkeypatch):
 
     monkeypatch.setattr(_pf._GATE, "_next_at", 0.0, raising=False)
     monkeypatch.setattr(_pf._GATE, "_sleep", lambda _s: None, raising=False)
+    # ⚠️ pump.fun 的连通性记录(_HEALTH)同样是进程级单例:不少用例故意塞「抛异常的会话」,
+    #    会在里面记下连不上;每条用例换一份新的,免得一条用例的「断网」漏到下一条,
+    #    让后面某条巡检用例平白多收一条「pump.fun 连不上了」。
+    monkeypatch.setattr(_pf, "_HEALTH", _pf.PumpHealth())
     yield
 
 

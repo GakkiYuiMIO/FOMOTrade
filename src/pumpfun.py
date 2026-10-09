@@ -56,7 +56,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from loguru import logger
 
@@ -230,6 +230,193 @@ class PumpRateGate:
 # 进程级的那一把。⚠️ 测试要换掉它就注入自己的 gate(PumpClient(gate=...)),
 #    或者 monkeypatch 这个名字 —— 但**生产代码里绝不能有第二个实例**。
 _GATE = PumpRateGate()
+
+
+# ============================================================
+# 连通性提醒(用户 2026-10-09 要的):pump.fun 连续连不上 10 分钟 → TG 推一条,恢复后再推一条
+# ============================================================
+# 事故背景:代理节点连不上 frontend-api-v3.pump.fun(TLS 握手 5 秒后被掐断),pump.fun 的买卖与
+# 观点推送整整停了几个小时,用户是翻日志才发现的 —— 日志里每 5 秒一条 WARNING,TG 里一个字都没有。
+PUMP_OUTAGE_ALERT_SEC = 600
+# 10 分钟里至少失败几次才算「持续连不上」:只试过一两次的,说明不了是网络断了还是刚好赶上一下抖动
+PUMP_OUTAGE_MIN_FAILS = 3
+
+# 各域名连不上时停掉的是哪些推送(写进提醒里,让人一眼知道丢了什么)
+_HOST_IMPACT = {
+    "frontend-api-v3.pump.fun": "pump.fun 的买卖推送和观点推送都停了(查持仓、拉观点都要经过它)",
+    "swap-api.pump.fun": "pump.fun 的买卖推送停了(查逐笔成交要经过它);观点推送不受影响",
+}
+
+
+def _classify_net_error(e) -> str:
+    """网络层报错 → 一句人话。⚠️ 不把原始报错塞进 TG(里面有 URL 和 libcurl 的长串,还可能有 <)"""
+    s = str(e)
+    if "SSL_connect" in s or "SSL_ERROR" in s:
+        return "SSL 握手被掐断"
+    if "timed out" in s.lower() or "(28)" in s:
+        return "连接超时"
+    if "resolve" in s.lower() or "(6)" in s:
+        return "域名解析失败"
+    if "refused" in s.lower() or "(7)" in s:
+        return "连接被拒"
+    return "网络错误"
+
+
+class PumpHealth:
+    """
+    pump.fun 各域名「连不连得上」。**进程级单例**(买卖巡检、观点巡检、/chips 共用一份)。
+
+    口径:
+      · 只有**网络层失败**(请求抛异常:握手被掐断 / 超时 / 解析失败)算失败;
+        只要拿到了响应 —— 哪怕是 429 / 404 / 5xx —— 就说明连得上,当场清零。
+        (callout/list 天天 429,那是限流不是断网,不能把它当成连不上。)
+      · 某个域名从第一次失败起**持续** PUMP_OUTAGE_ALERT_SEC 秒、且失败不少于 PUMP_OUTAGE_MIN_FAILS 次
+        → 推一条「连不上了」;之后第一次连上 → 推一条「恢复了」。一次中断各推一次。
+      · 「连不上了」那条**没发出去**(TG 挂了)就不算提醒过:下一轮重发;它没发出去时恢复了,
+        也就不推「恢复了」(用户压根不知道断过,突然说恢复只会让人困惑)。
+    ⚠️⚠️ 两个巡检任务跑在不同线程、会同时检查:提醒先**认领**(claim)再发,发完回报(done)——
+       否则两边同时看到「该提醒了」,同一条提醒会推两遍。
+    """
+
+    def __init__(self, clock=time.time) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._hosts: dict[str, dict] = {}
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return (urlsplit(url).hostname or "").lower() or "pump.fun"
+        except Exception:  # noqa: BLE001
+            return "pump.fun"
+
+    def _st(self, host: str) -> dict:
+        return self._hosts.setdefault(host, {"down_since": None, "fails": 0, "err": "",
+                                             "alerted": False, "recovered": None, "busy": set(),
+                                             "ok_while_sending": None})
+
+    def ok(self, url: str) -> None:
+        with self._lock:
+            st = self._hosts.get(self._host(url))
+            if st is None or st["down_since"] is None:
+                return
+            now = self._clock()
+            if st["alerted"]:
+                st["recovered"] = (st["down_since"], now)
+            elif "down" in st["busy"]:
+                # 「连不上了」正在发、还不知道发没发出去 —— 先记下,done 时再定要不要推「恢复了」
+                st["ok_while_sending"] = (st["down_since"], now)
+            st.update(down_since=None, fails=0, err="", alerted=False)
+
+    def fail(self, url: str, err) -> None:
+        with self._lock:
+            st = self._st(self._host(url))
+            if st["down_since"] is None:
+                st["down_since"] = self._clock()
+            st["fails"] += 1
+            st["err"] = _classify_net_error(err)
+
+    def claim(self) -> list[tuple[str, str, str]]:
+        """该发的提醒 [(域名, "down"|"up", 文案)]。认领之后别的线程就看不到它了,直到 done 回报。"""
+        out: list[tuple[str, str, str]] = []
+        with self._lock:
+            now = self._clock()
+            for host, st in self._hosts.items():
+                # 「恢复了」排在前面:上一次中断的恢复,先于(可能紧接着的)下一次中断
+                if st["recovered"] is not None and "up" not in st["busy"]:
+                    st["busy"].add("up")
+                    out.append((host, "up", _recovered_text(host, *st["recovered"])))
+                if (st["down_since"] is not None and not st["alerted"] and "down" not in st["busy"]
+                        and now - st["down_since"] >= PUMP_OUTAGE_ALERT_SEC
+                        and st["fails"] >= PUMP_OUTAGE_MIN_FAILS):
+                    st["busy"].add("down")
+                    out.append((host, "down", _outage_text(host, st, now)))
+        return out
+
+    def done(self, host: str, kind: str, sent: bool) -> None:
+        """回报认领的那条发没发出去。没发出去就放回去,下一轮再认领。"""
+        with self._lock:
+            st = self._hosts.get(host)
+            if st is None:
+                return
+            st["busy"].discard(kind)
+            if kind == "up":
+                if sent:
+                    st["recovered"] = None
+                return
+            healed, st["ok_while_sending"] = st["ok_while_sending"], None
+            if not sent:
+                return
+            if healed is not None:
+                # 发的那会儿已经连上了:「连不上了」既然发出去了,「恢复了」也得跟上
+                st["recovered"] = healed
+            elif st["down_since"] is not None:
+                st["alerted"] = True
+
+
+def _fmt_minutes(sec: float) -> str:
+    m = max(1, int(round(sec / 60)))
+    return f"{m} 分钟" if m < 120 else f"{m / 60:.1f}".rstrip("0").rstrip(".") + " 小时"
+
+
+def _backfill_windows() -> tuple[int, int, str]:
+    """
+    (成交补推窗口, 观点补推窗口, 「X 内的成交和观点」)。
+    ⚠️ 跟着配置走(FOMO_PUMP_TRADE_MAX_AGE_SEC / FOMO_PUMP_CALLOUT_MAX_AGE_SEC),不写死 2 小时 ——
+       配置改了,提醒里说的补推范围也得跟着对。
+    """
+    s = get_settings()
+    t, c = s.fomo_pump_trade_max_age_sec, s.fomo_pump_callout_max_age_sec
+    what = (f"{_fmt_minutes(t)}内的成交和观点" if t == c
+            else f"{_fmt_minutes(t)}内的成交、{_fmt_minutes(c)}内的观点")
+    return t, c, what
+
+
+def _outage_text(host: str, st: dict, now: float) -> str:
+    impact = _HOST_IMPACT.get(host, "pump.fun 的相关推送可能都停了")
+    _, _, what = _backfill_windows()
+    return (f"⚠️ <b>pump.fun 连不上了</b>(已持续 {_fmt_minutes(now - st['down_since'])})\n"
+            f"域名:{host} · {st['err']}(连续 {st['fails']} 次)\n"
+            f"影响:{impact}\n"
+            "多半是代理节点连不上这个域名 —— 在代理软件里换个节点就行,换好后自动恢复,不用重启。\n"
+            f"恢复后会补推最近 {what},更早的不补。")
+
+
+def _recovered_text(host: str, down_since: float, up_at: float) -> str:
+    gap = up_at - down_since
+    t, c, what = _backfill_windows()
+    tail = ("中断期间的成交和观点会陆续补推。" if gap < min(t, c)
+            else f"中断时间较长:只补推最近 {what},更早的不补了。")
+    return f"✅ <b>pump.fun 已恢复连接</b>({host} · 中断约 {_fmt_minutes(gap)})\n{tail}"
+
+
+_HEALTH = PumpHealth()
+
+
+def _announce_health(notifier, health: PumpHealth | None) -> None:
+    """
+    巡检每轮结束时调一次:有该发的连通性提醒就发。⚠️ 绝不抛 —— 提醒发不出去不能连累巡检。
+    health 不是 PumpHealth(测试里的假 client 没这个属性)就什么都不做,不去碰进程级单例。
+    """
+    if not isinstance(health, PumpHealth):
+        return
+    h = health
+    try:
+        items = h.claim()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pump.fun 连通性检查异常(不影响巡检): {}", e)
+        return
+    for host, kind, text in items:
+        sent = False
+        try:
+            sent = bool(notifier is not None and notifier.send(text))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pump.fun 连通性提醒发送失败(下一轮重试): {}", e)
+        finally:
+            h.done(host, kind, sent)
+        if sent:
+            logger.info("已推送 pump.fun 连通性提醒 | {} | {}", host, "连不上" if kind == "down" else "已恢复")
+
 
 # /users/{key} 里 key 的合法字符集 —— **它来自 Telegram 消息,是不可信输入**。
 # 覆盖三种真实形态:pump 用户名(hexiecs / 1000XCryptoD / brc20_niubi)、
@@ -853,7 +1040,8 @@ class PumpClient:
        共用一个是概率性的崩溃/串包(与 client.HttpFomoClient 同一条理由)。
     """
 
-    def __init__(self, proxy: str | None = None, gate: PumpRateGate | None = None) -> None:
+    def __init__(self, proxy: str | None = None, gate: PumpRateGate | None = None,
+                 health: PumpHealth | None = None) -> None:
         s = get_settings()
         self._proxy = s.fomo_proxy if proxy is None else proxy
         self._tl = threading.local()
@@ -861,6 +1049,8 @@ class PumpClient:
         #    命令侧的 client 与推送监控的 client 必须是同一把,否则闸形同虚设。
         #    gate 参数只给测试注入用,生产代码一律不传。
         self._gate = _GATE if gate is None else gate
+        # 连通性记录:每次请求连没连上都记一笔(见 PumpHealth)。默认进程级单例
+        self.health = _HEALTH if health is None else health
 
     def _session(self):
         sess = getattr(self._tl, "session", None)
@@ -911,7 +1101,10 @@ class PumpClient:
         except Exception as e:  # noqa: BLE001
             logger.warning("pump.fun {} 请求失败(下一轮重试): {}", tag, e)
             self.close()          # 连接可能已经废了,整池丢弃重建
+            self.health.fail(url, e)
             return None
+        # ⚠️ 拿到响应就算连得上 —— 哪怕是 429 / 404 / 5xx(见 PumpHealth 的口径)
+        self.health.ok(url)
         self._check_rate(tag, dict(resp.headers or {}))
         # ⚠️ 必须收整个 2xx,不能只认 200:trades/batch 是 **201 Created**(实测)。
         #    只认 200 的话逐笔成交这一路永远拿不到数据,而且不报错。
@@ -1158,6 +1351,9 @@ class PumpWatcher:
         except Exception as e:  # noqa: BLE001
             logger.exception("pump.fun 巡检异常,下一轮继续: {}", e)
             return 0
+        finally:
+            # 这一轮的请求连没连上都记过了,有该发的连通性提醒就发(见 PumpHealth)
+            _announce_health(self._notifier, getattr(self._client, "health", None))
 
     def close(self) -> None:
         """退出时释放连接池。⚠️ 同样不抛 —— 它跑在 cmd_run 的 finally 里。"""
@@ -1920,6 +2116,8 @@ class PumpCalloutWatcher:
         except Exception as e:  # noqa: BLE001
             logger.exception("pump.fun 观点巡检异常,下一轮继续: {}", e)
             return 0
+        finally:
+            _announce_health(self._notifier, getattr(self._client, "health", None))
 
     def close(self) -> None:
         """退出时释放连接池。⚠️ 同样不抛 —— 它跑在 cmd_run 的 finally 里。"""
