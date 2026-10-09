@@ -67,11 +67,11 @@ def login(monkeypatch):
 
         def extract(ctx):
             a = seq.pop(0) if len(seq) > 1 else seq[0]
-            return a, "refresh-" + a[-6:], "localStorage"
+            return a, "refresh-" + a[-6:], "localStorage", None
         monkeypatch.setattr(auth, "_extract_tokens", extract)
         saved: list = []
         monkeypatch.setattr(auth, "save_session",
-                            lambda a, r, source: saved.append((a, r, source)))
+                            lambda a, r, source, **kw: saved.append((a, r, source)))
         logs: list[str] = []
         hid = logger.add(lambda m: logs.append(m.record["message"]), level="INFO")
         try:

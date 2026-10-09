@@ -18,10 +18,10 @@ import base64
 import json
 import threading
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import httpx
 from loguru import logger
 
 from src.config import PROFILE_DIR, SESSION_FILE, get_settings, mask
@@ -33,6 +33,23 @@ from src.models import pick
 PRIVY_APP_ID = "cm6h485o300n3zj9yl6vpedq7"
 PRIVY_CLIENT_ID = "client-WY5gFSayQjxnQhG4rP6SnwPAyPZWZpNRhJ6b9rzMnYwqH"
 PRIVY_SESSIONS_URL = "https://auth.privy.io/api/v1/sessions"
+
+# ============ Privy「自定义域名 + HttpOnly Cookie」模式(FOMO 约 2026-10-08 起启用)============
+# 2026-10-09 实测(逆向 fomo.family 前端里的 Privy SDK + 公开应用配置 + 登录浏览器的 Cookie 库):
+#   · 应用配置 GET auth.privy.io/api/v1/apps/<appId> 里多了 custom_api_url = https://privy.fomo.family;
+#     SDK 一看到它就把认证请求的基础地址换过去,并切到服务端 Cookie 模式(useServerCookies)。
+#   · 真续期令牌是 `.privy.fomo.family` 域下的 HttpOnly Cookie `privy-refresh-token`(30 天),
+#     localStorage 的 privy:refresh_token 和续期响应 JSON 里的 refresh_token **只剩字面量 "deprecated"**。
+#   · SDK 的续期请求原样是:POST {custom_api_url}/api/v1/sessions,body {"refresh_token":"deprecated"},
+#     Authorization: Bearer <access>,credentials:"include"(浏览器自动带上那个 HttpOnly Cookie);
+#     新的续期令牌从响应的 Set-Cookie 里回来。
+# ⚠️⚠️ 旧写法把 "deprecated" 当真令牌存了(它不是空值)—— 10-08 18:58 那次续期成功后存下的就是它,
+#    一小时后再拿它续期 401、轮询停摆;用户重新 --login 也一样(localStorage 里也是它)。
+REFRESH_SENTINEL = "deprecated"
+PRIVY_REFRESH_COOKIE = "privy-refresh-token"
+# Cookie 模式的认证地址兜底值。正常情况下登录时从那个 Cookie 的域名推出来(见 _extract_tokens)。
+PRIVY_COOKIE_API_FALLBACK = "https://privy.fomo.family"
+_SESSIONS_PATH = "/api/v1/sessions"
 
 FOMO_ORIGIN = "https://fomo.family"
 
@@ -158,6 +175,8 @@ def save_session(
     *,
     source: str,
     path: Path | None = None,
+    refresh_via: str | None = None,
+    api_base: str | None = None,
 ) -> dict:
     """
     写登录态文件。expires_at 从 JWT 解,解不出用保守 TTL。
@@ -166,6 +185,9 @@ def save_session(
     """
     p = Path(path) if path else SESSION_FILE
     exp = decode_jwt_exp(access_token) or (time.time() + _FALLBACK_TTL_SEC)
+    # ⚠️ 占位符 "deprecated" 永远不落盘(见 REFRESH_SENTINEL);存 None 至少让下一步报的是
+    #    「请重新 --login」,而不是一小时后拿它去续期 401。
+    refresh_token = _real_refresh(refresh_token)
     data = {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -173,6 +195,11 @@ def save_session(
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "source": source,
     }
+    # Cookie 模式才写这两个键;老会话文件没有它们 = 老模式(向后兼容)
+    if refresh_token and refresh_via == "cookie":
+        data["refresh_via"] = "cookie"
+        if api_base:
+            data["api_base"] = api_base
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info(
@@ -202,6 +229,8 @@ class TokenProvider:
         self._access: str | None = None
         self._refresh: str | None = None
         self._expires_at: float = 0.0
+        self._refresh_via: str | None = None     # "cookie" = Privy Cookie 模式;None = 老模式
+        self._api_base: str | None = None        # Cookie 模式的认证地址
 
     # ---------- 内部 ----------
     def _ensure_loaded(self) -> None:
@@ -209,7 +238,10 @@ class TokenProvider:
             return
         data = load_session(self._path) or {}
         self._access = data.get("access_token")
-        self._refresh = data.get("refresh_token")
+        # ⚠️ 老会话文件里可能存着占位符(10-08 之后的那几份)—— 读进来就当没有
+        self._refresh = _real_refresh(data.get("refresh_token"))
+        self._refresh_via = data.get("refresh_via") if self._refresh else None
+        self._api_base = data.get("api_base") if self._refresh_via == "cookie" else None
         exp = data.get("expires_at")
         try:
             self._expires_at = float(exp) if exp else (decode_jwt_exp(self._access) or 0.0)
@@ -223,10 +255,11 @@ class TokenProvider:
         """
         用 refresh token 换一对新 token。
 
-        ⚠️ TODO(probe #14): 这个接口的请求/响应形状**完全没实测过** ——
-           请求体字段名、响应里 access/refresh 的字段名、过期表现(401 还是 403)都是推测。
-           因此续期失败时**必须把完整响应体打进日志**,否则用户第一次跑起来只会看到
-           「续期失败」四个字,无从下手。日志会自动脱敏长字符串。
+        ⚠️ 2026-10-09 实测(Cookie 模式):POST https://privy.fomo.family/api/v1/sessions,
+           正文 {"refresh_token":"deprecated"} + Cookie privy-refresh-token + Bearer 旧 access
+           → 200,正文里 token 是新 access、refresh_token 仍是占位符,新续期令牌在 Set-Cookie 里
+           (连续两次续期都换了新的;新 access 能正常请求 FOMO 接口)。老模式只在 10-08 之前实测过。
+           续期失败时**仍然把完整响应体打进日志** —— 上游再改一次,那是唯一的诊断线索。日志会自动脱敏。
         """
         settings = get_settings()
         headers = {
@@ -245,10 +278,21 @@ class TokenProvider:
         #    而前一小时一切正常,很容易被误认为"跑着跑着自己挂了"。
         if self._access:
             headers["Authorization"] = f"Bearer {self._access}"
-        logger.info("access token 即将过期,发起续期 | refresh={}", mask(self._refresh))
+        # 两种模式(见 REFRESH_SENTINEL 上面那段):
+        #   Cookie 模式 —— 发到自定义认证域名,body 照 SDK 写占位符,真令牌放在 Cookie 里;
+        #   老模式     —— 发到 auth.privy.io,真令牌放在 body 里(兼容 10-08 之前存下的会话)。
+        cookie_mode = self._refresh_via == "cookie"
+        if cookie_mode:
+            url = (self._api_base or PRIVY_COOKIE_API_FALLBACK) + _SESSIONS_PATH
+            body = {"refresh_token": REFRESH_SENTINEL}
+            cookies = {PRIVY_REFRESH_COOKIE: self._refresh}
+        else:
+            url, body, cookies = PRIVY_SESSIONS_URL, {"refresh_token": self._refresh}, None
+        logger.info("access token 即将过期,发起续期 | 模式={} refresh={}",
+                    "cookie" if cookie_mode else "body", mask(self._refresh))
         try:
-            with httpx.Client(timeout=20.0, proxy=settings.fomo_proxy) as c:
-                resp = c.post(PRIVY_SESSIONS_URL, json={"refresh_token": self._refresh}, headers=headers)
+            resp = _post_session(url, headers=headers, body=body, cookies=cookies,
+                                 proxy=settings.fomo_proxy)
         except Exception as e:  # noqa: BLE001
             # ⚠️ 网络层失败**绝不能**当成"登录态失效"。
             #    代理抖一下、DNS 超时、Privy 502 —— 这些和"你被登出了"是两回事,
@@ -268,23 +312,41 @@ class TokenProvider:
             raise AuthError(f"Privy 续期失败 HTTP {resp.status_code},请重新执行 --login")
 
         try:
-            data = resp.json()
+            data = json.loads(resp.text or "null")
+            if not isinstance(data, dict):
+                raise ValueError(f"不是 JSON 对象: {type(data).__name__}")
         except Exception as e:  # noqa: BLE001
             logger.error("Privy 续期响应不是 JSON | body={}", (resp.text or "")[:2000])
             raise AuthError("Privy 续期响应无法解析") from e
 
         # 字段名未实测,多键兜底(models.pick 的用途就是这个)
         access = pick(data, "token", "access_token", "accessToken", "privy_access_token")
-        refresh = pick(data, "refresh_token", "refreshToken", "privy_refresh_token")
         if not access:
             logger.error("Privy 续期响应里找不到 access token | body={}", (resp.text or "")[:2000])
             raise AuthError("Privy 续期响应缺少 access token,字段名可能已变(见上面的完整 body)")
 
+        # 新的续期令牌:先看正文(老模式),正文里是占位符就看 Set-Cookie(Cookie 模式)。
+        # ⚠️⚠️ 正文里的 "deprecated" 绝不能当真令牌存下来 —— 那正是 10-08 那次事故。
+        body_refresh = _real_refresh(pick(data, "refresh_token", "refreshToken", "privy_refresh_token"))
+        set_ck = next(((v, d) for n, v, d in resp.cookies
+                       if n == PRIVY_REFRESH_COOKIE and _real_refresh(v)), None)
+        if body_refresh:
+            self._refresh, self._refresh_via, self._api_base = body_refresh, None, None
+        elif set_ck:
+            # 老模式发过去、响应却给的是 Cookie(10-08 那次就是这个过渡):从此切到 Cookie 模式,
+            # 认证地址跟着 Cookie 的域名走 —— 下次得把它发回给发它的那个域名。
+            self._refresh, self._refresh_via = set_ck[0], "cookie"
+            self._api_base = (_cookie_api_base(set_ck[1]) or self._api_base
+                              or url[: -len(_SESSIONS_PATH)])
+        else:
+            # 两处都没有新令牌:沿用旧的(Privy 不一定每次都轮换)。但要留痕 ——
+            # 如果它其实已经被这次续期作废了,下一次续期会 401,那时用户需要重新 --login。
+            logger.warning("Privy 续期没给新的续期令牌(正文里没有真值、Set-Cookie 里也没有) —— 沿用旧的")
+
         self._access = str(access)
-        # Privy 可能不轮换 refresh token(不返回就沿用旧的),这里不能把它清空
-        self._refresh = str(refresh) if refresh else self._refresh
         self._expires_at = decode_jwt_exp(self._access) or (time.time() + _FALLBACK_TTL_SEC)
-        save_session(self._access, self._refresh, source="refresh", path=self._path)
+        save_session(self._access, self._refresh, source="refresh", path=self._path,
+                     refresh_via=self._refresh_via, api_base=self._api_base)
 
     # ---------- 对外 ----------
     @property
@@ -372,6 +434,60 @@ def _login_token_fresh(access: str, now: float | None = None) -> bool:
     return exp - (time.time() if now is None else now) > _LOGIN_MIN_REMAINING_SEC
 
 
+def _real_refresh(v) -> str | None:
+    """
+    续期令牌 → 真值;空 / 占位符一律 None。
+
+    ⚠️ 占位符 "deprecated" 是**真实出现过**的值(见 REFRESH_SENTINEL),当真令牌存下来的后果是
+       一小时后续期 401、轮询停摆。读、写、续期回来的每一个口子都过这一道。
+    """
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s or s.lower() in (REFRESH_SENTINEL, "null", "undefined", "none"):
+        return None
+    return s
+
+
+def _cookie_api_base(domain: str | None) -> str | None:
+    """Cookie 的域名(`.privy.fomo.family`)→ 认证地址(`https://privy.fomo.family`)。取不到返回 None。"""
+    host = (domain or "").strip().lstrip(".")
+    if not host or "/" in host or " " in host:
+        return None
+    return f"https://{host}"
+
+
+@dataclass(frozen=True)
+class _SessionResp:
+    """续期响应里用得到的三样:状态码、正文、Set-Cookie((名字, 值, 域名), …)。"""
+
+    status_code: int
+    text: str
+    cookies: tuple = ()
+
+
+def _post_session(url: str, *, headers: dict, body: dict, cookies: dict | None,
+                  proxy: str | None) -> _SessionResp:
+    """
+    发一次续期请求。单独拎出来是为了测试能整个换掉它(此前这条路径一个测试都没有)。
+
+    ⚠️ 用 curl_cffi + Chrome 指纹,不再用 httpx:privy.fomo.family 前面有 Cloudflare
+       (登录浏览器里就有它发的 __cf_bm),裸 TLS 指纹容易被拦;项目里其它对外请求也都是这么做的。
+    """
+    from curl_cffi import requests as cffi_requests
+
+    r = cffi_requests.post(url, json=body, headers=headers, cookies=cookies or None,
+                           impersonate="chrome", timeout=20,
+                           proxies={"http": proxy, "https": proxy} if proxy else None)
+    got: list[tuple[str, str, str]] = []
+    try:
+        for c in r.cookies.jar:
+            got.append((c.name, c.value or "", c.domain or ""))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("读取续期响应的 Set-Cookie 失败(不致命): {}", e)
+    return _SessionResp(status_code=r.status_code, text=r.text or "", cookies=tuple(got))
+
+
 def _looks_like_jwt(v: str | None) -> bool:
     """三段式且够长才算 —— 避免把 'true' / 'null' 这类占位值当成 token 存下来"""
     return bool(v) and v.count(".") == 2 and len(v) > 60
@@ -406,7 +522,7 @@ def _fuzzy_refresh(d: dict) -> str | None:
     return None
 
 
-def _extract_tokens(context) -> tuple[str | None, str | None, str]:
+def _extract_tokens(context) -> tuple[str | None, str | None, str, str | None]:
     """
     从浏览器上下文里抓 Privy token,返回 (access, refresh, 命中来源)。
 
@@ -423,29 +539,36 @@ def _extract_tokens(context) -> tuple[str | None, str | None, str]:
             logger.debug("读取 localStorage 失败(页面可能正在跳转): {}", e)
 
     access = _first(ls_all, _LS_ACCESS_KEYS) or _fuzzy_access(ls_all)
-    refresh = _first(ls_all, _LS_REFRESH_KEYS) or _fuzzy_refresh(ls_all)
+    # ⚠️ Cookie 模式下 localStorage 里是占位符 "deprecated":当成没有,往下去 Cookie 里找真令牌
+    refresh = _real_refresh(_first(ls_all, _LS_REFRESH_KEYS) or _fuzzy_refresh(ls_all))
+    api_base: str | None = None              # 只有续期令牌来自 Cookie 时才有
     source = "localStorage" if (access or refresh) else ""
     if ls_all:
         logger.debug("localStorage 里的 privy 键: {}", sorted(ls_all.keys()))
 
     if not (access and refresh):
         try:
-            ck = {c["name"]: c.get("value") for c in context.cookies()}
+            raw_ck = list(context.cookies())
         except Exception as e:  # noqa: BLE001
             logger.debug("读取 cookie 失败: {}", e)
-            ck = {}
+            raw_ck = []
+        ck = {c["name"]: c.get("value") for c in raw_ck if isinstance(c, dict) and c.get("name")}
         privy_ck = {k: v for k, v in ck.items() if "privy" in k.lower()}
         if privy_ck:
             logger.debug("cookie 里的 privy 键: {}", sorted(privy_ck.keys()))
         ck_access = _first(ck, _CK_ACCESS_KEYS) or _fuzzy_access(privy_ck)
-        ck_refresh = _first(ck, _CK_REFRESH_KEYS) or _fuzzy_refresh(privy_ck)
+        ck_refresh = _real_refresh(_first(ck, _CK_REFRESH_KEYS) or _fuzzy_refresh(privy_ck))
         if not access and ck_access:
             access, source = ck_access, (source + "+cookie" if source else "cookie")
         if not refresh and ck_refresh:
             refresh = ck_refresh
+            # 认证地址跟着这个 Cookie 的域名走(.privy.fomo.family → https://privy.fomo.family)
+            dom = next((c.get("domain") for c in raw_ck if isinstance(c, dict)
+                        and c.get("name") in _CK_REFRESH_KEYS and c.get("value") == ck_refresh), None)
+            api_base = _cookie_api_base(dom) or PRIVY_COOKIE_API_FALLBACK
             source = source if "cookie" in source else (source + "+cookie" if source else "cookie")
 
-    return access, refresh, source or "none"
+    return access, refresh, source or "none", api_base
 
 
 def _open_login_context(p, settings, cdp_url: str | None):
@@ -525,6 +648,7 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
     deadline = time.time() + timeout_sec
     access = refresh = None
     source = "none"
+    api_base: str | None = None
     stale_seen: str | None = None      # 已经提示过的那份旧令牌,同一份不重复刷日志
 
     with sync_playwright() as p:
@@ -554,7 +678,7 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
             if not context.pages:  # 用户把窗口全关了
                 logger.error("浏览器已被关闭,登录未完成")
                 break
-            access, refresh, source = _extract_tokens(context)
+            access, refresh, source, api_base = _extract_tokens(context)
             # access 必须像 JWT 才算数:登录中途 Privy 可能先写一个空壳值
             if _looks_like_jwt(access):
                 if _login_token_fresh(access):
@@ -589,7 +713,8 @@ def interactive_login(timeout_sec: int = LOGIN_TIMEOUT_SEC, cdp_url: str | None 
         # 没有 refresh token 不是致命错误:access token 还能用约 1 小时,只是到期要重新登录
         logger.warning("只抓到 access token,没抓到 refresh token —— 过期后需要重新 --login")
 
-    save_session(access, refresh, source=source)
+    save_session(access, refresh, source=source,
+                 refresh_via="cookie" if api_base else None, api_base=api_base)
     get_token_provider.cache_clear()  # 同进程内后续调用要拿到新会话
 
     # ⚠️ cdp 模式 attach 的是**用户自己的 Chrome**,PROFILE_DIR 从头到尾没被写过
